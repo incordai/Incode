@@ -923,6 +923,7 @@ impl CliApp {
                                         &task.roadmap_id,
                                         &steps,
                                         &verify,
+                                        &workspace,
                                     )
                                     .tasks,
                                 );
@@ -1874,7 +1875,7 @@ impl crate::runner::Replanner for LiveReplanner {
         if steps.is_empty() {
             return Vec::new();
         }
-        crate::ledger::Ledger::from_plan(roadmap_id, &steps, &self.verify).tasks
+        crate::ledger::Ledger::from_plan(roadmap_id, &steps, &self.verify, &self.workspace).tasks
     }
 }
 

@@ -729,7 +729,26 @@ impl Ledger {
     /// correctly and abandoned all thirteen with `0 attempt(s) made`, because
     /// nothing could ever have proved them.
     #[must_use]
-    pub fn from_plan(roadmap_item: &str, steps: &[crate::plan::Step], verify: &[String]) -> Self {
+    pub fn from_plan(
+        roadmap_item: &str,
+        steps: &[crate::plan::Step],
+        verify: &[String],
+        workspace: &Path,
+    ) -> Self {
+        // THE FROZEN INTERFACES, ATTACHED HERE SO NO CALLER CAN FORGET.
+        //
+        // `Task::contracts` was read by `runner::task_instruction` and written
+        // by nobody: `Task::with_contracts` existed, was tested, and had no
+        // production caller, so the block telling an agent which shapes are
+        // frozen never appeared in a single real prompt. Same shape as
+        // `with_tier` and `with_dependencies` — built, documented, unreachable.
+        //
+        // Done in `from_plan` rather than at the two call sites because a
+        // third caller is the way this comes back.
+        let contracts = crate::contracts::Contracts::load(workspace)
+            .map(|frozen| frozen.required_names())
+            .unwrap_or_default();
+
         let mut tasks: Vec<Task> = Vec::new();
         let mut preparation: Vec<String> = Vec::new();
         // Which task each PLAN STEP became, 1-based as the planner numbers
@@ -850,8 +869,18 @@ impl Ledger {
                 }
             }
 
+            // EVERY CODE TASK, not only the ones whose text happens to name a
+            // contract. A task that must honour a shape often does not
+            // mention it — and the cost of the two directions is not
+            // symmetric: an agent told about an interface it never touches
+            // reads one extra line, while an agent NOT told renames a field
+            // and breaks a module nobody notices until integration.
+            //
+            // Research tasks are left out: they write no code, so there is no
+            // shape for them to break.
             let mut task = Task::new(&id, roadmap_item.to_string(), title)
                 .with_tier(&step.role)
+                .with_contracts(contracts.clone())
                 .with_verify(verify.to_vec());
             if !depends.is_empty() {
                 task = task.with_dependencies(depends);
@@ -1451,6 +1480,7 @@ mod tests {
                 step("implement", "share the validation", vec![1, 2]),
             ],
             &["true".to_string()],
+            Path::new("."),
         );
 
         assert_eq!(ledger.tasks.len(), 3);
@@ -1484,6 +1514,7 @@ mod tests {
                 step("implement", "two", vec![]),
             ],
             &["true".to_string()],
+            Path::new("."),
         );
         assert!(ledger.tasks.iter().all(|t| t.depends_on.is_empty()));
     }
@@ -1505,6 +1536,7 @@ mod tests {
                 step("implement", "second", vec![]),
             ],
             &["true".to_string()],
+            Path::new("."),
         );
 
         assert!(
@@ -1533,6 +1565,7 @@ mod tests {
                 step("implement", "fix the second", vec![1]),
             ],
             &["true".to_string()],
+            Path::new("."),
         );
 
         // `plan` produced no task of its own; it folded into r-1.1.
@@ -1542,6 +1575,81 @@ mod tests {
             vec!["r-1.1".to_string()],
             "the dependency did not resolve to the task holding that work"
         );
+    }
+
+    /// **THE FROZEN INTERFACES MUST REACH THE AGENT THAT COULD BREAK THEM.**
+    ///
+    /// `Task::contracts` was read by `runner::task_instruction` — it builds
+    /// the block telling an agent which names are agreed and not to be
+    /// renamed — and written by nothing. `Task::with_contracts` existed, was
+    /// tested, and had no production caller, so that block never appeared in
+    /// a real prompt. The whole point of freezing a shape is that the person
+    /// building against it is told, and nobody was.
+    #[test]
+    fn a_code_task_is_told_which_shapes_are_frozen() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::create_dir_all(dir.path().join(".incord")).expect("mkdir");
+        std::fs::write(
+            dir.path().join(crate::contracts::CONTRACTS_FILE),
+            r#"{"schemas":{"User":{"id":"string"}},
+                "endpoints":[{"path":"POST /api/users","request":"User"}]}"#,
+        )
+        .expect("write");
+
+        let ledger = Ledger::from_plan(
+            "r-1",
+            &[
+                step("explore", "find the writers", vec![]),
+                step("implement", "add the endpoint", vec![]),
+            ],
+            &["true".to_string()],
+            dir.path(),
+        );
+
+        let change = ledger
+            .tasks
+            .iter()
+            .find(|t| t.deliverable.is_none())
+            .expect("the implement task");
+        assert!(
+            change.contracts.contains(&"User".to_string()),
+            "the agent was not told about the frozen schema: {:?}",
+            change.contracts
+        );
+        assert!(
+            change.contracts.contains(&"POST /api/users".to_string()),
+            "the agent was not told about the frozen endpoint: {:?}",
+            change.contracts
+        );
+
+        // AND IT REACHES THE PROMPT. The field is worth nothing if the
+        // instruction does not carry it.
+        let told = crate::runner::task_instruction(change);
+        assert!(told.contains("User"), "{told}");
+
+        // A research task writes no code, so there is no shape for it to
+        // break and no reason to spend prompt on one.
+        let research = ledger
+            .tasks
+            .iter()
+            .find(|t| t.deliverable.is_some())
+            .expect("the explore task");
+        assert!(research.contracts.is_empty(), "{:?}", research.contracts);
+    }
+
+    /// A project with no contracts file is the ordinary case and must produce
+    /// ordinary tasks — not an error, and not a task claiming shapes exist.
+    #[test]
+    fn no_contracts_file_means_no_contracts_and_no_complaint() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let ledger = Ledger::from_plan(
+            "r-1",
+            &[step("implement", "do it", vec![])],
+            &["true".to_string()],
+            dir.path(),
+        );
+        assert_eq!(ledger.tasks.len(), 1);
+        assert!(ledger.tasks[0].contracts.is_empty());
     }
 
     /// **A RESEARCH STEP IS A TASK, AND IT IS NOT JUDGED BY THE BUILD.**
@@ -1560,6 +1668,7 @@ mod tests {
                 step("implement", "fix them", vec![]),
             ],
             &["true".to_string()],
+            Path::new("."),
         );
 
         assert_eq!(ledger.tasks.len(), 2, "got {:?}", ledger.tasks);
@@ -1606,6 +1715,7 @@ mod tests {
                 step("review", "judge the approach", vec![]),
             ],
             &["true".to_string()],
+            Path::new("."),
         );
 
         assert_eq!(ledger.tasks.len(), 2, "got {:?}", ledger.tasks);

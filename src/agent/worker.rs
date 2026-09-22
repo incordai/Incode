@@ -2063,6 +2063,7 @@ mod tests {
             "r1",
             &steps,
             &["cargo".to_string(), "test".to_string()],
+            std::path::Path::new("."),
         );
 
         let mut worker = AgentBackendWorker::new(ScriptedBackend::saying(vec![AgentEvent::Text(

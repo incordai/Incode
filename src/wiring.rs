@@ -54,7 +54,7 @@ use std::path::{Path, PathBuf};
 /// actually happened, six times.
 ///
 /// Lower it whenever the number falls. The test fails and tells you to.
-pub const MAX_UNWIRED: usize = 63;
+pub const MAX_UNWIRED: usize = 59;
 
 /// A `pub` item nothing outside its own file calls.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -94,6 +94,20 @@ pub const DELIBERATELY_UNWIRED: &[(&str, &str)] = &[
          take exactly the capabilities it wants; the ladder is the API.",
     ),
     ("run_with_journal", "Same ladder as `run_with_owner`."),
+    (
+        "rules_for",
+        "The unbounded spelling of a request the two real callers both make \
+         with an explicit deadline (`session_context`, `context_for_turn`), \
+         because both run in front of a person waiting. Kept as the plain \
+         form of the module's one question. NOT a sign the rules are \
+         unloaded — they are, through those two.",
+    ),
+    (
+        "findings_for",
+        "Same shape as `rules_for`: the unbounded spelling of what \
+         `context_for_session_within` asks with a deadline. The auditor is \
+         wired; this is the entry point without a clock on it.",
+    ),
     (
         "Supervisor",
         "The generic dead-man's switch. `run_stdio` supervises the desktop \
