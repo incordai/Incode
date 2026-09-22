@@ -141,6 +141,24 @@ pub struct AdminConfig {
     /// less" is indistinguishable from "it silently did nothing".
     #[serde(default)]
     pub plugins: Plugins,
+    /// The operator's own commands, run around every desktop tool call.
+    ///
+    /// # Why the desktop specifically, and why here
+    ///
+    /// The desktop is the widest capability this harness hands over and the
+    /// only one whose mistakes a checkpoint cannot undo. It is also the only
+    /// tool dispatcher left in this crate's own process, so it is the one
+    /// place a hook can sit between the decision and the action.
+    ///
+    /// In this file rather than per-workspace because it is a guard on the
+    /// MACHINE — an operator who wants a confirmation before anything types
+    /// into their screen wants it for every project, not for the one they
+    /// remembered to configure. See [`crate::hooks`] for the contract, which
+    /// includes the fact that a hook is shown the real input.
+    ///
+    /// Empty is the default and costs nothing.
+    #[serde(default, skip_serializing_if = "crate::hooks::HookConfig::is_empty")]
+    pub desktop_hooks: crate::hooks::HookConfig,
 }
 
 /// Which optional parts of the body are in use.
@@ -998,6 +1016,13 @@ mod tests {
             verify_command: Some(vec!["cargo".to_string(), "test".to_string()]),
             memory_url: Some("http://127.0.0.1:9180".to_string()),
             plugins: Plugins::default(),
+            // A guard on the desktop has to survive the file too. An operator
+            // who writes one and gets it back empty has no guard and no way
+            // to tell.
+            desktop_hooks: crate::hooks::HookConfig {
+                pre_tool_use: vec!["a-guard-command".to_string()],
+                post_tool_use: vec!["a-logging-command".to_string()],
+            },
         };
         admin.save(dir.path()).expect("saves");
 

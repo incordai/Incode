@@ -82,6 +82,12 @@ pub struct Server {
     /// server by hand does not silently produce something more capable than
     /// the harness would have launched.
     permissions: crate::permissions::PermissionPolicy,
+    /// The operator's own commands, run around every call.
+    ///
+    /// `None` is the ordinary case and costs nothing. See [`crate::hooks`] for
+    /// the contract, and for why a hook sees the real input rather than the
+    /// redacted description the journal gets.
+    hooks: Option<crate::hooks::HookRunner>,
 }
 
 impl Server {
@@ -97,7 +103,19 @@ impl Server {
             permissions: crate::permissions::PermissionPolicy::for_desktop(
                 crate::permissions::PermissionMode::WorkspaceWrite,
             ),
+            hooks: None,
         }
+    }
+
+    /// Run the operator's own commands around every tool call.
+    ///
+    /// An empty config is dropped rather than stored, so the ordinary case
+    /// costs one `is_empty` at startup instead of two process spawns per
+    /// click.
+    #[must_use]
+    pub fn with_hooks(mut self, config: crate::hooks::HookConfig) -> Self {
+        self.hooks = (!config.is_empty()).then(|| crate::hooks::HookRunner::new(config));
+        self
     }
 
     /// Run this desktop under a session's permission mode.
@@ -267,11 +285,53 @@ impl Server {
             crate::permissions::PermissionOutcome::Deny { reason } => Err(reason),
         };
 
-        let outcome = match (&permitted, self.safety.is_stopped()) {
-            (Err(reason), _) => Err(reason.clone()),
-            (Ok(()), true) => Err(super::safety::Refusal::Stopped.message()),
-            (Ok(()), false) => self.run_tool(name, &args),
+        // THE OPERATOR'S OWN VETO, asked last of the three and only if the
+        // first two allowed. Ordering matters: a hook is a process spawn, so
+        // running it before a call that a mode or a stop would refuse anyway
+        // would pay for it to be told about work that is not going to happen.
+        //
+        // A hook sees the REAL arguments, not `describe`'s redacted line. That
+        // is the one place the redaction boundary is deliberately crossed, and
+        // [`crate::hooks`] says why: a hook that cannot see what is about to
+        // be typed cannot refuse on it.
+        let raw_args = args.to_string();
+        let vetoed = match (&permitted, self.safety.is_stopped(), self.hooks.as_ref()) {
+            (Ok(()), false, Some(hooks)) => {
+                let result = hooks.run_pre_tool_use(name, &raw_args);
+                if result.is_denied() {
+                    let said = result.messages().join("; ");
+                    Some(if said.is_empty() {
+                        format!("refused: a hook denied `{name}` and said nothing about why")
+                    } else {
+                        format!("refused by a hook: {said}")
+                    })
+                } else {
+                    None
+                }
+            }
+            _ => None,
         };
+
+        let outcome = match (&permitted, self.safety.is_stopped(), vetoed) {
+            (Err(reason), _, _) => Err(reason.clone()),
+            (Ok(()), true, _) => Err(super::safety::Refusal::Stopped.message()),
+            (Ok(()), false, Some(why)) => Err(why),
+            (Ok(()), false, None) => self.run_tool(name, &args),
+        };
+
+        // AFTER, and only for a call that actually ran. A post hook told about
+        // a refused click would be recording something that did not happen.
+        // It cannot deny: the action is already done, and reporting a refusal
+        // for it would be a lie to the agent.
+        if let Some(hooks) = self.hooks.as_ref() {
+            if outcome.is_ok() {
+                let said = hooks.run_post_tool_use(name, &raw_args, "", false);
+                for message in said.messages() {
+                    // stderr, never stdout: stdout is the protocol channel.
+                    eprintln!("hook after {name}: {message}");
+                }
+            }
+        }
 
         // Journalled HERE rather than inside `run_tool`, because this is the
         // one place every tool passes through with its outcome known. Putting
@@ -1169,6 +1229,94 @@ mod tests {
             assert_eq!(
                 looked["result"]["isError"], false,
                 "read-only must still be able to look at the screen: {looked}"
+            );
+        }
+
+        /// **AN OPERATOR'S HOOK CAN STOP A KEYSTROKE, AND IS SHOWN WHAT IT
+        /// WOULD BE.**
+        ///
+        /// `hooks` was the other capability that existed, was tested, and had
+        /// nobody to call it: the harness stopped dispatching tools, so there
+        /// was no before-and-after left in it. The desktop server is the one
+        /// that remained, and it is the one where a veto is worth the most —
+        /// a click reaches a machine the operator is signed into, and no
+        /// checkpoint undoes it.
+        ///
+        /// The hook denies by exit code 2. Its stdout reaches the agent, so a
+        /// refusal can say what to do instead.
+        ///
+        /// # Why this one cannot stop safety, and uses the mouse instead
+        ///
+        /// A hook is deliberately NOT run for a call that a mode or a stop has
+        /// already refused — spawning a process to ask about work that is not
+        /// going to happen is waste. So a stopped server never reaches the
+        /// hook, and the stop refusal is what comes back.
+        ///
+        /// That leaves the control run genuinely able to reach the desktop, so
+        /// the tool is `move_mouse` rather than `type_text`: with the wiring
+        /// deleted the pointer moves a pixel, which leaks nothing and undoes
+        /// itself the moment anyone touches the mouse.
+        #[test]
+        fn a_hook_can_refuse_an_action_before_it_reaches_the_desktop() {
+            let deny = if cfg!(windows) {
+                // Echoes what it was handed, then denies — proving both halves
+                // of the contract in one command.
+                "cmd /C echo blocked: %HOOK_TOOL_NAME% & exit 2"
+            } else {
+                "echo \"blocked: $HOOK_TOOL_NAME\"; exit 2"
+            };
+
+            let mut s = Server::new(InputThread::start().expect("input thread")).with_hooks(
+                crate::hooks::HookConfig {
+                    pre_tool_use: vec![deny.to_string()],
+                    post_tool_use: Vec::new(),
+                },
+            );
+
+            let blocked = call(
+                &mut s,
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call",
+                    "params":{"name":"move_mouse","arguments":{"x":1,"y":1}}}"#,
+            );
+            assert_eq!(blocked["result"]["isError"], true, "{blocked}");
+
+            let refusal = blocked["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default();
+            assert!(
+                refusal.contains("hook"),
+                "the refusal must say a hook caused it: {refusal}"
+            );
+            assert!(
+                refusal.contains("move_mouse"),
+                "the hook was not told which tool it was refusing: {refusal}"
+            );
+        }
+
+        /// A hook that allows must not change anything, or every operator who
+        /// adds a logging hook silently loses their desktop.
+        #[test]
+        fn a_hook_that_allows_leaves_the_call_alone() {
+            let allow = if cfg!(windows) {
+                "cmd /C exit 0"
+            } else {
+                "exit 0"
+            };
+            let mut s = Server::new(InputThread::start().expect("input thread")).with_hooks(
+                crate::hooks::HookConfig {
+                    pre_tool_use: vec![allow.to_string()],
+                    post_tool_use: Vec::new(),
+                },
+            );
+
+            let moved = call(
+                &mut s,
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call",
+                    "params":{"name":"move_mouse","arguments":{"x":1,"y":1}}}"#,
+            );
+            assert_eq!(
+                moved["result"]["isError"], false,
+                "a permitting hook refused the call: {moved}"
             );
         }
 

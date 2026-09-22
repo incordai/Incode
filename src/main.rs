@@ -89,8 +89,20 @@ fn main() -> anyhow::Result<()> {
             // banner there is a parse error at the client.
             let input = incord_code::desktop::thread::InputThread::start()
                 .map_err(|e| anyhow::anyhow!("could not start desktop input: {e}"))?;
-            let mut server =
-                incord_code::desktop::mcp::Server::new(input).with_permission_mode(permission_mode);
+            // The operator's settings, read from `~/.incord-code/admin.json`.
+            // This process holds no workspace, so a machine-wide file is the
+            // only place its configuration can come from — and a guard on the
+            // desktop is a machine-wide concern anyway.
+            let hooks = incord_code::admin::AdminConfig::load_default().desktop_hooks;
+            if !hooks.pre_tool_use.is_empty() {
+                eprintln!(
+                    "incord-desktop: {} pre-tool hook(s) will run before every action",
+                    hooks.pre_tool_use.len()
+                );
+            }
+            let mut server = incord_code::desktop::mcp::Server::new(input)
+                .with_permission_mode(permission_mode)
+                .with_hooks(hooks);
             if let Some(path) = journal {
                 eprintln!("incord-desktop journalling to {}", path.display());
                 server = server.with_journal(path);
