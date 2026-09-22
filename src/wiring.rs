@@ -54,7 +54,7 @@ use std::path::{Path, PathBuf};
 /// actually happened, six times.
 ///
 /// Lower it whenever the number falls. The test fails and tells you to.
-pub const MAX_UNWIRED: usize = 51;
+pub const MAX_UNWIRED: usize = 49;
 
 /// A `pub` item nothing outside its own file calls.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -101,6 +101,13 @@ pub const DELIBERATELY_UNWIRED: &[(&str, &str)] = &[
          because both run in front of a person waiting. Kept as the plain \
          form of the module's one question. NOT a sign the rules are \
          unloaded — they are, through those two.",
+    ),
+    (
+        "exhausted_message",
+        "The method spelling of `Budget::exhausted_text`, which IS wired — \
+         `StopReason::BudgetSpent` calls it after the `Budget` itself is out \
+         of reach. Kept because asking a budget why it stopped should not \
+         require unpacking it into two numbers first.",
     ),
     (
         "findings_for",

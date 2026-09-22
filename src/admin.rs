@@ -648,7 +648,15 @@ impl AdminConfig {
                 verify.value.join(" "),
                 verify.source.as_str()
             )),
-            None => out.push_str("  verify         none — nothing can prove a task finished\n"),
+            // WHY, not just THAT. "none" told an operator they had a problem
+            // and nothing about which one, so the two cases — nothing here
+            // names an ecosystem, versus two do and running one's tests would
+            // not prove the other's code — read identically. They need
+            // opposite responses, and `detection_note` already wrote both.
+            None => out.push_str(&format!(
+                "  verify         none — nothing can prove a task finished\n                 {}\n",
+                crate::verify::detection_note(workspace)
+            )),
         }
 
         // Every one of these is optional. Saying which are OFF is the point: a
@@ -1030,6 +1038,44 @@ mod tests {
             AdminConfig::load(dir.path()).expect("loads"),
             admin,
             "what was written must be what comes back"
+        );
+    }
+
+    /// **"NONE" IS NOT AN ANSWER AN OPERATOR CAN ACT ON.**
+    ///
+    /// Two workspaces get no check for opposite reasons: one names no
+    /// ecosystem this harness knows, the other names two and running one's
+    /// tests would not prove the other's code. The first wants a command
+    /// written down; the second wants a choice made. The report said "none"
+    /// for both, and `detection_note` had already written the difference and
+    /// was called by nothing.
+    #[test]
+    fn a_report_with_no_check_says_which_kind_of_none_it_is() {
+        let _guard = lock();
+        clear_env();
+        let admin = AdminConfig::default();
+
+        // Nothing recognisable here.
+        let empty = tempfile::tempdir().expect("temp dir");
+        let bare = admin.report(empty.path(), None);
+        assert!(bare.contains("nothing can prove"), "{bare}");
+        assert!(
+            bare.contains("names an ecosystem"),
+            "the report does not say WHY there is no check: {bare}"
+        );
+
+        // Two ecosystems, which is a different problem with a different fix.
+        let mixed = tempfile::tempdir().expect("temp dir");
+        std::fs::write(mixed.path().join("Cargo.toml"), "[package]\n").expect("write");
+        std::fs::write(mixed.path().join("package.json"), "{}").expect("write");
+        let ambiguous = admin.report(mixed.path(), None);
+        assert!(
+            ambiguous.contains("2 ecosystems are present"),
+            "the ambiguous case reads the same as the empty one: {ambiguous}"
+        );
+        assert!(
+            ambiguous.contains("Rust") && ambiguous.contains("Node.js"),
+            "the report must name them, or the operator cannot choose: {ambiguous}"
         );
     }
 

@@ -363,7 +363,18 @@ pub enum StopReason {
     /// silently in exactly the conditions where nobody is watching.
     GoalsUnchecked { why: String },
     /// The token ceiling was reached.
-    BudgetSpent { spent: u64 },
+    ///
+    /// Carries the CEILING as well as the spend, because "24,000 used" is not
+    /// something an operator can act on — they need to know what it was
+    /// measured against and which variable raises it. That text already
+    /// existed, in [`crate::budget::Budget::exhausted_message`], and nothing
+    /// called it while this variant printed a worse version of the same
+    /// sentence.
+    BudgetSpent {
+        spent: u64,
+        /// `None` when the run had no ceiling, which is a different sentence.
+        ceiling: Option<u64>,
+    },
     /// A task used its attempts. The run halts rather than skipping it: an
     /// unattended loop that steps over its failures reports success while
     /// leaving the work undone.
@@ -412,8 +423,12 @@ impl StopReason {
                 "Every task in the ledger is finished. The roadmap goals were NOT checked, so \
                  nothing here proves the work is done: {why}"
             ),
-            Self::BudgetSpent { spent } => {
-                format!("Stopped: the token budget is spent ({spent} used).")
+            // The budget writes its own message. Two places phrasing the same
+            // stop is how one of them ends up telling an operator less than
+            // the other — which is what happened: this arm said how much was
+            // used, and never what the limit was or how to raise it.
+            Self::BudgetSpent { spent, ceiling } => {
+                crate::budget::Budget::exhausted_text(*spent, *ceiling)
             }
             Self::TaskFailedTwice { id, why } => {
                 format!("Stopped: `{id}` failed twice and was set aside. Last failure: {why}")
@@ -1111,6 +1126,7 @@ fn work_the_ledger(
             return RunOutcome {
                 stop: StopReason::BudgetSpent {
                     spent: budget.spent(),
+                    ceiling: budget.ceiling(),
                 },
                 completed,
                 attempted,
@@ -3510,8 +3526,25 @@ mod tests {
             &never_cancelled(),
         );
 
-        assert_eq!(outcome.stop, StopReason::BudgetSpent { spent: 50 });
+        assert_eq!(
+            outcome.stop,
+            StopReason::BudgetSpent {
+                spent: 50,
+                ceiling: Some(10)
+            }
+        );
         assert_eq!(worker.calls, 0, "no task may be started with nothing left");
+
+        // AND THE MESSAGE IS ACTIONABLE. "50 used" is not something anyone can
+        // do anything with: it needs the limit it was measured against and the
+        // name of the variable that raises it. Both existed in
+        // `Budget::exhausted_message` and nothing called it.
+        let said = outcome.stop.message();
+        assert!(said.contains("50 of 10"), "{said}");
+        assert!(
+            said.contains(crate::budget::BUDGET_ENV),
+            "the operator is not told how to raise it: {said}"
+        );
     }
 
     #[test]
@@ -3564,7 +3597,10 @@ mod tests {
     fn every_stop_reason_says_what_happened() {
         for reason in [
             StopReason::LedgerEmpty,
-            StopReason::BudgetSpent { spent: 5 },
+            StopReason::BudgetSpent {
+                spent: 5,
+                ceiling: Some(4),
+            },
             StopReason::TaskFailedTwice {
                 id: "t-1".to_string(),
                 why: "the check failed".to_string(),

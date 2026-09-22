@@ -105,13 +105,30 @@ impl Budget {
     /// What to tell the operator when a run stops on its ceiling.
     #[must_use]
     pub fn exhausted_message(&self) -> String {
-        match self.ceiling {
+        Self::exhausted_text(self.spent, self.ceiling)
+    }
+
+    /// The same sentence, from the two numbers alone.
+    ///
+    /// # Why it is not only a method
+    ///
+    /// [`crate::runner::StopReason::BudgetSpent`] has to say this after the
+    /// `Budget` it came from is out of reach, and for a while it wrote its own
+    /// version — "the token budget is spent (24000 used)". Which is true, and
+    /// useless: it does not say what 24,000 was measured against, and it does
+    /// not name the variable that raises it. One sentence, one place, reached
+    /// from both.
+    #[must_use]
+    pub fn exhausted_text(spent: u64, ceiling: Option<u64>) -> String {
+        match ceiling {
             Some(ceiling) => format!(
-                "Stopped: the token budget is spent ({} of {} used). \
-                 Raise {BUDGET_ENV} or start a new run.",
-                self.spent, ceiling
+                "Stopped: the token budget is spent ({spent} of {ceiling} used). \
+                 Raise {BUDGET_ENV} or start a new run."
             ),
-            None => "Stopped: the token budget is spent.".to_string(),
+            // A run with no ceiling cannot exhaust one. Reaching here means
+            // something else stopped it and called this, so it says only what
+            // it knows rather than inventing a limit.
+            None => format!("Stopped: the token budget is spent ({spent} used)."),
         }
     }
 
