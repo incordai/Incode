@@ -1,0 +1,1042 @@
+//! Every tool the harness can offer a model, in one place.
+//!
+//! # Why this exists
+//!
+//! A model reached over an API brings nothing. It cannot read a file, run a
+//! command or search a tree unless this program hands it the means and then
+//! carries out what it asks for. Driving an installed agent CLI is the other
+//! way round — that CLI supplies its own tools — but it is the convenient case,
+//! not the general one, and building only for it leaves every other model
+//! unable to do the work at all.
+//!
+//! # What was already here
+//!
+//! Almost all of it. `read_file`, `write_file`, `edit_file`, `glob_search`,
+//! `grep_search` and `execute_bash` were written, tested and then ORPHANED when
+//! the old dispatch loop was removed: implementations with no caller. In the
+//! other direction `verify`, the recall pair and the memory tools each carried a
+//! schema with nothing to collect it — advertisements with no audience.
+//!
+//! Neither half was reachable, and neither was visibly broken: `pub` keeps the
+//! compiler quiet about unused code, and both halves carry their own passing
+//! tests. Nineteen green tests covered code that nothing called.
+//!
+//! So this module writes almost no new behaviour. It joins the two halves and
+//! makes the join testable, which is the part that was actually missing.
+//!
+//! # The invariant
+//!
+//! Every tool advertised can be run, and every tool that can be run is
+//! advertised. Both directions are asserted, because either one failing alone is
+//! silent: a schema with no implementation makes a model call something that
+//! answers "unknown tool", and an implementation with no schema is what the last
+//! six months of dead code looked like.
+
+use std::path::{Path, PathBuf};
+
+use serde_json::{json, Value};
+
+use crate::agent::AgentBackend;
+
+/// Read a file's contents.
+pub const READ: &str = "Read";
+/// Create or overwrite a file.
+pub const WRITE: &str = "Write";
+/// Replace a string inside a file.
+pub const EDIT: &str = "Edit";
+/// Find files by name pattern.
+pub const GLOB: &str = "Glob";
+/// Search file contents.
+pub const GREP: &str = "Grep";
+/// Run a shell command.
+pub const BASH: &str = "Bash";
+/// Read one skill's text, once it turns out to apply.
+pub const SKILL: &str = "Skill";
+/// Hand a self-contained piece of work to a fresh agent.
+pub const AGENT: &str = "Agent";
+
+/// How deep subagents may nest.
+///
+/// One level of delegation is what the pattern is for; the second is slack. A
+/// subagent that can spawn subagents that can spawn subagents is a bill with no
+/// ceiling and a tree nobody can read.
+const MAX_DEPTH: u8 = 2;
+
+/// What a subagent is told about its position.
+///
+/// Short on purpose. It inherits no conversation, so everything it needs is in
+/// the task it was handed — and a long preamble here is paid on every
+/// delegation.
+const SUBAGENT_SYSTEM: &str = "\
+    You are doing ONE piece of work handed to you by another agent, in its \
+    workspace, with the same tools. You do not have its conversation and cannot \
+    ask it questions. Do the work and report what you found or changed, briefly \
+    and concretely — your reply is the only thing that goes back.";
+
+/// One conversation a subagent opened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Spawned {
+    /// The subagent's own session id.
+    pub session: String,
+    /// What it was asked to do, trimmed.
+    pub title: String,
+}
+
+/// The tools this harness offers, and the workspace they act on.
+pub struct Toolbox {
+    workspace: PathBuf,
+    /// Whether a spawned command gets the filtered environment.
+    ///
+    /// Carried rather than read at the call site because the shell tool runs
+    /// commands the MODEL chose: an unfiltered child inherits every variable
+    /// this process holds, credentials included.
+    filter_env: bool,
+    /// The operator's protected paths.
+    ///
+    /// # Why this lives here rather than at the call site
+    ///
+    /// An agent CLI enforces the guards itself — the harness hands them over and
+    /// the write never happens. A model driven over an API has no such layer:
+    /// these functions ARE the write. Without this the protected paths would be
+    /// enforced on one route and not the other, which is the same as not being
+    /// enforced.
+    ///
+    /// Kept as a `Result` on purpose. A guards file that fails to parse must not
+    /// read as "no guards" — that is the one failure mode the guards module
+    /// singles out as the worst, because everything keeps working and nothing is
+    /// protected. Held as an error, it refuses the write instead.
+    guards: Result<crate::guards::Guards, String>,
+    /// How many agents deep this one is. Zero is the one the operator started.
+    depth: u8,
+    /// The conversations subagents opened, so the session record holds the tree
+    /// that actually ran rather than only its root.
+    ///
+    /// A mutex because [`Toolbox::run`] takes `&self`: running a tool is not a
+    /// mutation of the toolbox from the caller's side, and threading `&mut`
+    /// through every tool to record two strings would be the tail wagging the
+    /// dog.
+    children: std::sync::Mutex<Vec<Spawned>>,
+    checkpoints:
+        Option<std::sync::Arc<std::sync::Mutex<crate::tools::checkpoint::CheckpointStore>>>,
+}
+
+impl Toolbox {
+    /// A toolbox over one workspace, with that workspace's guards in force.
+    ///
+    /// The guards are loaded here rather than passed in so that the protected
+    /// paths apply by DEFAULT. A safety that has to be opted into is one that
+    /// some call site will eventually forget.
+    #[must_use]
+    pub fn new(workspace: &Path, filter_env: bool) -> Self {
+        Self {
+            workspace: workspace.to_path_buf(),
+            filter_env,
+            guards: crate::guards::Guards::load(workspace),
+            depth: 0,
+            children: std::sync::Mutex::new(Vec::new()),
+            checkpoints: None,
+        }
+    }
+
+    /// Attach a checkpoint store so that writes and edits snapshot files before modifying them.
+    #[must_use]
+    pub fn with_checkpoints(
+        mut self,
+        checkpoints: std::sync::Arc<std::sync::Mutex<crate::tools::checkpoint::CheckpointStore>>,
+    ) -> Self {
+        self.checkpoints = Some(checkpoints);
+        self
+    }
+
+    /// The same toolbox, one level further down the tree.
+    #[must_use]
+    pub fn at_depth(mut self, depth: u8) -> Self {
+        self.depth = depth;
+        self
+    }
+
+    /// The conversations subagents opened under this one.
+    #[must_use]
+    pub fn children(&self) -> Vec<Spawned> {
+        self.children.lock().map(|c| c.clone()).unwrap_or_default()
+    }
+
+    /// Hand one piece of work to a fresh agent.
+    ///
+    /// # Why a subagent is worth the trouble
+    ///
+    /// A long search or a wide read fills the caller's context with material it
+    /// will never need again. Handing that out means only the ANSWER comes back,
+    /// and the reading is paid for in a conversation that is then thrown away.
+    ///
+    /// # The role decides the model
+    ///
+    /// A subagent that greps and one that works out why a bug happens are not
+    /// the same job and should not cost the same. The role is looked up in the
+    /// operator's own table, so which model serves which kind of work stays
+    /// their decision — see [`crate::roles`].
+    fn run_subagent(&self, input: &Value) -> Result<String, String> {
+        if self.depth >= MAX_DEPTH {
+            return Err(format!(
+                "already {} agents deep, which is the limit. Do this work here \
+                 rather than handing it on again.",
+                self.depth
+            ));
+        }
+        let task = input
+            .get("task")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        if task.is_empty() {
+            return Err(
+                "a subagent needs a task: say what it should do and what to report back"
+                    .to_string(),
+            );
+        }
+        let Some(mut settings) = crate::agent::api::Settings::from_env() else {
+            return Err(
+                "no endpoint is configured, so there is nothing to hand work to".to_string(),
+            );
+        };
+
+        // The operator's routing, not ours. An unknown role leaves the model
+        // alone rather than guessing at one — the parent's model is a working
+        // answer, and a wrong model is a wasted call.
+        let role = input
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        let inherited = settings.model.clone();
+        if !role.is_empty() {
+            if let Some(chosen) = crate::roles::RoleTable::from_env().model_for(role) {
+                settings.model = crate::roles::model_name(chosen).to_string();
+            }
+        }
+        // WHICH WORK WENT WHERE. Routing is invisible from outside: a subagent on
+        // the wrong model looks exactly like one on the right model that answered
+        // badly. So the choice says itself — including when it did NOT route, and
+        // why, which is the case that silently costs the most.
+        if role.is_empty() {
+            crate::trace!("route", "subagent: no role given, inheriting {inherited}");
+        } else if settings.model == inherited {
+            crate::trace!(
+                "route",
+                "subagent: role `{role}` is not configured, inheriting {inherited}"
+            );
+        } else {
+            crate::trace!(
+                "route",
+                "subagent: role `{role}` -> {} (parent was {inherited})",
+                settings.model
+            );
+        }
+        crate::trace!(
+            "route",
+            "subagent spawning at depth {}",
+            self.depth.saturating_add(1)
+        );
+
+        let mut child = crate::agent::api::ApiBackend::new(
+            settings,
+            &self.workspace,
+            SUBAGENT_SYSTEM,
+            self.filter_env,
+        )
+        .at_depth(self.depth + 1);
+        if let Some(cp) = &self.checkpoints {
+            child = child.with_checkpoints(cp.clone());
+        }
+
+        let mut said = String::new();
+        let outcome = child
+            .run_turn(task, &mut |event| {
+                if let crate::agent::AgentEvent::Text(text) = event {
+                    said.push_str(text);
+                }
+            })
+            .map_err(|e| format!("the subagent could not finish: {e}"))?;
+
+        // Recorded whatever it said, INCLUDING a failure: a subagent that ran
+        // and got nowhere is still a conversation that was paid for, and the
+        // session record showing it is how that becomes visible.
+        if let Ok(mut children) = self.children.lock() {
+            children.push(Spawned {
+                session: outcome.session_id.clone(),
+                title: crate::text::truncate(task, 72),
+            });
+        }
+        if outcome.is_error {
+            return Err(outcome.failure());
+        }
+        if said.trim().is_empty() {
+            return Err("the subagent finished without reporting anything".to_string());
+        }
+        Ok(said)
+    }
+
+    /// Hand over one skill's text.
+    fn read_skill(&self, input: &Value) -> Result<String, String> {
+        let name = input.get("name").and_then(Value::as_str).unwrap_or("");
+        // Checked BEFORE the fetch. An unnamed ask cannot match anything, so
+        // going to the store for it spends a request — and a four-second
+        // timeout — to answer a question already answered here.
+        if name.trim().is_empty() {
+            return Err("say which skill to read, by the name it is listed under".to_string());
+        }
+        let (set, _) = crate::skills::load(&crate::admin::AdminConfig::default_dir());
+        let Some(skill) = crate::skills::find(&set, name) else {
+            // Listing what there IS beats "not found": the name came back
+            // through a model and the near miss is usually right there.
+            let known: Vec<&str> = set
+                .managed
+                .iter()
+                .chain(set.discovered.iter())
+                .map(|s| s.name.as_str())
+                .take(20)
+                .collect();
+            return Err(format!(
+                "there is no skill called `{name}`. Skills available: {}",
+                known.join(", ")
+            ));
+        };
+        crate::skills::body_of(skill)
+    }
+
+    /// Record part of the project's brief.
+    fn save_brief(&self, raw: &str) -> Result<String, String> {
+        let update = crate::brief::parse_save(raw)?;
+        // The workspace FOLDER, which is what the brief is looked up by when
+        // no exact path matches — see `brief_for`. A different name here would
+        // write a brief that the gate then reports as missing.
+        let project = self
+            .workspace
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let still_missing = crate::brief::save(&self.workspace, &project, &update)?;
+        Ok(crate::brief::saved_report(&still_missing))
+    }
+
+    /// Why this call is refused by the operator's guards, if it is.
+    fn refused(&self, name: &str, input: &Value) -> Option<String> {
+        // Reads and searches change nothing, so the guards have nothing to say
+        // about them: they protect against WRITES.
+        if !matches!(name, WRITE | EDIT | BASH) {
+            return None;
+        }
+        let guards = match &self.guards {
+            Ok(guards) => guards,
+            Err(why) => {
+                return Some(format!(
+                    "the guards could not be read, so nothing may be written until they are \
+                     fixed: {why}"
+                ))
+            }
+        };
+        if name == BASH {
+            let command = input.get("command").and_then(Value::as_str).unwrap_or("");
+            return guards.refuse_command(command);
+        }
+        let path = input.get("path").and_then(Value::as_str).unwrap_or("");
+        if let Some(reason) = guards.refuse_write(path) {
+            return Some(reason);
+        }
+        crate::spec::refuse_source_write(&self.workspace, path)
+    }
+
+    /// Every tool, as the model is told about them.
+    ///
+    /// The file and shell schemas are written here because their
+    /// implementations never had any; the rest come from the modules that own
+    /// them, so a tool's description lives beside the code that honours it.
+    #[must_use]
+    pub fn definitions(&self) -> Vec<Value> {
+        let mut all = vec![
+            json!({
+                "name": READ,
+                "description": "Read a file from the workspace. Returns the text with line \
+                    numbers. Use `offset` and `limit` to take part of a large file rather \
+                    than all of it.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "File to read, relative to the workspace or absolute."},
+                        "offset": {"type": "integer", "description": "First line to return, counting from 0."},
+                        "limit": {"type": "integer", "description": "How many lines to return."}
+                    },
+                    "required": ["path"]
+                }
+            }),
+            json!({
+                "name": WRITE,
+                "description": "Create a file, or replace one entirely. When the file already \
+                    exists the reply includes a diff of what changed. Prefer Edit for a small \
+                    change to a large file.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "content": {"type": "string", "description": "The complete new contents."}
+                    },
+                    "required": ["path", "content"]
+                }
+            }),
+            json!({
+                "name": EDIT,
+                "description": "Replace an exact string in a file. The old string must appear \
+                    exactly once, so include enough surrounding text to be unambiguous.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "old_string": {"type": "string", "description": "Text to replace, matched exactly."},
+                        "new_string": {"type": "string", "description": "What to put in its place."}
+                    },
+                    "required": ["path", "old_string", "new_string"]
+                }
+            }),
+            json!({
+                "name": GLOB,
+                "description": "Find files whose paths match a pattern, such as `**/*.rs`.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": {"type": "string"},
+                        "path": {"type": "string", "description": "Directory to search under. Defaults to the workspace."}
+                    },
+                    "required": ["pattern"]
+                }
+            }),
+            json!({
+                "name": GREP,
+                "description": "Search file contents for a regular expression.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": {"type": "string", "description": "Regular expression to search for."},
+                        "path": {"type": "string", "description": "Directory to search under. Defaults to the workspace."},
+                        "glob": {"type": "string", "description": "Only search files matching this, e.g. `*.rs`."}
+                    },
+                    "required": ["pattern"]
+                }
+            }),
+            json!({
+                "name": BASH,
+                "description": "Run a shell command in the workspace and return its output. \
+                    Output is truncated if very long, and the command is stopped if it runs \
+                    past its timeout.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string"},
+                        "timeout": {"type": "integer", "description": "Milliseconds before the command is stopped."}
+                    },
+                    "required": ["command"]
+                }
+            }),
+            json!({
+                "name": SKILL,
+                "description": "Read one skill's own text. The session lists what skills exist                     and what each is for, but not their contents — ask for one BY NAME when the                     work matches its description, and follow it only after reading it.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "The skill's name, as listed."}
+                    },
+                    "required": ["name"]
+                }
+            }),
+            json!({
+                "name": AGENT,
+                "description": "Hand one self-contained piece of work to a fresh agent and get \
+                    back only its answer. Use this when the work needs a lot of reading you will \
+                    not need again — a wide search, a long file, tracing a call path. The \
+                    subagent has the same tools and the same workspace but NOT this \
+                    conversation, so put everything it needs in `task` and say exactly what to \
+                    report back. It cannot ask you anything.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "task": {
+                            "type": "string",
+                            "description": "The whole job, self-contained, ending with what to report back."
+                        },
+                        "role": {
+                            "type": "string",
+                            "description": "What KIND of work this is, which decides how capable a \
+                                model serves it. Omit if unsure and it uses this one's model.",
+                            "enum": crate::roles::KNOWN_ROLES
+                        }
+                    },
+                    "required": ["task"]
+                }
+            }),
+            crate::verify::tool_definition(),
+            crate::recall::index_tool_definition(),
+            crate::recall::get_tool_definition(),
+            // The intake gate TELLS the model to call this. Offering the gate
+            // without the tool is an instruction that cannot be followed, and
+            // the loop stalls on a brief that can never be saved.
+            crate::brief::save_tool_definition(),
+        ];
+        all.extend(crate::knowledge::tool_definitions());
+        all.extend(crate::web::tool_definitions());
+        all
+    }
+
+    /// The name of every tool offered.
+    #[must_use]
+    pub fn names(&self) -> Vec<String> {
+        self.definitions()
+            .iter()
+            .filter_map(|d| d.get("name").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Carry out one call.
+    ///
+    /// A failure comes back as `Err` and belongs in the model's `tool_result`
+    /// marked as an error, NOT as a crash and not as text that reads like
+    /// success — a model told a write succeeded when it did not will build on
+    /// the file it thinks it wrote.
+    pub fn run(&self, name: &str, input: &Value) -> Result<String, String> {
+        crate::trace!(
+            "tool",
+            "{name} <- {}",
+            crate::text::truncate(&input.to_string(), 160)
+        );
+        // BEFORE the call, not after. The sentinel that watches the tree can
+        // only report a write that already happened; a protected path has to be
+        // refused while refusing it still means something.
+        if let Some(refusal) = self.refused(name, input) {
+            crate::trace!("tool", "{name} REFUSED by guards: {refusal}");
+            return Err(refusal);
+        }
+        // The file and shell tools parse their own JSON from a string, which is
+        // the interface they were written to; re-serialising here keeps that
+        // contract rather than rewriting six working implementations.
+        let raw = input.to_string();
+        let ws = self.workspace.as_path();
+
+        // Snapshot before file-modifying operations if checkpoints are enabled.
+        if matches!(name, WRITE | EDIT) {
+            if let Some(checkpoints) = &self.checkpoints {
+                if let Ok(target) = crate::tools::file_ops::target_path(ws, &raw) {
+                    if let Ok(mut store) = checkpoints.lock() {
+                        store.snapshot(&target);
+                    }
+                }
+            }
+        }
+
+        let began = std::time::Instant::now();
+        let outcome = match name {
+            READ => crate::tools::file_ops::read_file(ws, &raw).map_err(|e| e.to_string()),
+            WRITE => crate::tools::file_ops::write_file(ws, &raw).map_err(|e| e.to_string()),
+            EDIT => crate::tools::file_ops::edit_file(ws, &raw).map_err(|e| e.to_string()),
+            GLOB => crate::tools::file_ops::glob_search(ws, &raw).map_err(|e| e.to_string()),
+            GREP => crate::tools::file_ops::grep_search(ws, &raw).map_err(|e| e.to_string()),
+            BASH => crate::tools::bash::execute_bash(ws, &raw, self.filter_env)
+                .map_err(|e| e.to_string()),
+            crate::verify::VERIFY_TOOL => crate::verify::run_tool(ws),
+            crate::recall::INDEX_TOOL => crate::recall::run_index_tool(&raw),
+            crate::recall::GET_TOOL => crate::recall::run_get_tool(&raw),
+            SKILL => self.read_skill(input),
+            AGENT => self.run_subagent(input),
+            crate::brief::SAVE_TOOL => self.save_brief(&raw),
+            other => crate::knowledge::handle_tool(other, input)
+                .or_else(|| crate::web::handle_tool(other, input))
+                .unwrap_or_else(|| Err(format!("there is no tool called `{other}`"))),
+        };
+        // The OUTCOME, not just the attempt. A tool that ran and failed and a
+        // tool that was never reached look identical from the call above.
+        match &outcome {
+            Ok(said) => crate::trace!(
+                "tool",
+                "{name} ok in {:?}, {} bytes",
+                began.elapsed(),
+                said.len()
+            ),
+            Err(why) => crate::trace!("tool", "{name} FAILED in {:?}: {why}", began.elapsed()),
+        }
+        outcome
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn toolbox(root: &Path) -> Toolbox {
+        Toolbox::new(root, true)
+    }
+
+    #[test]
+    fn every_advertised_tool_can_actually_be_run() {
+        // THE INVARIANT, in the direction that costs a model a wasted turn: a
+        // schema whose name reaches no implementation answers "there is no tool
+        // called X" to a model that was told there was.
+        let dir = tempfile::tempdir().expect("tmp");
+        let box_ = toolbox(dir.path());
+        for name in box_.names() {
+            let answer = box_.run(&name, &json!({}));
+            // The call is expected to FAIL here — it is given no arguments. What
+            // must never happen is failing because nothing is wired to the name.
+            if let Err(e) = answer {
+                assert!(
+                    !e.contains("there is no tool called"),
+                    "advertised but not wired: {name} -> {e}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_unknown_tool_is_an_error_the_model_can_read() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let answer = toolbox(dir.path()).run("Teleport", &json!({}));
+        let message = answer.expect_err("an unknown tool cannot succeed");
+        assert!(message.contains("Teleport"), "{message}");
+    }
+
+    #[test]
+    fn the_control_for_that_invariant_works() {
+        // Proves the check above can fail at all: an unwired name really does
+        // produce the string the assertion looks for. Without this the loop
+        // could be passing because the message changed.
+        let dir = tempfile::tempdir().expect("tmp");
+        let e = toolbox(dir.path())
+            .run("NotATool", &json!({}))
+            .expect_err("must fail");
+        assert!(e.contains("there is no tool called"), "{e}");
+    }
+
+    #[test]
+    fn every_schema_is_shaped_the_way_a_model_expects() {
+        let dir = tempfile::tempdir().expect("tmp");
+        for def in toolbox(dir.path()).definitions() {
+            let name = def.get("name").and_then(Value::as_str);
+            assert!(name.is_some_and(|n| !n.is_empty()), "unnamed tool: {def}");
+            let described = def
+                .get("description")
+                .and_then(Value::as_str)
+                .is_some_and(|d| d.len() > 20);
+            assert!(described, "{name:?} needs a description a model can act on");
+            let schema = def.get("input_schema").and_then(|s| s.get("type"));
+            assert_eq!(
+                schema.and_then(Value::as_str),
+                Some("object"),
+                "{name:?} input_schema"
+            );
+        }
+    }
+
+    #[test]
+    fn no_tool_is_advertised_twice() {
+        // Two entries under one name means the second is unreachable, and which
+        // one a provider honours is not ours to decide.
+        let dir = tempfile::tempdir().expect("tmp");
+        let mut names = toolbox(dir.path()).names();
+        let before = names.len();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), before, "duplicated: {names:?}");
+    }
+
+    #[test]
+    fn the_file_schema_names_the_field_the_implementation_reads() {
+        // A schema saying `file_path` over an implementation reading `path`
+        // fails on every single call, and nothing in either half would show it:
+        // both are correct alone. This is the join, which is what was missing.
+        let dir = tempfile::tempdir().expect("tmp");
+        let defs = toolbox(dir.path()).definitions();
+        let read = defs
+            .iter()
+            .find(|d| d["name"] == READ)
+            .expect("Read is offered");
+        let props = &read["input_schema"]["properties"];
+        assert!(
+            props.get("path").is_some(),
+            "the implementation reads `path`: {props}"
+        );
+        assert!(
+            props.get("file_path").is_none(),
+            "the implementation does NOT read `file_path`: {props}"
+        );
+    }
+
+    #[test]
+    fn reading_a_file_works_through_the_toolbox() {
+        let dir = tempfile::tempdir().expect("tmp");
+        std::fs::write(dir.path().join("hello.txt"), "first\nsecond\n").expect("write");
+        let out = toolbox(dir.path())
+            .run(READ, &json!({"path": "hello.txt"}))
+            .expect("read");
+        assert!(out.contains("first"), "{out}");
+        assert!(out.contains("second"), "{out}");
+    }
+
+    #[test]
+    fn writing_then_reading_returns_what_was_written() {
+        // The round trip, not a return code: a write that reports success and
+        // leaves nothing on disk is the failure worth catching.
+        let dir = tempfile::tempdir().expect("tmp");
+        let box_ = toolbox(dir.path());
+        box_.run(
+            WRITE,
+            &json!({"path": "new.txt", "content": "the contents"}),
+        )
+        .expect("write");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("new.txt")).expect("on disk"),
+            "the contents",
+            "the file must actually hold it"
+        );
+        let back = box_.run(READ, &json!({"path": "new.txt"})).expect("read");
+        assert!(back.contains("the contents"), "{back}");
+    }
+
+    #[test]
+    fn editing_changes_the_file_on_disk() {
+        let dir = tempfile::tempdir().expect("tmp");
+        std::fs::write(dir.path().join("e.txt"), "keep OLD keep").expect("write");
+        toolbox(dir.path())
+            .run(
+                EDIT,
+                &json!({"path": "e.txt", "old_string": "OLD", "new_string": "NEW"}),
+            )
+            .expect("edit");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("e.txt")).expect("read"),
+            "keep NEW keep"
+        );
+    }
+
+    #[test]
+    fn a_failing_call_reports_the_failure_rather_than_inventing_a_result() {
+        // A model told a read succeeded when the file is missing will build on
+        // contents that were never there.
+        let dir = tempfile::tempdir().expect("tmp");
+        let answer = toolbox(dir.path()).run(READ, &json!({"path": "absent.txt"}));
+        assert!(answer.is_err(), "got: {answer:?}");
+    }
+
+    #[test]
+    fn searching_finds_a_file_that_is_there_and_not_one_that_is_not() {
+        let dir = tempfile::tempdir().expect("tmp");
+        std::fs::write(dir.path().join("found.rs"), "fn marker() {}").expect("write");
+        let box_ = toolbox(dir.path());
+        let hits = box_
+            .run(GLOB, &json!({"pattern": "**/*.rs"}))
+            .expect("glob");
+        assert!(hits.contains("found.rs"), "{hits}");
+        let none = box_
+            .run(GLOB, &json!({"pattern": "**/*.nope"}))
+            .expect("glob");
+        assert!(!none.contains("found.rs"), "control: {none}");
+    }
+
+    #[test]
+    fn the_gate_that_demands_a_brief_offers_the_tool_that_saves_one() {
+        // Watched live: the intake gate tells the model to "Save each part with
+        // save_brief" while that tool was offered to nobody. An instruction to
+        // call a tool that does not exist is a loop with no way out of it.
+        let dir = tempfile::tempdir().expect("tmp");
+        let names = toolbox(dir.path()).names();
+        assert!(
+            names.iter().any(|n| n == crate::brief::SAVE_TOOL),
+            "the gate's own tool is missing: {names:?}"
+        );
+    }
+
+    #[test]
+    fn asking_for_a_skill_without_naming_one_costs_no_request() {
+        // An unnamed ask cannot match anything, so going to the store for it
+        // spends a request and a four-second timeout to answer a question that
+        // was already answered.
+        let dir = tempfile::tempdir().expect("tmp");
+        let started = std::time::Instant::now();
+        let refused = toolbox(dir.path())
+            .run(SKILL, &json!({}))
+            .expect_err("nothing to look up");
+        assert!(refused.contains("say which skill"), "{refused}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "it went to the store anyway: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn delegation_stops_at_the_depth_limit() {
+        // A subagent that can spawn subagents that can spawn subagents is a bill
+        // with no ceiling. The refusal happens at the tool, because that is where
+        // the new agent would be made.
+        let dir = tempfile::tempdir().expect("tmp");
+        let deep = Toolbox::new(dir.path(), true).at_depth(MAX_DEPTH);
+        let refused = deep
+            .run(AGENT, &json!({"task": "go and do a thing"}))
+            .expect_err("past the limit");
+        assert!(refused.contains("agents deep"), "{refused}");
+        assert!(
+            deep.children().is_empty(),
+            "and nothing was spawned to record"
+        );
+    }
+
+    #[test]
+    fn a_subagent_with_no_task_is_refused_before_anything_is_spawned() {
+        // An empty task cannot be done, and finding that out by paying for a
+        // conversation is the expensive way to learn it.
+        let dir = tempfile::tempdir().expect("tmp");
+        let box_ = toolbox(dir.path());
+        let refused = box_
+            .run(AGENT, &json!({"task": "   "}))
+            .expect_err("nothing to do");
+        assert!(refused.contains("needs a task"), "{refused}");
+        assert!(box_.children().is_empty(), "nothing was spawned");
+    }
+
+    #[test]
+    fn the_control_for_the_depth_limit_works() {
+        // Proves the limit is what refused, not the task check above it: the
+        // SAME call one level shallower gets past the depth gate and fails
+        // later, on something else.
+        let dir = tempfile::tempdir().expect("tmp");
+        let shallow = Toolbox::new(dir.path(), true).at_depth(MAX_DEPTH - 1);
+        let refused = shallow
+            .run(AGENT, &json!({"task": "go and do a thing"}))
+            .expect_err("no endpoint is configured in a test");
+        assert!(
+            !refused.contains("agents deep"),
+            "the depth gate fired at the wrong depth: {refused}"
+        );
+    }
+
+    #[test]
+    fn a_write_to_a_protected_path_is_refused() {
+        // An agent CLI enforces this itself. Over an API these functions ARE
+        // the write, so unenforced here means unenforced entirely.
+        let dir = tempfile::tempdir().expect("tmp");
+        std::fs::create_dir_all(dir.path().join("tests")).expect("dir");
+        let box_ = toolbox(dir.path());
+        let refused = box_
+            .run(
+                WRITE,
+                &json!({"path": "tests/it.rs", "content": "assert!(true)"}),
+            )
+            .expect_err("a protected path must be refused");
+        assert!(refused.contains("protected"), "{refused}");
+        // BEFORE the write, not after: the file must not exist at all.
+        assert!(
+            !dir.path().join("tests/it.rs").exists(),
+            "the refusal came too late — the file was written"
+        );
+        // The control: an ordinary path in the same workspace still works once
+        // the spec set exists, or this proves only that writing is broken.
+        for f in &crate::spec::SPEC_SET {
+            let full = dir.path().join(f.path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(
+                full,
+                if f.path.ends_with(".json") {
+                    "{}"
+                } else {
+                    "ok"
+                },
+            )
+            .unwrap();
+        }
+        std::fs::create_dir_all(dir.path().join("src")).expect("dir");
+        box_.run(
+            WRITE,
+            &json!({"path": "src/it.rs", "content": "fn main() {}"}),
+        )
+        .expect("an unprotected path is fine");
+        assert!(dir.path().join("src/it.rs").exists());
+    }
+
+    #[test]
+    fn writing_source_without_spec_is_refused_by_toolbox() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let box_ = toolbox(dir.path());
+        let refused = box_
+            .run(
+                WRITE,
+                &json!({"path": "src/it.rs", "content": "fn main() {}"}),
+            )
+            .expect_err("source write without spec set must be refused");
+        assert!(refused.contains("not specified yet"), "{refused}");
+    }
+
+    #[test]
+    fn editing_a_protected_path_is_refused_too() {
+        // Write and Edit both change a file; guarding one and not the other
+        // leaves the door open beside the locked one.
+        let dir = tempfile::tempdir().expect("tmp");
+        std::fs::create_dir_all(dir.path().join("tests")).expect("dir");
+        std::fs::write(dir.path().join("tests/it.rs"), "OLD").expect("write");
+        let refused = toolbox(dir.path())
+            .run(
+                EDIT,
+                &json!({"path": "tests/it.rs", "old_string": "OLD", "new_string": "NEW"}),
+            )
+            .expect_err("refused");
+        assert!(refused.contains("protected"), "{refused}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("tests/it.rs")).expect("read"),
+            "OLD",
+            "the file is untouched"
+        );
+    }
+
+    #[test]
+    fn reading_a_protected_path_is_still_allowed() {
+        // The guards protect against writes. An agent that cannot READ the
+        // check it must satisfy cannot satisfy it.
+        let dir = tempfile::tempdir().expect("tmp");
+        std::fs::create_dir_all(dir.path().join("tests")).expect("dir");
+        std::fs::write(dir.path().join("tests/it.rs"), "the check").expect("write");
+        let out = toolbox(dir.path())
+            .run(READ, &json!({"path": "tests/it.rs"}))
+            .expect("reading is not writing");
+        assert!(out.contains("the check"), "{out}");
+    }
+
+    #[test]
+    fn unreadable_guards_stop_writes_rather_than_permitting_them() {
+        // The failure the guards module calls the worst one: protections that
+        // quietly stop applying while everything keeps working.
+        let dir = tempfile::tempdir().expect("tmp");
+        std::fs::create_dir_all(dir.path().join(".incord")).expect("dir");
+        std::fs::write(dir.path().join(crate::guards::GUARDS_FILE), "{ not json").expect("write");
+        let refused = toolbox(dir.path())
+            .run(WRITE, &json!({"path": "anything.txt", "content": "x"}))
+            .expect_err("a broken guards file must not read as no guards");
+        assert!(refused.contains("could not be read"), "{refused}");
+        assert!(
+            !dir.path().join("anything.txt").exists(),
+            "and nothing was written"
+        );
+    }
+
+    #[test]
+    fn the_shell_tool_runs_a_command_and_returns_its_output() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let out = toolbox(dir.path())
+            .run(BASH, &json!({"command": "echo toolbox_probe"}))
+            .expect("bash");
+        assert!(out.contains("toolbox_probe"), "{out}");
+    }
+
+    #[test]
+    fn the_orphaned_tools_are_all_reachable_again() {
+        // Named individually rather than counted: a count passes while the
+        // wrong six are present.
+        let dir = tempfile::tempdir().expect("tmp");
+        let names = toolbox(dir.path()).names();
+        for expected in [
+            READ,
+            WRITE,
+            EDIT,
+            GLOB,
+            GREP,
+            BASH,
+            crate::verify::VERIFY_TOOL,
+            crate::recall::INDEX_TOOL,
+            crate::recall::GET_TOOL,
+            crate::knowledge::REMEMBER_TOOL,
+            crate::knowledge::SEARCH_TOOL,
+            crate::knowledge::FORGET_TOOL,
+            SKILL,
+            AGENT,
+            crate::brief::SAVE_TOOL,
+            crate::knowledge::SYMBOL_TOOL,
+            crate::web::FETCH_TOOL,
+            crate::web::SEARCH_TOOL,
+        ] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "{expected} is not offered; have {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn writes_and_edits_via_toolbox_are_snapshotted_and_undoable() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let ws = dir.path();
+        let store = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::tools::checkpoint::CheckpointStore::new(),
+        ));
+        let box_ = toolbox(ws).with_checkpoints(store.clone());
+
+        store.lock().unwrap().begin("create and modify a file");
+
+        box_.run(
+            WRITE,
+            &json!({"path": "sample.txt", "content": "initial line\n"}),
+        )
+        .expect("write");
+        assert_eq!(
+            std::fs::read_to_string(ws.join("sample.txt")).unwrap(),
+            "initial line\n"
+        );
+
+        box_.run(
+            EDIT,
+            &json!({
+                "path": "sample.txt",
+                "old_string": "initial line\n",
+                "new_string": "modified line\n"
+            }),
+        )
+        .expect("edit");
+        assert_eq!(
+            std::fs::read_to_string(ws.join("sample.txt")).unwrap(),
+            "modified line\n"
+        );
+
+        let outcome = store.lock().unwrap().undo_last(ws).expect("undo");
+        assert_eq!(outcome.restored.len(), 1);
+        assert!(outcome.failed.is_empty());
+        assert!(!ws.join("sample.txt").exists());
+    }
+
+    #[test]
+    fn pre_existing_file_modified_via_toolbox_is_restored_on_undo() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let ws = dir.path();
+        std::fs::write(ws.join("existing.txt"), "before edit\n").expect("write");
+
+        let store = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::tools::checkpoint::CheckpointStore::new(),
+        ));
+        let box_ = toolbox(ws).with_checkpoints(store.clone());
+
+        store.lock().unwrap().begin("edit existing");
+
+        box_.run(
+            EDIT,
+            &json!({
+                "path": "existing.txt",
+                "old_string": "before edit\n",
+                "new_string": "after edit\n"
+            }),
+        )
+        .expect("edit");
+        assert_eq!(
+            std::fs::read_to_string(ws.join("existing.txt")).unwrap(),
+            "after edit\n"
+        );
+
+        let outcome = store.lock().unwrap().undo_last(ws).expect("undo");
+        assert_eq!(outcome.restored.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(ws.join("existing.txt")).unwrap(),
+            "before edit\n"
+        );
+    }
+}

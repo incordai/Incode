@@ -1,0 +1,139 @@
+[workspace]
+# Standalone workspace root. The crate previously inherited version/edition from
+# a parent workspace that does not exist, so cargo failed while parsing the
+# manifest, before it could even look at the source.
+
+[package]
+name = "incord-code"
+description = "Autonomous coding harness: plans work, delegates it to an installed agent on your own subscription, and proves it was done"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+# The oldest toolchain this actually builds on, MEASURED rather than guessed:
+# each package in Cargo.lock is resolved to its own manifest in the registry
+# cache and read for `rust-version` there (the lock file itself records no such
+# field). Declared here so cargo REFUSES an older toolchain with a message
+# naming the version, instead of failing somewhere inside a dependency where the
+# cause is unrecognisable.
+#
+# RE-MEASURED 2026-09-16, after xcap + image were added: 356 packages, 283 with
+# a manifest in the local cache, of which 213 declare a floor and 70 declare
+# none. The highest is `image 0.25.10` at exactly 1.88 — so the number below is
+# unchanged, but it is now pinned by a DIFFERENT package than before
+# (previously `home 0.5.12`, also 1.88).
+#
+# THE OTHER 73 COULD NOT BE READ, and that is a real limit on the measurement
+# rather than an oversight: they are the macOS and Linux capture stacks xcap
+# pulls in (wayland-*, xcb, zbus and friends). Cargo resolves them into the lock
+# but never downloads source for a target it is not building, so their floors
+# are unknown here. They cannot affect a Windows build. RE-MEASURE ON LINUX AND
+# macOS before claiming this floor for those platforms.
+#
+# Two traps, both hit while measuring, both worth the reader's time:
+#   - A loop that silently skips a missing manifest UNDERCOUNTS (154 read as
+#     152, 2026-09-01). Count the misses explicitly and make them add up.
+#   - `version = 4` on line 3 of Cargo.lock is the LOCKFILE FORMAT version, not
+#     a package's. Pairing name/version lines across the whole file shifts every
+#     pair by one and reports all 356 packages missing. Parse inside
+#     [[package]] blocks only.
+rust-version = "1.88"
+
+[[bin]]
+name = "incode"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+tracing = "0.1"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+# The local run server (`incode serve`). NO NEW CRATE: both are already in
+# Cargo.lock as reqwest's own dependencies, at these exact versions — declaring
+# them turns on the server half of code the binary already links. Hand-rolling
+# HTTP over a TcpListener would have added no dependency at all and a request
+# parser, which is a security surface even on a loopback socket.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+chrono = "0.4"
+uuid = { version = "1", features = ["v4"] }
+regex = "1"
+# Image attachments travel to the provider base64-encoded. Already resolved to
+# 0.22.1 as a transitive dependency, so declaring it pins nothing new.
+base64 = "0.22"
+
+# CLI-specific
+rustyline = { version = "15", features = ["derive"] }
+crossterm = "0.28"
+glob = "0.3"
+walkdir = "2"
+similar = "2"
+pulldown-cmark = "0.12"
+
+# Computer use — see docs/COMPUTER_USE.md. THESE ARE NEW PACKAGES, unlike every
+# other entry in this file, and the vetting is recorded in .incord/RULE_ACK:
+# latest stable as resolved from the live index on 2026-09-16, pinned, MSRV
+# re-measured (unchanged at 1.88, now pinned by `image` itself), builds clean.
+#
+# Both carry `default-features = false`, which is the point:
+#   - image defaults to FIFTEEN codecs (avif, exr, webp, tiff, dds, ...). We
+#     encode screenshots, so png + jpeg is the whole requirement.
+#   - xcap's optional `image` and `wgc` features are both left OFF. `wgc` is
+#     Windows Graphics Capture, a more modern capture path than the default —
+#     worth revisiting when there is a reason, not before, since it pulls
+#     further windows crates.
+#
+# `screenshots` is NOT used: it is deprecated in favour of xcap by the same
+# author, and the 0.8.x version in the original sketch is two minor lines stale.
+xcap = { version = "0.9.8", default-features = false }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
+enigo = { version = "0.6.1", default-features = false }
+
+# ---------------------------------------------------------------------------
+# Computer use — see docs/COMPUTER_USE.md.
+#
+# Windows only, because decision 8 ships Windows first. macOS and Linux get
+# their own target tables when they land; note that the rest of this crate
+# splits windows / not(windows), which is NOT good enough here — three
+# platforms need three arms, and `not(windows)` must never be read as Linux.
+#
+# NO NEW PACKAGE. windows-sys 0.61.2 is ALREADY resolved in Cargo.lock with 13
+# reverse dependencies of its own, so declaring it turns on Win32 bindings the
+# binary already links rather than pulling anything new — the same reasoning
+# the hyper and base64 entries above record.
+#
+# The four features are the smallest set that answers "where are the displays
+# and how is this one scaled": HiDpi for the process-awareness call and the
+# per-monitor DPI query, Gdi for the enumeration, Foundation for RECT, and
+# WindowsAndMessaging for the primary-display flag. Each was confirmed present
+# in the cached 0.61.2 manifest before being written here, rather than assumed.
+[target.'cfg(windows)'.dependencies]
+clipboard-win = "5.4.1"
+uiautomation = "0.25.1"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_HiDpi",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+# ---------------------------------------------------------------------------
+# Features
+#
+# The harness builds and tests standalone — no external Incord crates required.
+# Execution is delegated to installed agent CLIs, and memory/audit coordination
+# is handled with the Incord Memory service over HTTP.
+# ---------------------------------------------------------------------------
+
+[features]
+default = []
+
+[dev-dependencies]
+tempfile = "3"
+# Lets a test build a `reqwest::Response` directly. reqwest re-exports only
+# `header`/`Method`/`StatusCode`/`Version`, not `Response`, and its public
+# `From<http::Response<T>>` impl needs the type. Already resolved to 1.5.0 as a
+# transitive dependency of reqwest, so this pins nothing new and is test-only.
+http = "1"

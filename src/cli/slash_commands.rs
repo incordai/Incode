@@ -1,0 +1,1180 @@
+//! Slash commands — /help, /status, /compact, /tools, /skills, /mcp, /model, /clear, /sessions, /resume.
+
+use crate::cli::render;
+use crate::tools::tool_status::ToolStatusCache;
+use crate::tools::worktree::WorktreeManager;
+use crate::{out, outln};
+
+// ---------------------------------------------------------------------------
+// SlashCommand
+// ---------------------------------------------------------------------------
+
+/// Parsed slash command from user input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlashCommand {
+    Help,
+    Status,
+    Compact,
+    Tools,
+    Skills,
+    Mcp,
+    Model(Option<String>),
+    Clear,
+    Save(Option<String>),
+    Sessions,
+    Resume(Option<String>),
+    Remember(String),
+    Forget {
+        id: String,
+        confirmed: bool,
+    },
+    Memories(Option<String>),
+    Plan,
+    Act,
+    /// Put the files from the last change back as they were.
+    Undo,
+    /// Can this session actually work?
+    Doctor,
+    /// What the agent is not allowed to write.
+    Guards,
+    /// Also work in another directory.
+    AddDir(Option<String>),
+    /// What else touches this file.
+    Links(Option<String>),
+    /// Work the ledger until there is a reason to stop.
+    Run,
+    /// The roadmap, with what a command has actually proven.
+    Roadmap,
+    /// Show which models, ceiling and check this session resolved to.
+    Admin,
+    Jobs,
+    Kill(u32),
+    Background(String),
+    Worktree(Option<String>),
+    /// Diff code or workspace against older versions.
+    Diff(Option<String>),
+    Env,
+    Quit,
+    /// A REAL command, typed without what it needs. Carries the usage line.
+    ///
+    /// These used to be [`Self::Unknown`], so typing `/remember` on its own
+    /// answered "Unknown command: /remember (missing text). Type /help for
+    /// commands." — which is wrong twice over: `/remember` is a known command,
+    /// and `/help` does not tell you what it is missing. The operator is one
+    /// word away from success and is told to go and look somewhere else.
+    Usage(String),
+    Unknown(String),
+}
+
+impl SlashCommand {
+    /// Parse a line that starts with `/`.
+    pub fn parse(line: &str) -> Option<Self> {
+        if !line.starts_with('/') {
+            return None;
+        }
+
+        let parts: Vec<&str> = line.splitn(2, ' ').collect();
+        let cmd = parts[0].to_lowercase();
+        let arg = parts.get(1).map(|s| s.trim().to_string());
+
+        Some(match cmd.as_str() {
+            "/help" | "/h" | "/?" | "/" => Self::Help,
+            "/status" | "/s" => Self::Status,
+            "/compact" => Self::Compact,
+            "/undo" | "/u" => Self::Undo,
+            "/doctor" | "/dr" => Self::Doctor,
+            "/guards" | "/g" => Self::Guards,
+            "/add-dir" => Self::AddDir(arg),
+            "/links" | "/l" => Self::Links(arg),
+            "/run" => Self::Run,
+            "/roadmap" => Self::Roadmap,
+            "/admin" => Self::Admin,
+            "/tools" | "/t" => Self::Tools,
+            "/skills" | "/sk" => Self::Skills,
+            "/mcp" => Self::Mcp,
+            "/model" | "/m" => Self::Model(arg),
+            "/clear" => Self::Clear,
+            "/save" => Self::Save(arg),
+            "/sessions" | "/ls" => Self::Sessions,
+            "/resume" | "/load" => Self::Resume(arg),
+            "/remember" | "/rem" => {
+                if let Some(text) = arg {
+                    Self::Remember(text)
+                } else {
+                    Self::Usage("/remember <what to remember>".to_string())
+                }
+            }
+            "/forget" => match arg {
+                // `confirm` is typed by a person, deliberately, as a second
+                // word — the same two-step the tool and the service enforce.
+                Some(rest) => {
+                    let (id, tail) = rest.split_once(' ').unwrap_or((rest.as_str(), ""));
+                    Self::Forget {
+                        id: id.to_string(),
+                        confirmed: tail.trim().eq_ignore_ascii_case("confirm"),
+                    }
+                }
+                None => Self::Usage("/forget <conv_id>#<idx> [confirm]".to_string()),
+            },
+            "/memories" | "/mem" => Self::Memories(arg),
+            "/plan" => Self::Plan,
+            "/act" => Self::Act,
+            "/jobs" => Self::Jobs,
+            "/kill" => {
+                if let Some(id_str) = arg {
+                    if let Ok(id) = id_str.parse::<u32>() {
+                        Self::Kill(id)
+                    } else {
+                        Self::Usage("/kill <id>  (a job number from /jobs)".to_string())
+                    }
+                } else {
+                    Self::Usage("/kill <id>  (a job number from /jobs)".to_string())
+                }
+            }
+            "/bg" => {
+                if let Some(cmd) = arg {
+                    Self::Background(cmd)
+                } else {
+                    Self::Usage(
+                        "/bg <command>  (a shell command to run in the background)".to_string(),
+                    )
+                }
+            }
+            "/worktree" | "/wt" => Self::Worktree(arg),
+            "/diff" | "/df" => Self::Diff(arg),
+            "/env" => Self::Env,
+            "/quit" | "/exit" | "/q" => Self::Quit,
+            _ => Self::Unknown(cmd),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Command handlers
+// ---------------------------------------------------------------------------
+
+/// Every slash command, with what it does.
+///
+/// One table, because two would drift: `/help` prints it AND the input line
+/// completes from it. A command that exists but is not listed here is a command
+/// nobody can discover, which is the same as one that does not exist.
+pub const COMMANDS: &[(&str, &str)] = &[
+    ("/help", "Show this help message"),
+    ("/status", "Session info, token usage, model"),
+    (
+        "/compact",
+        "Say where context is managed — the agent compacts its own",
+    ),
+    (
+        "/undo",
+        "Put the files from the last change back as they were",
+    ),
+    (
+        "/doctor",
+        "Check that this session can work: agents, guards, specs, ledger, memory",
+    ),
+    (
+        "/guards",
+        "Show the paths the agent is not allowed to write",
+    ),
+    (
+        "/add-dir <path>",
+        "Also work in this directory — guards and undo extend to it too",
+    ),
+    (
+        "/links <file>",
+        "What else uses what this file defines, and what it depends on",
+    ),
+    (
+        "/tools",
+        "Say where the tools live — the agent brings its own",
+    ),
+    (
+        "/skills",
+        "List the skills this session loaded from the shared store",
+    ),
+    (
+        "/mcp",
+        "Say where MCP servers are configured — in the agent's settings",
+    ),
+    (
+        "/model [name]",
+        "Show or switch the model the agent runs on",
+    ),
+    ("/clear", "Start a new agent session on the next turn"),
+    (
+        "/save",
+        "Show the agent session id, to reopen this conversation",
+    ),
+    (
+        "/sessions",
+        "Show the agent session id for this conversation",
+    ),
+    ("/resume <id>", "Continue an agent session by id"),
+    (
+        "/remember <text>",
+        "Save a fact to the shared long-term memory",
+    ),
+    (
+        "/forget <ref> [confirm]",
+        "Delete one memory — shows it first, deletes only on confirm",
+    ),
+    ("/memories <query>", "Search the shared memory by meaning"),
+    (
+        "/plan",
+        "Plan mode — the agent proposes changes without making them",
+    ),
+    (
+        "/act",
+        "Act mode — the agent applies changes, within the guards",
+    ),
+    ("/bg <command>", "Run a bash command in the background"),
+    ("/jobs", "List background jobs"),
+    ("/kill <id>", "Kill a background job"),
+    (
+        "/worktree [cmd]",
+        "Git worktree management (create/list/remove)",
+    ),
+    (
+        "/diff [file] [rev]",
+        "Show git/file diff against older versions",
+    ),
+    ("/env", "Show filtered environment variables"),
+    (
+        "/admin",
+        "Show the operator's settings and which layer decided each",
+    ),
+    (
+        "/roadmap",
+        "What the roadmap says, and which goals a command has proven",
+    ),
+    (
+        "/run",
+        "Work the roadmap ledger until it is empty or something needs a person",
+    ),
+    ("/quit", "Exit Incord Code"),
+];
+
+/// The bare command word, without the `<args>` the table shows after it.
+#[must_use]
+pub fn command_name(entry: &str) -> &str {
+    entry.split(' ').next().unwrap_or(entry)
+}
+
+pub fn handle_help() {
+    render::print_header("Incord Code Commands");
+    for (cmd, desc) in COMMANDS {
+        outln!("  {cmd:<20} {desc}");
+    }
+    outln!();
+}
+
+/// The skills this session actually loaded, from the store every agent shares.
+///
+/// # Why this exists beside the feature-gated one below
+///
+/// The gated handler reads an external crate that is not present on this
+/// machine, so the branch that actually ships was a message saying skills were
+/// "not compiled in". That was false in the way that matters: [`crate::skills`]
+/// loads them from the store and puts the index into EVERY prompt
+/// (`cli/mod.rs`), so the command denied something the session was already
+/// doing — and a command that contradicts the harness teaches the operator to
+/// distrust the rest of them.
+///
+/// Bodies are not printed, for the same reason they are not put in the prompt:
+/// the index is what decides whether a body is wanted.
+pub fn handle_skills_from_store(root: &std::path::Path) {
+    render::print_header("Skills");
+    let (set, source) = crate::skills::load(root);
+    for line in skills_lines(&set, source) {
+        outln!("{line}");
+    }
+    outln!();
+}
+
+/// What `/skills` prints, as data.
+///
+/// Returned rather than printed for the same reason
+/// [`crate::session::summary_lines`] is: the command's whole job is *what it
+/// says*, and a handler that writes straight to the terminal can only be
+/// checked by a person looking at a screen. That is exactly how this command
+/// came to deny that skills existed while the same session was loading them —
+/// nothing executed the sentence, so nothing contradicted it.
+#[must_use]
+pub fn skills_lines(set: &crate::skills::Skillset, source: crate::skills::Source) -> Vec<String> {
+    let mut out = Vec::new();
+
+    // SAY WHERE IT CAME FROM. A cached list that reads exactly like a live one
+    // turns an unreachable store into a silent wrong answer.
+    match source {
+        crate::skills::Source::Store => {}
+        crate::skills::Source::Cache(age) => out.push(format!(
+            "  The skill store did not answer — this is what it last said, {age}s ago."
+        )),
+        crate::skills::Source::Nothing => {
+            out.push(
+                "  The skill store did not answer and nothing was kept. This session is \
+                 running without skills."
+                    .to_string(),
+            );
+            return out;
+        }
+    }
+
+    if set.is_empty() {
+        out.push("  The store holds no skills for this machine.".to_string());
+        return out;
+    }
+
+    if !set.managed.is_empty() {
+        out.push("  The operator's own, with their text:".to_string());
+        for skill in &set.managed {
+            out.push(format!("    {}  —  {}", skill.name, skill.description));
+        }
+    }
+    if !set.discovered.is_empty() {
+        if !set.managed.is_empty() {
+            out.push(String::new());
+        }
+        out.push("  Installed folders, read on request:".to_string());
+        for skill in &set.discovered {
+            out.push(format!("    {}  —  {}", skill.name, skill.description));
+        }
+    }
+    out.push(String::new());
+    out.push(format!(
+        "  {} skill(s): {} written by you, {} installed. The index rides every prompt;",
+        set.managed.len() + set.discovered.len(),
+        set.managed.len(),
+        set.discovered.len()
+    ));
+    out.push("  a body is read only when the agent asks for that skill by name.".to_string());
+    out
+}
+
+/// Diff code or workspace against older versions.
+pub fn handle_diff(arg: Option<&str>, workspace: &std::path::Path) {
+    match arg {
+        Some(target) => {
+            let parts: Vec<&str> = target.split_whitespace().collect();
+            if parts.len() >= 2 {
+                let p1 = workspace.join(parts[0]);
+                let p2 = workspace.join(parts[1]);
+                if p1.is_file() && p2.is_file() {
+                    match crate::tools::diff::diff_files(&p1, &p2) {
+                        Ok(diff) if diff.is_empty() => render::print_info("No differences found."),
+                        Ok(diff) => {
+                            let (added, removed) = crate::tools::diff::diff_stats(&diff);
+                            render::print_header(&format!(
+                                "Diff: {} -> {} (+{} -{})",
+                                parts[0], parts[1], added, removed
+                            ));
+                            outln!("{diff}");
+                        }
+                        Err(e) => render::print_error(&e),
+                    }
+                    return;
+                }
+            }
+            let file = parts[0];
+            let rev = parts.get(1).copied();
+            match crate::tools::diff::git_diff_file(workspace, file, rev) {
+                Ok(diff) if diff.is_empty() => {
+                    render::print_info(&format!("No changes detected for {file}."));
+                }
+                Ok(diff) => {
+                    let (added, removed) = crate::tools::diff::diff_stats(&diff);
+                    render::print_header(&format!("Diff: {file} (+{} -{})", added, removed));
+                    outln!("{diff}");
+                }
+                Err(e) => render::print_error(&e),
+            }
+        }
+        None => match crate::tools::diff::git_diff_workspace(workspace, None) {
+            Ok(diff) if diff.is_empty() => {
+                render::print_info("Working tree clean — no diff against HEAD.");
+            }
+            Ok(diff) => {
+                let (added, removed) = crate::tools::diff::diff_stats(&diff);
+                render::print_header(&format!("Workspace Diff (+{} -{})", added, removed));
+                outln!("{diff}");
+            }
+            Err(e) => render::print_error(&format!("Diff failed: {e}")),
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Memory command handlers
+// ---------------------------------------------------------------------------
+
+/// Save a quick memory (defaults to static/high).
+/// What this session is and what it has spent.
+///
+/// Reports the AGENT's numbers, because the agent is what ran — a count of
+/// messages this harness held would be a count of nothing.
+pub fn handle_agent_status(
+    model: &str,
+    workspace: &std::path::Path,
+    permission: &str,
+    session_id: Option<&str>,
+    turns: usize,
+    usage: &crate::runtime::usage::TokenUsage,
+    quota: Option<(&str, i64)>,
+) {
+    render::print_header("Session");
+    outln!("  Model:            {model}");
+    outln!("  Workspace:        {}", workspace.display());
+    outln!("  Permission:       {permission}");
+    outln!(
+        "  Agent session:    {}",
+        session_id.unwrap_or("not opened yet")
+    );
+    outln!("  Turns:            {turns}");
+    outln!("  {}", usage.summary_line(None));
+    // The number that decides whether work MOVES to another agent. Shown so a
+    // failover is something an operator can see coming rather than discover.
+    if let Some((status, resets_at)) = quota {
+        let room = if crate::agent::is_limit_status(status) {
+            "OUT OF ROOM — work will move to a standby agent"
+        } else {
+            "room to work"
+        };
+        outln!("  Quota:            {status} ({room})");
+        if resets_at > 0 {
+            outln!("  Resets at:        {resets_at} (unix time)");
+        }
+    }
+
+    // The work, not just the session.
+    //
+    // The ledger is the answer to "how is it going", and it used to be shown
+    // only once — after a run ENDED. A person watching a loop had no way to ask
+    // mid-flight, which is exactly when they want to know.
+    //
+    // Read from disk rather than from the runner: the runner owns it during a
+    // run and this is the same file it saves after every task, so what is shown
+    // is what was actually recorded.
+    render::print_header("Work");
+    match crate::ledger::Ledger::load(workspace) {
+        Ok(ledger) => outln!("{}", ledger.progress()),
+        // A ledger that cannot be read is said out loud rather than shown as
+        // "no work planned" — those are different facts.
+        Err(e) => render::print_error(&format!("the ledger could not be read: {e}")),
+    }
+}
+
+/// The roadmap, with what a command has actually proven.
+///
+/// # Wired to
+///
+/// - **Called by** `crate::cli::run`'s dispatch for [`SlashCommand::Roadmap`],
+///   and after a run ends.
+/// - **Calls** [`crate::brief::check`] for the items and
+///   [`crate::goal::standings`] for what is proven.
+/// - **Sibling to** [`handle_agent_status`], which shows the LEDGER — the tasks.
+///   This shows the ROADMAP — the goals those tasks were meant to reach. They
+///   disagree exactly when a plan was wrong, which is the case worth seeing.
+///
+/// Running the checks costs a command per item, which is why it is a command the
+/// owner types rather than something on every prompt.
+pub fn handle_roadmap(workspace: &std::path::Path) {
+    render::print_header("Roadmap");
+    // FOUR OUTCOMES, FOUR MESSAGES. A first cut printed "no brief covers this
+    // project" for all of them, and the very first live run hit it with the
+    // service mid-restart: the board reported an absent brief for a project
+    // whose brief was fine. That is the same conflation of "could not ask" with
+    // "the answer is nothing" that cost this codebase a day elsewhere, and
+    // `Gate` already draws the distinction — the handler was throwing it away.
+    let brief = match crate::brief::check(workspace) {
+        crate::brief::Gate::Ready(brief) => brief,
+        crate::brief::Gate::Unreachable { url, reason } => {
+            render::print_error(&format!(
+                "The roadmap could not be read because the memory service did not \
+                 answer ({url}): {reason}\nThis is NOT an empty roadmap — start \
+                 the service and ask again."
+            ));
+            return;
+        }
+        crate::brief::Gate::Incomplete { project, missing } => {
+            render::print_error(&format!(
+                "The brief for {project} is incomplete, so its roadmap is not \
+                 settled yet. Missing: {}",
+                missing
+                    .iter()
+                    .map(|a| crate::brief::Artifact::field(*a))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+            return;
+        }
+        crate::brief::Gate::NoBrief { workspace } => {
+            render::print_error(&format!(
+                "No brief covers {} yet, so there is no roadmap to show. The \
+                 goals live in the brief.",
+                workspace.display()
+            ));
+            return;
+        }
+    };
+
+    let items: Vec<(String, String)> = brief
+        .roadmap
+        .iter()
+        .map(|item| (item.id.clone(), item.title.clone()))
+        .collect();
+    let checks = crate::goal::checks_from_docs(workspace);
+    // The ledger is the other half of the cross-check: a goal may not advance on
+    // its own command alone while the tasks planned for it are unfinished. An
+    // unreadable ledger is an EMPTY one here, which is the conservative reading
+    // — no task claims to be done, so nothing is ticked on its say-so.
+    let ledger = crate::ledger::Ledger::load(workspace).unwrap_or_default();
+    let standings = crate::goal::standings(&items, &checks, workspace, &ledger.tasks);
+    out!("{}", crate::goal::board(&items, &standings));
+
+    // TELL THE BELIEF WHAT THE COMMANDS PROVED.
+    //
+    // Until this existed the roadmap status was written once and never touched
+    // by execution, so the proxy answered "todo" for goals that had been passing
+    // for days — and the proxy is what reaches the owner's phone. Verified on
+    // the live service: all three ball-game items read `status: 'todo'` while
+    // `/roadmap` proved all three passed.
+    //
+    // Only a REACHED standing ticks an item, and a standing is only reached when
+    // a command exited zero. Nothing here can move an item back — see
+    // `brief::mark_done_in_config` for why that asymmetry is deliberate.
+    let proven: Vec<String> = items
+        .iter()
+        .zip(standings.iter())
+        .filter(|(_, standing)| standing.is_reached())
+        .map(|((id, _), _)| id.clone())
+        .collect();
+    match crate::brief::mark_roadmap_done(&brief.project, &proven) {
+        Ok(0) => {}
+        Ok(n) => render::print_info(&format!(
+            "{n} roadmap item(s) marked done in the brief — the proxy and \
+             anything reading it now agree with the checks."
+        )),
+        // A belief that cannot be updated is worth saying out loud: the board
+        // above is right and the API is stale, which is exactly the drift this
+        // is meant to end.
+        Err(e) => render::print_error(&format!(
+            "The board is correct but the brief could not be updated, so the \
+             API still shows the old status: {e}"
+        )),
+    }
+
+    // A check that matches no item never runs and never complains. Named here
+    // because it is indistinguishable from "covered" everywhere else.
+    let orphans = crate::goal::orphans(&items, &checks);
+    if !orphans.is_empty() {
+        outln!(
+            "\n  {} check(s) in {} name an item this roadmap does not have, so \
+             they never run:",
+            orphans.len(),
+            crate::goal::VERIFICATION_PATH
+        );
+        for orphan in orphans {
+            outln!("    - {} ({})", orphan.title, orphan.roadmap_id);
+        }
+    }
+
+    // Said once, here, rather than repeated per line: an owner who has written
+    // no checks needs to know HOW, not that thirty items are unproven.
+    if checks.is_empty() && !items.is_empty() {
+        outln!(
+            "  Nothing here can be settled by a machine yet. Give an item a \
+             command in {} and it will be proven instead of assumed:",
+            crate::goal::VERIFICATION_PATH
+        );
+        outln!("    - **{}** — `the command that proves it`", items[0].0);
+    }
+}
+
+/// Where the tools live now.
+///
+/// The agent runs its own loop with its own tools, so listing this harness's
+/// would name things nothing calls. What the harness still does is said plainly
+/// instead of implied by an empty list.
+pub fn handle_delegated_tools(agent: &str) {
+    render::print_header("Tools");
+    outln!("  {agent} brings its own tools and runs its own loop.");
+    outln!("  This harness does not dispatch tools; it decides what is worth doing");
+    outln!("  and whether it was actually done:");
+    outln!("    · protected paths, enforced as deny rules the agent applies itself");
+    outln!("    · the check that settles whether a task is finished");
+    outln!("    · the contracts a change must honour");
+    outln!("    · the ledger, the budget, and the owner channel");
+    outln!();
+    outln!("  Installed on this machine:");
+}
+
+/// Whether this session can actually do the work.
+pub fn handle_doctor(workspace: &std::path::Path) {
+    render::print_header("Doctor");
+    let checks = crate::doctor::run(workspace);
+    out!("{}", crate::doctor::report(&checks));
+    match crate::doctor::worst(&checks) {
+        crate::doctor::Health::Ok => render::print_info("Everything needed is in place."),
+        crate::doctor::Health::Warn => {
+            render::print_info("Workable, with the notes above.");
+        }
+        crate::doctor::Health::Fail => {
+            render::print_error("Something above will stop work. Fix it before running.");
+        }
+    }
+}
+
+/// What the agent may not write.
+///
+/// A guard nobody can see is a guard nobody can check — and this one decides
+/// whether the thing being judged can edit its own exam, so it is worth being
+/// able to read without opening a JSON file.
+pub fn handle_guards(workspace: &std::path::Path) {
+    render::print_header("Protected paths");
+    match crate::guards::Guards::load(workspace) {
+        Ok(guards) => {
+            let paths = guards.effective();
+            if paths.is_empty() {
+                render::print_error(
+                    "Nothing is protected — every default has been switched off in .incord/guards.json.",
+                );
+                return;
+            }
+            for path in &paths {
+                outln!("  {path}");
+            }
+            outln!();
+            outln!(
+                "  {} pattern(s). The agent enforces these itself as deny rules, and a",
+                paths.len()
+            );
+            outln!("  sentinel checks the files again after every delegated task.");
+            if !guards.allow_writes_to.is_empty() {
+                outln!();
+                outln!("  Switched off by you:");
+                for exempt in &guards.allow_writes_to {
+                    outln!("    {exempt}");
+                }
+            }
+        }
+        Err(e) => render::print_error(&format!("the policy could not be read: {e}")),
+    }
+}
+
+/// What else touches this file.
+///
+/// The question an agent should ask before changing a function and does not: a
+/// backend edit that never reaches its API layer, its frontend and its tests
+/// leaves three files written against something that no longer exists.
+pub fn handle_links(roots: &[std::path::PathBuf], target: Option<&str>) {
+    let map = crate::links::LinkMap::build(roots);
+
+    let Some(target) = target else {
+        render::print_header("Links");
+        outln!("  {} source file(s) indexed.", map.len());
+        if map.is_truncated() {
+            render::print_error(
+                "The index stopped early — this tree is larger than the walk limit, so what is shown is partial.",
+            );
+        }
+        outln!("  Name a file to see what touches it, e.g. `/links src/thing.rs`.");
+        return;
+    };
+
+    // Matched by suffix so a person can type what they would say, rather than
+    // the absolute path the index happens to store.
+    let wanted = target.replace(char::from(92), "/");
+    let Some(file) = map.files_matching(&wanted).into_iter().next() else {
+        render::print_error(&format!(
+            "No indexed source file matches `{target}`. It may be outside the workspace, a type this index does not read, or generated."
+        ));
+        return;
+    };
+
+    render::print_header(&format!("Links — {file}"));
+
+    let dependents = map.dependents(&file);
+    if dependents.is_empty() {
+        outln!("  Nothing indexed uses what this file defines.");
+    } else {
+        outln!("  Used by (change this file, check these):");
+        for (dependent, symbol) in &dependents {
+            outln!("    {dependent}  (uses `{symbol}`)");
+        }
+    }
+
+    let dependencies = map.dependencies(&file);
+    if !dependencies.is_empty() {
+        outln!();
+        outln!("  Depends on:");
+        for (dependency, symbol) in dependencies.iter().take(20) {
+            outln!("    {dependency}  (defines `{symbol}`)");
+        }
+        if dependencies.len() > 20 {
+            outln!("    …and {} more", dependencies.len() - 20);
+        }
+    }
+
+    outln!();
+    outln!("  A text index, not a compiler: it can link files that merely share a");
+    outln!("  word, and miss a call made through a string. A place to look.");
+}
+
+pub fn handle_remember(text: &str, workspace: &std::path::Path) {
+    if text.trim().is_empty() {
+        render::print_error("Usage: /remember <what to remember>");
+        return;
+    }
+    // Saved against the workspace, so a fact about this project is recallable
+    // as a fact about this project rather than as a loose note.
+    match crate::knowledge::remember(text, "fact", &workspace.display().to_string()) {
+        Ok(id) => render::print_info(&format!("Saved to the shared memory as {id}.")),
+        Err(e) => render::print_error(&format!("NOT saved: {e}")),
+    }
+}
+
+/// Delete one stored message. Two steps, and the first one shows what would go.
+///
+/// The identifier is `conv_id#idx`, which is what `/memories` prints beside every
+/// result — so what is shown is exactly what can be typed back.
+pub fn handle_forget(id: &str, confirmed: bool) {
+    let Some((conv_id, idx)) = parse_memory_ref(id) else {
+        render::print_error(
+            "Usage: /forget <conv_id>#<idx>  (the reference /memories prints beside each result)",
+        );
+        return;
+    };
+    match crate::knowledge::forget(&conv_id, idx, confirmed) {
+        Ok(crate::knowledge::Forget::NeedsConfirmation { current }) => {
+            render::print_header("This would be deleted");
+            outln!(
+                "{current}
+"
+            );
+            render::print_info(&format!("Run `/forget {id} confirm` to delete it."));
+        }
+        Ok(crate::knowledge::Forget::Deleted { conv_id, idx }) => {
+            render::print_info(&format!("Deleted {conv_id}#{idx}."));
+        }
+        Err(e) => render::print_error(&format!("Not deleted: {e}")),
+    }
+}
+
+/// Split `conv_id#idx` into its parts.
+///
+/// `rsplit_once`, not `split_once`: a conversation id may itself contain `#`,
+/// and the index is always the last field.
+#[must_use]
+pub fn parse_memory_ref(id: &str) -> Option<(String, u64)> {
+    let (conv_id, idx) = id.trim().rsplit_once('#')?;
+    if conv_id.is_empty() {
+        return None;
+    }
+    Some((conv_id.to_string(), idx.trim().parse().ok()?))
+}
+
+/// Search the shared memory.
+pub fn handle_memories(query: Option<&str>) {
+    render::print_header("Memories");
+
+    let Some(q) = query.map(str::trim).filter(|q| !q.is_empty()) else {
+        // No listing endpoint, and inventing one by searching for the empty
+        // string would return whatever the index happened to rank first while
+        // looking like "everything you have".
+        render::print_info("Usage: /memories <what you are looking for>");
+        render::print_info("The shared memory is searched by meaning, so ask a question.");
+        outln!();
+        return;
+    };
+
+    match crate::knowledge::search(q, 10) {
+        Ok(matches) if matches.is_empty() => render::print_info("Nothing matches that."),
+        Ok(matches) => {
+            for m in &matches {
+                outln!("  {}#{} [{}]", m.conv_id, m.idx, m.role);
+                outln!("    {}", crate::text::head_bytes(&m.content, 300));
+            }
+            outln!();
+            render::print_info("Use /forget <conv_id>#<idx> to remove one.");
+        }
+        Err(e) => render::print_error(&format!("Search failed: {e}")),
+    }
+    outln!();
+}
+
+// ---------------------------------------------------------------------------
+// Code graph command handler
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Background job handlers
+// ---------------------------------------------------------------------------
+
+pub fn handle_jobs(job_mgr: &crate::tools::bash_jobs::BashJobManager) {
+    render::print_header("Background Jobs");
+    let jobs = job_mgr.list();
+    if jobs.is_empty() {
+        render::print_info("No background jobs. Use /bg <command> to start one.");
+    } else {
+        for (id, cmd, running, elapsed) in &jobs {
+            let status = if *running { "running" } else { "done" };
+            let cmd_preview = if cmd.len() > 60 {
+                format!("{}...", crate::text::head_bytes(cmd, 60))
+            } else {
+                cmd.to_string()
+            };
+            outln!("  #{id:<4} [{status}] {elapsed}s  {cmd_preview}");
+        }
+        outln!();
+        outln!(
+            "  {} job(s), {} running",
+            jobs.len(),
+            job_mgr.running_count()
+        );
+    }
+    outln!();
+}
+
+// ---------------------------------------------------------------------------
+// Session command handlers
+// ---------------------------------------------------------------------------
+
+/// Report the outcome of a `/model` request.
+///
+/// `switched` is what the client actually did. This used to print "switching
+/// to X" unconditionally while changing nothing, so every later turn quietly
+/// went to the original model at the original price.
+pub fn handle_model(current: &str, new_model: Option<&str>, switched: bool) {
+    match new_model {
+        Some(name) if switched => {
+            render::print_info(&format!("Model switched to: {name}"));
+        }
+        Some(name) => {
+            render::print_error(&format!(
+                "Cannot switch to '{name}' — this session's provider does not serve it. \
+                 Still using {current}."
+            ));
+        }
+        None => {
+            render::print_info(&format!("Current model: {current}"));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Provider registry handler
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// MCP sync + catalog handlers
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Worktree handler
+// ---------------------------------------------------------------------------
+
+pub fn handle_worktree(arg: Option<&str>, workspace: &std::path::Path) {
+    let mgr = WorktreeManager::new(workspace.to_path_buf());
+
+    match arg {
+        Some(sub) if sub.starts_with("create ") => {
+            let name = sub.strip_prefix("create ").unwrap_or("task").trim();
+            match mgr.create(name, None) {
+                Ok(wt) => {
+                    render::print_info(&format!(
+                        "Worktree created: {} (branch: {}, path: {})",
+                        wt.name,
+                        wt.branch,
+                        wt.path.display()
+                    ));
+                }
+                Err(e) => render::print_error(&format!("Worktree create failed: {e}")),
+            }
+        }
+        Some(sub) if sub.starts_with("remove ") => {
+            let name = sub.strip_prefix("remove ").unwrap_or("").trim();
+            match mgr.remove(name) {
+                Ok(()) => render::print_info(&format!("Worktree '{name}' removed.")),
+                Err(e) => render::print_error(&format!("Worktree remove failed: {e}")),
+            }
+        }
+        Some("list") | None => {
+            render::print_header("Git Worktrees");
+            outln!("{}", mgr.display_list());
+            outln!();
+        }
+        Some(sub) => {
+            render::print_error(&format!("Unknown worktree subcommand: {sub}"));
+            render::print_info("Usage: /worktree [list | create <name> | remove <name>]");
+        }
+    }
+    outln!();
+}
+
+// ---------------------------------------------------------------------------
+// SSH handler
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Env filter handler
+// ---------------------------------------------------------------------------
+
+pub fn handle_env() {
+    render::print_header("Environment Filter");
+    let filtered = crate::tools::env_filter::filtered_env();
+    let mut keys: Vec<&String> = filtered.keys().collect();
+    keys.sort();
+    for key in &keys {
+        let value = &filtered[*key];
+        let display_value = if value.len() > 60 {
+            format!("{}...", crate::text::head_bytes(value, 60))
+        } else {
+            value.clone()
+        };
+        outln!("  {key}={display_value}");
+    }
+    outln!();
+    render::print_info(&format!(
+        "{} env vars passed to subprocesses ({} blocked).",
+        filtered.len(),
+        std::env::vars().count().saturating_sub(filtered.len())
+    ));
+    outln!();
+}
+
+// ---------------------------------------------------------------------------
+// Tool status handler
+// ---------------------------------------------------------------------------
+
+pub fn handle_tool_status(cache: &ToolStatusCache) {
+    render::print_header("CLI Tool Status");
+    let all = cache.all();
+    let mut entries: Vec<(&String, &crate::tools::tool_status::ToolStatus)> = all.iter().collect();
+    entries.sort_by_key(|(name, _)| name.to_string());
+    for (name, status) in &entries {
+        let icon = if status.installed { "+" } else { "-" };
+        let version = status.version.as_deref().unwrap_or("n/a");
+        outln!("  [{icon}] {name:<12} {version}");
+    }
+    outln!();
+    outln!(
+        "  {} installed, {} not found",
+        cache.installed_count(),
+        entries.len() - cache.installed_count()
+    );
+    outln!();
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn skill(name: &str) -> crate::skills::Skill {
+        crate::skills::Skill {
+            name: name.to_string(),
+            description: format!("what {name} is for"),
+            body: String::new(),
+            path: String::new(),
+        }
+    }
+
+    /// **The command must not deny what the session is doing.** `/skills` used
+    /// to print "Skills are not compiled in. Rebuild with `--features
+    /// agent-tools`" on the branch that actually ships, while
+    /// `skills::session_context` was putting these very skills into every
+    /// prompt. Nothing executed that sentence, so nothing contradicted it.
+    #[test]
+    fn the_skills_that_were_loaded_are_the_skills_that_are_listed() {
+        let set = crate::skills::Skillset {
+            managed: vec![skill("Test Driven Developer")],
+            discovered: vec![skill("Ponytail"), skill("Reviewer Council")],
+        };
+        let lines = skills_lines(&set, crate::skills::Source::Store);
+        let all = lines.join("\n");
+
+        for name in ["Test Driven Developer", "Ponytail", "Reviewer Council"] {
+            assert!(all.contains(name), "`{name}` must be listed; got:\n{all}");
+        }
+        assert!(
+            !all.contains("not compiled in") && !all.contains("agent-tools"),
+            "it must never deny skills it was just handed; got:\n{all}"
+        );
+        assert!(
+            all.contains("3 skill(s): 1 written by you, 2 installed"),
+            "the counts must be the real ones; got:\n{all}"
+        );
+    }
+
+    /// **A cached list must not read like a live one.** An unreachable store
+    /// that answers silently from cache is a wrong answer nobody can see.
+    #[test]
+    fn a_cached_answer_says_it_is_cached() {
+        let set = crate::skills::Skillset {
+            managed: vec![skill("Ponytail")],
+            discovered: Vec::new(),
+        };
+        let all = skills_lines(&set, crate::skills::Source::Cache(90)).join("\n");
+        assert!(all.contains("did not answer"), "got:\n{all}");
+        assert!(
+            all.contains("90s ago"),
+            "the age must be stated; got:\n{all}"
+        );
+        assert!(all.contains("Ponytail"), "it still lists what it has");
+    }
+
+    /// Nothing at all is said plainly, and the list is not implied to be empty
+    /// for some other reason.
+    #[test]
+    fn an_unreachable_store_with_no_cache_says_so() {
+        let all = skills_lines(
+            &crate::skills::Skillset::default(),
+            crate::skills::Source::Nothing,
+        )
+        .join("\n");
+        assert!(all.contains("running without skills"), "got:\n{all}");
+    }
+
+    /// A store that answered, with nothing in it, is a different fact from a
+    /// store that did not answer.
+    #[test]
+    fn an_empty_store_is_not_reported_as_a_failure() {
+        let all = skills_lines(
+            &crate::skills::Skillset::default(),
+            crate::skills::Source::Store,
+        )
+        .join("\n");
+        assert!(all.contains("holds no skills"), "got:\n{all}");
+        assert!(!all.contains("did not answer"), "got:\n{all}");
+    }
+
+    /// **Every command in the table must be one `parse` actually accepts**, or
+    /// the help lists something that cannot be typed and completion offers it.
+    ///
+    /// A bare command that still needs an argument is fine — it is
+    /// [`SlashCommand::Usage`], which names what is missing. What is NOT fine is
+    /// `Unknown`, which tells the operator the command does not exist.
+    ///
+    /// This test found five: `/remember`, `/forget`, `/kill` (twice) and `/bg`
+    /// all answered "Unknown command" when typed without their argument.
+    #[test]
+    fn every_listed_command_parses_to_something_real() {
+        for (entry, _) in COMMANDS {
+            let word = command_name(entry);
+            let parsed = SlashCommand::parse(word)
+                .unwrap_or_else(|| panic!("`{word}` is listed in /help but does not parse"));
+            assert!(
+                !matches!(parsed, SlashCommand::Unknown(_)),
+                "`{word}` is listed in /help yet parses as Unknown — the operator is told a \
+                 real command does not exist"
+            );
+        }
+    }
+
+    /// A command missing its argument names what it needs, and never claims the
+    /// command itself is unknown.
+    #[test]
+    fn a_command_without_its_argument_is_told_what_it_needs() {
+        for (typed, must_mention) in [
+            ("/remember", "what to remember"),
+            ("/forget", "conv_id"),
+            ("/kill", "/jobs"),
+            ("/bg", "command"),
+        ] {
+            match SlashCommand::parse(typed) {
+                Some(SlashCommand::Usage(usage)) => assert!(
+                    usage.contains(must_mention),
+                    "`{typed}` must say what it needs — expected `{must_mention}` in `{usage}`"
+                ),
+                other => panic!("`{typed}` alone should ask for its argument, got {other:?}"),
+            }
+        }
+    }
+
+    /// A genuinely unknown command is still unknown — the new variant must not
+    /// swallow the case it was split off from.
+    #[test]
+    fn a_command_that_does_not_exist_is_still_unknown() {
+        assert_eq!(
+            SlashCommand::parse("/definitely-not-a-command"),
+            Some(SlashCommand::Unknown(
+                "/definitely-not-a-command".to_string()
+            ))
+        );
+    }
+
+    /// `/kill` with a non-numeric id is a usage problem, not an unknown command.
+    #[test]
+    fn kill_with_a_bad_id_asks_for_a_job_number() {
+        assert!(matches!(
+            SlashCommand::parse("/kill not-a-number"),
+            Some(SlashCommand::Usage(_))
+        ));
+    }
+
+    #[test]
+    fn parses_slash_commands() {
+        assert_eq!(SlashCommand::parse("/help"), Some(SlashCommand::Help));
+        assert_eq!(SlashCommand::parse("/status"), Some(SlashCommand::Status));
+        assert_eq!(SlashCommand::parse("/compact"), Some(SlashCommand::Compact));
+        assert_eq!(SlashCommand::parse("/tools"), Some(SlashCommand::Tools));
+        assert_eq!(SlashCommand::parse("/quit"), Some(SlashCommand::Quit));
+        assert_eq!(
+            SlashCommand::parse("/model opus"),
+            Some(SlashCommand::Model(Some("opus".to_string())))
+        );
+        assert_eq!(
+            SlashCommand::parse("/model"),
+            Some(SlashCommand::Model(None))
+        );
+        assert_eq!(SlashCommand::parse("hello"), None);
+    }
+
+    #[test]
+    fn parses_session_commands() {
+        assert_eq!(
+            SlashCommand::parse("/sessions"),
+            Some(SlashCommand::Sessions)
+        );
+        assert_eq!(SlashCommand::parse("/ls"), Some(SlashCommand::Sessions));
+        assert_eq!(
+            SlashCommand::parse("/resume myfile"),
+            Some(SlashCommand::Resume(Some("myfile".to_string())))
+        );
+        assert_eq!(
+            SlashCommand::parse("/load myfile"),
+            Some(SlashCommand::Resume(Some("myfile".to_string())))
+        );
+        assert_eq!(
+            SlashCommand::parse("/resume"),
+            Some(SlashCommand::Resume(None))
+        );
+        assert_eq!(
+            SlashCommand::parse("/save myname"),
+            Some(SlashCommand::Save(Some("myname".to_string())))
+        );
+    }
+
+    /// The command is the only way a user reaches undo, so both spellings are
+    /// pinned — and `/u` must not be swallowed by some other prefix match.
+    #[test]
+    fn parses_undo() {
+        assert_eq!(SlashCommand::parse("/run"), Some(SlashCommand::Run));
+        assert_eq!(SlashCommand::parse("/admin"), Some(SlashCommand::Admin));
+        assert_eq!(SlashCommand::parse("/undo"), Some(SlashCommand::Undo));
+        assert_eq!(SlashCommand::parse("/u"), Some(SlashCommand::Undo));
+        assert_eq!(SlashCommand::parse("/UNDO"), Some(SlashCommand::Undo));
+    }
+
+    #[test]
+    fn parses_unknown_command() {
+        assert_eq!(
+            SlashCommand::parse("/foobar"),
+            Some(SlashCommand::Unknown("/foobar".to_string()))
+        );
+    }
+}

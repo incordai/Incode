@@ -1,0 +1,49 @@
+{
+  "incord-enforce": {
+    "PostInvocation": [
+      {
+        "command": "C:\\Users\\ravik\\.incord\\incord-memory-service.exe hook capture",
+        "timeout": 60,
+        "type": "command"
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "C:\\Users\\ravik\\.incord\\incord-memory-service.exe hook code-edit",
+            "timeout": 60,
+            "type": "command"
+          }
+        ],
+        "matcher": "write_to_file|replace_file_content|multi_replace_file_content"
+      }
+    ],
+    "PreInvocation": [
+      {
+        "command": "C:\\Users\\ravik\\.incord\\incord-memory-service.exe hook session-start --agy",
+        "timeout": 60,
+        "type": "command"
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "C:\\Users\\ravik\\.incord\\incord-memory-service.exe hook pre-tool --agy",
+            "timeout": 600,
+            "type": "command"
+          }
+        ],
+        "matcher": "*"
+      }
+    ],
+    "Stop": [
+      {
+        "command": "C:\\Users\\ravik\\.incord\\incord-memory-service.exe hook capture",
+        "timeout": 600,
+        "type": "command"
+      }
+    ]
+  }
+}

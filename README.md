@@ -1,5 +1,3 @@
-# incord-code
-An autonomous coding harness. It plans work, delegates it to a coding agent you already have installed and logged in, and proves the work was done before it calls it done.
 # Incord Code
 
 `incode` — an autonomous coding harness. It plans work, delegates it to a coding
@@ -34,9 +32,94 @@ exited zero.
   always counted in full, including the request that crossed the line.
 - **Undoes a turn.** The tree is snapshotted before a delegated turn; `/undo`
   restores only what actually changed.
+- **Diffs against past code.** Unified line diffs compare files or the entire
+  workspace against older git revisions, commits, or other files via `/diff`.
 - **Remembers across sessions.** Context, standing rules, skills, already-solved
   work and audit findings are read from the shared memory service — not restated
   by you every morning.
+- **Compresses verification logs.** Noisy test suites and compiler runs (hundreds of
+  passing test lines or repeated warnings) are compacted before entering failure
+  reports, preserving critical error traces and panics without bloating model context.
+
+## Core Architecture: Asymmetric Execution & Incord Memory
+
+The primary design goal of `incode` is **asymmetric model economics for radical token efficiency**:
+
+```
+                       ┌──────────────────────────────┐
+                       │          BIG MODEL           │
+                       │    (Planning & Synthesis)    │
+                       └──────────────┬───────────────┘
+                                      │
+              1. Plans & decomposes   │  4. Re-checks chunk diffs
+                 into bounded tasks   │     via Incord Memory
+                                      ▼
+                       ┌──────────────────────────────┐
+                       │         SMALL MODELS         │
+                       │ (High-Volume Implementation) │
+                       └──────────────┬───────────────┘
+                                      │
+                                      │  2. Executes chunks,
+                                      │     writes code
+                                      ▼
+                       ┌──────────────────────────────┐
+                       │        INCORD MEMORY         │
+                       │ (Auto-Capturing Code Ledger) │
+                       └──────────────┬───────────────┘
+                                      │
+                                      │  3. Auto-indexes diffs &
+                                      │     records tool turns
+                                      ▼
+                       ┌──────────────────────────────┐
+                       │       MECHANICAL PROOF       │
+                       │   (verify::Verified: exit 0) │
+                       └──────────────────────────────┘
+```
+
+1. **Big Model for Planning & Decomposition (`src/plan.rs`):**
+   An expensive, high-reasoning frontier model is used sparingly: it reads the project brief/PRD, determines the architecture, and splits roadmap items into role-tagged chunks (`plan::split`). It never reads raw codebase files, greps strings, or writes boilerplate — avoiding high-tier token burn on low-altitude tasks.
+
+2. **Small Models for High-Volume Implementation (`src/roles.rs`):**
+   Fast, cheap, or local models (`haiku`, local models, etc.) take the decomposed tasks (`grunt`, `implement`, `frontend`). They perform 80–90% of the raw tool calls, edits, and test iterations at a fraction of the cost.
+
+3. **Strict Agent Isolation & Agent ID Attribution (`src/identity.rs`, `src/ledger.rs`):**
+   Each spawned worker agent carries an unforgeable identity:
+   - **`AgentId`**: Stable FNV-1a fingerprint (`backend:role`, e.g. `claude-code:grunt (2569feb9)`).
+   - **`instance`**: Unique per-spawn identifier (`agent-xxxxxxxxxxxx`).
+   All turns, code edits, and completed tasks are tagged with this identity in `.incord/journal.jsonl` and Incord Memory (`PROJECT#FINGERPRINT`). Workers operate in strict isolation: no small agent can inspect, tamper with, or disturb another small agent's workspace or context. Only the Main Agent (Orchestrator) has the full roadmap context to query, inspect, and evaluate individual worker contributions (`tasks_by_instance`, `tasks_by_fingerprint`).
+
+4. **Incord Memory Re-Checking Substrate (`src/knowledge.rs`, `src/recall.rs`):**
+   Incord Memory automatically captures every code edit and turn in the background. When the Main Agent re-checks the small models' work, it avoids loading massive multi-thousand-line contexts by using Incord Memory's high-efficiency AST tools:
+   - **`code_skeleton`**: Strips implementation bodies for ~90% token reduction, returning AST definitions, signatures, and doc comments so the evaluator verifies interface contracts without reading raw implementations.
+   - **`git_blast_radius`**: Analyzes the git diff against the memory graph, tracing transitive callers (depth 1–5) and identifying impacted test suites.
+
+5. **Unforgeable Proof & Targeted Small-Agent Repair Loop (`src/verify.rs`, `src/runner.rs`):**
+   Work completed by small models is never accepted on prose claims. `verify::Verified` demands a host process exit code 0, while `src/guards.rs` prevents agents from weakening the tests that judge them.
+   - **Self-Healing Loop**: If verification fails or a regression is detected, the Main Agent does not rewrite the code with expensive models. Instead, it identifies the specific worker responsible from the task attribution and re-dispatches *that specific small agent* with the compacted failure diagnostics (`compact_log`) and previous chunk context to edit and fix the issue it created.
+
+6. **Zero-Hardcoding Multi-Agent Fallback Chain (`src/agent/registry.rs`, `src/task_run.rs`):**
+   Execution is never pinned to a single hardcoded agent. `incode` probes and builds a candidate chain of drivable agents (`registry::drivable_chain`). If the primary agent encounters authentication expiry, process crashes, or quota exhaustion, `task_run` catches the failure and automatically cascades execution to the next available agent (e.g. from Claude Code to Codex CLI or Antigravity / Gemini) so work completes reliably.
+
+## Ecosystem Positioning & Comparison
+
+`incode` was evaluated against the 120+ terminal-native coding agents and orchestration harnesses curated in `awesome-cli-coding-agents` (open-source agents, session multiplexers, parallel worktree runners, autonomous loops, and agent infrastructure).
+
+While most tools focus on driving a raw model in an open-ended loop or tiling terminal multiplexers, `incode` acts as the deterministic execution layer and **the hands of Incord Memory**. It enforces invariants that models and wrappers cannot enforce on themselves:
+
+| Capability / Guarantee | Mainstream Coding CLIs & Harnesses | `incode` Guarantee |
+|---|---|---|
+| **Credential Model** | Requires raw provider API keys or vendor tokens | **Zero credentials held** — delegates via locally authenticated subscription CLIs (`claude`, `codex`, `agy`) |
+| **Agent Fallback Chain** | Pinned to a single CLI/model; fails immediately on error | **Automatic Multi-Agent Fallback** — Ordered candidate chain cascades from primary to alternatives on auth or process failures (`src/agent/registry.rs`, `src/task_run.rs`) |
+| **Model Token Economics** | Homogeneous model usage (expensive model does all typing) | **Asymmetric planning & execution** — Frontier model plans/reviews; cheap small models execute chunks (`src/plan.rs`, `src/roles.rs`) |
+| **Agent Isolation & ID** | Shared scratchpads or untracked multi-agent churn | **Strict worker isolation & Agent IDs** — Tasks tagged with `AgentId` and instance ID; isolated memory queries (`src/identity.rs`, `src/ledger.rs`) |
+| **Re-checking Efficiency** | Re-reads full files (100k+ token context blowup) | **AST Skeleton & Blast Radius** — `code_skeleton` (~90% cheaper token cost) and `git_blast_radius` callers walk (`src/knowledge.rs`) |
+| **Repair & Failure Loop** | Global re-prompting or expensive whole-plan resets | **Targeted small-agent repair** — Failing tasks re-dispatch the exact small agent that created the issue with compacted logs (`src/runner.rs`, `src/verify.rs`) |
+| **Completion Verification** | Model self-reporting or summary assertions | **Unforgeable mechanical proof** — `verify::Verified` demands a host process exit code 0 (`src/verify.rs`) |
+| **Evaluation Integrity** | Agents can freely edit tests, CI scripts, and checks | **Protected exam sentinel** — Deny rules + pre/post turn SHA256 tree hashing reject self-modified checks (`src/guards.rs`) |
+| **Intake Discipline** | Immediate coding on unvetted, ambiguous prompts | **Strict 5-spec gate** — PRD, Architecture, Conventions, Assumptions, and Verification must exist before source is written (`src/spec.rs`, `src/brief.rs`) |
+| **Memory & Context** | Fragmented per-repo files (`.memcode`, `AGENTS.md`) | **Unified Incord Memory** — Shared semantic recall, Watchman tool-result handoffs, and always-on ranked rules (`src/recall.rs`, `src/rules.rs`) |
+| **Log Compression** | Dumps raw build/test stdout into model context | **Pre-LLM compaction** — Collapses duplicate lines and passing test noise so failure diagnostics are not crowded out (`src/verify.rs`) |
+| **Task State Tracking** | Ad-hoc prompt loops or loose markdown checklists | **Deterministic 7-state ledger** — Append-only `.incord/journal.jsonl` audit trail with single-runner mutex (`src/ledger.rs`, `src/runner.rs`) |
 
 ## Requirements
 
@@ -107,9 +190,11 @@ incode --task "add a health endpoint and a test for it"
 | `/status` | Model, workspace, permission tier, tokens spent, and the ledger's progress |
 | `/admin` | Which model, ceiling and check this session resolved to, and which layer decided each |
 | `/run` | Work the roadmap ledger until it is empty or something needs a person |
+| `/roadmap` | What the roadmap says, and which goals a command has proven |
 | `/guards` | The paths the agent is not allowed to write |
 | `/links <file>` | What else uses what this file defines, and what it depends on |
 | `/undo` | Put the files from the last change back as they were |
+| `/diff [file] [rev]` | Unified diff of file or workspace against older code |
 | `/plan` · `/act` | Propose changes without making them · apply them, within the guards |
 | `/model [name]` | Show or switch the model |
 | `/clear` · `/save` · `/sessions` · `/resume <id>` | Session handling |
@@ -117,6 +202,7 @@ incode --task "add a health endpoint and a test for it"
 | `/skills` | The skills this session loaded from the shared store |
 | `/bg <cmd>` · `/jobs` · `/kill <id>` | Background shell jobs |
 | `/worktree [cmd]` | Git worktree create / list / remove |
+| `/add-dir <path>` | Also work in this directory — guards and undo extend to it too |
 | `/tools` · `/mcp` · `/env` · `/compact` | Where tools, MCP servers and context are handled |
 | `/quit` | Exit |
 
@@ -194,7 +280,7 @@ project's.
 ## Development
 
 ```sh
-cargo test                          # 780+ tests
+cargo test                          # 1,070+ tests (1,049 lib + 22 bin)
 cargo clippy --all-targets -- -D warnings
 cargo fmt
 ```
@@ -204,7 +290,13 @@ The documents under `docs/` are the input the loop reads, not decoration:
 the code should read), `ASSUMPTIONS.md` (what was decided without asking),
 `RUNNER.md` (the autonomous loop), `VERIFICATION.md` (what counts as done).
 
+### Ecosystem-Informed Roadmap Priorities
+
+From our comparative analysis against the 120+ coding harness ecosystem:
+1. **Multi-Worktree Parallel Runner**: Extending `src/runner.rs` to spawn concurrent workers in isolated Git worktrees for independent roadmap tasks (`depends_on: []`) using `src/tools/worktree.rs`.
+2. **Standard Agent Client Protocol (ACP)**: Implementing native ACP JSON-RPC 2.0 client support in `src/agent/` to drive any standards-compliant coding agent backend.
+3. **AST-Level Anti-Regression Guards**: Compiling memory-recorded failure lessons into pre-commit syntax/AST guards so resolved bugs can never be reintroduced.
+
 ## Licence
 
 MIT — see [LICENSE](LICENSE).
-

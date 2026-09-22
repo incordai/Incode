@@ -1,0 +1,17 @@
+# Build output.
+/target
+
+# Pre-edit copies. Kept outside the source tree on purpose: a `.bak` beside the
+# file it shadows gets read, grepped and occasionally edited by mistake, and
+# every one of them is a second copy of code that no longer compiles.
+#
+# NOT anchored to the root: `docs/.backups/` held 1,291 of them, and a rule that
+# only matched `/.backups` let every one into the first commit.
+.backups/
+*.bak
+*.bak.*
+
+# The ledger and other per-workspace run state. It records what happened to THIS
+# checkout and means nothing in another one. Unanchored for the same reason as
+# `.backups/`: `docs/.incord/` exists too.
+.incord/
