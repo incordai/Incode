@@ -436,6 +436,40 @@ compiling and tested and reaching nothing.
 review, pass its own tests, and stop not one click — the same failure as the kill switch
 corrected in 7b, found the same way.
 
+#### UPDATED 2026-09-22 — the policy now runs, inside the server
+
+The paragraph above was right about the wiring of the day and is no longer the
+state of the code. What it correctly identified is that a policy is worth nothing
+where nobody calls it; what it could not say is where it *should* be called.
+
+That place is point 1 below — the desktop MCP server, which this section already
+names as "the only one this crate fully controls". `desktop::mcp::call_tool` now
+asks `PermissionPolicy::for_desktop(mode)` before every tool, and the session's
+`-p` reaches that separate process on its argv.
+
+| Mode | The desktop it gets |
+|---|---|
+| `read-only` | `screen_info`, `cursor_position`, `screenshot`, `ui_tree`. Nothing that moves. |
+| `workspace-write` (default) | all twelve — unchanged from before |
+| `danger-full-access`, `allow` | all twelve |
+| `prompt` | nothing. stdin and stdout are the protocol, so there is no channel to ask a human on, and `authorize` with no prompter denies. |
+
+The acting tools require `WorkspaceWrite` rather than `DangerFullAccess`, even
+though a click reaches far outside any workspace. `workspace-write` is the default
+mode, so gating the desktop above it would ship the feature switched off and make
+the flag the thing people turn off.
+
+**What this fixes:** `-p read-only` governed the agent's file writing and stopped at
+the process boundary. A read-only session could not edit a file and could type into
+a login form.
+
+**And the operator's own command can refuse too.** `desktop_hooks` in
+`~/.incord-code/admin.json` runs a pre-tool command before every action; exit code 2
+refuses it and its stdout reaches the agent. A hook is shown the REAL tool input
+rather than the redacted line the journal gets — a hook that cannot see what is about
+to be typed cannot refuse on it — and is bounded at 10 seconds, because it runs
+between the agent asking and the screen moving.
+
 **The real mechanism is delegation.** `PermissionMode::agent_mode()` maps the operator's
 mode onto the *agent's* `--permission-mode` flag (`src/agent/claude_code.rs:913`), and the
 agent enforces it. This harness does not authorise tool calls; it configures the thing

@@ -283,3 +283,30 @@ The rule on writing new code: if you add a `pub fn` and nothing calls it in
 the same change, either wire it or do not add it. `findings::read` was
 written in this phase and deleted before it shipped for exactly that reason —
 the comment where it used to be says why the design does not want it.
+
+### The rule on an entry that is already there: wire it, do not delete it
+
+An item on this list is a capability somebody built and nobody reached. The
+first question is *where should this have been called*, not *can this go*.
+Four of the six originals turned out to have a correct home:
+
+| Capability | Where it belonged |
+|---|---|
+| `PermissionPolicy` | `desktop::mcp::call_tool` — `-p read-only` now means the agent may look at the screen and not touch it |
+| `hooks` | the same choke point, so an operator's own command can refuse a click |
+| `Task::with_contracts` | `from_plan`, so the frozen-interface block reaches the agent that could break it |
+| `Task::with_dependencies` | `from_plan`, resolving the planner's `[after N]` |
+
+Deleting any of them would have removed a working answer to a real question
+and left the gap it was written for still open.
+
+### A false positive is worse than a miss
+
+`production_half` cut each file at the first `#[cfg(test)]` *anywhere* in it.
+One test-only method 177 lines into `cli/agent_turn.rs` hid the remaining
+1,028 lines, so four capabilities reached by every `/undo` were reported dead.
+
+Four wrong entries make the whole list something a reader has to check by
+hand before believing any of it, which is how a check stops being used. The
+marker is now anchored to column zero — a test *module* is unindented, an
+attribute on an item inside an `impl` is not.
