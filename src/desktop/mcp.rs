@@ -74,6 +74,14 @@ pub struct Server {
     initialised: bool,
     journal: Option<super::journal::Journal>,
     stop_file: Option<std::path::PathBuf>,
+    /// What this session is allowed to do to the machine.
+    ///
+    /// Not optional, because "no policy" would mean an ungoverned desktop and
+    /// the whole point is that there is always an answer. The default is the
+    /// mode a session runs in unless told otherwise, so registering this
+    /// server by hand does not silently produce something more capable than
+    /// the harness would have launched.
+    permissions: crate::permissions::PermissionPolicy,
 }
 
 impl Server {
@@ -86,7 +94,22 @@ impl Server {
             initialised: false,
             journal: None,
             stop_file: None,
+            permissions: crate::permissions::PermissionPolicy::for_desktop(
+                crate::permissions::PermissionMode::WorkspaceWrite,
+            ),
         }
+    }
+
+    /// Run this desktop under a session's permission mode.
+    ///
+    /// The launcher passes what the operator asked for; see
+    /// [`crate::permissions::PermissionPolicy::for_desktop`] for which tools
+    /// each mode reaches. A server built without this keeps the default mode,
+    /// which is what a session gets when no flag is given.
+    #[must_use]
+    pub fn with_permission_mode(mut self, mode: crate::permissions::PermissionMode) -> Self {
+        self.permissions = crate::permissions::PermissionPolicy::for_desktop(mode);
+        self
     }
 
     /// Record every call to a journal the operator can watch — and watch for
@@ -227,10 +250,27 @@ impl Server {
         // nobody is supervising right now, it clears on its own, and refusing
         // to answer "what does the screen look like" during it would take away
         // the one tool for finding out why.
-        let outcome = if self.safety.is_stopped() {
-            Err(super::safety::Refusal::Stopped.message())
-        } else {
-            self.run_tool(name, &args)
+        // WHAT THIS SESSION IS ALLOWED TO DO, asked before the stop check is
+        // asked about anything and before a single pixel is read.
+        //
+        // The mode reached the agent (`PermissionMode::agent_mode`) and
+        // governed its file writing, but the desktop was outside it entirely:
+        // a session started `-p read-only` could not edit a file and could
+        // type into a login form. The policy that was written for this and
+        // never called now runs here, at the one point every tool passes.
+        //
+        // No prompter is passed, and there is none to pass: stdin and stdout
+        // are the protocol. `Prompt` therefore denies, which is the right
+        // answer for an unattended server rather than a gap.
+        let permitted = match self.permissions.authorize(name, &args.to_string(), None) {
+            crate::permissions::PermissionOutcome::Allow => Ok(()),
+            crate::permissions::PermissionOutcome::Deny { reason } => Err(reason),
+        };
+
+        let outcome = match (&permitted, self.safety.is_stopped()) {
+            (Err(reason), _) => Err(reason.clone()),
+            (Ok(()), true) => Err(super::safety::Refusal::Stopped.message()),
+            (Ok(()), false) => self.run_tool(name, &args),
         };
 
         // Journalled HERE rather than inside `run_tool`, because this is the
@@ -767,12 +807,23 @@ pub const CLIENT_KEY: &str = "desktop";
 /// `journal` is where the launched server should record what it did, so
 /// `--serve` can stream it (`COMPUTER_USE.md` 14c). `None` means nobody is
 /// watching and the server writes nowhere.
-pub fn client_config(exe: &std::path::Path, journal: Option<&std::path::Path>) -> Value {
+pub fn client_config(
+    exe: &std::path::Path,
+    journal: Option<&std::path::Path>,
+    mode: crate::permissions::PermissionMode,
+) -> Value {
     let mut args = vec!["--desktop-mcp".to_string()];
     if let Some(path) = journal {
         args.push("--desktop-journal".to_string());
         args.push(path.to_string_lossy().to_string());
     }
+    // ALWAYS PASSED, never omitted when it happens to be the default. This
+    // server is a separate process and cannot see the flag the session was
+    // started with; leaving it off would mean the operator's `-p read-only`
+    // stopped at the process boundary, which is exactly the bug that made a
+    // read-only session able to type.
+    args.push("-p".to_string());
+    args.push(mode.as_str().to_string());
     json!({
         "mcpServers": {
             CLIENT_KEY: {
@@ -784,8 +835,12 @@ pub fn client_config(exe: &std::path::Path, journal: Option<&std::path::Path>) -
 }
 
 /// [`client_config`] as the compact JSON string a `--mcp-config` flag takes.
-pub fn client_config_json(exe: &std::path::Path, journal: Option<&std::path::Path>) -> String {
-    client_config(exe, journal).to_string()
+pub fn client_config_json(
+    exe: &std::path::Path,
+    journal: Option<&std::path::Path>,
+    mode: crate::permissions::PermissionMode,
+) -> String {
+    client_config(exe, journal, mode).to_string()
 }
 
 /// The same registration as `-c key=value` overrides, which is how Codex takes
@@ -802,6 +857,7 @@ pub fn client_config_json(exe: &std::path::Path, journal: Option<&std::path::Pat
 pub fn codex_config_overrides(
     exe: &std::path::Path,
     journal: Option<&std::path::Path>,
+    mode: crate::permissions::PermissionMode,
 ) -> Vec<String> {
     // TOML basic strings take backslash escapes, so a Windows path must have
     // its separators doubled or `C:\Users\…` becomes an invalid escape. This
@@ -810,10 +866,11 @@ pub fn codex_config_overrides(
     let toml = |p: &std::path::Path| p.to_string_lossy().replace('\\', "\\\\");
     let args = match journal {
         Some(path) => format!(
-            "[\"--desktop-mcp\",\"--desktop-journal\",\"{}\"]",
-            toml(path)
+            "[\"--desktop-mcp\",\"--desktop-journal\",\"{}\",\"-p\",\"{}\"]",
+            toml(path),
+            mode.as_str()
         ),
-        None => "[\"--desktop-mcp\"]".to_string(),
+        None => format!("[\"--desktop-mcp\",\"-p\",\"{}\"]", mode.as_str()),
     };
     vec![
         format!("mcp_servers.{CLIENT_KEY}.command=\"{}\"", toml(exe)),
@@ -957,13 +1014,17 @@ mod tests {
         /// gibberish. That is a long debugging session for a one-word mistake.
         #[test]
         fn the_client_config_launches_this_binary_in_server_mode() {
-            let config = client_config(std::path::Path::new("C:/bin/incode.exe"), None);
+            let config = client_config(
+                std::path::Path::new("C:/bin/incode.exe"),
+                None,
+                crate::permissions::PermissionMode::WorkspaceWrite,
+            );
             let server = &config["mcpServers"][CLIENT_KEY];
 
             assert_eq!(server["command"], "C:/bin/incode.exe");
             assert_eq!(
                 server["args"],
-                json!(["--desktop-mcp"]),
+                json!(["--desktop-mcp", "-p", "workspace-write"]),
                 "the config must pass the flag that selects the server mode"
             );
 
@@ -972,14 +1033,18 @@ mod tests {
             let watched = client_config(
                 std::path::Path::new("C:/bin/incode.exe"),
                 Some(std::path::Path::new("C:/work/.incord/desktop.jsonl")),
+                crate::permissions::PermissionMode::ReadOnly,
             );
             assert_eq!(
                 watched["mcpServers"][CLIENT_KEY]["args"],
                 json!([
                     "--desktop-mcp",
                     "--desktop-journal",
-                    "C:/work/.incord/desktop.jsonl"
-                ])
+                    "C:/work/.incord/desktop.jsonl",
+                    "-p",
+                    "read-only"
+                ]),
+                "the session's mode must reach the child process on its argv"
             );
 
             // The same string main.rs matches on, so a rename breaks here
@@ -995,7 +1060,11 @@ mod tests {
 
         #[test]
         fn the_config_is_valid_json_for_a_command_line() {
-            let text = client_config_json(std::path::Path::new("/usr/local/bin/incode"), None);
+            let text = client_config_json(
+                std::path::Path::new("/usr/local/bin/incode"),
+                None,
+                crate::permissions::PermissionMode::WorkspaceWrite,
+            );
             let parsed: Value = serde_json::from_str(&text).expect("must be valid JSON");
             assert_eq!(
                 parsed["mcpServers"]["desktop"]["command"],
@@ -1030,6 +1099,93 @@ mod tests {
         fn call(server: &mut Server, line: &str) -> Value {
             let reply = server.handle_line(line).expect("a reply was expected");
             serde_json::from_str(&reply).expect("the reply must be valid JSON")
+        }
+
+        /// **`read-only` MUST MEAN THE AGENT CANNOT TYPE.**
+        ///
+        /// The mode governed the agent's file writing and stopped there: a
+        /// session started `-p read-only` got a desktop server with no
+        /// restriction at all, so it could click a button and type into a
+        /// login form while being unable to edit a file. `PermissionPolicy`
+        /// had been written for exactly this and was never called.
+        ///
+        /// Both directions in one test. A gate that refuses everything is not
+        /// a gate either — looking at the screen is precisely what a
+        /// read-only session should still be able to do.
+        /// # Why the typing half runs on a STOPPED server
+        ///
+        /// The first version of this test did not, and its control run —
+        /// deleting the gate to prove the test notices — typed `hunter2` into
+        /// whatever window happened to have focus on the machine running the
+        /// suite. A test whose FAILURE mode is "type a password into the
+        /// operator's screen" is not one to leave lying around.
+        ///
+        /// Stopping safety first makes that impossible: with the gate gone the
+        /// call is refused as stopped instead, and nothing reaches the
+        /// desktop. The assertion still distinguishes the two, because the
+        /// permission refusal names the mode and the stop refusal does not —
+        /// and permission is checked BEFORE the stop, so "read-only" in the
+        /// message can only have come from the gate.
+        #[test]
+        fn a_read_only_desktop_may_look_and_may_not_touch() {
+            let mut s = Server::new(InputThread::start().expect("input thread"))
+                .with_permission_mode(crate::permissions::PermissionMode::ReadOnly);
+            s.safety().stop();
+
+            let typed = call(
+                &mut s,
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call",
+                    "params":{"name":"type_text","arguments":{"text":"hunter2"}}}"#,
+            );
+            assert_eq!(
+                typed["result"]["isError"], true,
+                "a read-only session typed into the desktop: {typed}"
+            );
+            let refusal = typed["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default();
+            assert!(
+                refusal.contains("read-only"),
+                "the refusal must name the mode that caused it: {refusal}"
+            );
+            // THE REFUSAL MUST NOT QUOTE WHAT WAS TYPED. The text reaches the
+            // journal and the browser stream, and a refused password is still
+            // a password.
+            assert!(
+                !refusal.contains("hunter2"),
+                "the refusal leaked the typed text: {refusal}"
+            );
+
+            // AND THE READS STILL WORK — on a server that is not stopped,
+            // since a stop halts reads too and would prove nothing about the
+            // permission mode.
+            let mut looking = Server::new(InputThread::start().expect("input thread"))
+                .with_permission_mode(crate::permissions::PermissionMode::ReadOnly);
+            let looked = call(
+                &mut looking,
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/call",
+                    "params":{"name":"screen_info","arguments":{}}}"#,
+            );
+            assert_eq!(
+                looked["result"]["isError"], false,
+                "read-only must still be able to look at the screen: {looked}"
+            );
+        }
+
+        /// The ordinary mode is unchanged — the gate is a restriction people
+        /// opt into, not a new obstacle in the default path.
+        #[test]
+        fn the_default_mode_can_still_drive_the_desktop() {
+            let mut s = Server::new(InputThread::start().expect("input thread"));
+            let moved = call(
+                &mut s,
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call",
+                    "params":{"name":"move_mouse","arguments":{"x":1,"y":1}}}"#,
+            );
+            assert_eq!(
+                moved["result"]["isError"], false,
+                "the default session lost a capability it had: {moved}"
+            );
         }
 
         #[test]

@@ -178,6 +178,59 @@ impl PermissionPolicy {
         self
     }
 
+    /// The requirements for the tools this harness actually dispatches: the
+    /// twelve on the desktop MCP server.
+    ///
+    /// # Why the desktop is where this policy finally applies
+    ///
+    /// `PermissionPolicy` was written for a tool loop that no longer exists —
+    /// the agent runs file and shell tools in its own process now, under its
+    /// own rules, and this crate has no seat between the decision and the call.
+    /// [`Self::with_defaults`] still names those tools and still has nobody to
+    /// ask on their behalf.
+    ///
+    /// The desktop server is different: it IS the dispatcher.
+    /// `desktop::mcp::call_tool` is a choke point in this crate's own process,
+    /// and every click, keystroke and screenshot passes through it.
+    ///
+    /// # The split, and why it is only two rungs
+    ///
+    /// The four observing tools need `ReadOnly`; the eight that move something
+    /// need `WorkspaceWrite`. Not `DangerFullAccess`, even though a click
+    /// reaches far outside any workspace — because `workspace-write` is the
+    /// default mode, and putting the desktop above it would mean the feature
+    /// ships switched off and the flag becomes the thing people turn off.
+    ///
+    /// What this buys is the distinction that was missing: `-p read-only` now
+    /// means the agent may LOOK at the screen and may not touch it. Before
+    /// this, read-only sessions could type.
+    ///
+    /// `Prompt` denies everything here, and that is correct rather than
+    /// unfortunate: stdin and stdout are the MCP protocol, so there is no
+    /// channel to ask a human on, and [`Self::authorize`] with no prompter
+    /// denies.
+    #[must_use]
+    pub fn for_desktop(active_mode: PermissionMode) -> Self {
+        Self::new(active_mode)
+            // Observing. A screenshot photographs a machine signed into real
+            // accounts, which is why it is gated at all rather than left
+            // ungoverned — but it takes nothing and changes nothing.
+            .with_tool_requirement("screen_info", PermissionMode::ReadOnly)
+            .with_tool_requirement("cursor_position", PermissionMode::ReadOnly)
+            .with_tool_requirement("screenshot", PermissionMode::ReadOnly)
+            .with_tool_requirement("ui_tree", PermissionMode::ReadOnly)
+            // Acting. Each one changes the state of a machine the operator is
+            // signed into.
+            .with_tool_requirement("move_mouse", PermissionMode::WorkspaceWrite)
+            .with_tool_requirement("click", PermissionMode::WorkspaceWrite)
+            .with_tool_requirement("click_element", PermissionMode::WorkspaceWrite)
+            .with_tool_requirement("type_text", PermissionMode::WorkspaceWrite)
+            .with_tool_requirement("paste_text", PermissionMode::WorkspaceWrite)
+            .with_tool_requirement("key", PermissionMode::WorkspaceWrite)
+            .with_tool_requirement("scroll", PermissionMode::WorkspaceWrite)
+            .with_tool_requirement("drag", PermissionMode::WorkspaceWrite)
+    }
+
     /// Default permission requirements for the standard file/bash tools.
     #[must_use]
     pub fn with_defaults(self) -> Self {

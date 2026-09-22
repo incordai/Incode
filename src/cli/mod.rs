@@ -148,6 +148,11 @@ impl CliApp {
         }
 
         let permission_mode = PermissionMode::from_str_lossy(&self.config.permission_mode);
+        // PUBLISHED FOR THE REST OF THE PROCESS, so a backend built somewhere
+        // that cannot see this config still runs under the mode the operator
+        // chose. See `PERMISSION_MODE_ENV` for why this is a variable rather
+        // than an argument, and why it stops at this process boundary.
+        std::env::set_var(PERMISSION_MODE_ENV, permission_mode.as_str());
 
         // Incord Code data directory (history, sessions, memory)
         // One resolver for the data directory, shared with every caller that
@@ -1044,6 +1049,7 @@ impl CliApp {
                                 roles: admin.resolve_roles().value,
                                 extra_dirs: extra_dirs.clone(),
                                 desktop: desktop_enabled_from_env(),
+                                permission_mode,
                             },
                         );
                         run_status.stop();
@@ -1519,6 +1525,39 @@ struct RunWatcher<'a> {
 /// everyone (see [`crate::trace`]).
 pub(crate) const DESKTOP_ENV: &str = "INCORD_DESKTOP";
 
+/// What the session's `-p` was, for the parts of this file that build a
+/// backend without holding the session.
+///
+/// # Why an environment variable and not a parameter
+///
+/// The mode is resolved once, at session start, and never changes for the
+/// life of the process — while `run_backend` is reached from eight places,
+/// several of which (an interactive turn, a slash command) have no access to
+/// the session config. Threading it through all of them would add a parameter
+/// that is the same value every time it is passed.
+///
+/// It carries the mode WITHIN this process only. What reaches the desktop
+/// server is an explicit `-p` on its argv, because that is a different
+/// process and an environment it inherits is not a thing to rely on for a
+/// capability decision.
+///
+/// Unset means the default mode, which is what a session without `-p` runs as.
+pub(crate) const PERMISSION_MODE_ENV: &str = "INCORD_PERMISSION_MODE";
+
+/// The session's mode, or the default when nothing set it.
+///
+/// Uses [`crate::permissions::PermissionMode::from_str_lossy`], which fails
+/// CLOSED: a value nobody recognises lands on `read-only` rather than being
+/// treated as permission to act.
+fn permission_mode_from_env() -> crate::permissions::PermissionMode {
+    match std::env::var(PERMISSION_MODE_ENV) {
+        Ok(raw) if !raw.trim().is_empty() => {
+            crate::permissions::PermissionMode::from_str_lossy(raw.trim())
+        }
+        _ => crate::permissions::PermissionMode::WorkspaceWrite,
+    }
+}
+
 /// Every MCP server this harness hands a spawned agent, as one config.
 ///
 /// # Why they are merged and not passed separately
@@ -1537,6 +1576,7 @@ pub(crate) fn mcp_config_for(
     desktop: bool,
     exe: Option<std::path::PathBuf>,
     workspace: &Path,
+    mode: crate::permissions::PermissionMode,
 ) -> Option<String> {
     // No path to this binary means nothing can be launched at all. A config
     // naming a binary nobody can find fails later, inside the agent, as a
@@ -1552,7 +1592,7 @@ pub(crate) fn mcp_config_for(
 
     if desktop {
         let journal = crate::desktop::journal::path_in(workspace);
-        let desktop_config = crate::desktop::mcp::client_config(&exe, Some(&journal));
+        let desktop_config = crate::desktop::mcp::client_config(&exe, Some(&journal), mode);
         if let Some(entry) = desktop_config
             .get("mcpServers")
             .and_then(|m| m.get(crate::desktop::mcp::CLIENT_KEY))
@@ -1569,6 +1609,7 @@ pub(crate) fn mcp_overrides_for(
     desktop: bool,
     exe: Option<std::path::PathBuf>,
     workspace: &Path,
+    mode: crate::permissions::PermissionMode,
 ) -> Vec<String> {
     let Some(exe) = exe else {
         return Vec::new();
@@ -1578,6 +1619,7 @@ pub(crate) fn mcp_overrides_for(
         out.extend(crate::desktop::mcp::codex_config_overrides(
             &exe,
             Some(&crate::desktop::journal::path_in(workspace)),
+            mode,
         ));
     }
     out
@@ -1609,6 +1651,10 @@ pub(crate) struct CliLaneWorkers {
     pub roles: crate::roles::RoleTable,
     pub extra_dirs: Vec<std::path::PathBuf>,
     pub desktop: bool,
+    /// Carried rather than read from the environment, because a lane runs on
+    /// its own thread and a capability decision should not depend on what a
+    /// process-wide variable happens to hold when that thread gets there.
+    pub permission_mode: crate::permissions::PermissionMode,
 }
 
 impl crate::runner::LaneWorkers for CliLaneWorkers {
@@ -1622,6 +1668,7 @@ impl crate::runner::LaneWorkers for CliLaneWorkers {
             roles: self.roles.clone(),
             extra_dirs: self.extra_dirs.clone(),
             desktop: self.desktop,
+            permission_mode: self.permission_mode,
         }))
     }
 }
@@ -1636,6 +1683,7 @@ struct LaneAgent {
     roles: crate::roles::RoleTable,
     extra_dirs: Vec<std::path::PathBuf>,
     desktop: bool,
+    permission_mode: crate::permissions::PermissionMode,
 }
 
 impl crate::runner::TaskWorker for LaneAgent {
@@ -1650,6 +1698,7 @@ impl crate::runner::TaskWorker for LaneAgent {
             &self.guards,
             &self.system_prompt,
             self.desktop,
+            self.permission_mode,
         );
         let mut worker =
             crate::agent::worker::AgentBackendWorker::in_workspace(backend, self.workspace.clone())
@@ -1679,6 +1728,7 @@ pub(crate) fn run_backend(
         guards,
         system_prompt,
         desktop_enabled_from_env(),
+        permission_mode_from_env(),
     )
 }
 
@@ -1695,6 +1745,7 @@ fn run_backend_with_desktop(
     guards: &crate::guards::Guards,
     system_prompt: &[String],
     desktop: bool,
+    mode: crate::permissions::PermissionMode,
 ) -> Box<dyn crate::agent::AgentBackend> {
     match agent_id {
         // The registry ID, not the command name. `agy` is the binary; the agent
@@ -1720,7 +1771,8 @@ fn run_backend_with_desktop(
             // Codex spells registration as `-c key=value` TOML overrides rather
             // than a JSON flag — verified from `codex mcp add --help`, whose own
             // example passes an array.
-            let overrides = mcp_overrides_for(desktop, std::env::current_exe().ok(), workspace);
+            let overrides =
+                mcp_overrides_for(desktop, std::env::current_exe().ok(), workspace, mode);
             if !overrides.is_empty() {
                 backend = backend.with_mcp_overrides(overrides);
             }
@@ -1739,7 +1791,9 @@ fn run_backend_with_desktop(
             // `--help`. agy is the one backend left alone: it offers only a
             // persistent `mcp add`, which edits the operator's machine rather
             // than this spawn, and that is their decision to make.
-            if let Some(config) = mcp_config_for(desktop, std::env::current_exe().ok(), workspace) {
+            if let Some(config) =
+                mcp_config_for(desktop, std::env::current_exe().ok(), workspace, mode)
+            {
                 backend = backend.with_mcp_config(config);
             }
 
@@ -1976,6 +2030,14 @@ fn one_turn_with_context(
 mod tests {
     use super::*;
 
+    /// The mode a session runs in when the operator says nothing.
+    ///
+    /// Named so the tests below read as being about registration rather than
+    /// about permissions — the one test that IS about permissions passes a
+    /// different mode on purpose and is meant to stand out.
+    const ORDINARY: crate::permissions::PermissionMode =
+        crate::permissions::PermissionMode::WorkspaceWrite;
+
     /// **THE REGRESSION THAT HAPPENED TWICE.**
     ///
     /// The run backend shipped built without `with_system_context`, so every
@@ -2039,15 +2101,15 @@ mod tests {
     fn the_desktop_is_not_handed_over_unless_it_is_switched_on() {
         let exe = Some(std::path::PathBuf::from("C:/bin/incode.exe"));
 
-        let off = mcp_config_for(false, exe.clone(), Path::new("C:/work"))
+        let off = mcp_config_for(false, exe.clone(), Path::new("C:/work"), ORDINARY)
             .expect("the team channel is registered either way");
         assert!(
             !off.contains("--desktop-mcp"),
             "the desktop must not be offered when the switch is off: {off}"
         );
 
-        let config =
-            mcp_config_for(true, exe, Path::new("C:/work")).expect("switched on, so a config");
+        let config = mcp_config_for(true, exe, Path::new("C:/work"), ORDINARY)
+            .expect("switched on, so a config");
         assert!(config.contains("--desktop-mcp"), "got: {config}");
         assert!(config.contains("incode.exe"), "got: {config}");
         // The journal is what makes the work watchable; without it the agent
@@ -2064,7 +2126,7 @@ mod tests {
     #[test]
     fn both_servers_survive_being_registered_together() {
         let exe = Some(std::path::PathBuf::from("C:/bin/incode.exe"));
-        let config = mcp_config_for(true, exe, Path::new("C:/work")).expect("a config");
+        let config = mcp_config_for(true, exe, Path::new("C:/work"), ORDINARY).expect("a config");
 
         let parsed: serde_json::Value =
             serde_json::from_str(&config).expect("the config must be valid JSON");
@@ -2090,8 +2152,11 @@ mod tests {
     /// diagnose than simply not offering it.
     #[test]
     fn an_unknown_executable_path_offers_nothing() {
-        assert_eq!(mcp_config_for(true, None, Path::new("C:/work")), None);
-        assert!(mcp_overrides_for(true, None, Path::new("C:/work")).is_empty());
+        assert_eq!(
+            mcp_config_for(true, None, Path::new("C:/work"), ORDINARY),
+            None
+        );
+        assert!(mcp_overrides_for(true, None, Path::new("C:/work"), ORDINARY).is_empty());
     }
 
     /// An empty value does not count as on.
@@ -2134,6 +2199,7 @@ mod tests {
             &crate::guards::Guards::default(),
             &[],
             true,
+            ORDINARY,
         );
         let config = on
             .mcp_config()
@@ -2156,6 +2222,7 @@ mod tests {
             &crate::guards::Guards::default(),
             &[],
             false,
+            ORDINARY,
         );
         let quiet = off
             .mcp_config()
@@ -2184,6 +2251,7 @@ mod tests {
             // Switched ON, which is the case that matters: the point is that
             // agy stays empty-handed even then.
             true,
+            ORDINARY,
         );
         assert_eq!(backend.mcp_config(), None);
     }
@@ -2201,6 +2269,7 @@ mod tests {
             &crate::guards::Guards::default(),
             &[],
             true,
+            ORDINARY,
         );
         // TOML, not JSON — the difference that makes it codex's dialect.
         let config = on
@@ -2222,6 +2291,7 @@ mod tests {
             &crate::guards::Guards::default(),
             &[],
             false,
+            ORDINARY,
         );
         let quiet = off.mcp_config().expect("the team channel is not optional");
         assert!(
@@ -2241,6 +2311,7 @@ mod tests {
         let overrides = crate::desktop::mcp::codex_config_overrides(
             std::path::Path::new(r"C:\Users\someone\.cargo\bin\incode.exe"),
             Some(std::path::Path::new(r"C:\work\.incord\desktop.jsonl")),
+            ORDINARY,
         );
         assert!(
             overrides[0].contains(r"C:\\Users\\someone"),
@@ -2257,7 +2328,7 @@ mod tests {
         );
         assert_eq!(
             overrides[1],
-            r#"mcp_servers.desktop.args=["--desktop-mcp","--desktop-journal","C:\\work\\.incord\\desktop.jsonl"]"#
+            r#"mcp_servers.desktop.args=["--desktop-mcp","--desktop-journal","C:\\work\\.incord\\desktop.jsonl","-p","workspace-write"]"#
         );
     }
 

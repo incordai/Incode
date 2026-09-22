@@ -824,6 +824,7 @@ mod tests {
         let overrides = crate::desktop::mcp::codex_config_overrides(
             std::path::Path::new(r"C:\Users\someone\incode.exe"),
             Some(std::path::Path::new(r"C:\work\.incord\desktop.jsonl")),
+            crate::permissions::PermissionMode::WorkspaceWrite,
         );
 
         let argv = |backend: &CodexBackend| -> Vec<String> {

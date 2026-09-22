@@ -76,7 +76,10 @@ fn main() -> anyhow::Result<()> {
             .map(|_| ())
             .map_err(|e| anyhow::anyhow!(e));
         }
-        Parsed::DesktopMcp { journal } => {
+        Parsed::DesktopMcp {
+            journal,
+            permission_mode,
+        } => {
             // Synchronous on this thread, deliberately: the protocol is a
             // line-oriented pipe and the input thread is its own OS thread, so
             // a tokio runtime would add a scheduler to a program that has
@@ -86,13 +89,20 @@ fn main() -> anyhow::Result<()> {
             // banner there is a parse error at the client.
             let input = incord_code::desktop::thread::InputThread::start()
                 .map_err(|e| anyhow::anyhow!("could not start desktop input: {e}"))?;
-            let mut server = incord_code::desktop::mcp::Server::new(input);
+            let mut server =
+                incord_code::desktop::mcp::Server::new(input).with_permission_mode(permission_mode);
             if let Some(path) = journal {
                 eprintln!("incord-desktop journalling to {}", path.display());
                 server = server.with_journal(path);
             }
 
-            eprintln!("incord-desktop MCP server ready on stdio");
+            // Named on stderr so an operator who asked for `read-only` can see
+            // that it arrived. A capability restriction nobody can observe is
+            // one nobody trusts.
+            eprintln!(
+                "incord-desktop MCP server ready on stdio ({})",
+                permission_mode.as_str()
+            );
             incord_code::desktop::mcp::run_stdio(server)?;
             return Ok(());
         }
@@ -224,6 +234,14 @@ enum Parsed {
         /// means nobody is watching — a server started by hand for a protocol
         /// test writes nowhere.
         journal: Option<std::path::PathBuf>,
+        /// What this desktop is allowed to do.
+        ///
+        /// Passed on the argv by whoever launched the server, because this is
+        /// a separate process: the session's `-p` cannot reach it any other
+        /// way, and for a while it did not reach it at all — a `read-only`
+        /// session got a desktop that could type. See
+        /// [`incord_code::permissions::PermissionPolicy::for_desktop`].
+        permission_mode: incord_code::PermissionMode,
     },
 
     /// Halt the desktop driving this workspace.
@@ -397,6 +415,9 @@ fn parse_args(args: impl Iterator<Item = String>) -> anyhow::Result<Parsed> {
         }
         return Ok(Parsed::DesktopMcp {
             journal: desktop_journal,
+            // `-p` was validated by the loop above, so this cannot silently
+            // fall back — a typo was already refused with a message.
+            permission_mode: incord_code::PermissionMode::from_str_lossy(&config.permission_mode),
         });
     }
 
@@ -546,10 +567,34 @@ mod tests {
     #[test]
     fn desktop_mcp_is_its_own_mode() {
         match parse(&["--desktop-mcp"]).expect("valid") {
-            Parsed::DesktopMcp { journal } => {
+            Parsed::DesktopMcp {
+                journal,
+                permission_mode,
+            } => {
                 assert_eq!(journal, None, "nobody asked for a journal");
+                assert_eq!(
+                    permission_mode,
+                    incord_code::PermissionMode::WorkspaceWrite,
+                    "a desktop started with no `-p` must run as an ordinary session does"
+                );
             }
             other => panic!("--desktop-mcp must be its own mode, got {other:?}"),
+        }
+    }
+
+    /// **THE SESSION'S `-p` MUST CROSS THE PROCESS BOUNDARY.**
+    ///
+    /// The desktop server is a child process with its own argv. For a while
+    /// the mode stopped at the boundary, so `-p read-only` governed the
+    /// agent's file writing and left it free to type into whatever was on the
+    /// screen. The flag is the only way the restriction gets there.
+    #[test]
+    fn the_desktop_runs_under_the_mode_it_was_given() {
+        match parse(&["--desktop-mcp", "-p", "read-only"]).expect("valid") {
+            Parsed::DesktopMcp {
+                permission_mode, ..
+            } => assert_eq!(permission_mode, incord_code::PermissionMode::ReadOnly),
+            other => panic!("got {other:?}"),
         }
     }
 
@@ -562,7 +607,7 @@ mod tests {
     #[test]
     fn the_desktop_takes_a_journal_path() {
         match parse(&["--desktop-mcp", "--desktop-journal", "/tmp/d.jsonl"]).expect("valid") {
-            Parsed::DesktopMcp { journal } => {
+            Parsed::DesktopMcp { journal, .. } => {
                 assert_eq!(journal, Some(std::path::PathBuf::from("/tmp/d.jsonl")));
             }
             other => panic!("got {other:?}"),
