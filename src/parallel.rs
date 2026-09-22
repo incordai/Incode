@@ -133,6 +133,34 @@ pub fn requested_lanes() -> usize {
         .clamp(1, MAX_LANES)
 }
 
+/// What to tell an operator who asked for lanes and is not getting them.
+///
+/// `None` when there is nothing to say — either they did not ask, or they are
+/// getting what they asked for.
+///
+/// # Why this is a function and not an `if` at the call site
+///
+/// The reason for a single lane was already computed, carried on
+/// `Isolation::None`, and returned by [`Isolation::why_not`] — and nothing
+/// ever asked. An operator who set `INCORD_LANES=4` on a workspace that is
+/// not a git repository got a sequential run indistinguishable from one that
+/// simply had nothing to parallelise.
+///
+/// Putting the decision here rather than inline in the runner means the rule
+/// — *say it only when they asked* — can be tested. What is left at the call
+/// site is one print.
+#[must_use]
+pub fn shortfall_note(requested: usize, isolation: &Isolation) -> Option<String> {
+    // A default run has not asked for lanes. Explaining why it did not get
+    // them is noise about a feature nobody reached for.
+    if requested <= 1 {
+        return None;
+    }
+    isolation
+        .why_not()
+        .map(|why| format!("lanes: {requested} requested, running one at a time — {why}"))
+}
+
 /// How many lanes this run will actually use.
 ///
 /// Never more than there is work for: three lanes and two ready tasks is two
@@ -543,6 +571,49 @@ mod tests {
             1,
             "four lanes in one directory is four agents overwriting each other"
         );
+    }
+
+    /// **ASKING FOR FOUR AND GETTING ONE MUST NOT BE SILENT.**
+    ///
+    /// The reason was computed, carried on `Isolation::None`, and returned by
+    /// `why_not` — and nothing asked for it. An operator who set
+    /// `INCORD_LANES=4` on a workspace that is not a git repository got a
+    /// sequential run that looked exactly like one with nothing to
+    /// parallelise, and no way to tell the difference.
+    #[test]
+    fn asking_for_lanes_and_not_getting_them_is_explained() {
+        let blocked = Isolation::None {
+            why: "not a git repository".to_string(),
+        };
+
+        let note = shortfall_note(4, &blocked).expect("four were asked for and refused");
+        assert!(
+            note.contains("not a git repository"),
+            "the note must carry the actionable reason: {note}"
+        );
+        assert!(
+            note.contains('4'),
+            "and how many were asked for, or it reads as a general complaint: {note}"
+        );
+    }
+
+    /// **AND A RUN THAT DID NOT ASK MUST STAY QUIET.**
+    ///
+    /// One lane is the default. Explaining why a default run is not doing
+    /// something nobody requested trains an operator to ignore the line — and
+    /// the line matters in the case above.
+    #[test]
+    fn a_default_run_is_not_told_about_lanes_it_never_wanted() {
+        let blocked = Isolation::None {
+            why: "not a git repository".to_string(),
+        };
+        assert_eq!(shortfall_note(1, &blocked), None);
+
+        // Nor is a run that asked and is getting them.
+        let fine = Isolation::Worktrees {
+            repo_root: PathBuf::from("."),
+        };
+        assert_eq!(shortfall_note(4, &fine), None);
     }
 
     /// This repository IS one, so the detection is exercised against a real

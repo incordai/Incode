@@ -2274,6 +2274,42 @@ mod tests {
         assert_eq!(ready.refusal(), None);
     }
 
+    /// **`may_code` AND "IS IT READY" MUST STAY THE SAME QUESTION.**
+    ///
+    /// `/run` used to decide with `matches!(check(..), Gate::Ready(_))` —
+    /// true today, and not the rule. It now asks `may_code`, which is the one
+    /// place the rule lives. That substitution is only correct while the two
+    /// agree, so the agreement is pinned here rather than reasoned about: a
+    /// variant added later that is `Ready` but must not code, or vice versa,
+    /// fails this instead of silently opening the loop.
+    #[test]
+    fn may_code_and_being_ready_are_the_same_question() {
+        let cases = [
+            Gate::Ready(Box::new(complete())),
+            Gate::Incomplete {
+                project: "p".to_string(),
+                missing: vec![],
+            },
+            Gate::NoBrief {
+                workspace: std::path::PathBuf::from("."),
+            },
+            Gate::Unreachable {
+                url: "u".to_string(),
+                reason: "r".to_string(),
+            },
+        ];
+
+        for gate in cases {
+            let ready = matches!(gate, Gate::Ready(_));
+            assert_eq!(
+                gate.may_code(),
+                ready,
+                "`may_code` and `Gate::Ready` disagree for {gate:?}; \
+                 the `/run` gate depends on them agreeing"
+            );
+        }
+    }
+
     /// An unreachable service must not be treated as a passing check. This is
     /// the failure that would quietly disable the whole gate.
     #[test]

@@ -123,15 +123,21 @@ fn check_agents() -> Check {
             "none installed",
             "Install an agent CLI and log it in. This harness delegates the work and holds no API credential of its own.",
         ),
+        // NAMED WITH THEIR VERSIONS. This is the arm someone reads while
+        // actively diagnosing "why is nothing running", and a list of display
+        // names does not answer it — whether an agent is too old is the first
+        // thing to check, and the version was already being collected.
+        // `Agent::display_line` wrote exactly this line and nothing called it.
         0 => Check::fail(
             "agent",
             format!(
-                "{} installed, none drivable",
+                "{} installed, none drivable\n{}",
+                found.len(),
                 found
                     .iter()
-                    .map(|a| a.display_name.as_str())
+                    .map(|a| format!("    {}", a.display_line()))
                     .collect::<Vec<_>>()
-                    .join(", ")
+                    .join("\n")
             ),
             "Only agents whose stream protocol has been verified are driven. Install a supported one.",
         ),
@@ -342,6 +348,36 @@ pub fn report(checks: &[Check]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **"NONE DRIVABLE" MUST NAME VERSIONS, NOT JUST NAMES.**
+    ///
+    /// This is the line someone reads while working out why nothing runs.
+    /// A list of display names does not answer it — whether the installed
+    /// agent is simply too old is the first thing to check, and the version
+    /// was already collected. `Agent::display_line` wrote exactly this and
+    /// had no caller.
+    #[test]
+    fn an_undrivable_agent_is_reported_with_its_version() {
+        let agent = crate::agent::registry::DetectedAgent {
+            id: "some-agent".to_string(),
+            display_name: "Some Agent".to_string(),
+            command: "some-agent".to_string(),
+            path: None,
+            version: Some("0.1.0".to_string()),
+            protocol: crate::agent::registry::Protocol::Unverified,
+        };
+
+        let line = agent.display_line();
+        assert!(line.contains("some-agent"), "{line}");
+        assert!(
+            line.contains("0.1.0"),
+            "the version is the first thing a diagnosis needs: {line}"
+        );
+        assert!(
+            line.contains("detected"),
+            "and whether it can be driven at all: {line}"
+        );
+    }
 
     /// **A failing check always says what to do.** One that reports a problem
     /// and no remedy leaves the operator exactly as stuck as before it ran.

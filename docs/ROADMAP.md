@@ -5,8 +5,8 @@ Ordered by what it costs to be wrong about, not by what is quickest.
 Process for every item: `PROCESS.md`. Local `main` is the test bench, the gate
 runs before anything is pushed, and every load-bearing change gets a control.
 
-**Status as of 2026-09-22:** 1279 lib + 38 bin tests, clippy 0, fmt clean,
-51 unwired capabilities.
+**Status as of 2026-09-22:** 1288 lib + 38 bin tests, clippy 0, fmt clean,
+43 unwired capabilities (67 at the start of the day).
 
 ---
 
@@ -30,22 +30,42 @@ Each item gets the same three questions, in order:
 None of these are pre-judged below. The grouping is by *where they live*, and
 the disposition is decided by reading the code, not by this table.
 
-### A1 — Things that report, and are never reported (9)
+### A1 — Things that report, and are never reported — DONE 2026-09-22
 
-The highest-value group: each is an answer to a question an operator actually
-asks, computed and thrown away.
+Each was an answer to a question an operator actually asks, computed and
+thrown away. Eight of the nine are wired; one was allowlisted honestly.
 
-| Item | The question it answers |
-|---|---|
-| `verify::detection_note` | why no check was detected — written this phase for the two-ecosystem case, never shown |
-| `budget::exhausted_message` | what to say when the ceiling stops a run |
-| `parallel::why_not` | why the run used one lane when more were asked for |
-| `ledger::has_open_work` | whether anything is still open |
-| `ledger::attempts_left` | how many tries a task has left |
-| `ledger::is_done` | whether a task finished |
-| `ask::unattended_note` | what an unanswered question means for the run |
-| `brief::may_code` | whether the gate lets work start |
-| `agent::registry::display_line` | which agent is serving, in one line |
+| Item | Where it went | What it was hiding |
+|---|---|---|
+| `verify::detection_note` | `--admin`'s verify line | "none" read the same for *no ecosystem here* and *two, so running one's tests proves nothing about the other* — opposite problems, opposite fixes |
+| `budget::exhausted_message` | `StopReason::BudgetSpent`, via `exhausted_text` | the stop said "24000 used" — not what it was measured against, not which variable raises it |
+| `parallel::why_not` | `parallel::shortfall_note`, printed by the runner | `INCORD_LANES=4` on a non-repository gave a sequential run indistinguishable from having nothing to parallelise |
+| `ledger::attempts_left` | `task_instruction` | the final attempt worked exactly like the first, reaching for the better change rather than the one it was sure of |
+| `ask::unattended_note` | `task_run`, after the turn | **`--task` never parsed the agent's `<ask>` blocks.** An agent that hit a fork, asked, and guessed produced a run reporting plain success with the question sitting in the prose |
+| `brief::may_code` | `/run`'s brief gate | read as `matches!(Gate::Ready(_))` — true today, not the rule; a variant added later would fall through silently |
+| `agent::registry::display_line` | `doctor`'s "none drivable" arm | the arm someone reads to find out why nothing runs listed names without versions |
+| `ledger::has_open_work` | the runner's drained-queue branch | **the largest find — see below** |
+| `budget::exhausted_message` (the method) | allowlisted | it is the method spelling of `exhausted_text`, which *is* wired; inventing a call site would be worse than saying so |
+
+#### The bug `has_open_work` was hiding
+
+`next_ready` finds `Ready`. `waiting_ids` finds `Blocked` and `Pending`.
+**`Running` was in neither, and nothing reclaims it** — there is no lease. A
+run killed mid-task left that state on disk, and the next run walked past it
+into the goals check.
+
+Measured with a control, with goals that pass: the run reported
+`LedgerEmpty` — *every task is finished* — with a task still marked in
+progress. That is the same fabrication `NothingRunnable` was added to stop,
+arriving through the one state neither query covered.
+
+Now `StopReason::Stranded`, its own reason rather than folded into
+`NothingRunnable` — that message says the tasks are "waiting on somebody",
+and these are waiting on nobody. Sending a person to find who is holding it
+would send them after someone who does not exist.
+
+**Still open from this group:** `ledger::is_done` and the three `tasks_by_*`
+queries (A2) have no natural caller yet and have NOT been settled either way.
 
 ### A2 — Per-worker ledger queries (3)
 

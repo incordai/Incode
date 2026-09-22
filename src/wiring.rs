@@ -54,7 +54,7 @@ use std::path::{Path, PathBuf};
 /// actually happened, six times.
 ///
 /// Lower it whenever the number falls. The test fails and tells you to.
-pub const MAX_UNWIRED: usize = 49;
+pub const MAX_UNWIRED: usize = 43;
 
 /// A `pub` item nothing outside its own file calls.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]

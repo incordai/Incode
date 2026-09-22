@@ -247,7 +247,31 @@ pub fn run_task_with_model(
             return Err(refusal);
         }
 
-        return Ok(said.join("\n"));
+        let answer = said.join("\n");
+
+        // A DECISION NOBODY MADE MUST NOT VANISH INTO THE OUTPUT.
+        //
+        // This path is unattended by definition — one instruction, nobody at
+        // the prompt — and it never looked at what the agent said for an
+        // `<ask>` block. So an agent that reached a fork, asked, and carried
+        // on with a guess produced a run that reported plain success, with
+        // the question sitting in the middle of the prose as though it were
+        // commentary. `ask::unattended_note` was written for exactly this and
+        // had no caller.
+        //
+        // Reported, NOT failed. The agent did the work; what it could not do
+        // is get an answer. Failing here would throw away a result that is
+        // often fine, and blocking would hang a run nobody is watching —
+        // which is the thing this path exists to avoid.
+        if let Some(note) = crate::ask::unattended_note(&crate::ask::parse(&answer)) {
+            outln!("\n{note}");
+            // Returned as well as printed: the caller records this string,
+            // and a warning that exists only on a terminal nobody was
+            // watching is the same as no warning.
+            return Ok(format!("{answer}\n\n{note}"));
+        }
+
+        return Ok(answer);
     }
 
     Err(if failures.is_empty() {
@@ -328,6 +352,51 @@ pub fn build_prompt(workspace: &Path, instruction: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **AN UNANSWERED DECISION MUST NOT READ AS PROSE.**
+    ///
+    /// `--task` is unattended by definition: one instruction, nobody at the
+    /// prompt. It never looked at what the agent said for an `<ask>` block,
+    /// so an agent that reached a fork, asked, and carried on with a guess
+    /// produced a run reporting plain success — with the question sitting in
+    /// the middle of the output as though it were commentary.
+    ///
+    /// `ask::unattended_note` was written for this and had no caller. This
+    /// asserts the pieces the wiring depends on: that the block is recognised
+    /// in ordinary agent text, and that the note names the question rather
+    /// than merely saying one was asked.
+    #[test]
+    fn a_question_asked_with_nobody_to_answer_it_is_named() {
+        let said = "I started on the endpoint.\n\
+                    <ask>\n\
+                    Which store should this use?\n\
+                    1. Postgres — the document implies joins\n\
+                    2. SQLite — one file, nothing to operate\n\
+                    </ask>\n\
+                    I went with Postgres for now.";
+
+        let questions = crate::ask::parse(said);
+        assert_eq!(questions.len(), 1, "the block was not recognised: {said}");
+
+        let note = crate::ask::unattended_note(&questions).expect("a question was asked");
+        assert!(
+            note.contains("Which store should this use?"),
+            "the note must carry the question, not just its existence: {note}"
+        );
+        assert!(
+            note.contains("Postgres") && note.contains("SQLite"),
+            "and the options, or the operator cannot answer it: {note}"
+        );
+    }
+
+    /// And ordinary output stays ordinary. A note on every run would train an
+    /// operator to ignore the one that matters.
+    #[test]
+    fn a_task_that_asked_nothing_gets_no_note() {
+        let plain = "I added the endpoint and its test. Both pass.";
+        assert!(crate::ask::parse(plain).is_empty());
+        assert_eq!(crate::ask::unattended_note(&crate::ask::parse(plain)), None);
+    }
 
     /// **The instruction goes last.** Context after an instruction reads as an
     /// afterthought, and the agent acts on what it read most recently.

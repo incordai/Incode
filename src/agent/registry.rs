@@ -292,6 +292,13 @@ impl DetectedAgent {
     }
 
     /// One display line, e.g. `claude-code  2.1.229 (Claude Code)  [drivable]`.
+    ///
+    /// # Wired to
+    ///
+    /// `doctor::check_agents`, in the arm that fires when agents are installed
+    /// and none can be driven. That is the line someone reads while working
+    /// out why nothing runs, and a list of display names does not answer it —
+    /// whether the installed one is too old is the first thing to check.
     #[must_use]
     pub fn display_line(&self) -> String {
         format!(

@@ -309,12 +309,13 @@ fail in the safe direction:
 
 ## 6. Stop conditions
 
-Six are implemented. `GuardDenied` below is still a design note, not code.
+Nine are implemented. `GuardDenied` below is still a design note, not code.
 
 | Reason | Fires when |
 |---|---|
 | `LedgerEmpty` | no ready task, nothing blocked, **and every roadmap goal proved reached** — the only one that means "finished" |
 | `NothingRunnable` | no ready task, but work is still parked or waiting. Names every waiting task and says plainly they are NOT finished — shipped 2026-08-17, because reporting this case as `LedgerEmpty` is how held work disappears |
+| `Stranded` | work is open that is neither ready nor waiting on anyone — added 2026-09-22. `next_ready` finds `Ready` and `waiting_ids` finds `Blocked`/`Pending`; **`Running` was in neither, and nothing reclaims it.** A run killed mid-task left that state on disk and the next run walked past it into the goals check. Measured with a control: the run reported `LedgerEmpty` — *every task is finished* — with a task still marked in progress. Its own reason rather than folded into `NothingRunnable`, whose message says the tasks are "waiting on somebody"; these are waiting on nobody |
 | `GoalsUnmet` | every task ran and a roadmap item is still not proved — see §6a |
 | `GoalsUnchecked` | every task ran and the goals could not be READ, so nothing was proved — see §6a |
 | `BudgetSpent` | ceiling reached |

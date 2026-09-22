@@ -686,10 +686,14 @@ impl CliApp {
                                 // then asked for, and a brief a person wrote
                                 // is never overwritten: `from_docs` carries
                                 // only the fields the document actually has.
-                                if !matches!(
-                                    crate::brief::check(&workspace),
-                                    crate::brief::Gate::Ready(_)
-                                ) {
+                                // Asked as the QUESTION rather than matched as
+                                // a shape. `Gate::may_code` is the one place
+                                // that decides whether work may start, and it
+                                // had no caller — so this read as "is it the
+                                // Ready variant", which is true today and is
+                                // not the rule. A variant added later would
+                                // fall through this match silently.
+                                if !crate::brief::check(&workspace).may_code() {
                                     match crate::brief::derive_from_docs(&workspace) {
                                         Ok(still_missing) if still_missing.is_empty() => {
                                             render::print_info(

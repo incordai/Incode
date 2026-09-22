@@ -391,6 +391,22 @@ pub enum StopReason {
     /// `dead` is the subset that can never become ready at all, with what holds
     /// each one — a task waiting on an abandoned dependency is not waiting, it
     /// is stuck, and the two need different words.
+    /// Work is open that is neither ready nor waiting on anyone.
+    ///
+    /// # The hole this closes
+    ///
+    /// `next_ready` finds `Ready`; `waiting_ids` finds `Blocked` and
+    /// `Pending`. `Running` is in neither — and nothing reclaims it. A run
+    /// killed mid-task leaves that state on disk, and the next run found no
+    /// ready task, no waiting task, went on to the goals check and could
+    /// report `LedgerEmpty`: *every task is finished*, with one still marked
+    /// in progress.
+    ///
+    /// Not folded into [`Self::NothingRunnable`], whose message says the
+    /// tasks are "waiting on somebody". These are waiting on nobody. A person
+    /// told to go and find who is holding it would be looking for someone who
+    /// does not exist.
+    Stranded { ids: Vec<String> },
     NothingRunnable {
         waiting: Vec<String>,
         dead: Vec<(String, Vec<String>)>,
@@ -453,6 +469,14 @@ impl StopReason {
                 }
                 out
             }
+            Self::Stranded { ids } => format!(
+                "Stopped: {} task(s) are marked in progress with nothing running them: {}. \
+                 They are NOT finished. A run that was killed or crashed mid-task leaves \
+                 this behind, and nothing reclaims it — set each one back to `ready` in \
+                 `.incord/ledger.json`, or cancel it, then run again.",
+                ids.len(),
+                ids.join(", ")
+            ),
             Self::Cancelled => "Stopped: cancelled.".to_string(),
         }
     }
@@ -1111,6 +1135,21 @@ fn work_the_ledger(
     // learn a fact about the workspace that cannot change mid-run.
     let isolation = crate::parallel::detect_isolation(workspace);
 
+    // ASKED FOR FOUR, GOT ONE, AND TOLD WHY.
+    //
+    // `Isolation::None` carries the reason and `why_not` returns it, and
+    // nothing asked: an operator who set INCORD_LANES=4 and got a sequential
+    // run had no way to learn that the workspace is not a git repository.
+    // The run looks identical to one that simply had nothing to parallelise.
+    //
+    // The rule for WHEN to say it lives in `parallel::shortfall_note`, which
+    // is testable. What is left here is the print.
+    if let Some(note) =
+        crate::parallel::shortfall_note(crate::parallel::requested_lanes(), &isolation)
+    {
+        eprintln!("{note}");
+    }
+
     loop {
         if cancelled() {
             return RunOutcome {
@@ -1170,6 +1209,30 @@ fn work_the_ledger(
                     spend_by_agent: ranked(&by_agent),
                 };
             }
+            // NOTHING READY, NOTHING WAITING, AND STILL WORK OPEN.
+            //
+            // Only `Running` can be here. Nothing reclaims it — there is no
+            // lease — so a run killed mid-task leaves that state on disk and
+            // the next run walked straight past it into the goals check,
+            // where it could report `LedgerEmpty`: every task is finished,
+            // with one still marked in progress. `Ledger::has_open_work` is
+            // the question that catches it, and nothing had ever asked it.
+            if ledger.has_open_work() {
+                return RunOutcome {
+                    stop: StopReason::Stranded {
+                        ids: ledger
+                            .tasks
+                            .iter()
+                            .filter(|t| t.state.is_open())
+                            .map(|t| t.id.clone())
+                            .collect(),
+                    },
+                    completed,
+                    attempted,
+                    spend_by_agent: ranked(&by_agent),
+                };
+            }
+
             // THE FINAL TESTING, and it belongs to the orchestrator.
             //
             // Until this ran, a drained queue was reported as success. Every
@@ -1583,6 +1646,24 @@ pub fn task_instruction(task: &Task) -> String {
          Do not claim success you have not earned, and do not attempt to run \
          the check yourself — reporting on your own work proves nothing.",
     );
+
+    // HOW MANY TRIES ARE LEFT, on the attempt where it changes what a
+    // reasonable agent does. `Task::attempts_left` existed and nothing asked
+    // it, so an agent on its final attempt worked exactly as it had on its
+    // first — taking the same wide approach on the try where a narrow,
+    // certain fix is worth more than an ambitious one.
+    //
+    // Said only when this is the LAST attempt. "You have 2 attempts" on a
+    // first pass invites spending one, which is the opposite of the point.
+    if task.attempts_left() <= 1 && task.attempts > 0 {
+        out.push_str(
+            "\n\nThis is the LAST attempt at this task. If it does not pass, the \
+             task is set aside and a person has to pick it up. Prefer the \
+             smallest change you are confident is correct over a larger one you \
+             think is better.",
+        );
+    }
+
     out
 }
 
@@ -2467,6 +2548,95 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **THE LAST ATTEMPT SHOULD KNOW IT IS THE LAST.**
+    ///
+    /// `Task::attempts_left` was computed and nobody asked it, so an agent on
+    /// its final try worked exactly as it had on its first — reaching for the
+    /// better change rather than the one it was sure of, on the attempt where
+    /// failing means the task is set aside for a person.
+    ///
+    /// And NOT on the first attempt: telling an agent it has two tries invites
+    /// it to spend one.
+    #[test]
+    fn only_the_final_attempt_is_told_that_it_is_final() {
+        let mut task = Task::new("t-1", "r-1", "fix it").with_verify(["true"]);
+
+        assert!(
+            !task_instruction(&task).contains("LAST attempt"),
+            "a first attempt must not be told it is the last"
+        );
+
+        task.attempts = crate::ledger::MAX_ATTEMPTS - 1;
+        let final_try = task_instruction(&task);
+        assert!(
+            final_try.contains("LAST attempt"),
+            "the final attempt was not told: {final_try}"
+        );
+        assert!(
+            final_try.contains("smallest change"),
+            "saying it is the last is only useful with what to do about it: {final_try}"
+        );
+    }
+
+    /// **A TASK LEFT `Running` MUST NOT BE REPORTED AS FINISHED.**
+    ///
+    /// `next_ready` finds `Ready`, `waiting_ids` finds `Blocked` and
+    /// `Pending`, and nothing looked for `Running`. Nothing reclaims it
+    /// either — there is no lease — so a run killed mid-task leaves that on
+    /// disk, and the next run walked past it into the goals check and could
+    /// announce that every task was finished.
+    ///
+    /// That is the same fabrication `NothingRunnable` was added to stop,
+    /// arriving through the one state neither query covered.
+    #[test]
+    fn a_task_left_running_by_a_crash_is_not_called_finished() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut stranded = passing_task("t-1");
+        // Exactly what a killed run leaves behind: claimed, never settled.
+        stranded.state = TaskState::Running;
+        let mut ledger = Ledger {
+            version: 1,
+            tasks: vec![stranded],
+        };
+
+        // Goals that PASS, deliberately. With the check removed this run
+        // reports `LedgerEmpty` — "every task is finished" — which is the
+        // exact fabrication being guarded against. Without them the control
+        // would stop at `GoalsUnchecked` and the test would prove a near-miss
+        // instead of the thing it claims.
+        let outcome = run_watched(
+            &mut ledger,
+            &mut NeverWorker,
+            dir.path(),
+            &mut Budget::default(),
+            &never_cancelled(),
+            &mut NoOwner,
+            &mut NoJournal,
+            &mut Unwatched,
+            &mut NoReplan,
+            &mut AllGoalsReached,
+            &NoLanes,
+        );
+
+        assert_eq!(
+            outcome.stop,
+            StopReason::Stranded {
+                ids: vec!["t-1".to_string()]
+            },
+            "a task still marked in progress was reported as {:?}",
+            outcome.stop
+        );
+
+        // AND THE MESSAGE SAYS WHAT TO DO. "Stranded" is not a thing an
+        // operator can act on without being told where the state lives.
+        let said = outcome.stop.message();
+        assert!(said.contains("t-1"), "{said}");
+        assert!(
+            said.contains("ledger.json"),
+            "the operator is not told where to fix it: {said}"
+        );
     }
 
     /// Fails like [`FailingWorker`], but keeps every task it was handed.
