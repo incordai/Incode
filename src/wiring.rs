@@ -54,7 +54,7 @@ use std::path::{Path, PathBuf};
 /// actually happened, six times.
 ///
 /// Lower it whenever the number falls. The test fails and tells you to.
-pub const MAX_UNWIRED: usize = 59;
+pub const MAX_UNWIRED: usize = 51;
 
 /// A `pub` item nothing outside its own file calls.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -208,10 +208,32 @@ fn rust_files(src: &Path) -> std::io::Result<Vec<PathBuf>> {
 /// its own tests is exactly what this looks for — so counting them would make
 /// the check report nothing, forever.
 fn production_half(text: &str) -> &str {
-    match text.find("#[cfg(test)]") {
-        Some(at) => &text[..at],
-        None => text,
+    // THE MARKER MUST BE AT COLUMN ZERO.
+    //
+    // `text.find("#[cfg(test)]")` was wrong in a way that made the check lie
+    // rather than merely miss things. `cli/agent_turn.rs` has a single
+    // test-only method at line 177 — `#[cfg(test)] pub fn with_backend` —
+    // and matching that threw away the remaining 1,028 lines of the file.
+    // Every call site in it became invisible, so `checkpoint::begin`,
+    // `has_undo`, `pending_label` and `undo_last` were all reported as having
+    // no caller while `/undo` was working perfectly.
+    //
+    // That is a FALSE POSITIVE, which this module's own header calls the
+    // thing that kills a check: four items were on the list for months
+    // pointing at code that was fine, and the next reader has to verify by
+    // hand before believing any entry.
+    //
+    // A test MODULE is written at column zero (`#[cfg(test)]\nmod tests`);
+    // an attribute on an item inside an `impl` is indented. Anchoring to the
+    // line start keeps the trailing test block out and keeps the file in.
+    let mut offset = 0usize;
+    for line in text.split_inclusive('\n') {
+        if line.starts_with("#[cfg(test)]") {
+            return &text[..offset];
+        }
+        offset += line.len();
     }
+    text
 }
 
 /// The same code with comment lines BLANKED, not removed.
@@ -252,13 +274,37 @@ fn declarations(code: &str) -> Vec<(String, usize)> {
     const KINDS: [&str; 1] = ["fn "];
     let mut out = Vec::new();
 
+    // Whether the previous non-blank line marked the next item as test-only.
+    // Now that `production_half` keeps the rest of a file after an item-level
+    // `#[cfg(test)]`, those items are in range — and a helper that exists only
+    // for tests is not a production capability, so declaring it would put a
+    // permanent false entry on the list.
+    let mut test_only = false;
+
     for (index, line) in code.lines().enumerate() {
         let trimmed = line.trim_start();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with("#[cfg(test)]") {
+            test_only = true;
+            continue;
+        }
+
         // `pub(crate)` and `pub(super)` count: a crate-visible item nothing in
         // the crate calls is the same defect, and more clearly so.
         let Some(rest) = trimmed.strip_prefix("pub") else {
+            // Attributes and doc lines sit between the marker and the item, so
+            // the flag survives them and clears on the first real statement.
+            if !trimmed.starts_with('#') {
+                test_only = false;
+            }
             continue;
         };
+        if test_only {
+            test_only = false;
+            continue;
+        }
         let rest = match rest.find(char::is_whitespace) {
             Some(cut) => rest[cut..].trim_start(),
             None => continue,
@@ -412,6 +458,54 @@ mod tests {
         assert!(
             !names.contains(&"helper".to_string()),
             "an ordinary helper was reported as dead: {names:?}"
+        );
+    }
+
+    /// **ONE TEST-ONLY METHOD MUST NOT BLIND THE REST OF ITS FILE.**
+    ///
+    /// The check used to cut a file at the first `#[cfg(test)]` anywhere in
+    /// it. `cli/agent_turn.rs` has one test-only method 177 lines in, so the
+    /// remaining 1,028 lines — every caller in the file — were invisible, and
+    /// four working capabilities sat on the dead list for months:
+    /// `checkpoint::begin`, `has_undo`, `pending_label` and `undo_last`, all
+    /// of them reached every time anyone typed `/undo`.
+    ///
+    /// A false positive is worse than a miss here. It makes the list
+    /// something a reader has to verify by hand before believing any of it,
+    /// which is how a check stops being used.
+    #[test]
+    fn a_test_only_method_does_not_hide_the_callers_below_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "pub fn used_later() {}\n\
+             impl Thing {\n\
+             \x20   #[cfg(test)]\n\
+             \x20   pub fn only_for_tests(&self) {}\n\
+             }\n\
+             fn real_caller() { used_later(); }\n\
+             #[cfg(test)]\n\
+             mod tests {\n\
+             \x20   fn t() { whatever(); }\n\
+             }\n",
+        )
+        .expect("write");
+
+        let names: Vec<String> = unwired_in(dir.path())
+            .expect("scan")
+            .into_iter()
+            .map(|u| u.name)
+            .collect();
+
+        assert!(
+            !names.contains(&"used_later".to_string()),
+            "a caller below an item-level `#[cfg(test)]` was not seen: {names:?}"
+        );
+        // AND THE TEST-ONLY ITEM IS NOT A CAPABILITY. Keeping the rest of the
+        // file in scope must not put every test helper onto the list instead.
+        assert!(
+            !names.contains(&"only_for_tests".to_string()),
+            "a test-only method was reported as a dead capability: {names:?}"
         );
     }
 
