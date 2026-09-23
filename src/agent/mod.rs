@@ -19,6 +19,7 @@ pub mod api;
 pub mod claude_code;
 pub mod codex;
 pub mod registry;
+pub mod stderr_tail;
 pub mod worker;
 
 use std::fmt::{Display, Formatter};

@@ -1066,6 +1066,9 @@ impl AgentBackend for ClaudeCodeBackend {
             .stdout
             .take()
             .ok_or_else(|| AgentError::new("child stdout was not piped"))?;
+        // Drained from now, not after `wait()`: an agent that fills the pipe
+        // blocks on the write and never exits. See `stderr_tail`.
+        let stderr = crate::agent::stderr_tail::StderrTail::capture(child.stderr.take());
 
         let outcome = consume_stream(
             BufReader::new(stdout),
@@ -1094,18 +1097,11 @@ impl AgentBackend for ClaudeCodeBackend {
                 }
                 Ok(o)
             }
-            None => {
-                let mut stderr = String::new();
-                if let Some(mut e) = child.stderr.take() {
-                    use std::io::Read;
-                    let _ = e.read_to_string(&mut stderr);
-                }
-                Err(AgentError::new(format!(
-                    "agent exited with {} before producing a result: {}",
-                    status.code().unwrap_or(-1),
-                    stderr.trim()
-                )))
-            }
+            None => Err(AgentError::new(format!(
+                "agent exited with {} before producing a result: {}",
+                status.code().unwrap_or(-1),
+                stderr.finish()
+            ))),
         }
     }
 }
@@ -1813,6 +1809,80 @@ mod tests {
             backend.ladder_for("explore"),
             backend.ladder_for("diagnose"),
             "reading and reasoning must not draw the same tier"
+        );
+    }
+
+    /// A stand-in agent that writes far more to stderr than a pipe holds, then
+    /// exits without ever printing a result — the shape of a CLI that fails
+    /// loudly at startup.
+    fn a_loud_failing_agent(dir: &std::path::Path) -> PathBuf {
+        #[cfg(windows)]
+        {
+            let path = dir.join("loud-agent.cmd");
+            std::fs::write(
+                &path,
+                "@echo off\r\nfor /L %%i in (1,1,3000) do echo stderr line %%i \
+                 padding padding padding padding padding padding padding 1>&2\r\n\
+                 echo token=hunter2-not-a-real-secret 1>&2\r\nexit /b 3\r\n",
+            )
+            .expect("write the fake agent");
+            path
+        }
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = dir.join("loud-agent.sh");
+            std::fs::write(
+                &path,
+                "#!/bin/sh\ni=0\nwhile [ $i -lt 3000 ]; do echo \"stderr line $i padding \
+                 padding padding padding padding padding padding\" >&2; i=$((i+1)); done\n\
+                 echo 'token=hunter2-not-a-real-secret' >&2\nexit 3\n",
+            )
+            .expect("write the fake agent");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("make it runnable");
+            path
+        }
+    }
+
+    /// **A LOUD FAILURE DOES NOT HANG THE TURN, AND WHAT IT SAID IS BOUNDED
+    /// AND CLEANED.**
+    ///
+    /// stderr was piped and only read after `wait()`. An agent that wrote more
+    /// than the pipe holds blocked on the write, never exited, and `wait()`
+    /// never returned: the turn hung with no message. The same text, once
+    /// read, went unbounded and unredacted into the error, the ledger and the
+    /// transcript.
+    #[test]
+    fn an_agent_that_floods_stderr_fails_promptly_with_a_bounded_clean_reason() {
+        let dir = tempfile::tempdir().expect("scratch");
+        let fake = a_loud_failing_agent(dir.path());
+        let workspace = dir.path().to_path_buf();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut backend = ClaudeCodeBackend::new(workspace).with_binary(fake.to_string_lossy());
+            let result = backend.run_turn("hi", &mut |_| {});
+            let _ = tx.send(result.map(|_| ()).map_err(|e| e.to_string()));
+        });
+
+        let result = rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the turn hung: the agent's stderr was never drained");
+        let reason = result.expect_err("the fake agent produced no result line");
+
+        assert!(
+            reason.contains("stderr line"),
+            "what the agent said was lost: {reason}"
+        );
+        assert!(
+            reason.len() <= crate::agent::stderr_tail::MAX_BYTES + 1024,
+            "the reason was not bounded: {} bytes",
+            reason.len()
+        );
+        assert!(
+            !reason.contains("hunter2-not-a-real-secret"),
+            "a secret-shaped value reached the error unredacted"
         );
     }
 }

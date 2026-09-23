@@ -405,15 +405,7 @@ impl AgentBackend for AgyBackend {
             .take()
             .ok_or_else(|| AgentError::new("the agent produced no output stream"))?;
 
-        let stderr = child.stderr.take();
-        let stderr_handle = std::thread::spawn(move || {
-            let mut buf = String::new();
-            if let Some(mut r) = stderr {
-                use std::io::Read;
-                let _ = r.read_to_string(&mut buf);
-            }
-            buf
-        });
+        let stderr = crate::agent::stderr_tail::StderrTail::capture(child.stderr.take());
 
         let mut outcome: Option<TurnOutcome> = None;
         let mut usage = crate::runtime::usage::TokenUsage::default();
@@ -500,13 +492,12 @@ impl AgentBackend for AgyBackend {
             .wait()
             .map_err(|e| AgentError::new(format!("the agent did not exit cleanly: {e}")))?;
 
-        let stderr_output = stderr_handle.join().unwrap_or_default();
-
         outcome.ok_or_else(|| {
-            let detail = if stderr_output.trim().is_empty() {
+            let stderr_output = stderr.finish();
+            let detail = if stderr_output.is_empty() {
                 String::new()
             } else {
-                format!(": {}", stderr_output.trim())
+                format!(": {stderr_output}")
             };
             AgentError::new(format!(
                 "the agent produced no result line (exit {}){detail}",
