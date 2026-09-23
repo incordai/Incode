@@ -1,16 +1,23 @@
-//! The local run server: two GETs, loopback only, read-only.
+//! The local run server: loopback only, read-only.
 //!
-//! # Bound to loopback, and that is the whole access control
+//! # Who can reach it
 //!
 //! This serves what agents are doing to a project on this machine — file paths,
 //! task titles, transcript-derived status. It listens on `127.0.0.1` and
-//! nowhere else, so the only clients are programs already running as this user.
-//! There is no token because a token on a loopback socket protects nothing that
-//! the socket does not already protect, and inventing one would read as a
-//! security boundary that is not there.
+//! nowhere else, which keeps other MACHINES out. It does not keep other
+//! WEBSITES out: any page the operator opens can send a request to loopback.
+//! So every request passes [`Access::admit`] first:
 //!
-//! **Do not move this to `0.0.0.0` without adding authentication first.** The
-//! bind address is the boundary.
+//! - the `Host` header must name this server by a loopback name and its own
+//!   port, which defeats DNS rebinding (a hostile domain resolved to
+//!   127.0.0.1, whose requests the browser treats as same-origin);
+//! - a browser `Origin`, when there is one, must be loopback or listed in
+//!   [`ORIGINS_ENV`], and is echoed back exactly — never `*`.
+//!
+//! A client that sends no `Origin` (curl, a script) is not a browser page and
+//! is admitted on the Host check alone.
+//!
+//! **Do not move this to `0.0.0.0` without adding authentication first.**
 //!
 //! # Why the stream polls
 //!
@@ -97,16 +104,112 @@ pub fn published(workspace: &std::path::Path) -> Option<Address> {
 
 type Body = BoxBody<Bytes, Infallible>;
 
+/// Extra browser origins allowed to read this server, comma-separated — for an
+/// interface that is not served from loopback, such as a desktop shell's own
+/// scheme (`tauri://localhost`). Loopback origins need no entry.
+pub const ORIGINS_ENV: &str = "INCORD_SERVE_ORIGINS";
+
+/// Who may talk to this server. See the module note.
+#[derive(Debug, Clone)]
+pub struct Access {
+    port: u16,
+    extra_origins: Vec<String>,
+}
+
+impl Access {
+    #[must_use]
+    pub fn new(port: u16, extra_origins: Vec<String>) -> Self {
+        Access {
+            port,
+            extra_origins,
+        }
+    }
+
+    /// The bound port, plus whatever [`ORIGINS_ENV`] lists.
+    #[must_use]
+    pub fn from_env(port: u16) -> Self {
+        let extra = std::env::var(ORIGINS_ENV)
+            .unwrap_or_default()
+            .split(',')
+            .map(|o| o.trim().trim_end_matches('/').to_string())
+            .filter(|o| !o.is_empty())
+            .collect();
+        Access::new(port, extra)
+    }
+
+    /// Whether a request may be answered, given its `Host` and `Origin`.
+    ///
+    /// `Ok(Some(origin))` is a browser origin to echo in the reply; `Ok(None)`
+    /// is a client that sent none.
+    ///
+    /// # Errors
+    ///
+    /// Why the request is refused, in words for the 403.
+    pub fn admit(
+        &self,
+        host: Option<&str>,
+        origin: Option<&str>,
+    ) -> Result<Option<String>, String> {
+        let host = host.ok_or("no Host header")?;
+        let expected = [
+            format!("127.0.0.1:{}", self.port),
+            format!("localhost:{}", self.port),
+        ];
+        if !expected.iter().any(|e| e.eq_ignore_ascii_case(host)) {
+            return Err(format!("this server does not answer to `{host}`"));
+        }
+        let Some(origin) = origin else {
+            return Ok(None);
+        };
+        if is_loopback_origin(origin) || self.extra_origins.iter().any(|o| o == origin) {
+            Ok(Some(origin.to_string()))
+        } else {
+            Err(format!(
+                "origin `{origin}` is not allowed; loopback origins are, and others can be \
+                 listed in {ORIGINS_ENV}"
+            ))
+        }
+    }
+}
+
+/// `http(s)://localhost` or `http(s)://127.0.0.1`, with an optional port and
+/// nothing else — `localhost.evil.example` is not loopback.
+fn is_loopback_origin(origin: &str) -> bool {
+    let Some(rest) = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    let (name, port) = match rest.split_once(':') {
+        Some((name, port)) => (name, Some(port)),
+        None => (rest, None),
+    };
+    let port_ok = port.is_none_or(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+    port_ok && (name.eq_ignore_ascii_case("localhost") || name == "127.0.0.1")
+}
+
+/// Name the admitted origin on a reply, so that browser — and only that one —
+/// may read it.
+fn with_cors(mut reply: Response<Body>, origin: Option<&str>) -> Response<Body> {
+    if let Some(value) = origin.and_then(|o| hyper::header::HeaderValue::from_str(o).ok()) {
+        let headers = reply.headers_mut();
+        headers.insert(hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN, value);
+        // The reply differs by Origin, so a cache must not hand one site's
+        // answer to another.
+        headers.insert(
+            hyper::header::VARY,
+            hyper::header::HeaderValue::from_static("origin"),
+        );
+    }
+    reply
+}
+
 fn json(status: StatusCode, value: &impl serde::Serialize) -> Response<Body> {
     let text = serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string());
     Response::builder()
         .status(status)
         .header("content-type", "application/json")
-        // The interface is served from a different origin (a dev server, or a
-        // desktop shell's own scheme), so without this the browser refuses the
-        // reply. Open, because the socket is already loopback-only — see the
-        // module note.
-        .header("access-control-allow-origin", "*")
         .body(Full::new(Bytes::from(text)).boxed())
         .unwrap_or_else(|_| Response::new(Full::new(Bytes::new()).boxed()))
 }
@@ -132,7 +235,6 @@ pub fn route(method: &Method, path: &str, workspace: &std::path::Path) -> Option
         (&Method::OPTIONS, _) => Some(
             Response::builder()
                 .status(StatusCode::NO_CONTENT)
-                .header("access-control-allow-origin", "*")
                 .header("access-control-allow-methods", "GET, OPTIONS")
                 .body(Full::new(Bytes::new()).boxed())
                 .unwrap_or_else(|_| Response::new(Full::new(Bytes::new()).boxed())),
@@ -212,7 +314,6 @@ fn stream(workspace: PathBuf) -> Response<Body> {
         .status(StatusCode::OK)
         .header("content-type", "text/event-stream")
         .header("cache-control", "no-store")
-        .header("access-control-allow-origin", "*")
         .body(body.boxed())
         .unwrap_or_else(|_| Response::new(Full::new(Bytes::new()).boxed()))
 }
@@ -269,16 +370,35 @@ pub async fn listen(workspace: PathBuf, port: Option<u16>) -> std::io::Result<()
     println!("  GET /v1/run/state   what is happening now");
     println!("  GET /v1/run/stream  the same, whenever it changes");
 
+    let access = Arc::new(Access::from_env(bound));
     let workspace = Arc::new(workspace);
 
     loop {
         let (socket, _) = listener.accept().await?;
         let workspace = Arc::clone(&workspace);
+        let access = Arc::clone(&access);
         tokio::spawn(async move {
             let io = hyper_util::rt::TokioIo::new(socket);
             let service = hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
                 let workspace = Arc::clone(&workspace);
+                let access = Arc::clone(&access);
                 async move {
+                    let header = |name| {
+                        req.headers()
+                            .get(name)
+                            .and_then(|v: &hyper::header::HeaderValue| v.to_str().ok())
+                    };
+                    let origin = match access
+                        .admit(header(hyper::header::HOST), header(hyper::header::ORIGIN))
+                    {
+                        Ok(origin) => origin,
+                        Err(why) => {
+                            return Ok::<_, Infallible>(json(
+                                StatusCode::FORBIDDEN,
+                                &serde_json::json!({ "error": why }),
+                            ))
+                        }
+                    };
                     let path = req.uri().path().to_string();
                     let method = req.method().clone();
                     let reply = match route(&method, &path, workspace.as_path()) {
@@ -287,7 +407,7 @@ pub async fn listen(workspace: PathBuf, port: Option<u16>) -> std::io::Result<()
                         // to own a ticker, which a pure function cannot.
                         None => stream((*workspace).clone()),
                     };
-                    Ok::<_, Infallible>(reply)
+                    Ok(with_cors(reply, origin.as_deref()))
                 }
             });
             let _ = hyper::server::conn::http1::Builder::new()
@@ -356,13 +476,117 @@ mod tests {
         }
     }
 
-    /// The browser's pre-flight is answered, or the interface never gets to ask.
+    /// The browser's pre-flight is answered, or the interface never gets to ask
+    /// — and only an admitted origin is named in the answer.
     #[test]
     fn a_cross_origin_preflight_is_allowed() {
         let dir = tempfile::tempdir().expect("a scratch workspace");
         let reply = route(&Method::OPTIONS, "/v1/run/state", dir.path()).expect("answered");
         assert_eq!(reply.status(), StatusCode::NO_CONTENT);
-        assert!(reply.headers().contains_key("access-control-allow-origin"));
+        let reply = with_cors(reply, Some("http://localhost:5173"));
+        assert_eq!(
+            reply
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
+            Some("http://localhost:5173")
+        );
+    }
+
+    const PORT: u16 = 41234;
+
+    fn access() -> Access {
+        Access::new(PORT, vec!["tauri://localhost".to_string()])
+    }
+
+    fn at_home() -> Option<String> {
+        Some(format!("127.0.0.1:{PORT}"))
+    }
+
+    /// **NO REPLY IS OPEN TO EVERY ORIGIN.**
+    ///
+    /// Loopback stops other MACHINES, not other WEBSITES: any page the
+    /// operator opens can `fetch` 127.0.0.1, and a wildcard lets its script
+    /// read what comes back — file paths, task titles, what the agent typed.
+    #[test]
+    fn no_route_answers_with_a_wildcard_origin() {
+        let dir = tempfile::tempdir().expect("a scratch workspace");
+        for (method, path) in [
+            (Method::GET, "/v1/run/state"),
+            (Method::GET, "/v1/project/gate"),
+            (Method::OPTIONS, "/v1/run/state"),
+            (Method::GET, "/nowhere"),
+        ] {
+            let reply = route(&method, path, dir.path()).expect("answered");
+            assert!(
+                reply.headers().get("access-control-allow-origin").is_none(),
+                "{method} {path} named an origin before anyone was admitted"
+            );
+        }
+    }
+
+    /// **A PAGE FROM ANOTHER SITE IS REFUSED.**
+    #[test]
+    fn a_foreign_origin_is_refused() {
+        let refused = access().admit(at_home().as_deref(), Some("https://evil.example"));
+        assert!(refused.is_err(), "a foreign site was admitted: {refused:?}");
+        let null = access().admit(at_home().as_deref(), Some("null"));
+        assert!(null.is_err(), "an opaque origin was admitted: {null:?}");
+    }
+
+    /// **A REQUEST ADDRESSED TO ANOTHER NAME IS REFUSED.**
+    ///
+    /// DNS rebinding: a hostile domain is pointed at 127.0.0.1, so the page's
+    /// requests are same-origin in the browser's eyes and no CORS rule is
+    /// consulted at all. The Host header still names the hostile domain.
+    #[test]
+    fn a_rebound_host_is_refused() {
+        let host = format!("evil.example:{PORT}");
+        assert!(access().admit(Some(&host), None).is_err());
+        let wrong_port = format!("127.0.0.1:{}", PORT + 1);
+        assert!(access().admit(Some(&wrong_port), None).is_err());
+        assert!(access().admit(None, None).is_err(), "no Host at all");
+    }
+
+    /// A local dev server, a configured shell, and a plain client all get in —
+    /// and a browser origin is echoed exactly, never widened.
+    #[test]
+    fn local_and_configured_origins_are_admitted_and_echoed() {
+        let a = access();
+        assert_eq!(
+            a.admit(at_home().as_deref(), Some("http://localhost:5173")),
+            Ok(Some("http://localhost:5173".to_string()))
+        );
+        assert_eq!(
+            a.admit(at_home().as_deref(), Some("http://127.0.0.1:3000")),
+            Ok(Some("http://127.0.0.1:3000".to_string()))
+        );
+        assert_eq!(
+            a.admit(at_home().as_deref(), Some("tauri://localhost")),
+            Ok(Some("tauri://localhost".to_string()))
+        );
+        let named = format!("localhost:{PORT}");
+        assert_eq!(
+            a.admit(Some(&named), None),
+            Ok(None),
+            "curl sends no Origin"
+        );
+    }
+
+    /// A loopback NAME inside a longer host is not loopback.
+    #[test]
+    fn a_lookalike_loopback_origin_is_refused() {
+        for origin in [
+            "http://localhost.evil.example",
+            "http://127.0.0.1.evil.example:80",
+            "http://localhost:5173/path",
+            "http://localhost:notaport",
+        ] {
+            assert!(
+                access().admit(at_home().as_deref(), Some(origin)).is_err(),
+                "{origin} was taken for loopback"
+            );
+        }
     }
 
     /// **Two servers on one machine do not fight over a port.**
