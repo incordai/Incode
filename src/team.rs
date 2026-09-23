@@ -130,6 +130,16 @@ impl Message {
 pub struct Channel {
     path: PathBuf,
     next_seq: u64,
+    /// The file as this handle left it after its own last write — size and
+    /// modified time. Different at the next write means someone else wrote.
+    left_as: Option<(u64, std::time::SystemTime)>,
+}
+
+/// Size and modified time of the channel file, the cheap way: no open, so no
+/// read of the contents.
+fn signature(path: &Path) -> Option<(u64, std::time::SystemTime)> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.len(), meta.modified().ok()?))
 }
 
 impl Channel {
@@ -140,7 +150,11 @@ impl Channel {
     #[must_use]
     pub fn at(path: PathBuf) -> Self {
         let next_seq = read_all(&path).last().map_or(0, |m| m.seq + 1);
-        Self { path, next_seq }
+        Self {
+            path,
+            next_seq,
+            left_as: None,
+        }
     }
 
     /// The channel for a workspace.
@@ -169,6 +183,21 @@ impl Channel {
         task: Option<&str>,
         text: &str,
     ) -> std::io::Result<Message> {
+        // Numbered from the FILE when anyone else has written to it: every
+        // agent's team server, the worker and `--serve` each hold their own
+        // `Channel`, and a number read once at open was handed out twice.
+        //
+        // Read only when the file changed since this handle's own last write.
+        // Reading it on every message was measured at ~36 ms a write on
+        // Windows once the file neared its cap — opening a freshly written
+        // file for reading is scanned — against microseconds for this check.
+        //
+        // What remains is the moment between the read and the append below,
+        // which a file lock would close — `File::lock` needs Rust 1.89 and this
+        // crate's floor is 1.88.
+        if signature(&self.path) != self.left_as {
+            self.next_seq = self.next_seq.max(next_seq_in(&self.path));
+        }
         let message = Message {
             seq: self.next_seq,
             at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
@@ -198,8 +227,10 @@ impl Channel {
         // One write of one whole line, so a reader polling mid-append sees the
         // line or nothing, never half of it.
         file.write_all(line.as_bytes())?;
+        drop(file);
 
         self.next_seq += 1;
+        self.left_as = signature(&self.path);
         Ok(message)
     }
 
@@ -310,6 +341,41 @@ impl Channel {
 ///
 /// An unparseable line is SKIPPED, not fatal: a half-written last line during
 /// an append must not blank the conversation.
+/// The number the next message in the file should get, reading only its end.
+///
+/// Called before every write, so it must not parse the whole file: a channel
+/// near [`MAX_BYTES`] is thousands of lines, and parsing all of them on each
+/// message made filling one quadratic. The tail holds the newest line; a line
+/// longer than the tail (one enormous message) falls back to a full read.
+fn next_seq_in(path: &Path) -> u64 {
+    use std::io::{Read, Seek, SeekFrom};
+    const TAIL: u64 = 16 * 1024;
+
+    let whole = || read_all(path).last().map_or(0, |m| m.seq + 1);
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return 0;
+    };
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let start = len.saturating_sub(TAIL);
+    let mut tail = Vec::new();
+    if file.seek(SeekFrom::Start(start)).is_err() || file.read_to_end(&mut tail).is_err() {
+        return whole();
+    }
+    let text = String::from_utf8_lossy(&tail);
+    // Reading from the middle cuts the first line; it is not a message.
+    let newest = text
+        .lines()
+        .skip(usize::from(start > 0))
+        .filter_map(|line| serde_json::from_str::<Message>(line).ok())
+        .map(|m| m.seq)
+        .max();
+    match newest {
+        Some(seq) => seq + 1,
+        None if start > 0 => whole(),
+        None => 0,
+    }
+}
+
 fn read_all(path: &Path) -> Vec<Message> {
     let Ok(text) = std::fs::read_to_string(path) else {
         return Vec::new();
@@ -559,6 +625,31 @@ mod tests {
         let back = channel.unread_for("implement", Some(asked.seq));
         assert_eq!(back.len(), 1);
         assert!(back[0].text.contains("email"));
+    }
+
+    /// **TWO WRITERS ON ONE CHANNEL NEVER HAND OUT THE SAME NUMBER.**
+    ///
+    /// Each agent's team server, the worker and `--serve` all hold their own
+    /// `Channel` on the same file. Numbering was read once, at open, so two of
+    /// them issued the same `#n` — and an answer names its question by number.
+    #[test]
+    fn two_open_channels_do_not_reuse_a_number() {
+        let path = temp_channel("two-writers");
+        let mut first = Channel::at(path.clone());
+        let mut second = Channel::at(path.clone());
+
+        let a = first
+            .say("implement", EVERYONE, Kind::Note, None, "from the first")
+            .expect("say");
+        let b = second
+            .say("review", EVERYONE, Kind::Note, None, "from the second")
+            .expect("say");
+        let c = first
+            .say("implement", EVERYONE, Kind::Note, None, "the first again")
+            .expect("say");
+
+        assert_ne!(a.seq, b.seq, "two writers issued #{} twice", a.seq);
+        assert!(c.seq > b.seq, "#{} was issued after #{}", c.seq, b.seq);
     }
 
     /// **AN AGENT MUST NOT BE SHOWN ITS OWN WORDS AS INCOMING.**
