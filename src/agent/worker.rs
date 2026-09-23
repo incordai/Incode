@@ -832,17 +832,8 @@ impl<B: AgentBackend> TaskWorker for AgentBackendWorker<B> {
         }
         let channel = crate::team::Channel::in_workspace(&self.workspace);
         // New messages, PLUS any question still open that this agent could
-        // answer. The second is not a duplicate of the first: a question asked
-        // while this agent was mid-turn is already behind its cursor, so
-        // showing only unread messages is how a question gets asked once and
-        // seen by nobody.
-        let mut waiting = channel.unread_for(&speaking_as, self.heard_up_to);
-        for question in channel.open_for(&speaking_as) {
-            if !waiting.iter().any(|m| m.seq == question.seq) {
-                waiting.push(question);
-            }
-        }
-        waiting.sort_by_key(|m| m.seq);
+        // answer — see `Channel::waiting_for`.
+        let waiting = channel.waiting_for(&speaking_as, self.heard_up_to);
 
         if let Some(block) = crate::team::unread_block(&waiting) {
             instruction.push_str("\n\n");

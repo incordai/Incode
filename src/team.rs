@@ -245,6 +245,26 @@ impl Channel {
             .collect()
     }
 
+    /// What to put in front of `who`: messages after `cursor`, plus every
+    /// question still open that `who` could answer, oldest first, each once.
+    ///
+    /// The one definition of "what is waiting for you", used by the worker's
+    /// briefing and by `team_read` mid-turn. The second is not a duplicate of
+    /// the first: a question asked while `who` was mid-turn is already behind
+    /// its cursor, so unread messages alone is how a question gets asked once
+    /// and seen by nobody ([`Self::open_for`]).
+    #[must_use]
+    pub fn waiting_for(&self, who: &str, cursor: Option<u64>) -> Vec<Message> {
+        let mut waiting = self.unread_for(who, cursor);
+        for question in self.open_for(who) {
+            if !waiting.iter().any(|m| m.seq == question.seq) {
+                waiting.push(question);
+            }
+        }
+        waiting.sort_by_key(|m| m.seq);
+        waiting
+    }
+
     /// Questions nothing has answered yet, oldest first.
     ///
     /// The orchestrator's list. A question that no agent can answer is not a

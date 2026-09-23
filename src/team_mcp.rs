@@ -71,6 +71,9 @@ pub struct Server {
     channel: Channel,
     /// Who this server speaks for. Settled from the environment at startup.
     speaking_as: String,
+    /// The last message `team_read` has shown, so the next read starts after
+    /// it. Open questions ignore it — see [`Channel::waiting_for`].
+    heard_up_to: Option<u64>,
     initialised: bool,
 }
 
@@ -81,6 +84,7 @@ impl Server {
         Server {
             channel,
             speaking_as,
+            heard_up_to: None,
             initialised: false,
         }
     }
@@ -189,12 +193,27 @@ impl Server {
 
         match name {
             "team_read" => {
-                let unread = self.channel.unread_for(&self.speaking_as, None);
-                if unread.is_empty() {
+                let waiting = self
+                    .channel
+                    .waiting_for(&self.speaking_as, self.heard_up_to);
+                // Everything handed over counts as heard, including anything
+                // beyond SHOWN — the count of those is said below rather than
+                // replayed on every later read.
+                if let Some(last) = waiting.iter().map(|m| m.seq).max() {
+                    self.heard_up_to = Some(self.heard_up_to.map_or(last, |h| h.max(last)));
+                }
+                if waiting.is_empty() {
                     return Ok("Nothing has been said to you.".to_string());
                 }
+                let shown = waiting.len().min(crate::team::SHOWN);
                 let mut out = String::new();
-                for message in unread.iter().rev().take(crate::team::SHOWN).rev() {
+                if waiting.len() > shown {
+                    out.push_str(&format!(
+                        "({} older message(s) not shown)\n",
+                        waiting.len() - shown
+                    ));
+                }
+                for message in &waiting[waiting.len() - shown..] {
                     out.push_str(&message.line());
                     out.push('\n');
                 }
@@ -659,5 +678,83 @@ mod tests {
     fn a_missing_identity_is_unrouted_not_a_crash() {
         std::env::remove_var(IDENTITY_ENV);
         assert_eq!(Server::identity_from_env(), "unrouted");
+    }
+
+    fn read(server: &mut Server) -> String {
+        let reply = call(
+            server,
+            r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"team_read","arguments":{}}}"#,
+        );
+        reply["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// **`team_read` SHOWS EACH NOTE ONCE, AS ITS DESCRIPTION PROMISES.**
+    ///
+    /// It said "everything said to you that you have not been shown" and kept
+    /// no cursor, so every call returned the same last dozen messages — an
+    /// agent polling mid-turn read old notes as new ones.
+    #[test]
+    fn a_note_already_read_is_not_shown_again() {
+        let path = temp_path("read-once");
+        let mut channel = Channel::at(path.clone());
+        channel
+            .say("review", "implement", Kind::Note, None, "the schema moved")
+            .expect("say");
+        let mut s = server(&path, "implement");
+
+        assert!(read(&mut s).contains("the schema moved"), "never shown");
+        let second = read(&mut s);
+        assert!(
+            !second.contains("the schema moved"),
+            "a note already read was shown again: {second}"
+        );
+
+        channel
+            .say("review", "implement", Kind::Note, None, "tests pass now")
+            .expect("say");
+        let third = read(&mut s);
+        assert!(third.contains("tests pass now"), "the new note was missed");
+        assert!(
+            !third.contains("the schema moved"),
+            "the old note came back beside the new one: {third}"
+        );
+    }
+
+    /// **AN OPEN QUESTION KEEPS BEING SHOWN UNTIL SOMEONE ANSWERS IT.**
+    ///
+    /// The same rule the worker's briefing follows (`Channel::open_for`): a
+    /// question is not done with when it has been seen once, only when it has
+    /// been answered.
+    #[test]
+    fn an_open_question_is_shown_until_it_is_answered() {
+        let path = temp_path("read-open");
+        let mut channel = Channel::at(path.clone());
+        let asked = channel
+            .say("review", "implement", Kind::Question, None, "uuid or int?")
+            .expect("say");
+        let mut s = server(&path, "implement");
+
+        assert!(read(&mut s).contains("uuid or int?"));
+        assert!(
+            read(&mut s).contains("uuid or int?"),
+            "an unanswered question disappeared after one read"
+        );
+
+        channel
+            .say(
+                "implement",
+                "review",
+                Kind::Answer { to: asked.seq },
+                None,
+                "uuid",
+            )
+            .expect("answer");
+        assert!(
+            !read(&mut s).contains("uuid or int?"),
+            "an answered question is still being shown"
+        );
     }
 }
