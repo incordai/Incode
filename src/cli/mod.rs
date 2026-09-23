@@ -743,6 +743,21 @@ impl CliApp {
                         ));
 
                         let stop_flag = cancel.clone();
+                        // A Ctrl-C pressed at the prompt, or a stop that ended
+                        // an earlier run, left the flag set; without a reset
+                        // this run would stop before its first task.
+                        cancel.reset();
+                        // The interface's stop button: `--serve` is another
+                        // process, so it writes a request and this watches for
+                        // it for as long as the run lasts.
+                        let stop_watch = cancel
+                            .cancel_on_request(crate::runtime::cancel::stop_path_in(&workspace));
+                        if stop_watch.cleared_stale() {
+                            render::print_info(
+                                "An old stop request from the interface was cleared: it was \
+                                 made while nothing was running.",
+                            );
+                        }
                         // The ceiling the operator set, from wherever they set it
                         // — not the environment alone, which would ignore the
                         // admin file and run unbounded while `/admin` claimed a

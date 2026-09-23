@@ -48,11 +48,137 @@ impl CancelToken {
     pub fn reset(&self) {
         self.flag.store(false, Ordering::SeqCst);
     }
+
+    /// Cancel this token when a stop request appears at `path`, for as long as
+    /// the returned [`StopWatch`] lives.
+    ///
+    /// The other way to press Ctrl-C: `--serve` runs in a different process,
+    /// so its stop button writes a file ([`stop_path_in`]) and this notices it.
+    /// A request is CONSUMED when obeyed, so it stops one run and not the next.
+    /// One already there when watching starts was made while nothing was
+    /// running; obeying it would stop a run nobody asked to stop, so it is
+    /// cleared instead, and [`StopWatch::cleared_stale`] says so.
+    #[must_use]
+    pub fn cancel_on_request(&self, path: std::path::PathBuf) -> StopWatch {
+        let cleared_stale = path.exists() && std::fs::remove_file(&path).is_ok();
+        let done = Arc::new(AtomicBool::new(false));
+        let (token, watching) = (self.clone(), Arc::clone(&done));
+        let handle = std::thread::spawn(move || {
+            while !watching.load(Ordering::SeqCst) {
+                if path.exists() {
+                    let _ = std::fs::remove_file(&path);
+                    eprintln!("stop requested from the interface");
+                    token.cancel();
+                    return;
+                }
+                std::thread::sleep(STOP_POLL);
+            }
+        });
+        StopWatch {
+            done,
+            handle: Some(handle),
+            cleared_stale,
+        }
+    }
+}
+
+/// Where a stop request for a workspace's run is written, inside `.incord/`.
+pub const STOP_FILE: &str = "run.stop";
+
+/// How often a [`StopWatch`] looks for a request. A person pressing stop
+/// waits at most this long for it to be noticed.
+const STOP_POLL: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// The stop request file for `workspace`.
+#[must_use]
+pub fn stop_path_in(workspace: &std::path::Path) -> std::path::PathBuf {
+    workspace.join(crate::ledger::LEDGER_DIR).join(STOP_FILE)
+}
+
+/// Watching for a stop request; stops watching when dropped.
+pub struct StopWatch {
+    done: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+    cleared_stale: bool,
+}
+
+impl StopWatch {
+    /// Whether a request left over from before this run was cleared unobeyed.
+    #[must_use]
+    pub fn cleared_stale(&self) -> bool {
+        self.cleared_stale
+    }
+}
+
+impl Drop for StopWatch {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn eventually(what: impl Fn() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if what() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        what()
+    }
+
+    /// **A STOP PRESSED IN THE INTERFACE STOPS THE RUN** — and is consumed, so
+    /// it stops this run and not the next.
+    #[test]
+    fn a_stop_request_cancels_the_token_and_is_consumed() {
+        let dir = tempfile::tempdir().expect("a workspace");
+        let path = stop_path_in(dir.path());
+        let token = CancelToken::new();
+        let watch = token.cancel_on_request(path.clone());
+
+        crate::desktop::safety::request_stop(&path).expect("request");
+        assert!(eventually(|| token.is_cancelled()), "the stop was not seen");
+        assert!(
+            eventually(|| !path.exists()),
+            "the request was not consumed"
+        );
+        assert!(!watch.cleared_stale());
+    }
+
+    /// A request left from before the run started is not obeyed.
+    #[test]
+    fn a_request_older_than_the_run_is_cleared_not_obeyed() {
+        let dir = tempfile::tempdir().expect("a workspace");
+        let path = stop_path_in(dir.path());
+        crate::desktop::safety::request_stop(&path).expect("request");
+
+        let token = CancelToken::new();
+        let watch = token.cancel_on_request(path.clone());
+        assert!(watch.cleared_stale(), "the old request was not reported");
+        std::thread::sleep(STOP_POLL * 3);
+        assert!(!token.is_cancelled(), "a stale request stopped a new run");
+    }
+
+    /// Once the run is over, a request is not acted on by a watcher nobody
+    /// holds any more.
+    #[test]
+    fn a_dropped_watch_no_longer_listens() {
+        let dir = tempfile::tempdir().expect("a workspace");
+        let path = stop_path_in(dir.path());
+        let token = CancelToken::new();
+        drop(token.cancel_on_request(path.clone()));
+
+        crate::desktop::safety::request_stop(&path).expect("request");
+        std::thread::sleep(STOP_POLL * 3);
+        assert!(!token.is_cancelled(), "a finished run's watcher acted");
+    }
 
     /// The whole point: the handle that cancels and the handle that checks are
     /// different objects. If cloning copied the flag instead of sharing it,

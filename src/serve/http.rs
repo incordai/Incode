@@ -1,5 +1,6 @@
 //! The local run server: loopback only. Reads are open to admitted clients;
-//! the one write ([`command`]) also needs this run's token ([`TOKEN_FILE`]).
+//! the two writes ([`command`] — answer a question, stop the run) also need
+//! this run's token ([`TOKEN_FILE`]).
 //!
 //! # Who can reach it
 //!
@@ -275,7 +276,7 @@ pub fn command(
     body: &[u8],
     workspace: &std::path::Path,
 ) -> Option<Response<Body>> {
-    if !(method == Method::POST && path == "/v1/team/answer") {
+    if !(method == Method::POST && matches!(path, "/v1/team/answer" | "/v1/run/stop")) {
         return None;
     }
     if !authorized {
@@ -286,6 +287,30 @@ pub fn command(
                  with the token from .incord/{TOKEN_FILE}"
             ) }),
         ));
+    }
+    if path == "/v1/run/stop" {
+        // The run is another process. It watches for this file and trips the
+        // same cancel Ctrl-C does — see `CancelToken::cancel_on_request`.
+        let requested =
+            crate::desktop::safety::request_stop(&crate::runtime::cancel::stop_path_in(workspace));
+        return Some(match requested {
+            Ok(()) => json(
+                StatusCode::ACCEPTED,
+                &serde_json::json!({
+                    "stop": "requested",
+                    "note": "a running /run stops within a second, ending the agent and \
+                             what it started; a run begun later is not affected"
+                }),
+            ),
+            // A stop that silently failed is worse than no stop button: the
+            // person believes the work has halted.
+            Err(e) => json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &serde_json::json!({ "error": format!(
+                    "the stop request could not be written, so nothing was stopped: {e}"
+                ) }),
+            ),
+        });
     }
     let request: AnswerRequest = match serde_json::from_slice(body) {
         Ok(request) => request,
@@ -508,6 +533,7 @@ pub async fn listen(workspace: PathBuf, port: Option<u16>) -> std::io::Result<()
                     .display()
             );
             println!("  POST /v1/team/answer  answer an agent's question as the owner");
+            println!("  POST /v1/run/stop     stop the running /run, and what it started");
             Some(token)
         }
         Err(e) => {
@@ -859,6 +885,30 @@ mod tests {
         )
         .expect("a command route");
         assert_eq!(reply.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// **THE STOP BUTTON NEEDS THE TOKEN.** Without it nothing is written, so
+    /// no run stops.
+    #[test]
+    fn a_stop_without_the_token_writes_nothing() {
+        let dir = tempfile::tempdir().expect("a workspace");
+        let reply = command(&Method::POST, "/v1/run/stop", false, b"", dir.path())
+            .expect("a command route");
+        assert_eq!(reply.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            !crate::runtime::cancel::stop_path_in(dir.path()).exists(),
+            "an unauthorised request asked the run to stop"
+        );
+    }
+
+    /// With it, the request is written where the run's watcher looks.
+    #[test]
+    fn a_stop_with_the_token_is_written_for_the_run() {
+        let dir = tempfile::tempdir().expect("a workspace");
+        let reply =
+            command(&Method::POST, "/v1/run/stop", true, b"", dir.path()).expect("a command route");
+        assert_eq!(reply.status(), StatusCode::ACCEPTED);
+        assert!(crate::runtime::cancel::stop_path_in(dir.path()).exists());
     }
 
     /// Reads stay reads: a path that is not a command is not answered here.

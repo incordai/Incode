@@ -213,6 +213,8 @@ and never the work.
 | `.incord/team.jsonl` | **machine**, append-only | what agents asked each other, and who answered |
 | `.incord/desktop.jsonl` | **machine**, append-only | what an agent did to the screen, streamed to `--serve` |
 | `.incord/desktop.stop` | **human** | its existence halts the desktop; nothing parses it |
+| `.incord/serve.token` | machine, per `--serve` start | the token a write to `--serve` must carry; readable by anything in the workspace, agents included |
+| `.incord/run.stop` | **human**, via `--serve` | a stop request; a running `/run` consumes it and stops, one found at `/run` start is cleared unobeyed |
 | `.incord/findings/<task>.md` | **agent** | one research task's answer, and the thing its check reads |
 | `.incord/brief.cache.json` | machine | the last complete brief, so an unreachable memory service does not stop a run |
 | `<repo-parent>/worktrees/` | machine | one checkout per lane, removed after; the **branch is kept** |

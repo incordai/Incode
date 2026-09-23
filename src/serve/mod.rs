@@ -6,10 +6,12 @@
 //! says what it found — the half that CANNOT break a run, so it can ship while
 //! a run is working.
 //!
-//! The one write is the person answering a question an agent left on the team
-//! channel ([`http::command`]), behind a per-run token. It adds a message to a
-//! file agents already read between turns; it does not reach into a running
-//! turn. A chat box wired straight into a working agent is a different thing:
+//! There are two writes ([`http::command`]), both behind a per-run token: the
+//! person answering a question an agent left on the team channel, which adds
+//! a message to a file agents already read between turns; and the stop
+//! button, which writes a request the running `/run` watches for and obeys
+//! the way it obeys Ctrl-C. Neither reaches into a turn to change what the
+//! agent is doing. A chat box wired straight into a working agent would:
 //! it would arrive mid-turn, where most of these CLIs either drop it or restart
 //! and re-bill the whole context. That still belongs behind its own door.
 

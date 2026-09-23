@@ -132,11 +132,18 @@ Registration syntax is proven — the TOML escaping was verified by an accidenta
 before/after control. The tool *call* has never run: blocked by a provider usage
 limit. One live call is all that is missing.
 
-### B3 — The viewer's stop button
+### B3 — The viewer's stop button — DONE 2026-09-23
 
-`--serve` is read-only by construction, and a stop button makes it write. That
-is an architecture decision, not a bug — it is the owner's call, and it stays
-here until made.
+The owner decided: reads, plus two writes behind a per-run token
+(`.incord/serve.token`, `Authorization: Bearer`). `POST /v1/run/stop` writes
+`.incord/run.stop`; a running `/run` watches for it and trips the same cancel
+Ctrl-C does, which ends the agent and its whole process tree. `POST
+/v1/team/answer` records the person's answer to an agent's question. Every
+request also passes the Host and Origin checks.
+
+**Not covered by a test:** the two lines in `cli/mod.rs` that arm the watcher
+when `/run` starts — exercising them needs a live `/run`. The watcher, the
+route and the file between them are each tested with a control.
 
 ### B4 — The stale code tree in `PRD.md` §6
 
