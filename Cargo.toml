@@ -117,7 +117,19 @@ windows-sys = { version = "0.61", features = [
     "Win32_Graphics_Gdi",
     "Win32_UI_HiDpi",
     "Win32_UI_WindowsAndMessaging",
+    # agent::process_tree — a job object, so stopping an agent stops everything
+    # it started, and the tree dies with incode. SECURITY_ATTRIBUTES and
+    # IO_COUNTERS appear in the job object signatures, hence the other two.
+    "Win32_System_JobObjects",
+    "Win32_Security",
+    "Win32_System_Threading",
 ] }
+
+# agent::process_tree on Linux and macOS: `killpg` for the process group the
+# agent is started in. NO NEW PACKAGE — libc is already resolved in Cargo.lock
+# (0.2.189) as a dependency of tokio and others.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 # ---------------------------------------------------------------------------
 # Features

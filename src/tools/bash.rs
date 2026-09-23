@@ -59,6 +59,7 @@ pub fn execute_bash(workspace: &Path, input: &str, filter_env: bool) -> Result<S
         }
     }
 
+    crate::agent::process_tree::prepare(&mut child);
     let spawned = child.spawn().context("failed to spawn shell")?;
 
     // Wait with timeout
@@ -92,33 +93,147 @@ pub fn execute_bash(workspace: &Path, input: &str, filter_env: bool) -> Result<S
     Ok(result)
 }
 
+/// Wait for `child` to finish, or kill it — and everything it started — at
+/// `timeout`. The one bounded waiter in the crate: the bash tool, `verify` and
+/// hooks all come through here.
+///
+/// Spawn `child` from a command passed through
+/// [`crate::agent::process_tree::prepare`], or on Linux and macOS its
+/// descendants cannot be reached.
+///
+/// # Why the pipes are read while waiting
+///
+/// This used to poll `try_wait` and read stdout and stderr only after exit. A
+/// command that printed more than a pipe holds blocked on the write and never
+/// exited, so a verbose check was killed at the deadline and reported as a
+/// hang. Measured: 4,000 lines of output, "command timed out after 30s".
 pub(crate) fn wait_with_timeout(
     mut child: std::process::Child,
     timeout: Duration,
 ) -> Result<std::process::Output> {
-    // Simple approach: use wait_with_output with a thread-based timeout
-    let start = std::time::Instant::now();
-
-    loop {
-        match child.try_wait() {
-            Ok(Some(_status)) => {
-                return child.wait_with_output().context("failed to collect output");
+    let tree = crate::agent::process_tree::Tree::adopt(&child);
+    let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut buf);
             }
+            buf
+        })
+    };
+    let stdout = drain(child.stdout.take().map(|p| Box::new(p) as _));
+    let stderr = drain(child.stderr.take().map(|p| Box::new(p) as _));
+
+    let start = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
             Ok(None) => {
                 if start.elapsed() > timeout {
-                    let _ = child.kill();
+                    tree.kill(&mut child);
+                    let _ = child.wait();
+                    // The readers are not joined: something outside the tree
+                    // could still hold a pipe, and a timeout must not become
+                    // a hang. They end when the pipes close.
                     anyhow::bail!("command timed out after {}s", timeout.as_secs());
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
             Err(e) => return Err(e.into()),
         }
-    }
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: stdout.join().unwrap_or_default(),
+        stderr: stderr.join().unwrap_or_default(),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A shell command that prints `lines` lines of about 70 bytes each.
+    fn loud(lines: u32) -> Command {
+        #[cfg(windows)]
+        {
+            let mut c = Command::new("cmd");
+            c.arg("/C").arg(format!(
+                "for /L %i in (1,1,{lines}) do @echo line %i padding padding padding padding padding"
+            ));
+            c
+        }
+        #[cfg(not(windows))]
+        {
+            let mut c = Command::new("sh");
+            c.arg("-c").arg(format!(
+                "i=0; while [ $i -lt {lines} ]; do echo \"line $i padding padding padding \
+                 padding padding\"; i=$((i+1)); done"
+            ));
+            c
+        }
+    }
+
+    /// **A CHECK THAT PRINTS A LOT IS NOT MISTAKEN FOR ONE THAT HANGS.**
+    ///
+    /// The waiter polled `try_wait` and only read the pipes after exit. A
+    /// command that printed more than a pipe holds blocked on the write,
+    /// never exited, and was killed at the deadline as a "timeout" — a
+    /// verbose test suite reported as a hung one.
+    #[test]
+    fn a_command_with_a_lot_of_output_finishes_and_keeps_it() {
+        let mut cmd = loud(4000);
+        cmd.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        crate::agent::process_tree::prepare(&mut cmd);
+        let child = cmd.spawn().expect("spawn");
+
+        let output = wait_with_timeout(child, Duration::from_secs(30))
+            .expect("a command that only printed a lot was treated as hung");
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            text.contains("line 4000 "),
+            "the end of the output was lost"
+        );
+        assert!(
+            output.stdout.len() > 200_000,
+            "{} bytes",
+            output.stdout.len()
+        );
+    }
+
+    /// **A TIMED-OUT COMMAND TAKES WHAT IT STARTED WITH IT.**
+    ///
+    /// A check is a shell that starts a build tool that starts test binaries.
+    /// Killing only the shell left the rest running after the run moved on.
+    #[test]
+    fn a_timed_out_command_stops_its_children_too() {
+        let dir = tempfile::tempdir().expect("scratch");
+        let (mut cmd, ticks) =
+            crate::agent::process_tree::a_parent_with_a_ticking_grandchild(dir.path());
+        crate::agent::process_tree::prepare(&mut cmd);
+        let child = cmd.spawn().expect("spawn");
+
+        let result = wait_with_timeout(child, Duration::from_secs(4));
+        assert!(
+            result.is_err(),
+            "a command that sleeps 60s did not time out"
+        );
+
+        let size = |p: &std::path::Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+        std::thread::sleep(Duration::from_millis(1500));
+        let after = size(&ticks);
+        assert!(
+            after > 0,
+            "the grandchild never ran, so this proves nothing"
+        );
+        std::thread::sleep(Duration::from_millis(2500));
+        assert_eq!(
+            size(&ticks),
+            after,
+            "the command's child kept running after the timeout"
+        );
+    }
 
     /// Echo a variable in a way both shells understand.
     fn echo_var(name: &str) -> String {

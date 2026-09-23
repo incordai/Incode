@@ -1271,6 +1271,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "image",
+ "libc",
  "pulldown-cmark",
  "regex",
  "reqwest",

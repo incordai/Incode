@@ -18,6 +18,7 @@ pub mod agy;
 pub mod api;
 pub mod claude_code;
 pub mod codex;
+pub mod process_tree;
 pub mod registry;
 pub mod stderr_tail;
 pub mod worker;

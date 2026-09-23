@@ -373,6 +373,7 @@ pub fn run(argv: &[String], cwd: &Path) -> Result<CommandEvidence, String> {
         c
     };
 
+    crate::agent::process_tree::prepare(&mut cmd);
     let spawned = cmd
         .current_dir(cwd)
         .stdout(std::process::Stdio::piped())

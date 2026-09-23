@@ -1,11 +1,12 @@
 //! Windows display enumeration.
 //!
-//! # This is the only `unsafe` in the crate
+//! # One of two places with `unsafe` in the crate
 //!
 //! Measured 2026-09-16: 42,536 lines under `src/` contained no `unsafe` block
 //! at all. Reading the physical geometry of a display cannot be done without
-//! Win32, so this file introduces it — and keeps it here. The rules it follows,
-//! so the next platform backend follows them too:
+//! Win32, so this file introduced it. The other is `agent::process_tree`, for
+//! job objects and process groups. The rules both follow, so the next platform
+//! backend follows them too:
 //!
 //! - Every `unsafe` block carries a SAFETY comment naming the invariant that
 //!   makes it sound, not a restatement of what the call does.

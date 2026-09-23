@@ -199,6 +199,7 @@ fn run_shell_command(
     // which waits forever: a hook that blocks on input would have hung the
     // desktop between the agent asking and anything happening, with nothing
     // on either side able to say which of them was stuck.
+    crate::agent::process_tree::prepare(&mut child);
     let spawned = child.spawn()?;
     let output = crate::tools::bash::wait_with_timeout(spawned, HOOK_TIMEOUT)
         .map_err(|e| std::io::Error::other(e.to_string()))?;

@@ -363,12 +363,14 @@ impl AgentBackend for CodexBackend {
         on_event: &mut dyn FnMut(&AgentEvent),
     ) -> Result<TurnOutcome, AgentError> {
         let sent = self.full_prompt(prompt);
-        let mut child = self
-            .command(&sent)
+        let mut command = self.command(&sent);
+        crate::agent::process_tree::prepare(&mut command);
+        let mut child = command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| AgentError::new(format!("could not start `{}`: {e}", self.binary)))?;
+        let tree = crate::agent::process_tree::Tree::adopt(&child);
 
         let stdout = child
             .stdout
@@ -383,7 +385,7 @@ impl AgentBackend for CodexBackend {
         for line in BufReader::new(stdout).lines() {
             if let Some(token) = &self.cancel {
                 if token.is_cancelled() {
-                    let _ = child.kill();
+                    tree.kill(&mut child);
                     return Err(AgentError::new("the turn was cancelled"));
                 }
             }

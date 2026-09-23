@@ -1054,6 +1054,7 @@ impl AgentBackend for ClaudeCodeBackend {
 
         // stdin must be closed explicitly, or the CLI waits ~3s for piped input
         // on every invocation.
+        crate::agent::process_tree::prepare(&mut cmd);
         let mut child = cmd
             .current_dir(&self.workspace)
             .stdin(Stdio::null())
@@ -1061,6 +1062,7 @@ impl AgentBackend for ClaudeCodeBackend {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| AgentError::new(format!("failed to spawn `{}`: {e}", self.binary)))?;
+        let tree = crate::agent::process_tree::Tree::adopt(&child);
 
         let stdout = child
             .stdout
@@ -1079,10 +1081,10 @@ impl AgentBackend for ClaudeCodeBackend {
 
         // Whatever happened, the child must not outlive this call. A cancelled
         // turn that left the agent running would keep writing files with
-        // nobody reading its output.
+        // nobody reading its output — and that includes whatever it started.
         let cancelled = matches!(outcome, Err(ref e) if e.to_string() == CANCELLED);
         if cancelled {
-            let _ = child.kill();
+            tree.kill(&mut child);
         }
         let outcome = outcome?;
 

@@ -23,6 +23,9 @@ pub struct BashJob {
     pub output: String,
     stdout_handle: Option<std::thread::JoinHandle<Vec<u8>>>,
     stderr_handle: Option<std::thread::JoinHandle<Vec<u8>>>,
+    /// What the job's shell started, so `/kill` ends the command and not
+    /// just the shell around it.
+    tree: crate::agent::process_tree::Tree,
 }
 
 // ---------------------------------------------------------------------------
@@ -78,9 +81,11 @@ impl BashJobManager {
             }
         }
 
+        crate::agent::process_tree::prepare(&mut cmd_builder);
         let mut child = cmd_builder
             .spawn()
             .context("failed to spawn background job")?;
+        let tree = crate::agent::process_tree::Tree::adopt(&child);
 
         let stdout = child.stdout.take();
         let stdout_handle = stdout.map(|mut r| {
@@ -110,6 +115,7 @@ impl BashJobManager {
             output: String::new(),
             stdout_handle,
             stderr_handle,
+            tree,
         });
 
         Ok(id)
@@ -179,7 +185,7 @@ impl BashJobManager {
     /// Kill a running job. Returns true if the job was found and killed.
     pub fn kill(&mut self, id: u32) -> bool {
         if let Some(job) = self.jobs.iter_mut().find(|j| j.id == id && !j.finished) {
-            let _ = job.child.kill();
+            job.tree.kill(&mut job.child);
             // `kill` only sends the signal. Without reaping the child it stays
             // a zombie in the process table for as long as the CLI runs, and a
             // long session that kills jobs leaks one entry per job.
