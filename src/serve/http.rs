@@ -231,6 +231,14 @@ pub fn route(method: &Method, path: &str, workspace: &std::path::Path) -> Option
         (&Method::GET, "/v1/project/gate") => {
             Some(json(StatusCode::OK, &super::project::gate_of(workspace)))
         }
+        (&Method::GET, "/v1/tasks") => Some(match super::tasks_of(workspace) {
+            Ok(tasks) => json(StatusCode::OK, &serde_json::json!({ "tasks": tasks })),
+            Err(why) => json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &serde_json::json!({ "error": why }),
+            ),
+        }),
+        (&Method::GET, "/v1/team") => Some(json(StatusCode::OK, &super::team_of(workspace))),
         // A browser asks before it fetches from another origin.
         (&Method::OPTIONS, _) => Some(
             Response::builder()
@@ -367,8 +375,11 @@ pub async fn listen(workspace: PathBuf, port: Option<u16>) -> std::io::Result<()
             "Listening on http://127.0.0.1:{bound}, but could not write the address file: {e}"
         ),
     }
-    println!("  GET /v1/run/state   what is happening now");
-    println!("  GET /v1/run/stream  the same, whenever it changes");
+    println!("  GET /v1/run/state     what is happening now");
+    println!("  GET /v1/run/stream    the same, whenever it changes");
+    println!("  GET /v1/project/gate  whether the project is ready to be worked in");
+    println!("  GET /v1/tasks         every task in the ledger");
+    println!("  GET /v1/team          what agents said, and open questions");
 
     let access = Arc::new(Access::from_env(bound));
     let workspace = Arc::new(workspace);
@@ -491,6 +502,77 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("http://localhost:5173")
         );
+    }
+
+    async fn body_text(reply: Response<Body>) -> String {
+        let bytes = reply
+            .into_body()
+            .collect()
+            .await
+            .map(http_body_util::Collected::to_bytes)
+            .unwrap_or_default();
+        String::from_utf8_lossy(&bytes).to_string()
+    }
+
+    /// **THE FRONT END SEES EVERY TASK, NOT ONLY THE ONES AN AGENT TOUCHED.**
+    ///
+    /// `/v1/run/state` shows workers — tasks with a transcript. A board needs
+    /// the whole ledger: what is queued, blocked, done and on which branch.
+    #[tokio::test]
+    async fn the_task_list_is_the_whole_ledger() {
+        let dir = tempfile::tempdir().expect("a workspace");
+        let mut ledger = crate::ledger::Ledger::new();
+        ledger.tasks.push(crate::ledger::Task::new(
+            "t-queued",
+            "r-1",
+            "never picked up",
+        ));
+        ledger.save(dir.path()).expect("save");
+
+        let reply = route(&Method::GET, "/v1/tasks", dir.path()).expect("answered");
+        assert_eq!(reply.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&body_text(reply).await).expect("json");
+        assert_eq!(body["tasks"][0]["id"], "t-queued", "{body}");
+    }
+
+    /// A ledger that cannot be read is an error the interface can show, not
+    /// an empty board that reads as "nothing to do".
+    #[tokio::test]
+    async fn a_broken_ledger_is_an_error_not_an_empty_board() {
+        let dir = tempfile::tempdir().expect("a workspace");
+        let path = crate::ledger::Ledger::path_for(dir.path());
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+        std::fs::write(&path, "{ not json").expect("write");
+
+        let reply = route(&Method::GET, "/v1/tasks", dir.path()).expect("answered");
+        assert_eq!(reply.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body_text(reply).await.contains("not a ledger"));
+    }
+
+    /// The team channel: what was said, and which questions still wait for an
+    /// answer — the list an answer box is built from.
+    #[tokio::test]
+    async fn the_team_endpoint_lists_messages_and_open_questions() {
+        let dir = tempfile::tempdir().expect("a workspace");
+        let mut channel = crate::team::Channel::in_workspace(dir.path());
+        channel
+            .say("review", "all", crate::team::Kind::Note, None, "heads up")
+            .expect("say");
+        channel
+            .say(
+                "implement",
+                "review",
+                crate::team::Kind::Question,
+                None,
+                "uuid?",
+            )
+            .expect("ask");
+
+        let reply = route(&Method::GET, "/v1/team", dir.path()).expect("answered");
+        assert_eq!(reply.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&body_text(reply).await).expect("json");
+        assert_eq!(body["messages"].as_array().map(Vec::len), Some(2), "{body}");
+        assert_eq!(body["open_questions"][0]["text"], "uuid?", "{body}");
     }
 
     const PORT: u16 = 41234;

@@ -19,6 +19,39 @@ pub mod state;
 
 use state::{Item, RunState, WorkState, Worker};
 
+/// Every task in the ledger, in plan order — queued, blocked and finished
+/// alike, with the branch a conflicted lane left its work on.
+///
+/// [`snapshot_at`] shows only tasks an agent has touched, and shows an
+/// unreadable ledger as an empty board. A task list must not: a corrupt
+/// ledger is an error a person needs to see, not "nothing to do".
+///
+/// # Errors
+///
+/// The ledger exists and cannot be read or parsed.
+pub fn tasks_of(workspace: &std::path::Path) -> Result<Vec<crate::ledger::Task>, String> {
+    crate::ledger::Ledger::load(workspace).map(|ledger| ledger.tasks)
+}
+
+/// The team channel as an interface shows it.
+#[derive(Debug, serde::Serialize)]
+pub struct Team {
+    /// Everything said, oldest first.
+    pub messages: Vec<crate::team::Message>,
+    /// Questions nobody has answered — what an answer box is built from.
+    pub open_questions: Vec<crate::team::Message>,
+}
+
+/// What the agents said to each other, and what still waits for an answer.
+#[must_use]
+pub fn team_of(workspace: &std::path::Path) -> Team {
+    let channel = crate::team::Channel::in_workspace(workspace);
+    Team {
+        messages: channel.all(),
+        open_questions: channel.open_questions(),
+    }
+}
+
 /// Everything the interface shows, as of now.
 ///
 /// `now` is passed in rather than read here so the staleness rule can be tested
