@@ -269,32 +269,13 @@ impl Server {
             }
 
             "team_answer" => {
-                let text = body("text");
-                if text.is_empty() {
-                    return Err("`text` is required: there is no answer to send".to_string());
-                }
                 let raw = body("question");
                 let number = raw.trim_start_matches('#').parse::<u64>().map_err(|_| {
                     format!("`question` must be the number of the question, like 4 — got `{raw}`")
                 })?;
-                // An answer filed against a question that does not exist
-                // leaves the real one open AND reads as settled, which is
-                // worse than not answering.
-                if !self.channel.all().iter().any(|m| m.seq == number) {
-                    return Err(format!(
-                        "there is no message #{number} on this channel, so nothing was recorded"
-                    ));
-                }
                 let sent = self
                     .channel
-                    .say(
-                        &self.speaking_as,
-                        crate::team::EVERYONE,
-                        Kind::Answer { to: number },
-                        None,
-                        &text,
-                    )
-                    .map_err(|e| format!("the answer could not be written: {e}"))?;
+                    .answer(&self.speaking_as, number, &body("text"))?;
                 Ok(format!("Answered #{number} as #{}.", sent.seq))
             }
 

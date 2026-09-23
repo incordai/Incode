@@ -1,4 +1,5 @@
-//! The local run server: loopback only, read-only.
+//! The local run server: loopback only. Reads are open to admitted clients;
+//! the one write ([`command`]) also needs this run's token ([`TOKEN_FILE`]).
 //!
 //! # Who can reach it
 //!
@@ -205,6 +206,116 @@ fn with_cors(mut reply: Response<Body>, origin: Option<&str>) -> Response<Body> 
     reply
 }
 
+/// Where this run's write token is kept, inside `.incord/`.
+///
+/// Reads need no token. A write — answering an agent — needs it, sent as
+/// `Authorization: Bearer <token>`. It keeps out web pages (which also fail the
+/// origin check) and other users' programs. It does NOT keep out an agent
+/// working in this workspace, which can read `.incord/` like any file; nothing
+/// a write offers is more than such an agent can already do to that directory.
+pub const TOKEN_FILE: &str = "serve.token";
+
+/// The largest request body a command accepts. An answer is a sentence or a
+/// paragraph; anything near this is not one.
+const MAX_BODY: usize = 64 * 1024;
+
+/// Make this run's write token and write it where a local interface can read
+/// it. A fresh one each time the server starts.
+fn issue_token(workspace: &std::path::Path) -> std::io::Result<String> {
+    use std::io::Write;
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    let dir = workspace.join(crate::ledger::LEDGER_DIR);
+    std::fs::create_dir_all(&dir)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+        .open(dir.join(TOKEN_FILE))?
+        .write_all(token.as_bytes())?;
+    Ok(token)
+}
+
+/// Whether `header` is exactly `Bearer <token>`, compared in constant time so
+/// the reply's timing does not reveal how much of a guess was right.
+fn bearer_matches(header: Option<&str>, token: &str) -> bool {
+    let Some(given) = header.and_then(|h| h.strip_prefix("Bearer ")) else {
+        return false;
+    };
+    let (given, token) = (given.as_bytes(), token.as_bytes());
+    if token.is_empty() || given.len() != token.len() {
+        return false;
+    }
+    given
+        .iter()
+        .zip(token)
+        .fold(0u8, |differ, (a, b)| differ | (a ^ b))
+        == 0
+}
+
+/// An answer to an agent's question, as the interface sends it.
+#[derive(serde::Deserialize)]
+struct AnswerRequest {
+    question: u64,
+    text: String,
+}
+
+/// The routes that change something. `None` for a path that is not one, so
+/// the caller falls through to [`route`] — which has no write arm at all.
+///
+/// Split from the socket, like [`route`], so every decision here is testable
+/// without binding a port.
+pub fn command(
+    method: &Method,
+    path: &str,
+    authorized: bool,
+    body: &[u8],
+    workspace: &std::path::Path,
+) -> Option<Response<Body>> {
+    if !(method == Method::POST && path == "/v1/team/answer") {
+        return None;
+    }
+    if !authorized {
+        return Some(json(
+            StatusCode::UNAUTHORIZED,
+            &serde_json::json!({ "error": format!(
+                "a write needs this run's token: send `Authorization: Bearer <token>` \
+                 with the token from .incord/{TOKEN_FILE}"
+            ) }),
+        ));
+    }
+    let request: AnswerRequest = match serde_json::from_slice(body) {
+        Ok(request) => request,
+        Err(e) => {
+            return Some(json(
+                StatusCode::BAD_REQUEST,
+                &serde_json::json!({ "error": format!(
+                    "expected {{\"question\": <number>, \"text\": \"...\"}}: {e}"
+                ) }),
+            ))
+        }
+    };
+    Some(
+        match crate::team::Channel::in_workspace(workspace).answer(
+            crate::team::OWNER,
+            request.question,
+            &request.text,
+        ) {
+            Ok(sent) => json(
+                StatusCode::OK,
+                &serde_json::json!({ "answered": request.question, "seq": sent.seq }),
+            ),
+            Err(why) => json(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &serde_json::json!({ "error": why }),
+            ),
+        },
+    )
+}
+
 fn json(status: StatusCode, value: &impl serde::Serialize) -> Response<Body> {
     let text = serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string());
     Response::builder()
@@ -243,7 +354,11 @@ pub fn route(method: &Method, path: &str, workspace: &std::path::Path) -> Option
         (&Method::OPTIONS, _) => Some(
             Response::builder()
                 .status(StatusCode::NO_CONTENT)
-                .header("access-control-allow-methods", "GET, OPTIONS")
+                .header("access-control-allow-methods", "GET, POST, OPTIONS")
+                .header(
+                    "access-control-allow-headers",
+                    "authorization, content-type",
+                )
                 .body(Full::new(Bytes::new()).boxed())
                 .unwrap_or_else(|_| Response::new(Full::new(Bytes::new()).boxed())),
         ),
@@ -381,6 +496,25 @@ pub async fn listen(workspace: PathBuf, port: Option<u16>) -> std::io::Result<()
     println!("  GET /v1/tasks         every task in the ledger");
     println!("  GET /v1/team          what agents said, and open questions");
 
+    // A write with no token to check against must be refused, not waved
+    // through — so a token that could not be written means reads only.
+    let token: Arc<Option<String>> = Arc::new(match issue_token(&workspace) {
+        Ok(token) => {
+            println!(
+                "  writes need the token in {}",
+                workspace
+                    .join(crate::ledger::LEDGER_DIR)
+                    .join(TOKEN_FILE)
+                    .display()
+            );
+            println!("  POST /v1/team/answer  answer an agent's question as the owner");
+            Some(token)
+        }
+        Err(e) => {
+            println!("  could not write the token file ({e}); serving reads only");
+            None
+        }
+    });
     let access = Arc::new(Access::from_env(bound));
     let workspace = Arc::new(workspace);
 
@@ -388,11 +522,13 @@ pub async fn listen(workspace: PathBuf, port: Option<u16>) -> std::io::Result<()
         let (socket, _) = listener.accept().await?;
         let workspace = Arc::clone(&workspace);
         let access = Arc::clone(&access);
+        let token = Arc::clone(&token);
         tokio::spawn(async move {
             let io = hyper_util::rt::TokioIo::new(socket);
             let service = hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
                 let workspace = Arc::clone(&workspace);
                 let access = Arc::clone(&access);
+                let token = Arc::clone(&token);
                 async move {
                     let header = |name| {
                         req.headers()
@@ -410,8 +546,35 @@ pub async fn listen(workspace: PathBuf, port: Option<u16>) -> std::io::Result<()
                             ))
                         }
                     };
+                    let authorized = (*token)
+                        .as_deref()
+                        .is_some_and(|t| bearer_matches(header(hyper::header::AUTHORIZATION), t));
                     let path = req.uri().path().to_string();
                     let method = req.method().clone();
+
+                    if method == Method::POST {
+                        let body = http_body_util::Limited::new(req.into_body(), MAX_BODY);
+                        let bytes = match body.collect().await {
+                            Ok(collected) => collected.to_bytes(),
+                            Err(e) => {
+                                let status = if e.is::<http_body_util::LengthLimitError>() {
+                                    StatusCode::PAYLOAD_TOO_LARGE
+                                } else {
+                                    StatusCode::BAD_REQUEST
+                                };
+                                return Ok(with_cors(
+                                    json(status, &serde_json::json!({ "error": e.to_string() })),
+                                    origin.as_deref(),
+                                ));
+                            }
+                        };
+                        if let Some(reply) =
+                            command(&method, &path, authorized, &bytes, workspace.as_path())
+                        {
+                            return Ok(with_cors(reply, origin.as_deref()));
+                        }
+                    }
+
                     let reply = match route(&method, &path, workspace.as_path()) {
                         Some(reply) => reply,
                         // The one route the router hands back: the stream needs
@@ -470,9 +633,10 @@ mod tests {
 
     /// **A write is not a route here.**
     ///
-    /// This server is read-only by construction: there is no POST arm to
-    /// forget to guard. If one is ever added, this test fails and whoever adds
-    /// it has to decide what it means — which is the point.
+    /// `route` is read-only by construction: there is no POST arm to forget to
+    /// guard. Writes live in [`command`], which checks the token first. If a
+    /// write arm is ever added to `route`, this test fails and whoever adds it
+    /// has to decide what it means — which is the point.
     #[test]
     fn nothing_here_accepts_a_write() {
         let dir = tempfile::tempdir().expect("a scratch workspace");
@@ -573,6 +737,153 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&body_text(reply).await).expect("json");
         assert_eq!(body["messages"].as_array().map(Vec::len), Some(2), "{body}");
         assert_eq!(body["open_questions"][0]["text"], "uuid?", "{body}");
+    }
+
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+    fn answer_body(question: u64, text: &str) -> Vec<u8> {
+        serde_json::json!({ "question": question, "text": text })
+            .to_string()
+            .into_bytes()
+    }
+
+    fn a_workspace_with_an_open_question() -> (tempfile::TempDir, u64) {
+        let dir = tempfile::tempdir().expect("a workspace");
+        let asked = crate::team::Channel::in_workspace(dir.path())
+            .say(
+                "implement",
+                "all",
+                crate::team::Kind::Question,
+                None,
+                "uuid or int?",
+            )
+            .expect("ask");
+        (dir, asked.seq)
+    }
+
+    /// The token is checked as a whole, never by prefix, and only in the
+    /// `Bearer` form a browser `fetch` sends.
+    #[test]
+    fn only_the_exact_bearer_token_is_accepted() {
+        let good = format!("Bearer {TOKEN}");
+        assert!(bearer_matches(Some(&good), TOKEN));
+        assert!(!bearer_matches(None, TOKEN), "no header");
+        assert!(!bearer_matches(Some(TOKEN), TOKEN), "no Bearer scheme");
+        assert!(!bearer_matches(Some("Bearer "), TOKEN), "empty token");
+        assert!(
+            !bearer_matches(Some(&format!("Bearer {}", &TOKEN[..31])), TOKEN),
+            "a prefix of the token"
+        );
+        assert!(
+            !bearer_matches(Some(&format!("Bearer {TOKEN}0")), TOKEN),
+            "the token plus more"
+        );
+    }
+
+    /// **A WRITE WITHOUT THE TOKEN IS REFUSED, AND NOTHING IS WRITTEN.**
+    #[test]
+    fn an_answer_without_the_token_is_refused_and_nothing_is_written() {
+        let (dir, asked) = a_workspace_with_an_open_question();
+        let reply = command(
+            &Method::POST,
+            "/v1/team/answer",
+            false,
+            &answer_body(asked, "uuid"),
+            dir.path(),
+        )
+        .expect("a command route");
+        assert_eq!(reply.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            crate::team::Channel::in_workspace(dir.path())
+                .open_questions()
+                .len(),
+            1,
+            "an unauthorised request closed the question"
+        );
+    }
+
+    /// **THE PERSON ANSWERS AN AGENT'S QUESTION FROM THE INTERFACE.**
+    #[test]
+    fn the_owner_answers_an_open_question() {
+        let (dir, asked) = a_workspace_with_an_open_question();
+        let reply = command(
+            &Method::POST,
+            "/v1/team/answer",
+            true,
+            &answer_body(asked, "uuid"),
+            dir.path(),
+        )
+        .expect("a command route");
+        assert_eq!(reply.status(), StatusCode::OK);
+
+        let channel = crate::team::Channel::in_workspace(dir.path());
+        assert!(
+            channel.open_questions().is_empty(),
+            "the question is still open"
+        );
+        let last = channel.all().pop().expect("the answer");
+        assert_eq!(last.from, crate::team::OWNER);
+        assert_eq!(last.kind, crate::team::Kind::Answer { to: asked });
+    }
+
+    /// An answer to a message that does not exist is refused, and recorded
+    /// nowhere — the same rule the agents' own `team_answer` follows.
+    #[test]
+    fn an_answer_to_no_such_question_is_refused() {
+        let (dir, _) = a_workspace_with_an_open_question();
+        let before = crate::team::Channel::in_workspace(dir.path()).all().len();
+        let reply = command(
+            &Method::POST,
+            "/v1/team/answer",
+            true,
+            &answer_body(999, "uuid"),
+            dir.path(),
+        )
+        .expect("a command route");
+        assert_eq!(reply.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            crate::team::Channel::in_workspace(dir.path()).all().len(),
+            before
+        );
+    }
+
+    #[test]
+    fn a_malformed_answer_is_a_bad_request() {
+        let (dir, _) = a_workspace_with_an_open_question();
+        let reply = command(
+            &Method::POST,
+            "/v1/team/answer",
+            true,
+            b"not json",
+            dir.path(),
+        )
+        .expect("a command route");
+        assert_eq!(reply.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Reads stay reads: a path that is not a command is not answered here.
+    #[test]
+    fn a_read_path_is_not_a_command() {
+        let dir = tempfile::tempdir().expect("a workspace");
+        assert!(command(&Method::POST, "/v1/run/state", true, b"{}", dir.path()).is_none());
+        assert!(command(&Method::GET, "/v1/team/answer", true, b"", dir.path()).is_none());
+    }
+
+    /// The preflight must allow what a write needs, or a browser never sends it.
+    #[test]
+    fn the_preflight_allows_a_tokened_post() {
+        let dir = tempfile::tempdir().expect("a scratch workspace");
+        let reply = route(&Method::OPTIONS, "/v1/team/answer", dir.path()).expect("answered");
+        let header = |name: &str| {
+            reply
+                .headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+        };
+        assert!(header("access-control-allow-methods").contains("post"));
+        assert!(header("access-control-allow-headers").contains("authorization"));
     }
 
     const PORT: u16 = 41234;

@@ -60,6 +60,13 @@ pub const SHOWN: usize = 12;
 /// model answered when the answer came from the loop.
 pub const ORCHESTRATOR: &str = "orchestrator";
 
+/// The person's name on the channel, when they answer from the interface.
+///
+/// It carries no extra weight: the channel file lives in the workspace, where
+/// an agent can write too, so a message signed `owner` is information like any
+/// other — never an instruction that outranks the task.
+pub const OWNER: &str = "owner";
+
 /// Everyone.
 pub const EVERYONE: &str = "all";
 
@@ -232,6 +239,30 @@ impl Channel {
         self.next_seq += 1;
         self.left_as = signature(&self.path);
         Ok(message)
+    }
+
+    /// Answer message `#question` as `from`.
+    ///
+    /// The one place the rule lives, for an agent's `team_answer` and for the
+    /// person answering from the interface alike: an answer filed against a
+    /// message that does not exist would leave the real question open AND read
+    /// as settled, which is worse than not answering.
+    ///
+    /// # Errors
+    ///
+    /// Empty text, no such message, or the answer could not be written — each
+    /// in words that say nothing was recorded.
+    pub fn answer(&mut self, from: &str, question: u64, text: &str) -> Result<Message, String> {
+        if text.trim().is_empty() {
+            return Err("`text` is required: there is no answer to send".to_string());
+        }
+        if !self.all().iter().any(|m| m.seq == question) {
+            return Err(format!(
+                "there is no message #{question} on this channel, so nothing was recorded"
+            ));
+        }
+        self.say(from, EVERYONE, Kind::Answer { to: question }, None, text)
+            .map_err(|e| format!("the answer could not be written: {e}"))
     }
 
     /// Everything said, oldest first.

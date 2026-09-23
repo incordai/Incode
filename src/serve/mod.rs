@@ -1,17 +1,17 @@
 //! What a watching interface needs, read from what the run already wrote.
 //!
-//! # Read-only, on purpose
+//! # Almost entirely reads
 //!
-//! Nothing in here starts work, stops work, or speaks to an agent. It reads the
-//! ledger and the transcripts and says what it found. That is not a first
-//! instalment with the interesting half missing — it is the half that CANNOT
-//! break a run, and it is therefore the half that can ship while a run is
-//! working.
+//! Everything here reads the ledger, the transcripts and the team channel and
+//! says what it found — the half that CANNOT break a run, so it can ship while
+//! a run is working.
 //!
-//! Sending an instruction back the other way is a different thing entirely: it
-//! needs something to own the run loop, and a chat box wired to a working agent
-//! would arrive mid-turn, where most of these CLIs either drop it or restart
-//! and re-bill the whole context. That belongs behind its own door.
+//! The one write is the person answering a question an agent left on the team
+//! channel ([`http::command`]), behind a per-run token. It adds a message to a
+//! file agents already read between turns; it does not reach into a running
+//! turn. A chat box wired straight into a working agent is a different thing:
+//! it would arrive mid-turn, where most of these CLIs either drop it or restart
+//! and re-bill the whole context. That still belongs behind its own door.
 
 pub mod http;
 pub mod project;
