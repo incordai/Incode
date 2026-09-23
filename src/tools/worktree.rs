@@ -16,6 +16,25 @@ pub struct Worktree {
     pub created_at: u64,
 }
 
+/// What [`WorktreeManager::remove`] did with the branch behind a checkout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Removed {
+    pub branch: String,
+    /// `None` when the branch was deleted; otherwise why it was kept.
+    pub branch_kept: Option<String>,
+}
+
+/// Whether two paths name the same place on disk.
+///
+/// Compared canonically when both exist, so separator style, `.`/`..` and
+/// case on case-insensitive filesystems do not decide it.
+fn same_path(a: &std::path::Path, b: &std::path::Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
 /// Worktree manager — create, list, and manage git worktrees.
 pub struct WorktreeManager {
     /// The main repository root.
@@ -165,38 +184,95 @@ impl WorktreeManager {
             .collect())
     }
 
-    /// Remove a worktree by name (or path).
-    pub fn remove(&self, name_or_path: &str) -> Result<(), String> {
-        // Try to find the worktree
+    /// Remove a worktree by name (or path), and its branch only if nothing is
+    /// lost by doing so.
+    ///
+    /// # Nothing here destroys work
+    ///
+    /// This used to run `git worktree remove --force` and then `git branch -D`
+    /// unconditionally. The first wiped uncommitted work in the checkout; the
+    /// second deleted the branch that [`crate::parallel`] had just promised the
+    /// operator was keeping a conflicted lane's work. Now:
+    ///
+    /// - the checkout is removed WITHOUT `--force`, so git refuses one that
+    ///   still holds uncommitted changes, and that refusal is returned;
+    /// - the branch is deleted only when [`Self::branch_is_landed`] proves its
+    ///   work is already in `HEAD`. Otherwise it is kept and the returned
+    ///   [`Removed::branch_kept`] says so.
+    ///
+    /// # Errors
+    ///
+    /// No such managed worktree, or git refused or failed to remove it.
+    pub fn remove(&self, name_or_path: &str) -> Result<Removed, String> {
         let managed = self.list_managed()?;
+        // Paths are compared as the filesystem sees them, not as strings: git
+        // prints `D:/x/y` where a `PathBuf` built on Windows holds `D:\x\y`, so
+        // a string match found nothing and every lane checkout was left behind.
+        let wanted = std::path::Path::new(name_or_path);
         let wt = managed
             .iter()
-            .find(|w| w.name == name_or_path || w.path.to_string_lossy() == name_or_path)
+            .find(|w| w.name == name_or_path || same_path(&w.path, wanted))
             .ok_or_else(|| format!("worktree '{name_or_path}' not found"))?;
 
         let branch = wt.branch.clone();
-        let wt_path = wt.path.clone();
-
-        // git worktree remove --force <path>
         let output = Command::new("git")
-            .args(["worktree", "remove", "--force"])
-            .arg(&wt_path)
+            .args(["worktree", "remove"])
+            .arg(&wt.path)
             .current_dir(&self.repo_root)
             .output()
             .map_err(|e| format!("spawn git: {e}"))?;
-
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("git worktree remove failed: {stderr}"));
+            return Err(format!("git worktree remove failed: {}", stderr.trim()));
         }
 
-        // Try to delete the branch too (non-critical)
-        let _ = Command::new("git")
-            .args(["branch", "-D", &branch])
-            .current_dir(&self.repo_root)
-            .output();
+        let branch_kept = match self.branch_is_landed(&branch) {
+            Ok(true) => {
+                // `-d`, not `-D`: git makes the same check again and refuses
+                // if it disagrees, so a mistake here cannot cost a commit.
+                let deleted = Command::new("git")
+                    .args(["branch", "-d", &branch])
+                    .current_dir(&self.repo_root)
+                    .output()
+                    .map_err(|e| format!("spawn git: {e}"))?;
+                if deleted.status.success() {
+                    None
+                } else {
+                    Some(format!(
+                        "git would not delete it: {}",
+                        String::from_utf8_lossy(&deleted.stderr).trim()
+                    ))
+                }
+            }
+            Ok(false) => Some("it holds work that is not in HEAD".to_string()),
+            Err(why) => Some(format!("could not tell whether its work landed: {why}")),
+        };
+        Ok(Removed {
+            branch,
+            branch_kept,
+        })
+    }
 
-        Ok(())
+    /// Whether everything on `branch` is already in `HEAD`, proved by git:
+    /// the branch is an ancestor of `HEAD` — merged, or never moved from its
+    /// base. Then deleting it loses nothing.
+    ///
+    /// # Errors
+    ///
+    /// git could not answer. The caller must then keep the branch.
+    pub fn branch_is_landed(&self, branch: &str) -> Result<bool, String> {
+        // Answered by the exit code: 0 yes, 1 no, anything else is git
+        // failing to answer at all — which must not be read as either.
+        let ancestor = Command::new("git")
+            .args(["merge-base", "--is-ancestor", branch, "HEAD"])
+            .current_dir(&self.repo_root)
+            .output()
+            .map_err(|e| format!("spawn git: {e}"))?;
+        match ancestor.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err(String::from_utf8_lossy(&ancestor.stderr).trim().to_string()),
+        }
     }
 
     /// Formatted list for display.

@@ -444,7 +444,7 @@ where
         // Close whatever opened before giving up, or the next run inherits
         // orphaned worktrees and a repository nobody can reason about.
         for lane in &lanes {
-            close_lane(repo_root, lane);
+            close_lane_or_report(repo_root, lane);
         }
         return tasks
             .iter()
@@ -515,7 +515,7 @@ where
                     why: "the agent did not finish, so nothing was merged".to_string(),
                 }
             };
-            close_lane(repo_root, lane);
+            close_lane_or_report(repo_root, lane);
             LaneOutcome {
                 task: task.clone(),
                 report,
@@ -527,13 +527,40 @@ where
         .collect()
 }
 
-/// Take a lane's checkout away, leaving its branch.
+/// Take a lane's checkout away without losing anything that was in it.
 ///
-/// The branch STAYS. It is where the work is when a merge conflicted, and
-/// deleting it to tidy up would be the one irreversible thing in this file.
-pub fn close_lane(repo_root: &Path, lane: &Lane) {
+/// Whatever the agent left uncommitted is sealed onto the branch FIRST — a
+/// lane whose agent failed never reached [`merge_lane`], so its half-done work
+/// exists only in the checkout that is about to go. Then the checkout is
+/// removed, and the branch goes with it only if git proves its work already
+/// landed ([`crate::tools::worktree::WorktreeManager::remove`]). A conflicted
+/// or failed lane's branch STAYS: it is the only copy of work already paid for.
+///
+/// # Errors
+///
+/// The work could not be sealed (the checkout is then left in place rather
+/// than wiped), or git would not remove the checkout.
+pub fn close_lane(repo_root: &Path, lane: &Lane) -> Result<(), String> {
+    seal_lane(lane).map_err(|why| {
+        format!(
+            "kept the checkout at {}: its work could not be committed ({why})",
+            lane.workspace.display()
+        )
+    })?;
     let manager = crate::tools::worktree::WorktreeManager::new(repo_root.to_path_buf());
-    let _ = manager.remove(&lane.workspace.to_string_lossy());
+    manager
+        .remove(&lane.workspace.to_string_lossy())
+        .map(|_| ())
+}
+
+/// Close a lane, saying so when it could not be closed.
+///
+/// A lane left open is a directory and a registered worktree the operator has
+/// to find by hand, so the failure is printed rather than dropped.
+fn close_lane_or_report(repo_root: &Path, lane: &Lane) {
+    if let Err(why) = close_lane(repo_root, lane) {
+        eprintln!("lane `{}` was not closed: {why}", lane.task_id);
+    }
 }
 
 #[cfg(test)]
@@ -797,7 +824,7 @@ mod tests {
         assert!(root.join("two.txt").exists(), "lane two's work is missing");
 
         for lane in &lanes {
-            close_lane(&root, lane);
+            close_lane(&root, lane).expect("close");
         }
     }
 
@@ -856,17 +883,132 @@ mod tests {
             "the first lane's work was disturbed"
         );
 
+        // Closed the way `run_batch` closes them, BEFORE looking for the work.
+        // Checking the branch while the lane was still open is how this test
+        // once passed while `close_lane` deleted the very branch it names.
+        for lane in &lanes {
+            close_lane(&root, lane).expect("close");
+        }
+
         // AND THE LOSER'S WORK STILL EXISTS, on its branch.
         let kept = git(&root, &["show", &format!("{}:shared.txt", lanes[1].branch)])
-            .expect("the branch must still hold the work");
+            .expect("closing the lane deleted the branch that holds the work");
         assert!(
             kept.contains("TWO"),
             "the conflicting lane's work was lost: {kept}"
         );
+        assert!(
+            !lanes[1].workspace.exists(),
+            "the checkout was left behind: {}",
+            lanes[1].workspace.display()
+        );
+    }
 
-        for lane in &lanes {
-            close_lane(&root, lane);
+    /// Every worktree git knows about for `root`, the main tree included.
+    fn worktree_count(root: &Path) -> usize {
+        git(root, &["worktree", "list", "--porcelain"])
+            .expect("worktree list")
+            .lines()
+            .filter(|l| l.starts_with("worktree "))
+            .count()
+    }
+
+    /// **A FAILED LANE'S HALF-DONE WORK IS KEPT, NOT WIPED.**
+    ///
+    /// It is not merged — unproven work stays out of the main tree — but it
+    /// was paid for, and the checkout it sat in is about to be removed. Only
+    /// a commit on the branch survives that.
+    #[test]
+    fn a_failed_lanes_partial_work_survives_on_its_branch() {
+        let Some((_guard, root)) = a_repo() else {
+            return;
+        };
+
+        struct GivesUp(PathBuf);
+        impl crate::runner::TaskWorker for GivesUp {
+            fn work(&mut self, _task: &crate::ledger::Task) -> Result<String, String> {
+                let _ = std::fs::write(self.0.join("half.txt"), "incomplete\n");
+                Err("could not finish".to_string())
+            }
         }
+
+        let outcomes = run_batch(&root, &[ready("t-1")], |workspace| {
+            Box::new(GivesUp(workspace.to_path_buf()))
+        });
+
+        assert!(
+            !root.join("half.txt").exists(),
+            "unfinished work was merged"
+        );
+        let kept = git(
+            &root,
+            &["show", &format!("{}:half.txt", outcomes[0].branch)],
+        )
+        .expect("the partial work was destroyed with the checkout");
+        assert!(kept.contains("incomplete"), "got: {kept}");
+        assert_eq!(
+            worktree_count(&root),
+            1,
+            "the lane's checkout was left behind"
+        );
+    }
+
+    /// **REMOVING A CHECKOUT THAT HOLDS UNCOMMITTED WORK IS REFUSED.**
+    ///
+    /// `/worktree remove` reaches the same call as a lane. With `--force` it
+    /// wiped whatever the person had not committed; git's own refusal is the
+    /// right answer, and the work must still be there after it.
+    #[test]
+    fn removing_a_checkout_with_uncommitted_work_is_refused() {
+        let Some((_guard, root)) = a_repo() else {
+            return;
+        };
+        let (lanes, failure) = open_lanes(&root, &[ready("t-1")]);
+        assert!(failure.is_none(), "{failure:?}");
+        let unsaved = lanes[0].workspace.join("unsaved.txt");
+        std::fs::write(&unsaved, "not committed\n").expect("write");
+
+        let manager = crate::tools::worktree::WorktreeManager::new(root.clone());
+        let refused = manager.remove(&lanes[0].workspace.to_string_lossy());
+
+        assert!(
+            refused.is_err(),
+            "a dirty checkout was removed: {refused:?}"
+        );
+        assert!(unsaved.exists(), "the uncommitted work was destroyed");
+        close_lane(&root, &lanes[0]).expect("close");
+    }
+
+    /// **A LANE WHOSE WORK LANDED LEAVES NOTHING BEHIND.**
+    ///
+    /// Its branch holds nothing the main tree does not, so deleting it loses
+    /// nothing — the one case where tidying up is safe, and git proves it
+    /// rather than the merge's exit code.
+    #[test]
+    fn a_landed_lane_leaves_no_branch_and_no_checkout() {
+        let Some((_guard, root)) = a_repo() else {
+            return;
+        };
+        let (lanes, failure) = open_lanes(&root, &[ready("t-1")]);
+        assert!(failure.is_none(), "{failure:?}");
+        std::fs::write(lanes[0].workspace.join("one.txt"), "landed\n").expect("write");
+        assert_eq!(merge_lane(&root, &lanes[0]), Merged::Clean);
+
+        close_lane(&root, &lanes[0]).expect("close");
+
+        assert!(
+            git(
+                &root,
+                &["rev-parse", "--verify", "--quiet", &lanes[0].branch]
+            )
+            .is_err(),
+            "a branch whose work landed was kept"
+        );
+        assert_eq!(
+            worktree_count(&root),
+            1,
+            "the lane's checkout was left behind"
+        );
     }
 
     /// **THE LANES REALLY DO OVERLAP IN TIME.**
@@ -984,7 +1126,7 @@ mod tests {
         assert!(failure.is_none(), "{failure:?}");
 
         assert_eq!(merge_lane(&root, &lanes[0]), Merged::Nothing);
-        close_lane(&root, &lanes[0]);
+        close_lane(&root, &lanes[0]).expect("close");
     }
 
     /// The requested count is read from the environment and clamped.

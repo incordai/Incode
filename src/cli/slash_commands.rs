@@ -895,7 +895,16 @@ pub fn handle_worktree(arg: Option<&str>, workspace: &std::path::Path) {
         Some(sub) if sub.starts_with("remove ") => {
             let name = sub.strip_prefix("remove ").unwrap_or("").trim();
             match mgr.remove(name) {
-                Ok(()) => render::print_info(&format!("Worktree '{name}' removed.")),
+                Ok(removed) => match removed.branch_kept {
+                    None => render::print_info(&format!(
+                        "Worktree '{name}' removed, and branch {} with it.",
+                        removed.branch
+                    )),
+                    Some(why) => render::print_info(&format!(
+                        "Worktree '{name}' removed. Branch {} was KEPT: {why}.",
+                        removed.branch
+                    )),
+                },
                 Err(e) => render::print_error(&format!("Worktree remove failed: {e}")),
             }
         }
