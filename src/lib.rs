@@ -1,5 +1,6 @@
 //! incord-code — AI coding agent CLI with agentic loop, multi-provider LLM, and 66 Incord tools.
 
+pub mod acp_agent;
 pub mod admin;
 pub mod agent;
 pub mod ask;

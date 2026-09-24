@@ -1,0 +1,1540 @@
+//! `incode --acp`: incode as an Agent Client Protocol agent.
+//!
+//! An ACP client — an editor, or the owner's desktop app — starts
+//! `incode --acp` as a child process and drives it with JSON-RPC 2.0, one
+//! message per line on stdin and stdout, exactly as it drives any other ACP
+//! agent. Here incode IS the agent. The work underneath is still done by the
+//! subscription CLIs incode already drives headless, through the SAME session
+//! the interactive REPL builds ([`crate::cli::prepare_session`]) and the SAME
+//! turn it runs ([`crate::cli::plan_turn`] and
+//! [`AgentSession::turn_observed`]). incode never drives another harness over
+//! ACP; this module is only ever the agent side of the pipe.
+//!
+//! # Methods answered
+//!
+//! - `initialize` — protocol version 1, and the capabilities incode really
+//!   has: text and embedded-context prompts. No session loading, no client
+//!   MCP servers, no authentication methods.
+//! - `authenticate` — refused as invalid params: the method id must be one
+//!   `initialize` advertised, and none is. The subscription CLIs hold their
+//!   own logins.
+//! - `session/new` — `cwd` must be an absolute path to an existing directory;
+//!   it becomes the workspace. The session is built on its own thread.
+//! - `session/prompt` — one turn; its text, tool calls, tool results and task
+//!   list stream as `session/update`, and the reply carries the stop reason.
+//! - `session/cancel` — trips the session's cancel token; the pending prompt
+//!   answers `cancelled`.
+//! - `session/set_mode` — `read-only`, `workspace-write` or
+//!   `danger-full-access`, applied from the next turn.
+//! - `session/close` — cancels the session's turn and frees its slot.
+//!
+//! Any other request is answered "method not found"; a notification nothing
+//! handles is dropped, as JSON-RPC requires. See `docs/ARCHITECTURE.md`.
+//!
+//! # Threads
+//!
+//! The reader — the calling thread — parses and dispatches and never runs a
+//! turn, so a `session/cancel` is read while a prompt is running. Each session
+//! lives on a thread of its own, because an [`AgentSession`] is not `Send`: it
+//! is built there and never leaves.
+//!
+//! # stdout
+//!
+//! Protocol only. [`run_stdio`] moves the process's standard handles before
+//! anything else happens — see [`stdio`].
+
+mod present;
+mod stdio;
+mod transport;
+
+use std::collections::HashMap;
+use std::io::{BufReader, Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use agent_client_protocol_schema::v1 as acp;
+use agent_client_protocol_schema::ProtocolVersion;
+use serde::de::DeserializeOwned;
+use serde_json::Value;
+
+use crate::agent::AgentEvent;
+use crate::cli::agent_turn::AgentSession;
+use crate::config::IncordCodeConfig;
+use crate::permissions::PermissionMode;
+use crate::runtime::cancel::CancelToken;
+use transport::{Incoming, Line, Outbox};
+
+/// How many sessions one connection may hold at once.
+///
+/// Each session is a thread and, while a turn runs, an agent process tree. An
+/// editor opens one per conversation; sixteen is well past what a person
+/// drives by hand, and still bounds what a runaway client can make this
+/// process start. A `session/new` beyond it is refused, not queued.
+const MAX_SESSIONS: usize = 16;
+
+/// Prompts waiting for a session's thread.
+///
+/// One. A session runs one prompt at a time and a second is refused on the
+/// reader BEFORE it is queued, so this never holds more than the prompt about
+/// to start — and the reader never blocks on it.
+const PROMPT_QUEUE: usize = 1;
+
+/// At the end of input, how long running turns get to stop before this
+/// process returns anyway.
+///
+/// End of input means the client has gone. Every running turn is cancelled
+/// first, and a backend kills its process tree on cancel, which takes well
+/// under a second. Two seconds bounds the exit without cutting that short.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+
+/// How often the shutdown looks at the session threads while it waits.
+const SHUTDOWN_POLL: Duration = Duration::from_millis(50);
+
+/// The modes a client may choose, in the order they are offered.
+///
+/// incode's own permission modes, one to one. `prompt` and `allow` are
+/// policies with no rung on the capability ladder and are not offered.
+const MODES: [PermissionMode; 3] = [
+    PermissionMode::ReadOnly,
+    PermissionMode::WorkspaceWrite,
+    PermissionMode::DangerFullAccess,
+];
+
+/// Run `incode --acp` on this process's stdin and stdout until the client
+/// closes stdin.
+///
+/// # Errors
+///
+/// When stdin and stdout cannot be taken for the protocol. Nothing is served
+/// then: serving with stdout still shared is the failure this mode must not
+/// have.
+pub fn run_stdio(config: IncordCodeConfig) -> anyhow::Result<()> {
+    let claimed = stdio::claim()
+        .map_err(|e| anyhow::anyhow!("could not take stdin/stdout for the protocol: {e}"))?;
+    // stderr, which after `claim` is also where stdout goes.
+    eprintln!("incode ACP agent ready on stdio");
+    serve(
+        claimed.input,
+        Box::new(claimed.output),
+        CliSessions { config },
+        transport::MAX_LINE_BYTES,
+    );
+    Ok(())
+}
+
+/// A session, as built for one `session/new`.
+pub(crate) struct Opened {
+    pub(crate) session: AgentSession,
+    /// The permission mode already applied to it.
+    pub(crate) mode: PermissionMode,
+}
+
+/// Builds the session a `session/new` asks for.
+///
+/// Called on the thread that will drive the session, because a session cannot
+/// cross threads. `cancel` is the token `session/cancel` trips.
+pub(crate) trait SessionFactory: Send + Sync + 'static {
+    fn open(&self, workspace: &Path, cancel: CancelToken) -> Result<Opened, String>;
+}
+
+/// The production factory: the interactive CLI's own session builder.
+struct CliSessions {
+    config: IncordCodeConfig,
+}
+
+impl SessionFactory for CliSessions {
+    fn open(&self, workspace: &Path, cancel: CancelToken) -> Result<Opened, String> {
+        let mut config = self.config.clone();
+        config.workspace = workspace.to_path_buf();
+        let prepared = crate::cli::prepare_session(&config, cancel, Instant::now())
+            .map_err(|e| e.to_string())?;
+        Ok(Opened {
+            session: prepared.session,
+            mode: prepared.permission_mode,
+        })
+    }
+}
+
+/// Serve one client until its input ends.
+pub(crate) fn serve<R: Read, F: SessionFactory>(
+    input: R,
+    output: Box<dyn Write + Send>,
+    factory: F,
+    max_line: usize,
+) {
+    let mut server = Server {
+        outbox: Arc::new(Outbox::new(output)),
+        factory: Arc::new(factory),
+        sessions: HashMap::new(),
+    };
+    let mut reader = BufReader::new(input);
+    loop {
+        match transport::read_bounded_line(&mut reader, max_line) {
+            Ok(None) => break,
+            Ok(Some(Line::TooLong { id })) => server.outbox.respond::<Value>(
+                id,
+                Err(acp::Error::invalid_request().data(Value::String(format!(
+                    "a message longer than {max_line} bytes was dropped unread"
+                )))),
+            ),
+            Ok(Some(Line::Text(text))) => {
+                if !text.trim().is_empty() {
+                    server.handle(&text);
+                }
+            }
+            Err(e) => {
+                eprintln!("incode acp: reading from the client failed: {e}");
+                break;
+            }
+        }
+    }
+    server.shutdown();
+}
+
+struct Server<F: SessionFactory> {
+    outbox: Arc<Outbox>,
+    factory: Arc<F>,
+    sessions: HashMap<String, SessionHandle>,
+}
+
+/// The reader's hold on one session.
+struct SessionHandle {
+    prompts: SyncSender<Prompt>,
+    shared: Arc<Shared>,
+    thread: JoinHandle<()>,
+}
+
+/// One `session/prompt`, handed to the session's thread.
+struct Prompt {
+    id: acp::RequestId,
+    blocks: Vec<acp::ContentBlock>,
+}
+
+/// What the reader and a session's thread both touch.
+struct Shared {
+    /// The token the session was built with — tripped by `session/cancel`.
+    cancel: CancelToken,
+    state: Mutex<TurnState>,
+}
+
+#[derive(Default)]
+struct TurnState {
+    /// A prompt is running or about to.
+    running: bool,
+    /// The client cancelled the running prompt.
+    cancelled: bool,
+    /// The mode the client last chose; applied before the next turn.
+    mode: Option<PermissionMode>,
+}
+
+impl Shared {
+    fn new() -> Self {
+        Self {
+            cancel: CancelToken::new(),
+            state: Mutex::new(TurnState::default()),
+        }
+    }
+
+    fn state(&self) -> MutexGuard<'_, TurnState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Claim the session for a prompt; `false` when one is already running.
+    fn begin(&self) -> bool {
+        let mut state = self.state();
+        if state.running {
+            return false;
+        }
+        state.running = true;
+        state.cancelled = false;
+        true
+    }
+
+    fn finish(&self) {
+        let mut state = self.state();
+        state.running = false;
+        state.cancelled = false;
+    }
+
+    /// Cancel the running prompt, if there is one. A cancel with nothing
+    /// running is dropped rather than left to stop the next prompt.
+    fn cancel_running(&self) {
+        let mut state = self.state();
+        if state.running {
+            state.cancelled = true;
+            self.cancel.cancel();
+        }
+    }
+
+    fn cancelled(&self) -> bool {
+        self.state().cancelled
+    }
+
+    /// Trip the token again if the prompt was cancelled.
+    ///
+    /// A turn clears the token when it starts, so that a stale Ctrl-C cannot
+    /// cancel it. A `session/cancel` that lands between the last check before
+    /// the turn and that reset is cleared with it. Re-tripping on every event
+    /// of the turn narrows what that costs to the agent's first line of
+    /// output — the backends look at the token per line — and the prompt
+    /// still answers `cancelled`, because the answer is decided by
+    /// [`Shared::cancelled`], which the reset does not touch.
+    fn hold_cancel(&self) {
+        if self.cancelled() {
+            self.cancel.cancel();
+        }
+    }
+}
+
+impl<F: SessionFactory> Server<F> {
+    fn handle(&mut self, line: &str) {
+        match transport::classify(line) {
+            Err(refused) => {
+                let transport::Refusal { id, error } = *refused;
+                self.outbox.respond::<Value>(id, Err(error));
+            }
+            Ok(Incoming::Response) => {}
+            Ok(Incoming::Notification { method, params }) => self.notification(&method, params),
+            Ok(Incoming::Request { id, method, params }) => self.request(id, &method, params),
+        }
+    }
+
+    fn request(&mut self, id: acp::RequestId, method: &str, params: Option<Value>) {
+        let names = &acp::AGENT_METHOD_NAMES;
+        if method == names.initialize {
+            let answer = decode::<acp::InitializeRequest>(params).map(|_| initialize());
+            self.outbox.respond(id, answer);
+        } else if method == names.authenticate {
+            let answer = decode::<acp::AuthenticateRequest>(params).and_then(|request| {
+                Err::<acp::AuthenticateResponse, _>(invalid_params(format!(
+                    "`{}` is not an authentication method this agent offered; it offers \
+                     none, because the agent CLIs underneath hold their own logins",
+                    request.method_id
+                )))
+            });
+            self.outbox.respond(id, answer);
+        } else if method == names.session_new {
+            self.new_session(id, params);
+        } else if method == names.session_prompt {
+            self.prompt(id, params);
+        } else if method == names.session_set_mode {
+            let answer = self.set_mode(params);
+            self.outbox.respond(id, answer);
+        } else if method == names.session_close {
+            let answer = self.close(params);
+            self.outbox.respond(id, answer);
+        } else {
+            self.outbox
+                .respond::<Value>(id, Err(acp::Error::method_not_found()));
+        }
+    }
+
+    fn notification(&mut self, method: &str, params: Option<Value>) {
+        // Every other notification — the protocol-level `$/cancel_request`
+        // included — has nothing to act on here: the only long-running thing
+        // this agent does is a prompt, and `session/cancel` is how one stops.
+        if method != acp::AGENT_METHOD_NAMES.session_cancel {
+            return;
+        }
+        match decode::<acp::CancelNotification>(params) {
+            Ok(cancel) => {
+                if let Some(handle) = self.sessions.get(&*cancel.session_id.0) {
+                    handle.shared.cancel_running();
+                }
+            }
+            Err(e) => eprintln!("incode acp: a session/cancel could not be read: {e}"),
+        }
+    }
+
+    fn new_session(&mut self, id: acp::RequestId, params: Option<Value>) {
+        let request = match decode::<acp::NewSessionRequest>(params) {
+            Ok(request) => request,
+            Err(e) => return self.outbox.respond::<Value>(id, Err(e)),
+        };
+        let workspace = match workspace_from(&request.cwd) {
+            Ok(workspace) => workspace,
+            Err(why) => return self.outbox.respond::<Value>(id, Err(invalid_params(why))),
+        };
+        if !request.additional_directories.is_empty() {
+            // Not advertised, so a client must not send them — and a root
+            // outside `cwd` named by the client is exactly what is not taken
+            // on trust. Operator-chosen roots come from `--add-dir` instead.
+            return self.outbox.respond::<Value>(
+                id,
+                Err(invalid_params(
+                    "additional directories are not offered: this agent works in `cwd` only",
+                )),
+            );
+        }
+        if !request.mcp_servers.is_empty() {
+            // Accepted and not passed on. See `docs/ARCHITECTURE.md`: the
+            // backends' MCP configuration is assembled inside the spawn, with
+            // no seam for servers a client names — and a stdio server is a
+            // program the client would have this machine run.
+            eprintln!(
+                "incode acp: {} MCP server(s) from the client were not passed to the agent",
+                request.mcp_servers.len()
+            );
+        }
+
+        // Sessions whose thread has ended — a build that failed — no longer
+        // count against the limit.
+        self.sessions
+            .retain(|_, handle| !handle.thread.is_finished());
+        if self.sessions.len() >= MAX_SESSIONS {
+            return self.outbox.respond::<Value>(
+                id,
+                Err(acp::Error::invalid_request().data(Value::String(format!(
+                    "this connection already holds {MAX_SESSIONS} sessions"
+                )))),
+            );
+        }
+
+        let session_id = acp::SessionId::new(uuid::Uuid::new_v4().to_string());
+        let shared = Arc::new(Shared::new());
+        let (prompts, queue) = mpsc::sync_channel::<Prompt>(PROMPT_QUEUE);
+        let thread = {
+            let factory = Arc::clone(&self.factory);
+            let outbox = Arc::clone(&self.outbox);
+            let shared = Arc::clone(&shared);
+            let session_id = session_id.clone();
+            std::thread::spawn(move || {
+                drive(
+                    factory.as_ref(),
+                    &outbox,
+                    id,
+                    &session_id,
+                    &workspace,
+                    &shared,
+                    &queue,
+                );
+            })
+        };
+        self.sessions.insert(
+            session_id.0.to_string(),
+            SessionHandle {
+                prompts,
+                shared,
+                thread,
+            },
+        );
+    }
+
+    fn prompt(&mut self, id: acp::RequestId, params: Option<Value>) {
+        let request = match decode::<acp::PromptRequest>(params) {
+            Ok(request) => request,
+            Err(e) => return self.outbox.respond::<Value>(id, Err(e)),
+        };
+        let Some(handle) = self.sessions.get(&*request.session_id.0) else {
+            return self.outbox.respond::<Value>(
+                id,
+                Err(invalid_params(format!(
+                    "no session `{}` on this connection",
+                    request.session_id
+                ))),
+            );
+        };
+        if !handle.shared.begin() {
+            return self.outbox.respond::<Value>(
+                id,
+                Err(acp::Error::invalid_request().data(Value::String(
+                    "a prompt is already running in this session".to_string(),
+                ))),
+            );
+        }
+        let prompt = Prompt {
+            id: id.clone(),
+            blocks: request.prompt,
+        };
+        match handle.prompts.try_send(prompt) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
+                handle.shared.finish();
+                self.outbox
+                    .respond::<Value>(id, Err(internal("the session has ended".to_string())));
+            }
+        }
+    }
+
+    fn set_mode(
+        &mut self,
+        params: Option<Value>,
+    ) -> Result<acp::SetSessionModeResponse, acp::Error> {
+        let request = decode::<acp::SetSessionModeRequest>(params)?;
+        let handle = self.sessions.get(&*request.session_id.0).ok_or_else(|| {
+            invalid_params(format!(
+                "no session `{}` on this connection",
+                request.session_id
+            ))
+        })?;
+        let mode = MODES
+            .into_iter()
+            .find(|mode| mode.as_str() == &*request.mode_id.0)
+            .ok_or_else(|| {
+                invalid_params(format!(
+                    "`{}` is not a mode this agent offers: {}",
+                    request.mode_id,
+                    MODES.map(PermissionMode::as_str).join(", ")
+                ))
+            })?;
+        handle.shared.state().mode = Some(mode);
+        Ok(acp::SetSessionModeResponse::new())
+    }
+
+    /// End one session: cancel its turn, let its thread go, free its slot.
+    ///
+    /// The only way a slot comes back on a long-lived connection — without
+    /// it, the [`MAX_SESSIONS`]th `session/new` would be refused for good.
+    fn close(&mut self, params: Option<Value>) -> Result<acp::CloseSessionResponse, acp::Error> {
+        let request = decode::<acp::CloseSessionRequest>(params)?;
+        let handle = self
+            .sessions
+            .remove(&*request.session_id.0)
+            .ok_or_else(|| {
+                invalid_params(format!(
+                    "no session `{}` on this connection",
+                    request.session_id
+                ))
+            })?;
+        handle.shared.cancel_running();
+        // Dropping the sender ends the thread once its turn, if any, has
+        // answered `cancelled`. It is not joined: the reader never waits on a
+        // turn.
+        drop(handle.prompts);
+        Ok(acp::CloseSessionResponse::new())
+    }
+
+    /// The client has gone: stop every turn, and give them a moment to stop.
+    fn shutdown(self) {
+        let mut threads = Vec::new();
+        for (_, handle) in self.sessions {
+            handle.shared.cancel_running();
+            // Dropping the sender ends the thread's wait for the next prompt.
+            drop(handle.prompts);
+            threads.push(handle.thread);
+        }
+        let deadline = Instant::now() + SHUTDOWN_GRACE;
+        while threads.iter().any(|t| !t.is_finished()) && Instant::now() < deadline {
+            std::thread::sleep(SHUTDOWN_POLL);
+        }
+        for thread in threads {
+            if thread.is_finished() {
+                let _ = thread.join();
+            }
+        }
+    }
+}
+
+/// One session's thread: build it, answer `session/new`, then run prompts
+/// until the reader lets go.
+fn drive<F: SessionFactory>(
+    factory: &F,
+    outbox: &Outbox,
+    opened_by: acp::RequestId,
+    session_id: &acp::SessionId,
+    workspace: &Path,
+    shared: &Shared,
+    prompts: &Receiver<Prompt>,
+) {
+    // A panic is caught here and at each prompt below, never let through: the
+    // request that was running is owed an answer, and an unwound thread would
+    // leave the client waiting for it forever.
+    let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        factory.open(workspace, shared.cancel.clone())
+    }))
+    .unwrap_or_else(|_| Err("building it panicked".to_string()));
+    let Opened { mut session, mode } = match opened {
+        Ok(opened) => opened,
+        Err(why) => {
+            return outbox.respond::<Value>(
+                opened_by,
+                Err(internal(format!("the session could not be built: {why}"))),
+            );
+        }
+    };
+    // A mode that is not offered cannot be shown as current. It fails CLOSED,
+    // like `PermissionMode::from_str_lossy`.
+    let mut applied = if MODES.contains(&mode) {
+        mode
+    } else {
+        session.set_permission_mode(PermissionMode::ReadOnly.agent_mode());
+        PermissionMode::ReadOnly
+    };
+    outbox.respond(
+        opened_by,
+        Ok(acp::NewSessionResponse::new(session_id.clone()).modes(mode_state(applied))),
+    );
+
+    while let Ok(prompt) = prompts.recv() {
+        let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_prompt(
+                &mut session,
+                &mut applied,
+                workspace,
+                outbox,
+                session_id,
+                shared,
+                &prompt.blocks,
+            )
+        }));
+        let Ok(answer) = answer else {
+            shared.finish();
+            // The session's state is unknown after a panic, so it is not
+            // offered another turn: this prompt is answered, and the thread
+            // ends — later prompts to it are refused as a session that ended.
+            outbox.respond::<Value>(
+                prompt.id,
+                Err(internal(
+                    "the turn panicked; this session has ended".to_string(),
+                )),
+            );
+            return;
+        };
+        // Released BEFORE the answer goes out, so a client that sends its next
+        // prompt the moment it reads this one's reply is not refused as busy.
+        shared.finish();
+        outbox.respond(prompt.id, answer.map(acp::PromptResponse::new));
+    }
+}
+
+/// One prompt: the same turn an interactive line runs, streamed as updates.
+fn run_prompt(
+    session: &mut AgentSession,
+    applied: &mut PermissionMode,
+    workspace: &Path,
+    outbox: &Outbox,
+    session_id: &acp::SessionId,
+    shared: &Shared,
+    blocks: &[acp::ContentBlock],
+) -> Result<acp::StopReason, acp::Error> {
+    let text = present::prompt_text(blocks, workspace).map_err(invalid_params)?;
+    if text.trim().is_empty() {
+        return Err(invalid_params("the prompt has no text"));
+    }
+
+    // The mode the client chose, sent to the thing that does the writing —
+    // as `-p` is at startup. Before the turn, because a running agent's mode
+    // was fixed when it was started.
+    let wanted = shared.state().mode;
+    if let Some(wanted) = wanted {
+        if wanted != *applied {
+            session.set_permission_mode(wanted.agent_mode());
+            *applied = wanted;
+        }
+    }
+
+    if shared.cancelled() {
+        return Ok(acp::StopReason::Cancelled);
+    }
+
+    let say = |update: acp::SessionUpdate| {
+        outbox.notify(
+            acp::CLIENT_METHOD_NAMES.session_update,
+            acp::SessionNotification::new(session_id.clone(), update),
+        );
+    };
+    let say_text = |text: &str| {
+        if !text.is_empty() {
+            say(acp::SessionUpdate::AgentMessageChunk(
+                acp::ContentChunk::new(acp::ContentBlock::from(text)),
+            ));
+        }
+    };
+
+    let (instruction, context) = match crate::cli::plan_turn(session, workspace, &text, &text) {
+        crate::cli::TurnPlan::NextQuestion(reply) | crate::cli::TurnPlan::Greeting(reply) => {
+            say_text(&reply);
+            return Ok(acp::StopReason::EndTurn);
+        }
+        crate::cli::TurnPlan::Agent {
+            instruction,
+            context,
+        } => (instruction, context),
+    };
+
+    // Looked at again AFTER the plan, which can wait on the memory service:
+    // a cancel that landed during that wait is honoured here, before an agent
+    // is started, rather than being cleared when the turn resets its token.
+    if shared.cancelled() {
+        return Ok(acp::StopReason::Cancelled);
+    }
+
+    let outcome = session.turn_observed(
+        workspace,
+        &instruction,
+        &context,
+        &mut |fragment: &str| {
+            shared.hold_cancel();
+            say_text(fragment);
+        },
+        &mut |_status| {},
+        Some(&mut |event: &AgentEvent| {
+            shared.hold_cancel();
+            for update in updates_for(event) {
+                say(update);
+            }
+        }),
+    );
+
+    // What the session holds for the person once the turn is over — a
+    // question the agent asked, a guard the sentinel caught. The REPL prints
+    // these after the status line stops; here they follow the reply.
+    for notice in session.take_notices() {
+        say_text(&format!("\n{notice}\n"));
+    }
+
+    // A cancel decides the answer whatever the turn did with it: ACP requires
+    // `cancelled` once the client has asked, even if stopping surfaced as an
+    // error underneath.
+    if shared.cancelled() {
+        return Ok(acp::StopReason::Cancelled);
+    }
+    match outcome {
+        Ok(outcome) => Ok(present::stop_reason(&outcome.stop_reason)),
+        Err(why) => Err(internal(why)),
+    }
+}
+
+/// The `session/update`s one agent event becomes. Text is not here: it comes
+/// through the turn's text callback, after the question block is filtered out.
+fn updates_for(event: &AgentEvent) -> Vec<acp::SessionUpdate> {
+    match event {
+        AgentEvent::ToolUse { id, name, input } => {
+            let mut updates = vec![acp::SessionUpdate::ToolCall(present::tool_call(
+                id, name, input,
+            ))];
+            if let Some(plan) = present::plan_of(name, input) {
+                updates.push(acp::SessionUpdate::Plan(plan));
+            }
+            updates
+        }
+        AgentEvent::ToolResult {
+            id,
+            output,
+            is_error,
+        } => vec![acp::SessionUpdate::ToolCallUpdate(present::tool_result(
+            id, output, *is_error,
+        ))],
+        _ => Vec::new(),
+    }
+}
+
+fn initialize() -> acp::InitializeResponse {
+    // One protocol version is spoken. The rule is to answer the client's
+    // version when it is supported and the latest supported one otherwise;
+    // with a single version both answers are this one.
+    acp::InitializeResponse::new(ProtocolVersion::LATEST)
+        .agent_capabilities(
+            acp::AgentCapabilities::new()
+                .load_session(false)
+                .prompt_capabilities(acp::PromptCapabilities::new().embedded_context(true))
+                .mcp_capabilities(acp::McpCapabilities::new())
+                .session_capabilities(
+                    acp::SessionCapabilities::new().close(acp::SessionCloseCapabilities::new()),
+                ),
+        )
+        .auth_methods(Vec::new())
+        .agent_info(
+            acp::Implementation::new("incode", env!("CARGO_PKG_VERSION")).title("Incord Code"),
+        )
+}
+
+fn mode_state(current: PermissionMode) -> acp::SessionModeState {
+    acp::SessionModeState::new(
+        current.as_str(),
+        MODES
+            .into_iter()
+            .map(|mode| {
+                let (name, description) = match mode {
+                    PermissionMode::ReadOnly => {
+                        ("Read only", "Proposes changes without making them.")
+                    }
+                    PermissionMode::DangerFullAccess => (
+                        "Full access",
+                        "incode's full-access mode. The agent CLI runs as it does for \
+                         workspace-write: edits accepted, the protected paths still enforced.",
+                    ),
+                    _ => (
+                        "Workspace write",
+                        "Edits files in the workspace, within the guards.",
+                    ),
+                };
+                acp::SessionMode::new(mode.as_str(), name).description(description)
+            })
+            .collect(),
+    )
+}
+
+/// The workspace a `session/new` names, when it is one this agent will use.
+fn workspace_from(cwd: &Path) -> Result<PathBuf, String> {
+    if !cwd.is_absolute() {
+        return Err(format!(
+            "`cwd` must be an absolute path, got `{}`",
+            cwd.display()
+        ));
+    }
+    if !cwd.is_dir() {
+        return Err(format!(
+            "`cwd` `{}` is not an existing directory",
+            cwd.display()
+        ));
+    }
+    Ok(cwd.to_path_buf())
+}
+
+fn decode<T: DeserializeOwned>(params: Option<Value>) -> Result<T, acp::Error> {
+    serde_json::from_value(params.unwrap_or(Value::Null)).map_err(|e| invalid_params(e.to_string()))
+}
+
+fn invalid_params(why: impl Into<String>) -> acp::Error {
+    acp::Error::invalid_params().data(Value::String(why.into()))
+}
+
+fn internal(why: String) -> acp::Error {
+    acp::Error::internal_error().data(Value::String(why))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::{AgentBackend, AgentError, TurnOutcome};
+    use serde_json::json;
+    use std::io::BufRead;
+
+    /// How long a test waits for any one message before it fails. A hang is a
+    /// failure, never a stuck suite.
+    const WAIT: Duration = Duration::from_secs(20);
+
+    /// How long the cancel fake waits for a cancel before finishing normally.
+    /// Shorter than [`WAIT`], so a cancel that never lands shows up as the
+    /// wrong stop reason rather than as a timeout.
+    const CANCEL_FAKE_PATIENCE: Duration = Duration::from_secs(5);
+
+    #[derive(Clone, Copy)]
+    enum Behaviour {
+        /// Text, a tool call and its result, and a task list.
+        Stream,
+        /// Text, then nothing until cancelled.
+        WaitForCancel,
+        /// [`Behaviour::Stream`], after printing to stdout every way this
+        /// crate can.
+        Noisy,
+    }
+
+    #[derive(Clone)]
+    struct Script {
+        behaviour: Behaviour,
+        /// Every agent mode the session set on the backend, in order.
+        modes: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Script {
+        fn new(behaviour: Behaviour) -> Self {
+            Self {
+                behaviour,
+                modes: Arc::default(),
+            }
+        }
+    }
+
+    struct FakeBackend {
+        script: Script,
+        cancel: Option<CancelToken>,
+    }
+
+    fn ended(stop_reason: &str) -> TurnOutcome {
+        TurnOutcome {
+            session_id: "fake-session".to_string(),
+            stop_reason: stop_reason.to_string(),
+            is_error: false,
+            detail: None,
+            served_by: Vec::new(),
+        }
+    }
+
+    fn stream(on_event: &mut dyn FnMut(&AgentEvent)) -> Result<TurnOutcome, AgentError> {
+        on_event(&AgentEvent::TextDelta("Hel".to_string()));
+        on_event(&AgentEvent::TextDelta("lo".to_string()));
+        on_event(&AgentEvent::ToolUse {
+            id: "t1".to_string(),
+            name: "Read".to_string(),
+            input: r#"{"file_path":"a.txt"}"#.to_string(),
+        });
+        on_event(&AgentEvent::ToolResult {
+            id: "t1".to_string(),
+            output: "the contents".to_string(),
+            is_error: false,
+        });
+        on_event(&AgentEvent::ToolUse {
+            id: "t2".to_string(),
+            name: "TodoWrite".to_string(),
+            input: r#"{"todos":[{"content":"read a.txt","status":"completed","activeForm":"reading"}]}"#
+                .to_string(),
+        });
+        Ok(ended("end_turn"))
+    }
+
+    impl AgentBackend for FakeBackend {
+        fn id(&self) -> &str {
+            "fake"
+        }
+
+        fn run_turn(
+            &mut self,
+            _prompt: &str,
+            on_event: &mut dyn FnMut(&AgentEvent),
+        ) -> Result<TurnOutcome, AgentError> {
+            match self.script.behaviour {
+                Behaviour::Stream => stream(on_event),
+                Behaviour::WaitForCancel => {
+                    on_event(&AgentEvent::TextDelta("working".to_string()));
+                    let deadline = Instant::now() + CANCEL_FAKE_PATIENCE;
+                    while Instant::now() < deadline {
+                        if self.cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
+                            return Err(AgentError::new(crate::agent::claude_code::CANCELLED));
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Ok(ended("end_turn"))
+                }
+                Behaviour::Noisy => {
+                    println!("STRAY println from the backend");
+                    let mut raw = std::io::stdout();
+                    let _ =
+                        raw.write_all(b"STRAY print from the backend, straight at the handle\n");
+                    let _ = raw.flush();
+                    crate::cli::render::print_info("STRAY render from the backend");
+                    crate::outln!("STRAY outln from the backend");
+                    // A child that inherits stdout, as a probe or a hook does.
+                    #[cfg(windows)]
+                    let child = std::process::Command::new("cmd")
+                        .args(["/C", "echo STRAY child process"])
+                        .status();
+                    #[cfg(not(windows))]
+                    let child = std::process::Command::new("sh")
+                        .args(["-c", "echo STRAY child process"])
+                        .status();
+                    assert!(child.is_ok_and(|s| s.success()), "the noisy child must run");
+                    stream(on_event)
+                }
+            }
+        }
+
+        fn session_id(&self) -> Option<&str> {
+            None
+        }
+
+        fn set_cancel(&mut self, token: CancelToken) {
+            self.cancel = Some(token);
+        }
+
+        fn set_permission_mode(&mut self, mode: &str) {
+            self.script
+                .modes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(mode.to_string());
+        }
+    }
+
+    /// Builds sessions the way [`CliSessions`] does — an [`AgentSession`] with
+    /// the cancel token and the mode applied — around a fake backend, so no
+    /// real agent CLI ever runs.
+    struct FakeSessions {
+        script: Script,
+        mode: PermissionMode,
+    }
+
+    impl SessionFactory for FakeSessions {
+        fn open(&self, workspace: &Path, cancel: CancelToken) -> Result<Opened, String> {
+            let mut session = AgentSession::new(
+                workspace.to_path_buf(),
+                "claude-code",
+                "claude".to_string(),
+                &crate::guards::Guards::default(),
+                Vec::new(),
+            )
+            .with_backend(Box::new(FakeBackend {
+                script: self.script.clone(),
+                cancel: None,
+            }))
+            .with_cancel(cancel);
+            session.set_permission_mode(self.mode.agent_mode());
+            Ok(Opened {
+                session,
+                mode: self.mode,
+            })
+        }
+    }
+
+    /// Every line on the protocol channel must be a JSON-RPC 2.0 message: a
+    /// response (id with result or error) or a notification or request
+    /// (method). Anything else is what a client chokes on.
+    fn assert_json_rpc(line: &str) -> Value {
+        let value: Value = serde_json::from_str(line)
+            .unwrap_or_else(|e| panic!("not JSON on the protocol channel ({e}): {line:?}"));
+        assert_eq!(value["jsonrpc"], "2.0", "not JSON-RPC 2.0: {line}");
+        let is_response = value.get("id").is_some()
+            && (value.get("result").is_some() || value.get("error").is_some());
+        assert!(
+            is_response || value.get("method").is_some(),
+            "neither a response nor a message: {line}"
+        );
+        value
+    }
+
+    /// A client on the other end of a pipe pair, with the agent on a thread.
+    struct Client {
+        to_agent: Option<std::io::PipeWriter>,
+        from_agent: Receiver<String>,
+        server: JoinHandle<()>,
+        next_id: i64,
+    }
+
+    impl Client {
+        fn start(script: Script, mode: PermissionMode, max_line: usize) -> Self {
+            let (agent_in, to_agent) = std::io::pipe().expect("pipe");
+            let (from_agent_raw, agent_out) = std::io::pipe().expect("pipe");
+            let server = std::thread::spawn(move || {
+                serve(
+                    agent_in,
+                    Box::new(agent_out),
+                    FakeSessions { script, mode },
+                    max_line,
+                );
+            });
+            let (lines, from_agent) = mpsc::channel();
+            std::thread::spawn(move || {
+                for line in BufReader::new(from_agent_raw).lines() {
+                    let Ok(line) = line else { break };
+                    if lines.send(line).is_err() {
+                        break;
+                    }
+                }
+            });
+            Self {
+                to_agent: Some(to_agent),
+                from_agent,
+                server,
+                next_id: 0,
+            }
+        }
+
+        fn send_raw(&mut self, text: &str) {
+            let pipe = self.to_agent.as_mut().expect("still open");
+            pipe.write_all(text.as_bytes()).expect("write");
+            pipe.write_all(b"\n").expect("write");
+            pipe.flush().expect("flush");
+        }
+
+        fn request(&mut self, method: &str, params: Value) -> i64 {
+            self.next_id += 1;
+            let id = self.next_id;
+            self.send_raw(
+                &json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})
+                    .to_string(),
+            );
+            id
+        }
+
+        fn notify(&mut self, method: &str, params: Value) {
+            self.send_raw(
+                &json!({"jsonrpc": "2.0", "method": method, "params": params}).to_string(),
+            );
+        }
+
+        /// The next message, checked to be JSON-RPC.
+        fn next(&self) -> Value {
+            let line = self
+                .from_agent
+                .recv_timeout(WAIT)
+                .unwrap_or_else(|_| panic!("the agent said nothing for {WAIT:?}"));
+            assert_json_rpc(&line)
+        }
+
+        /// Messages up to and including the response to `id`: the
+        /// notifications that came first, then the response.
+        fn until_response(&self, id: i64) -> (Vec<Value>, Value) {
+            let mut before = Vec::new();
+            loop {
+                let message = self.next();
+                if message.get("method").is_none() && message["id"] == json!(id) {
+                    return (before, message);
+                }
+                before.push(message);
+            }
+        }
+
+        fn call(&mut self, method: &str, params: Value) -> Value {
+            let id = self.request(method, params);
+            self.until_response(id).1
+        }
+
+        fn open_session(&mut self, cwd: &Path) -> String {
+            let reply = self.call("session/new", json!({"cwd": cwd, "mcpServers": []}));
+            reply["result"]["sessionId"]
+                .as_str()
+                .unwrap_or_else(|| panic!("no session id: {reply}"))
+                .to_string()
+        }
+
+        /// Close the client's end and wait — bounded — for the agent to stop.
+        fn close(mut self) {
+            drop(self.to_agent.take());
+            let deadline = Instant::now() + WAIT;
+            while !self.server.is_finished() {
+                assert!(
+                    Instant::now() < deadline,
+                    "the agent did not stop at end of input"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    fn updates_of(messages: &[Value]) -> Vec<&Value> {
+        messages
+            .iter()
+            .filter(|m| m["method"] == "session/update")
+            .map(|m| &m["params"]["update"])
+            .collect()
+    }
+
+    fn text_of(messages: &[Value]) -> String {
+        updates_of(messages)
+            .into_iter()
+            .filter(|u| u["sessionUpdate"] == "agent_message_chunk")
+            .filter_map(|u| u["content"]["text"].as_str())
+            .collect()
+    }
+
+    fn client(behaviour: Behaviour) -> Client {
+        Client::start(
+            Script::new(behaviour),
+            PermissionMode::WorkspaceWrite,
+            transport::MAX_LINE_BYTES,
+        )
+    }
+
+    /// **THE HANDSHAKE.** Version 1, and only the capabilities incode really
+    /// has: text and embedded context, no session loading, no auth methods.
+    #[test]
+    fn initialize_negotiates_version_one_and_states_real_capabilities() {
+        let mut client = client(Behaviour::Stream);
+        let reply = client.call(
+            "initialize",
+            json!({"protocolVersion": 1, "clientCapabilities": {}}),
+        );
+        let result = &reply["result"];
+        assert_eq!(result["protocolVersion"], 1, "{reply}");
+        assert_eq!(result["agentCapabilities"]["loadSession"], false, "{reply}");
+        assert_eq!(
+            result["agentCapabilities"]["promptCapabilities"]["embeddedContext"], true,
+            "{reply}"
+        );
+        assert_eq!(
+            result["agentCapabilities"]["promptCapabilities"]["image"], false,
+            "{reply}"
+        );
+        assert_eq!(result["authMethods"], json!([]), "{reply}");
+        assert_eq!(result["agentInfo"]["name"], "incode", "{reply}");
+
+        // A client on a newer protocol is answered with the version spoken.
+        let newer = client.call(
+            "initialize",
+            json!({"protocolVersion": 7, "clientCapabilities": {}}),
+        );
+        assert_eq!(newer["result"]["protocolVersion"], 1, "{newer}");
+
+        // No method was offered, so none can be chosen.
+        let auth = client.call("authenticate", json!({"methodId": "anything"}));
+        assert_eq!(auth["error"]["code"], -32602, "{auth}");
+        client.close();
+    }
+
+    /// **A BAD `cwd` IS REFUSED, NEVER BUILT.** Relative, missing, and a file
+    /// that is not a directory: each is invalid params, and no session opens.
+    #[test]
+    fn session_new_refuses_a_cwd_that_is_not_an_absolute_directory() {
+        let mut client = client(Behaviour::Stream);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file = dir.path().join("a-file.txt");
+        std::fs::write(&file, "x").expect("write");
+
+        for cwd in [
+            json!("relative/dir"),
+            json!(dir.path().join("does-not-exist")),
+            json!(file),
+        ] {
+            let reply = client.call("session/new", json!({"cwd": cwd, "mcpServers": []}));
+            assert_eq!(
+                reply["error"]["code"], -32602,
+                "cwd {cwd} must be refused: {reply}"
+            );
+            assert!(reply.get("result").is_none(), "{reply}");
+        }
+        client.close();
+    }
+
+    /// **A PROMPT STREAMS, THEN ENDS WITH `end_turn`.** The text arrives as
+    /// message chunks, the tool call and its result as structure, the task
+    /// list as a plan — all before the reply that ends the prompt.
+    #[test]
+    fn a_prompt_streams_its_turn_and_ends_with_end_turn() {
+        let mut client = client(Behaviour::Stream);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let session = client.open_session(dir.path());
+
+        let id = client.request(
+            "session/prompt",
+            json!({"sessionId": session, "prompt": [{"type": "text", "text": "read a.txt and report"}]}),
+        );
+        let (streamed, reply) = client.until_response(id);
+
+        assert_eq!(reply["result"]["stopReason"], "end_turn", "{reply}");
+        // The turn ends its text on a line boundary, as it does in a terminal.
+        assert_eq!(text_of(&streamed).trim_end(), "Hello", "{streamed:#?}");
+        let updates = updates_of(&streamed);
+        let call = updates
+            .iter()
+            .find(|u| u["sessionUpdate"] == "tool_call" && u["toolCallId"] == "t1")
+            .unwrap_or_else(|| panic!("no tool call: {updates:#?}"));
+        assert_eq!(call["kind"], "read", "{call}");
+        assert_eq!(call["status"], "in_progress", "{call}");
+        let result = updates
+            .iter()
+            .find(|u| u["sessionUpdate"] == "tool_call_update" && u["toolCallId"] == "t1")
+            .unwrap_or_else(|| panic!("no tool result: {updates:#?}"));
+        assert_eq!(result["status"], "completed", "{result}");
+        let plan = updates
+            .iter()
+            .find(|u| u["sessionUpdate"] == "plan")
+            .unwrap_or_else(|| panic!("no plan: {updates:#?}"));
+        assert_eq!(plan["entries"][0]["status"], "completed", "{plan}");
+        client.close();
+    }
+
+    /// **CANCEL MID-PROMPT ENDS WITH `cancelled`, AND THE READER NEVER
+    /// WAITED ON THE TURN.** While the prompt runs, an unrelated request is
+    /// answered — the proof the reader is free — and then the cancel lands
+    /// and the prompt answers `cancelled`, well before the fake would have
+    /// finished on its own.
+    #[test]
+    fn cancel_mid_prompt_ends_with_cancelled() {
+        let mut client = client(Behaviour::WaitForCancel);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let session = client.open_session(dir.path());
+
+        let prompt = client.request(
+            "session/prompt",
+            json!({"sessionId": session, "prompt": [{"type": "text", "text": "do the long thing"}]}),
+        );
+        // The turn is running once its first words arrive.
+        loop {
+            let message = client.next();
+            if message["params"]["update"]["content"]["text"] == "working" {
+                break;
+            }
+        }
+        let busy = client.call("session/list", json!({}));
+        assert_eq!(
+            busy["error"]["code"], -32601,
+            "answered during the turn: {busy}"
+        );
+
+        let started = Instant::now();
+        client.notify("session/cancel", json!({"sessionId": session}));
+        let (_, reply) = client.until_response(prompt);
+        assert_eq!(reply["result"]["stopReason"], "cancelled", "{reply}");
+        assert!(
+            started.elapsed() < CANCEL_FAKE_PATIENCE,
+            "the cancel must stop the turn, not wait it out: {:?}",
+            started.elapsed()
+        );
+        client.close();
+    }
+
+    /// **`set_mode` CHANGES THE MODE THE AGENT RUNS UNDER.** The session opens
+    /// in `workspace-write`; after `read-only` is chosen, the next turn's
+    /// agent is set to its propose-only mode. An unknown mode is refused.
+    #[test]
+    fn set_mode_changes_the_permission_mode_of_the_next_turn() {
+        let script = Script::new(Behaviour::Stream);
+        let mut client = Client::start(
+            script.clone(),
+            PermissionMode::WorkspaceWrite,
+            transport::MAX_LINE_BYTES,
+        );
+        let dir = tempfile::tempdir().expect("temp dir");
+        let opened = client.call("session/new", json!({"cwd": dir.path(), "mcpServers": []}));
+        let modes = &opened["result"]["modes"];
+        assert_eq!(modes["currentModeId"], "workspace-write", "{opened}");
+        let offered: Vec<&str> = modes["availableModes"]
+            .as_array()
+            .expect("modes")
+            .iter()
+            .filter_map(|m| m["id"].as_str())
+            .collect();
+        assert_eq!(
+            offered,
+            ["read-only", "workspace-write", "danger-full-access"]
+        );
+        let session = opened["result"]["sessionId"]
+            .as_str()
+            .expect("id")
+            .to_string();
+
+        let bogus = client.call(
+            "session/set_mode",
+            json!({"sessionId": session, "modeId": "yolo"}),
+        );
+        assert_eq!(bogus["error"]["code"], -32602, "{bogus}");
+
+        let set = client.call(
+            "session/set_mode",
+            json!({"sessionId": session, "modeId": "read-only"}),
+        );
+        assert!(set.get("result").is_some(), "{set}");
+
+        let reply = client.call(
+            "session/prompt",
+            json!({"sessionId": session, "prompt": [{"type": "text", "text": "look around"}]}),
+        );
+        assert_eq!(reply["result"]["stopReason"], "end_turn", "{reply}");
+        let modes = script.modes.lock().expect("modes").clone();
+        assert_eq!(
+            modes.last().map(String::as_str),
+            Some(PermissionMode::ReadOnly.agent_mode()),
+            "the turn after set_mode must run read-only: {modes:?}"
+        );
+        client.close();
+    }
+
+    /// **A CLOSED SESSION GIVES ITS SLOT BACK.** Without `session/close` a
+    /// long-lived connection would hit [`MAX_SESSIONS`] and be refused for
+    /// good; with it, the limit is on sessions open at once.
+    #[test]
+    fn closing_sessions_frees_their_slots() {
+        let mut client = client(Behaviour::Stream);
+        let dir = tempfile::tempdir().expect("temp dir");
+        for _ in 0..(MAX_SESSIONS + 2) {
+            let session = client.open_session(dir.path());
+            let closed = client.call("session/close", json!({"sessionId": session}));
+            assert!(closed.get("result").is_some(), "{closed}");
+            let gone = client.call(
+                "session/prompt",
+                json!({"sessionId": session, "prompt": [{"type": "text", "text": "hi there"}]}),
+            );
+            assert_eq!(
+                gone["error"]["code"], -32602,
+                "a closed session is gone: {gone}"
+            );
+        }
+        client.close();
+    }
+
+    #[test]
+    fn an_unknown_method_is_method_not_found() {
+        let mut client = client(Behaviour::Stream);
+        let reply = client.call("session/fork", json!({}));
+        assert_eq!(reply["error"]["code"], -32601, "{reply}");
+        // A notification nobody handles gets no answer at all — the next
+        // thing back is the reply to the request after it.
+        client.notify("something/unheard_of", json!({}));
+        let after = client.call("initialize", json!({"protocolVersion": 1}));
+        assert!(after.get("result").is_some(), "{after}");
+        client.close();
+    }
+
+    #[test]
+    fn malformed_json_is_a_parse_error_and_the_connection_survives() {
+        let mut client = client(Behaviour::Stream);
+        client.send_raw("{\"jsonrpc\": \"2.0\", \"id\": 1, \"method\": ");
+        let reply = client.next();
+        assert_eq!(reply["error"]["code"], -32700, "{reply}");
+        assert_eq!(reply["id"], Value::Null, "{reply}");
+        let after = client.call("initialize", json!({"protocolVersion": 1}));
+        assert!(after.get("result").is_some(), "{after}");
+        client.close();
+    }
+
+    /// **AN OVER-LONG LINE IS REFUSED UNREAD, AND THE NEXT ONE IS SERVED.**
+    #[test]
+    fn an_over_long_line_is_refused_and_the_connection_survives() {
+        let mut client = Client::start(
+            Script::new(Behaviour::Stream),
+            PermissionMode::WorkspaceWrite,
+            1024,
+        );
+        let long = json!({"jsonrpc": "2.0", "id": 99, "method": "initialize",
+                          "params": {"protocolVersion": 1, "pad": "x".repeat(5000)}});
+        client.send_raw(&long.to_string());
+        let refused = client.next();
+        assert_eq!(refused["error"]["code"], -32600, "{refused}");
+        assert_eq!(
+            refused["id"], 99,
+            "answered under its own id, or the client waits forever: {refused}"
+        );
+        let after = client.call("initialize", json!({"protocolVersion": 1}));
+        assert!(after.get("result").is_some(), "{after}");
+        client.close();
+    }
+
+    /// Set only in the child process [`the_protocol_channel_carries_nothing_else`]
+    /// starts; it names the workspace the child serves.
+    const PURITY_CHILD: &str = "INCODE_ACP_PURITY_CHILD";
+
+    /// The child half of the stdout test: this process's REAL stdin and
+    /// stdout, claimed exactly as `run_stdio` claims them, serving a backend
+    /// that prints to stdout every way this crate can.
+    ///
+    /// Returns at once — passing — unless started by the test below, which
+    /// sets [`PURITY_CHILD`]. It exits the process itself when the client
+    /// closes stdin, so the test harness prints nothing after it.
+    #[test]
+    fn protocol_channel_child() {
+        if std::env::var_os(PURITY_CHILD).is_none() {
+            return;
+        }
+        let claimed = stdio::claim().expect("claim stdin/stdout");
+        serve(
+            claimed.input,
+            Box::new(claimed.output),
+            FakeSessions {
+                script: Script::new(Behaviour::Noisy),
+                mode: PermissionMode::WorkspaceWrite,
+            },
+            transport::MAX_LINE_BYTES,
+        );
+        std::process::exit(0);
+    }
+
+    /// **STDOUT CARRIES THE PROTOCOL AND NOTHING ELSE.**
+    ///
+    /// A whole handshake and prompt, against a real process's real stdout,
+    /// while the backend prints through `println!`, `print!`, the console's
+    /// `render` and `outln!`, and a child process that inherits stdout. Every
+    /// line on stdout must be a JSON-RPC message, and the stray text must turn
+    /// up on stderr — which proves it was printed, and moved, rather than
+    /// never printed at all.
+    ///
+    /// The one exception is the test harness's own banner (`running 1 test`),
+    /// printed before the child's code starts; it is matched exactly, so
+    /// nothing else can hide behind it.
+    #[test]
+    fn the_protocol_channel_carries_nothing_else() {
+        use std::process::{Command, Stdio};
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut child = Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "acp_agent::tests::protocol_channel_child",
+                "--nocapture",
+                "--test-threads=1",
+                "-q",
+            ])
+            .env(PURITY_CHILD, workspace.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start the child");
+
+        let (stdout_lines, from_child) = mpsc::channel::<String>();
+        let child_out = child.stdout.take().expect("stdout");
+        std::thread::spawn(move || {
+            for line in BufReader::new(child_out).lines() {
+                let Ok(line) = line else { break };
+                if stdout_lines.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let child_err = child.stderr.take().expect("stderr");
+        let stderr = std::thread::spawn(move || {
+            let mut text = String::new();
+            let _ = BufReader::new(child_err).read_to_string(&mut text);
+            text
+        });
+        let mut to_child = child.stdin.take().expect("stdin");
+
+        let mut seen: Vec<String> = Vec::new();
+        let mut exchange = |request: Value| -> Value {
+            let id = request["id"].clone();
+            writeln!(to_child, "{request}").expect("write");
+            to_child.flush().expect("flush");
+            loop {
+                let line = from_child.recv_timeout(WAIT).unwrap_or_else(|_| {
+                    panic!("the child said nothing for {WAIT:?}; stdout so far: {seen:#?}")
+                });
+                seen.push(line.clone());
+                if let Ok(value) = serde_json::from_str::<Value>(&line) {
+                    if value["id"] == id && value.get("method").is_none() {
+                        return value;
+                    }
+                }
+            }
+        };
+
+        let init = exchange(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                                   "params": {"protocolVersion": 1}}));
+        assert!(init.get("result").is_some(), "{init}");
+        let opened = exchange(json!({"jsonrpc": "2.0", "id": 2, "method": "session/new",
+                                     "params": {"cwd": workspace.path(), "mcpServers": []}}));
+        let session = opened["result"]["sessionId"]
+            .as_str()
+            .expect("session")
+            .to_string();
+        let prompt = exchange(
+            json!({"jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+                                     "params": {"sessionId": session,
+                                                "prompt": [{"type": "text", "text": "read a.txt"}]}}),
+        );
+        assert_eq!(prompt["result"]["stopReason"], "end_turn", "{prompt}");
+        drop(to_child);
+
+        let deadline = Instant::now() + WAIT;
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("wait") {
+                break status;
+            }
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                panic!("the child did not exit after its input closed");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(status.success(), "child exit: {status}");
+        seen.extend(from_child.try_iter());
+        let stderr = stderr.join().expect("stderr reader");
+
+        let harness_banner = |line: &str| line.is_empty() || line == "running 1 test";
+        let protocol: Vec<&String> = seen.iter().filter(|l| !harness_banner(l)).collect();
+        assert!(protocol.len() >= 3, "three replies at least: {seen:#?}");
+        for line in &protocol {
+            assert_json_rpc(line);
+        }
+        assert!(
+            protocol.iter().any(|l| l.contains("agent_message_chunk")),
+            "the turn streamed on stdout: {seen:#?}"
+        );
+        for stray in [
+            "STRAY println",
+            "STRAY print from",
+            "STRAY render",
+            "STRAY outln",
+            "STRAY child process",
+        ] {
+            assert!(
+                stderr.contains(stray),
+                "`{stray}` was printed, so it must have gone to stderr:\n{stderr}"
+            );
+        }
+    }
+}

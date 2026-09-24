@@ -51,6 +51,39 @@ registers over **HTTP**. The client is gone along with the rest of the tool laye
 MCP servers are the agent's business now, configured in the agent's own settings and
 connected by it. The harness proxies nothing.
 
+### `incode --acp`: incode as the agent an editor drives
+
+An Agent Client Protocol client (an editor, or the owner's desktop app) starts
+`incode --acp` and drives it with JSON-RPC 2.0, one message per line on stdin/stdout.
+incode is the **agent** here, never the client: underneath, the work is still done by
+the subscription CLIs, through the same `cli::prepare_session` the REPL builds its
+session with and the same `cli::plan_turn` / `AgentSession::turn_observed` a typed line
+runs. The code is `src/acp_agent/`; payloads are `agent-client-protocol-schema` types.
+
+| Method | What incode does |
+|---|---|
+| `initialize` | protocol version 1; prompts take text and embedded context; no session loading, no client MCP servers, no auth methods |
+| `authenticate` | invalid params — no method was offered; the CLIs hold their own logins |
+| `session/new` | `cwd` must be absolute and an existing directory; it becomes the workspace. The session is built on its own thread |
+| `session/prompt` | one turn: text as `agent_message_chunk`, tool calls and results as `tool_call` / `tool_call_update`, the task list as `plan`; replies with the stop reason, or a JSON-RPC error if the turn failed |
+| `session/cancel` | trips the session's cancel token; the prompt answers `cancelled` |
+| `session/set_mode` | `read-only`, `workspace-write`, `danger-full-access`; applied from the next turn |
+| `session/close` | cancels the session's turn and frees its slot (at most 16 sessions open at once) |
+| anything else | `-32601`; malformed JSON `-32700`; a line over 8 MiB is dropped unread and answered `-32600` under the id found in its first 4 KiB |
+
+**stdout is the protocol and nothing else.** Before anything runs, `acp_agent::stdio`
+takes the real stdin and stdout as private handles and repoints the process-wide
+standard handles: stdout at stderr, stdin at the null device. Every render call, stray
+`println!` and inherited child process therefore lands on stderr, and no child can read
+the client's messages. A test drives a whole handshake and prompt through a real
+process whose backend prints to stdout every way the crate can, and requires every
+stdout line to be JSON-RPC.
+
+Not offered: `session/load` and `session/resume` (the agent CLI owns the transcript and
+an ACP session id has no stored mapping to it), slash commands, the client's MCP servers
+(no seam in the backends, and a stdio server is a program the client would have this
+machine run), and `session/request_permission` / fs / terminal.
+
 ---
 
 ## 3. Module map

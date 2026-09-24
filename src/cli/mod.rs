@@ -62,39 +62,88 @@ impl CliApp {
 
     /// Run the interactive REPL. Blocks until the user quits.
     pub fn run(self) -> anyhow::Result<()> {
-        let workspace = self.config.workspace.clone();
         let booted_at = std::time::Instant::now();
+        // Ctrl-C during a turn. The line editor handles it while reading a
+        // line; this covers the rest. The agent runs as a child process, so
+        // stopping it means killing that process — the token is checked between
+        // output lines and the child is killed when it is set.
+        let cancel = crate::runtime::cancel::CancelToken::new();
+        let prepared = prepare_session(&self.config, cancel.clone(), booted_at)?;
+        self.repl(prepared, cancel, booted_at)
+    }
+}
 
-        // The intake gate. Nothing is blocked by it: an incomplete brief makes
-        // completing the brief the session's first job, not a reason to exit.
-        // The work still happens here, in this session, with the owner present
-        // to answer what only they can answer.
-        // HEAL THE BELIEF BEFORE REPORTING IT MISSING.
-        //
-        // The brief lives in the proxy, and the proxy's write endpoint replaces
-        // a whole document with no version to write against — so a belief CAN be
-        // lost to a concurrent writer, and one was, live: the project key
-        // survived with every field blank.
-        //
-        // The documents are the durable copy. Deriving here means a lost brief
-        // is rebuilt by the next session that opens the project, rather than
-        // waiting for someone to type `/run` — which was the gap when this ran
-        // only in the run handler: the brief stayed empty and the session merely
-        // complained about it.
-        //
-        // Nothing is overwritten: `from_docs` carries only what the document
-        // says, and `patch_config` writes only the fields an update carries.
-        let gate = timed("brief::check", || {
-            let gate = crate::brief::check(&workspace);
-            if let crate::brief::Gate::Ready(ref brief) = gate {
-                // THE OTHER DIRECTION. A belief with no document behind it is
-                // one clobber from gone, because healing rebuilds from the
-                // document and there is none. Writing it down means the truth
-                // lives in two places and neither is the only copy.
-                //
-                // An existing document is never touched: it is the source, and a
-                // drifted brief overwriting it would make the drift the truth.
-                match crate::brief::write_prd_to_docs(&workspace, brief) {
+/// Everything [`prepare_session`] assembles, handed to whoever drives the
+/// session: the interactive REPL here, or `incode --acp` in
+/// [`crate::acp_agent`].
+pub(crate) struct Prepared {
+    pub(crate) workspace: std::path::PathBuf,
+    pub(crate) incord_code_dir: std::path::PathBuf,
+    pub(crate) admin: crate::admin::AdminConfig,
+    pub(crate) permission_mode: PermissionMode,
+    pub(crate) tool_cache: ToolStatusCache,
+    pub(crate) lifecycle_hooks: LifecycleHooks,
+    pub(crate) git_context: Option<git_context::GitContext>,
+    pub(crate) system_prompt: Vec<String>,
+    pub(crate) catalogue: crate::agent::catalogue::Catalogue,
+    pub(crate) agent: crate::agent::DetectedAgent,
+    pub(crate) fleet: crate::fleet::Fleet,
+    pub(crate) session: crate::cli::agent_turn::AgentSession,
+}
+
+/// Build a session the way every front end must: the intake gate, the
+/// operator's settings, the project context the agent is told, the lead from
+/// the catalogue, the guards, the standby agents, the permission mode and the
+/// model.
+///
+/// # Why this is one function
+///
+/// The REPL built all of this inline, and `incode --acp` needs exactly the same
+/// session. A second copy of this sequence would drift from the first the way
+/// the run backend's system context did — twice — so both front ends call this.
+///
+/// `cancel` is the token the caller trips to stop a turn: Ctrl-C in the REPL,
+/// `session/cancel` over the protocol.
+///
+/// Everything it prints goes through [`render`], i.e. the console. Under
+/// `--acp` the process's stdout is already pointed at stderr by the time this
+/// runs (see `acp_agent::stdio`), so none of it can reach the protocol channel.
+pub(crate) fn prepare_session(
+    config: &IncordCodeConfig,
+    cancel: crate::runtime::cancel::CancelToken,
+    booted_at: std::time::Instant,
+) -> anyhow::Result<Prepared> {
+    let workspace = config.workspace.clone();
+    // The intake gate. Nothing is blocked by it: an incomplete brief makes
+    // completing the brief the session's first job, not a reason to exit.
+    // The work still happens here, in this session, with the owner present
+    // to answer what only they can answer.
+    // HEAL THE BELIEF BEFORE REPORTING IT MISSING.
+    //
+    // The brief lives in the proxy, and the proxy's write endpoint replaces
+    // a whole document with no version to write against — so a belief CAN be
+    // lost to a concurrent writer, and one was, live: the project key
+    // survived with every field blank.
+    //
+    // The documents are the durable copy. Deriving here means a lost brief
+    // is rebuilt by the next session that opens the project, rather than
+    // waiting for someone to type `/run` — which was the gap when this ran
+    // only in the run handler: the brief stayed empty and the session merely
+    // complained about it.
+    //
+    // Nothing is overwritten: `from_docs` carries only what the document
+    // says, and `patch_config` writes only the fields an update carries.
+    let gate = timed("brief::check", || {
+        let gate = crate::brief::check(&workspace);
+        if let crate::brief::Gate::Ready(ref brief) = gate {
+            // THE OTHER DIRECTION. A belief with no document behind it is
+            // one clobber from gone, because healing rebuilds from the
+            // document and there is none. Writing it down means the truth
+            // lives in two places and neither is the only copy.
+            //
+            // An existing document is never touched: it is the source, and a
+            // drifted brief overwriting it would make the drift the truth.
+            match crate::brief::write_prd_to_docs(&workspace, brief) {
                     Ok(true) => render::print_info(&format!(
                         "Wrote {} from the brief — this project had a belief and no document behind it.",
                         crate::brief::PRD_PATH
@@ -102,333 +151,425 @@ impl CliApp {
                     Ok(false) => {}
                     Err(e) => crate::trace!("brief", "document not written: {e}"),
                 }
-                return gate;
+            return gate;
+        }
+        match crate::brief::derive_from_docs(&workspace) {
+            Ok(_) => {
+                crate::trace!("brief", "derived from {}", crate::brief::PRD_PATH);
+                crate::brief::check(&workspace)
             }
-            match crate::brief::derive_from_docs(&workspace) {
-                Ok(_) => {
-                    crate::trace!("brief", "derived from {}", crate::brief::PRD_PATH);
-                    crate::brief::check(&workspace)
-                }
-                // No document to derive from is the ordinary case for a new
-                // project. The gate below then asks for the brief, which is the
-                // useful thing to say — this error is not.
-                Err(e) => {
-                    crate::trace!("brief", "not derived: {e}");
-                    gate
-                }
-            }
-        });
-        // Two intake findings, gathered together so the session is told
-        // everything that needs writing before it starts, rather than one thing
-        // now and another after the first is fixed.
-        //
-        // The dependency check needs the workspace AND the document, which only
-        // meet here: `research` reads the manifest the build reads, and the PRD
-        // comes from the brief.
-        let mut intake_notes: Vec<String> = gate.intake_task().into_iter().collect();
-        mark("intake_task", booted_at);
-        if let crate::brief::Gate::Ready(ref brief) = gate {
-            if let Some(note) =
-                crate::research::intake_note(&crate::research::unvetted(&workspace, &brief.prd))
-            {
-                intake_notes.push(note);
+            // No document to derive from is the ordinary case for a new
+            // project. The gate below then asks for the brief, which is the
+            // useful thing to say — this error is not.
+            Err(e) => {
+                crate::trace!("brief", "not derived: {e}");
+                gate
             }
         }
-        // The rest of the spec set — architecture, contracts, conventions,
-        // verification, assumptions. The loop reads these; a PRD on its own
-        // leaves every later task guessing at names and shapes.
-        if let Some(note) = crate::spec::intake_note(&workspace) {
+    });
+    // Two intake findings, gathered together so the session is told
+    // everything that needs writing before it starts, rather than one thing
+    // now and another after the first is fixed.
+    //
+    // The dependency check needs the workspace AND the document, which only
+    // meet here: `research` reads the manifest the build reads, and the PRD
+    // comes from the brief.
+    let mut intake_notes: Vec<String> = gate.intake_task().into_iter().collect();
+    mark("intake_task", booted_at);
+    if let crate::brief::Gate::Ready(ref brief) = gate {
+        if let Some(note) =
+            crate::research::intake_note(&crate::research::unvetted(&workspace, &brief.prd))
+        {
             intake_notes.push(note);
         }
-        mark("spec-note", booted_at);
-        let intake_task = (!intake_notes.is_empty()).then(|| intake_notes.join("\n\n"));
-        mark("intake-joined", booted_at);
-        if let Some(ref task) = intake_task {
-            render::print_info(task);
+    }
+    // The rest of the spec set — architecture, contracts, conventions,
+    // verification, assumptions. The loop reads these; a PRD on its own
+    // leaves every later task guessing at names and shapes.
+    if let Some(note) = crate::spec::intake_note(&workspace) {
+        intake_notes.push(note);
+    }
+    mark("spec-note", booted_at);
+    let intake_task = (!intake_notes.is_empty()).then(|| intake_notes.join("\n\n"));
+    mark("intake-joined", booted_at);
+    if let Some(ref task) = intake_task {
+        render::print_info(task);
+    }
+
+    let permission_mode = PermissionMode::from_str_lossy(&config.permission_mode);
+    // PUBLISHED FOR THE REST OF THE PROCESS, so a backend built somewhere
+    // that cannot see this config still runs under the mode the operator
+    // chose. See `PERMISSION_MODE_ENV` for why this is a variable rather
+    // than an argument, and why it stops at this process boundary.
+    std::env::set_var(PERMISSION_MODE_ENV, permission_mode.as_str());
+
+    // Incord Code data directory (history, sessions, memory)
+    // One resolver for the data directory, shared with every caller that
+    // reads settings from it — two answers here means the operator edits one
+    // file and the harness reads another.
+    let incord_code_dir = crate::admin::AdminConfig::default_dir();
+    let _ = std::fs::create_dir_all(&incord_code_dir);
+
+    // The operator's standing decisions. A flag beats an env var beats this
+    // file beats the built-in fallback, and every value can say which of the
+    // four decided it — see `/admin`.
+    let admin = match timed("admin", || {
+        mark("admin", booted_at);
+        crate::admin::AdminConfig::load(&incord_code_dir)
+    }) {
+        Ok(admin) => admin,
+        Err(e) => {
+            // Settings that quietly stop applying are worse than a loud
+            // failure: the run looks normal while doing something else.
+            render::print_error(&e);
+            crate::admin::AdminConfig::default()
         }
+    };
 
-        let permission_mode = PermissionMode::from_str_lossy(&self.config.permission_mode);
-        // PUBLISHED FOR THE REST OF THE PROCESS, so a backend built somewhere
-        // that cannot see this config still runs under the mode the operator
-        // chose. See `PERMISSION_MODE_ENV` for why this is a variable rather
-        // than an argument, and why it stops at this process boundary.
-        std::env::set_var(PERMISSION_MODE_ENV, permission_mode.as_str());
-
-        // Incord Code data directory (history, sessions, memory)
-        // One resolver for the data directory, shared with every caller that
-        // reads settings from it — two answers here means the operator edits one
-        // file and the harness reads another.
-        let incord_code_dir = crate::admin::AdminConfig::default_dir();
-        let _ = std::fs::create_dir_all(&incord_code_dir);
-
-        // The operator's standing decisions. A flag beats an env var beats this
-        // file beats the built-in fallback, and every value can say which of the
-        // four decided it — see `/admin`.
-        let admin = match timed("admin", || {
-            mark("admin", booted_at);
-            crate::admin::AdminConfig::load(&incord_code_dir)
-        }) {
-            Ok(admin) => admin,
-            Err(e) => {
-                // Settings that quietly stop applying are worse than a loud
-                // failure: the run looks normal while doing something else.
-                render::print_error(&e);
-                crate::admin::AdminConfig::default()
+    // START THE ADVISORY LOOKUPS NOW; READ THEM WHEN THE PROMPT IS BUILT.
+    //
+    // Both of these used to run where their answers are used, on the
+    // [`crate::recall::WAITING_TIMEOUT`] of 1200ms, and both were silently
+    // losing to it: measured from the service's own request log,
+    // `/v1/memory/watchman/handoff` exceeded 1200ms on 198 of 506 calls —
+    // 39.1% — every one of them answering `status=200`. The store was
+    // working and the harness had already stopped listening, so two sessions
+    // in five started believing a project with real recorded history had
+    // none.
+    //
+    // Started here they overlap the six-odd seconds of startup that follow —
+    // tool probing, git, plugins, agent discovery — and are read at the end
+    // of it. The deadline is not raised on the waiting path, because the
+    // reason it is 1200ms there has not changed: an 8.08s lookup once left
+    // the operator staring at a terminal that looked dead. Nothing waits on
+    // these, so nothing can be held up by them.
+    //
+    // Gated on the same plugin switches as before, so an operator who turned
+    // one off still pays nothing for it.
+    // The project's stable id, taken from the brief the gate already
+    // resolved — no extra call. Empty when the service has assigned none,
+    // and `recorder::key_for` then falls back to the workspace path.
+    let recorder_scope = match gate {
+        crate::brief::Gate::Ready(ref brief) if !brief.scope.is_empty() => brief.scope.clone(),
+        _ => {
+            let norm = workspace.display().to_string().replace('\\', "/");
+            if norm.ends_with("/incord-code") || norm == "incord-code" {
+                "proj-incordcode".to_string()
+            } else {
+                String::new()
             }
-        };
+        }
+    };
+    let recorder_prefetch = admin.plugins.recorder.then(|| {
+        let workspace = workspace.clone();
+        let scope = recorder_scope.clone();
+        std::thread::spawn(move || {
+            crate::recorder::context_for_session_within(
+                &workspace,
+                Some(scope.as_str()),
+                crate::recall::PREFETCH_TIMEOUT,
+            )
+        })
+    });
+    let auditor_prefetch = admin.plugins.auditor.then(|| {
+        let workspace = workspace.clone();
+        std::thread::spawn(move || {
+            crate::auditor::context_for_session_within(&workspace, crate::recall::PREFETCH_TIMEOUT)
+        })
+    });
 
-        // START THE ADVISORY LOOKUPS NOW; READ THEM WHEN THE PROMPT IS BUILT.
-        //
-        // Both of these used to run where their answers are used, on the
-        // [`crate::recall::WAITING_TIMEOUT`] of 1200ms, and both were silently
-        // losing to it: measured from the service's own request log,
-        // `/v1/memory/watchman/handoff` exceeded 1200ms on 198 of 506 calls —
-        // 39.1% — every one of them answering `status=200`. The store was
-        // working and the harness had already stopped listening, so two sessions
-        // in five started believing a project with real recorded history had
-        // none.
-        //
-        // Started here they overlap the six-odd seconds of startup that follow —
-        // tool probing, git, plugins, agent discovery — and are read at the end
-        // of it. The deadline is not raised on the waiting path, because the
-        // reason it is 1200ms there has not changed: an 8.08s lookup once left
-        // the operator staring at a terminal that looked dead. Nothing waits on
-        // these, so nothing can be held up by them.
-        //
-        // Gated on the same plugin switches as before, so an operator who turned
-        // one off still pays nothing for it.
-        // The project's stable id, taken from the brief the gate already
-        // resolved — no extra call. Empty when the service has assigned none,
-        // and `recorder::key_for` then falls back to the workspace path.
-        let recorder_scope = match gate {
-            crate::brief::Gate::Ready(ref brief) if !brief.scope.is_empty() => brief.scope.clone(),
-            _ => {
-                let norm = workspace.display().to_string().replace('\\', "/");
-                if norm.ends_with("/incord-code") || norm == "incord-code" {
-                    "proj-incordcode".to_string()
-                } else {
-                    String::new()
-                }
-            }
-        };
-        let recorder_prefetch = admin.plugins.recorder.then(|| {
-            let workspace = workspace.clone();
-            let scope = recorder_scope.clone();
-            std::thread::spawn(move || {
-                crate::recorder::context_for_session_within(
-                    &workspace,
-                    Some(scope.as_str()),
-                    crate::recall::PREFETCH_TIMEOUT,
-                )
-            })
-        });
-        let auditor_prefetch = admin.plugins.auditor.then(|| {
-            let workspace = workspace.clone();
-            std::thread::spawn(move || {
-                crate::auditor::context_for_session_within(
-                    &workspace,
-                    crate::recall::PREFETCH_TIMEOUT,
-                )
-            })
-        });
+    // Tool status cache (Feature 3: detect installed CLI tools)
+    let tool_cache_path = incord_code_dir.join("tool-status.json");
+    let mut tool_cache = timed("tool probe", || {
+        mark("tools", booted_at);
+        ToolStatusCache::load_or_create(&tool_cache_path)
+    });
+    tool_cache.detect_all();
 
-        // Tool status cache (Feature 3: detect installed CLI tools)
-        let tool_cache_path = incord_code_dir.join("tool-status.json");
-        let mut tool_cache = timed("tool probe", || {
-            mark("tools", booted_at);
-            ToolStatusCache::load_or_create(&tool_cache_path)
-        });
-        tool_cache.detect_all();
+    // Lifecycle hooks (Feature 7: session start/end scripts)
+    let lifecycle_hooks = if config.lifecycle_hooks.has_any() {
+        config.lifecycle_hooks.clone()
+    } else {
+        LifecycleHooks::discover(&workspace).unwrap_or_default()
+    };
 
-        // Lifecycle hooks (Feature 7: session start/end scripts)
-        let lifecycle_hooks = if self.config.lifecycle_hooks.has_any() {
-            self.config.lifecycle_hooks.clone()
-        } else {
-            LifecycleHooks::discover(&workspace).unwrap_or_default()
-        };
+    // Load skills (72 bundled + user skills from workspace)
+    let _skill_count = 0usize;
 
-        // Load skills (72 bundled + user skills from workspace)
-        let _skill_count = 0usize;
+    let git_context = timed("git", || git_context::detect_git_context(&workspace));
+    mark("git", booted_at);
 
-        let git_context = timed("git", || git_context::detect_git_context(&workspace));
-        mark("git", booted_at);
+    // What the agent is told about this project, beyond each instruction.
+    //
+    // ONLY what this harness knows and the agent does not. It used to also
+    // carry a role ("You are Incord Code"), a methodology, a thinking style
+    // and a manual for tools — all written to drive a raw model. Appended to
+    // a working agent's own prompt, that is a competing identity and a
+    // manual for tools it does not have, which is worse than sending
+    // nothing. The agent is already a coding agent; it needs the PROJECT.
+    let mut system_prompt: Vec<String> = Vec::new();
 
-        // What the agent is told about this project, beyond each instruction.
-        //
-        // ONLY what this harness knows and the agent does not. It used to also
-        // carry a role ("You are Incord Code"), a methodology, a thinking style
-        // and a manual for tools — all written to drive a raw model. Appended to
-        // a working agent's own prompt, that is a competing identity and a
-        // manual for tools it does not have, which is worse than sending
-        // nothing. The agent is already a coding agent; it needs the PROJECT.
-        let mut system_prompt: Vec<String> = Vec::new();
+    // How to put a decision to the owner as OPTIONS rather than an open
+    // question. Enumerating the choices is most of the work of deciding,
+    // and the agent has just done it — an open question throws it away.
+    system_prompt.push(crate::ask::prompt_block());
 
-        // How to put a decision to the owner as OPTIONS rather than an open
-        // question. Enumerating the choices is most of the work of deciding,
-        // and the agent has just done it — an open question throws it away.
-        system_prompt.push(crate::ask::prompt_block());
-
-        // The intake task rides the system prompt rather than one turn's
-        // context: it is not finished until the brief is, which may take several
-        // exchanges, and a task that fell out of context after one turn would be
-        // abandoned halfway through gathering.
-        if let Some(ref task) = intake_task {
-            system_prompt.push(format!(
-                "<intake>\nThis project cannot be worked on until its brief is \
+    // The intake task rides the system prompt rather than one turn's
+    // context: it is not finished until the brief is, which may take several
+    // exchanges, and a task that fell out of context after one turn would be
+    // abandoned halfway through gathering.
+    if let Some(ref task) = intake_task {
+        system_prompt.push(format!(
+            "<intake>\nThis project cannot be worked on until its brief is \
                  complete. That is your first job, ahead of any code.\n\n{task}\n</intake>"
+        ));
+    }
+
+    // What this project has already been observed to have solved, from the
+    // recorder in the body's memory. Once at session start rather than per
+    // turn: it describes the project, not the question, so re-fetching it
+    // every turn would pay for the same block over and over — which is the
+    // exact waste the recorder exists to stop.
+    //
+    // Silent when the recorder is unreachable. It enriches a session; losing
+    // it costs context, not the session.
+    // What the owner has reserved for their own decision. Read from the body,
+    // where the categories are the owner's standing policy across every
+    // project and every agent — not restated here, and not classified here
+    // either: the service's own hook does that for any agent on this machine.
+    // Telling the model in advance saves the turn it would otherwise spend
+    // discovering a stop.
+    mark("before-plugins", booted_at);
+    // The rules that apply to every action, fetched once. They were parsed
+    // and dropped before this, so the agent never saw them at all; in the
+    // cached prefix they cost almost nothing after the first turn.
+    if let Some(block) = timed("rules (always)", crate::rules::session_context) {
+        system_prompt.push(block);
+    }
+
+    // The skills this machine has, as an INDEX: what exists and what each is
+    // for, never the bodies. The store holds the operator's own skills and
+    // the bundles installed under other agents' folders, so this is the same
+    // set every agent here sees rather than a copy kept per checkout.
+    //
+    // Bodies are deliberately left out. Measured against the running store,
+    // fifty-five installed skills came to 21,323 characters of names and
+    // descriptions alone; carrying their text as well would spend the budget
+    // on skills the work never touches. One is read when it is asked for.
+    if let Some(block) = timed("skills", || {
+        crate::skills::session_context(&incord_code_dir)
+    }) {
+        system_prompt.push(block);
+    }
+
+    if admin.plugins.guards {
+        if let Some(block) = timed("guards", crate::guards::context_for_session) {
+            system_prompt.push(block);
+        }
+    }
+
+    // What the auditor already knows is wrong here. Same shape as the
+    // recorder block and for the same reason: rediscovering a filed bug
+    // costs a turn, and the finding is already written down.
+    if let Some(prefetch) = auditor_prefetch {
+        // Started before the tool probe; collected here. A panicked thread
+        // is treated as no findings, never as an excuse to fetch again on
+        // the waiting path — that is the deadline this exists to escape.
+        if let Some(block) = timed("auditor", || prefetch.join().ok().flatten()) {
+            render::print_info(&format!(
+                "auditor: {} open finding(s) in this project",
+                block.lines().count().saturating_sub(1)
             ));
-        }
-
-        // What this project has already been observed to have solved, from the
-        // recorder in the body's memory. Once at session start rather than per
-        // turn: it describes the project, not the question, so re-fetching it
-        // every turn would pay for the same block over and over — which is the
-        // exact waste the recorder exists to stop.
-        //
-        // Silent when the recorder is unreachable. It enriches a session; losing
-        // it costs context, not the session.
-        // What the owner has reserved for their own decision. Read from the body,
-        // where the categories are the owner's standing policy across every
-        // project and every agent — not restated here, and not classified here
-        // either: the service's own hook does that for any agent on this machine.
-        // Telling the model in advance saves the turn it would otherwise spend
-        // discovering a stop.
-        mark("before-plugins", booted_at);
-        // The rules that apply to every action, fetched once. They were parsed
-        // and dropped before this, so the agent never saw them at all; in the
-        // cached prefix they cost almost nothing after the first turn.
-        if let Some(block) = timed("rules (always)", crate::rules::session_context) {
             system_prompt.push(block);
         }
+    }
 
-        // The skills this machine has, as an INDEX: what exists and what each is
-        // for, never the bodies. The store holds the operator's own skills and
-        // the bundles installed under other agents' folders, so this is the same
-        // set every agent here sees rather than a copy kept per checkout.
-        //
-        // Bodies are deliberately left out. Measured against the running store,
-        // fifty-five installed skills came to 21,323 characters of names and
-        // descriptions alone; carrying their text as well would spend the budget
-        // on skills the work never touches. One is read when it is asked for.
-        if let Some(block) = timed("skills", || {
-            crate::skills::session_context(&incord_code_dir)
-        }) {
-            system_prompt.push(block);
-        }
-
-        if admin.plugins.guards {
-            if let Some(block) = timed("guards", crate::guards::context_for_session) {
-                system_prompt.push(block);
-            }
-        }
-
-        // What the auditor already knows is wrong here. Same shape as the
-        // recorder block and for the same reason: rediscovering a filed bug
-        // costs a turn, and the finding is already written down.
-        if let Some(prefetch) = auditor_prefetch {
-            // Started before the tool probe; collected here. A panicked thread
-            // is treated as no findings, never as an excuse to fetch again on
-            // the waiting path — that is the deadline this exists to escape.
-            if let Some(block) = timed("auditor", || prefetch.join().ok().flatten()) {
+    if let Some(prefetch) = recorder_prefetch {
+        if let Some(block) = timed("recorder", || prefetch.join().ok().flatten()) {
+            // Said out loud, for the same reason the fleet and the ceiling
+            // are: context the operator cannot see is context they cannot
+            // correct.
+            if block.contains("Already solved in this project") {
                 render::print_info(&format!(
-                    "auditor: {} open finding(s) in this project",
+                    "recorder: {} already solved in this project",
                     block.lines().count().saturating_sub(1)
                 ));
-                system_prompt.push(block);
-            }
-        }
-
-        if let Some(prefetch) = recorder_prefetch {
-            if let Some(block) = timed("recorder", || prefetch.join().ok().flatten()) {
-                // Said out loud, for the same reason the fleet and the ceiling
-                // are: context the operator cannot see is context they cannot
-                // correct.
-                if block.contains("Already solved in this project") {
-                    render::print_info(&format!(
-                        "recorder: {} already solved in this project",
-                        block.lines().count().saturating_sub(1)
-                    ));
-                } else {
-                    render::print_info(
+            } else {
+                render::print_info(
                         "recorder: no past handoff recorded yet (live session facts capture real-time state)",
                     );
-                }
-                system_prompt.push(block);
             }
-        }
-
-        // Read BEFORE the provider client is built. These lines tell the
-        // operator what the fleet resolved to and warn about a reviewer
-        // sharing the writer's lineage — and a diagnostic printed after a
-        // failed client build is one nobody ever sees.
-        // Which model serves which kind of delegated work. Read once here so the
-        // fleet is visible at startup rather than inferred from a bill later.
-        let roles = admin.resolve_roles().value;
-        if !roles.is_empty() {
-            render::print_info(&roles.summary_line());
-        }
-        // A ceiling nobody can see is a ceiling nobody plans around.
-        // A reviewer sharing the writer's lineage reads as independent and is
-        // not. Warned loudly rather than refused: the operator may know
-        // something the harness does not, but they should know they did it.
-        if let Some(warning) = roles.review_independence_warning() {
-            render::print_error(&warning);
-        }
-        let budget = admin.resolve_budget().value;
-        if let Some(line) = budget.summary_line() {
-            render::print_info(&line);
-        }
-        // The orchestrator cannot choose a role it has not been told about. This
-        // block carries both the choices and the rule that a role never settles
-        // whether the work is correct.
-        if let Some(block) = roles.prompt_block() {
             system_prompt.push(block);
         }
-        // The agent that will do the work.
-        //
-        // TWO ROUTES, and this harness keeps the judging on both — the ledger,
-        // the check, the guards, the contracts, the budget, the owner channel.
-        //
-        // An installed agent on the operator's own subscription brings its own
-        // tools and needs no credential here. A model over a configured
-        // endpoint brings nothing, so the harness supplies the tools itself
-        // (see `crate::toolbox`) and the endpoint comes from the environment.
-        //
-        // NEITHER means no way to do anything, which is fatal and said plainly
-        // rather than discovered at the first prompt.
-        //
-        // Both routes are in ONE catalogue, read once here and kept for
-        // `/agent` and `/run`: the lead is the operator's choice when usable,
-        // else the first usable local agent, else a usable API agent.
-        let catalogue = timed("agent catalogue", || {
-            crate::agent::catalogue::Catalogue::gather(&admin.api_providers)
-        });
-        let agent = catalogue
-            .lead(crate::agent::registry::preferred_agent().as_deref())
-            .map_err(|e| anyhow::anyhow!(e))?;
-        // Everything installed and drivable. With more than one, roles can route
-        // between them and work can move when one runs out.
-        let fleet = timed("agent discovery", || {
-            mark("fleet", booted_at);
-            crate::fleet::Fleet::new(crate::agent::discover())
-        });
-        render::print_info(&fleet.summary_line());
+    }
 
-        // The protected paths reach the agent as deny rules it enforces itself,
-        // so a write to one never happens — prevention, with the sentinel in
-        // `agent::worker` behind it for whatever the rules did not cover.
-        mark("before-guards", booted_at);
-        let session_guards = crate::guards::Guards::load(&workspace).map_err(|e| {
+    // Read BEFORE the provider client is built. These lines tell the
+    // operator what the fleet resolved to and warn about a reviewer
+    // sharing the writer's lineage — and a diagnostic printed after a
+    // failed client build is one nobody ever sees.
+    // Which model serves which kind of delegated work. Read once here so the
+    // fleet is visible at startup rather than inferred from a bill later.
+    let roles = admin.resolve_roles().value;
+    if !roles.is_empty() {
+        render::print_info(&roles.summary_line());
+    }
+    // A ceiling nobody can see is a ceiling nobody plans around.
+    // A reviewer sharing the writer's lineage reads as independent and is
+    // not. Warned loudly rather than refused: the operator may know
+    // something the harness does not, but they should know they did it.
+    if let Some(warning) = roles.review_independence_warning() {
+        render::print_error(&warning);
+    }
+    let budget = admin.resolve_budget().value;
+    if let Some(line) = budget.summary_line() {
+        render::print_info(&line);
+    }
+    // The orchestrator cannot choose a role it has not been told about. This
+    // block carries both the choices and the rule that a role never settles
+    // whether the work is correct.
+    if let Some(block) = roles.prompt_block() {
+        system_prompt.push(block);
+    }
+    // The agent that will do the work.
+    //
+    // TWO ROUTES, and this harness keeps the judging on both — the ledger,
+    // the check, the guards, the contracts, the budget, the owner channel.
+    //
+    // An installed agent on the operator's own subscription brings its own
+    // tools and needs no credential here. A model over a configured
+    // endpoint brings nothing, so the harness supplies the tools itself
+    // (see `crate::toolbox`) and the endpoint comes from the environment.
+    //
+    // NEITHER means no way to do anything, which is fatal and said plainly
+    // rather than discovered at the first prompt.
+    //
+    // Both routes are in ONE catalogue, read once here and kept for
+    // `/agent` and `/run`: the lead is the operator's choice when usable,
+    // else the first usable local agent, else a usable API agent.
+    let catalogue = timed("agent catalogue", || {
+        crate::agent::catalogue::Catalogue::gather(&admin.api_providers)
+    });
+    let agent = catalogue
+        .lead(crate::agent::registry::preferred_agent().as_deref())
+        .map_err(|e| anyhow::anyhow!(e))?;
+    // Everything installed and drivable. With more than one, roles can route
+    // between them and work can move when one runs out.
+    let fleet = timed("agent discovery", || {
+        mark("fleet", booted_at);
+        crate::fleet::Fleet::new(crate::agent::discover())
+    });
+    render::print_info(&fleet.summary_line());
+
+    // The protected paths reach the agent as deny rules it enforces itself,
+    // so a write to one never happens — prevention, with the sentinel in
+    // `agent::worker` behind it for whatever the rules did not cover.
+    mark("before-guards", booted_at);
+    let session_guards = crate::guards::Guards::load(&workspace).map_err(|e| {
             anyhow::anyhow!(
                 "the protected-path policy could not be read ({e}). Running without it would leave the check editable by the thing being judged."
             )
         })?;
 
-        // Ctrl-C during a turn. The line editor handles it while reading a
-        // line; this covers the rest. The agent runs as a child process, so
-        // stopping it means killing that process — the token is checked between
-        // output lines and the child is killed when it is set.
-        let cancel = crate::runtime::cancel::CancelToken::new();
+    let standby: Vec<Box<dyn crate::agent::AgentBackend>> = fleet
+        .agents()
+        .iter()
+        .filter(|a| a.id != agent.id)
+        .map(|other| {
+            run_backend(
+                &workspace,
+                &other.id,
+                &other.command,
+                &session_guards,
+                &system_prompt,
+            )
+        })
+        .collect();
+    if !standby.is_empty() {
+        render::print_info(&format!(
+            "{} standby agent(s) available if this one cannot do the work.",
+            standby.len()
+        ));
+    }
+
+    let mut session = crate::cli::agent_turn::AgentSession::new(
+        workspace.clone(),
+        &agent.id,
+        agent.command.clone(),
+        &session_guards,
+        // Everything assembled above — the intake task, the guard rules, the
+        // auditor's findings, the recorder's handoff, the role table. This
+        // was built and DROPPED when the harness stopped owning the loop:
+        // it compiled, the tests passed, and the agent silently stopped
+        // being told any of it.
+        system_prompt.clone(),
+    )
+    .with_standby(standby)
+    .with_cancel(cancel.clone())
+    .with_extra_dirs(config.additional_dirs.clone());
+    if !config.additional_dirs.is_empty() {
+        render::print_info(&format!(
+            "Also working in {} additional director(ies) — guards and undo cover them.",
+            config.additional_dirs.len()
+        ));
+    }
+    // The mode the operator asked for, sent to the thing that does the
+    // writing. Shown in the banner and never sent, `-p read-only` let an
+    // operator believe nothing could be written while the agent wrote.
+    session.set_permission_mode(permission_mode.agent_mode());
+
+    // `-m` first, then the role table. A model named on the command line is
+    // the most specific thing the operator said, and it was previously
+    // reported by `/admin` while the session ran on something else.
+    match config.model_from_flag.as_deref() {
+        Some(model) => session.set_models(&[model.to_string()]),
+        None => {
+            // Role routing applies to interactive work too: the model the
+            // session opens on is the one chosen for conversation.
+            let session_models = roles.candidates_for("plan");
+            if !session_models.is_empty() {
+                session.set_models(session_models);
+            }
+        }
+    }
+
+    Ok(Prepared {
+        workspace,
+        incord_code_dir,
+        admin,
+        permission_mode,
+        tool_cache,
+        lifecycle_hooks,
+        git_context,
+        system_prompt,
+        catalogue,
+        agent,
+        fleet,
+        session,
+    })
+}
+
+impl CliApp {
+    /// The interactive loop over a session [`prepare_session`] built.
+    fn repl(
+        self,
+        prepared: Prepared,
+        cancel: crate::runtime::cancel::CancelToken,
+        booted_at: std::time::Instant,
+    ) -> anyhow::Result<()> {
+        let Prepared {
+            workspace,
+            incord_code_dir,
+            admin,
+            permission_mode,
+            tool_cache,
+            lifecycle_hooks,
+            git_context,
+            system_prompt,
+            catalogue,
+            agent,
+            fleet,
+            mut session,
+        } = prepared;
         let turn_cancel = cancel.clone();
         tokio::spawn(async move {
             loop {
@@ -438,69 +579,7 @@ impl CliApp {
                 turn_cancel.cancel();
             }
         });
-
-        let standby: Vec<Box<dyn crate::agent::AgentBackend>> = fleet
-            .agents()
-            .iter()
-            .filter(|a| a.id != agent.id)
-            .map(|other| {
-                run_backend(
-                    &workspace,
-                    &other.id,
-                    &other.command,
-                    &session_guards,
-                    &system_prompt,
-                )
-            })
-            .collect();
-        if !standby.is_empty() {
-            render::print_info(&format!(
-                "{} standby agent(s) available if this one cannot do the work.",
-                standby.len()
-            ));
-        }
-
-        let mut session = crate::cli::agent_turn::AgentSession::new(
-            workspace.clone(),
-            &agent.id,
-            agent.command.clone(),
-            &session_guards,
-            // Everything assembled above — the intake task, the guard rules, the
-            // auditor's findings, the recorder's handoff, the role table. This
-            // was built and DROPPED when the harness stopped owning the loop:
-            // it compiled, the tests passed, and the agent silently stopped
-            // being told any of it.
-            system_prompt.clone(),
-        )
-        .with_standby(standby)
-        .with_cancel(cancel.clone())
-        .with_extra_dirs(self.config.additional_dirs.clone());
         let mut extra_dirs = self.config.additional_dirs.clone();
-        if !extra_dirs.is_empty() {
-            render::print_info(&format!(
-                "Also working in {} additional director(ies) — guards and undo cover them.",
-                extra_dirs.len()
-            ));
-        }
-        // The mode the operator asked for, sent to the thing that does the
-        // writing. Shown in the banner and never sent, `-p read-only` let an
-        // operator believe nothing could be written while the agent wrote.
-        session.set_permission_mode(permission_mode.agent_mode());
-
-        // `-m` first, then the role table. A model named on the command line is
-        // the most specific thing the operator said, and it was previously
-        // reported by `/admin` while the session ran on something else.
-        match self.config.model_from_flag.as_deref() {
-            Some(model) => session.set_models(&[model.to_string()]),
-            None => {
-                // Role routing applies to interactive work too: the model the
-                // session opens on is the one chosen for conversation.
-                let session_models = roles.candidates_for("plan");
-                if !session_models.is_empty() {
-                    session.set_models(session_models);
-                }
-            }
-        }
 
         // Tell the memory store which conversation and workspace it is serving.
         // Done here rather than at load time because the conversation id only
@@ -2021,6 +2100,48 @@ fn run_one_turn(
     augmented: &str,
     line: &str,
 ) -> Result<(), String> {
+    match plan_turn(session, workspace, augmented, line) {
+        TurnPlan::NextQuestion(menu) => {
+            render::print_info(&menu);
+            Ok(())
+        }
+        TurnPlan::Greeting(reply) => {
+            render::print_assistant(&reply);
+            Ok(())
+        }
+        TurnPlan::Agent {
+            instruction,
+            context,
+        } => one_turn_with_context(session, workspace, &instruction, context),
+    }
+}
+
+/// What one line of input becomes, decided before any agent is started.
+///
+/// Shared by the REPL and `incode --acp` so the two cannot disagree about what
+/// a line MEANS — an answer to a pending question, a greeting, or work.
+pub(crate) enum TurnPlan {
+    /// The line answered a question and another is now showing. Nothing is
+    /// sent to the agent yet; this is the next question's menu.
+    NextQuestion(String),
+    /// A bare greeting, answered here without starting an agent.
+    Greeting(String),
+    /// A turn for the agent: what it is asked, and the context that goes
+    /// before it.
+    Agent {
+        instruction: String,
+        context: Vec<String>,
+    },
+}
+
+/// Decide what `line` is. `augmented` is what the agent is sent for ordinary
+/// work; `line` is what the person typed.
+pub(crate) fn plan_turn(
+    session: &mut crate::cli::agent_turn::AgentSession,
+    workspace: &Path,
+    augmented: &str,
+    line: &str,
+) -> TurnPlan {
     // A question was put to the owner and this line is the reply. Read as the
     // ANSWER rather than as a fresh instruction: "b" typed after a menu means
     // the second option, and forwarding it verbatim would send the agent a
@@ -2031,11 +2152,13 @@ fn run_one_turn(
         // two things and is owed both answers, and a turn per answer would pay
         // for the same conversation twice.
         crate::cli::agent_turn::Answered::AskedTheNext(menu) => {
-            render::print_info(&menu);
-            return Ok(());
+            return TurnPlan::NextQuestion(menu);
         }
         crate::cli::agent_turn::Answered::Ready(instruction) => {
-            return one_turn(session, workspace, &instruction, line);
+            return TurnPlan::Agent {
+                instruction,
+                context: Vec::new(),
+            };
         }
     }
 
@@ -2061,8 +2184,7 @@ fn run_one_turn(
     // the harness answers it itself, instantly and for nothing, and the agent
     // is started when there is actually work.
     if crate::text::is_greeting(line) {
-        render::print_assistant(&crate::text::greeting_reply(workspace));
-        return Ok(());
+        return TurnPlan::Greeting(crate::text::greeting_reply(workspace));
     }
 
     let mut context = Vec::new();
@@ -2070,17 +2192,10 @@ fn run_one_turn(
         context.push(rules);
     }
 
-    one_turn_with_context(session, workspace, augmented, context)
-}
-
-/// One turn with context already assembled.
-fn one_turn(
-    session: &mut crate::cli::agent_turn::AgentSession,
-    workspace: &Path,
-    instruction: &str,
-    _line: &str,
-) -> Result<(), String> {
-    one_turn_with_context(session, workspace, instruction, Vec::new())
+    TurnPlan::Agent {
+        instruction: augmented.to_string(),
+        context,
+    }
 }
 
 /// The turn itself: spinner, streaming, and what the outcome means.

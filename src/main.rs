@@ -32,6 +32,11 @@ OPTIONS:
                               client, not by hand; stdout is the protocol.
         --desktop-journal <P> With --desktop-mcp, append what the desktop did to
                               this file so --serve can stream it to a watcher
+        --acp                 Speak the Agent Client Protocol on stdin/stdout, as
+                              the agent an editor drives. Launched BY an ACP
+                              client, not by hand; stdout is the protocol.
+                              Takes -p (read-only | workspace-write |
+                              danger-full-access), -m and --no-env-filter
         --team-mcp            Speak MCP on stdin/stdout so a running agent can
                               reach its teammates. Needs --team-channel
         --team-channel <P>    The conversation --team-mcp joins
@@ -117,6 +122,13 @@ fn main() -> anyhow::Result<()> {
             );
             incord_code::desktop::mcp::run_stdio(server)?;
             return Ok(());
+        }
+        Parsed::Acp(config) => {
+            // Its own threads, no runtime around them: the protocol is a
+            // line-oriented pipe, and the HTTP helpers bring their own runtime
+            // when none is ambient. Nothing may reach stdout — `run_stdio`
+            // moves the standard handles before anything is printed.
+            return incord_code::acp_agent::run_stdio(*config);
         }
         Parsed::TeamMcp { channel } => {
             let speaking_as = incord_code::team_mcp::Server::identity_from_env();
@@ -292,6 +304,13 @@ enum Parsed {
     TeamMcp {
         channel: std::path::PathBuf,
     },
+
+    /// Be an Agent Client Protocol agent on stdio.
+    ///
+    /// Carries the config for the flags that apply to every session it opens
+    /// (`-p`, `-m`, `--no-env-filter`). The workspace does NOT come from here:
+    /// each `session/new` names its own `cwd`.
+    Acp(Box<IncordCodeConfig>),
 }
 
 /// Parse command-line arguments into a config.
@@ -312,6 +331,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> anyhow::Result<Parsed> {
     let mut check_findings: Option<String> = None;
     let mut team_mcp = false;
     let mut team_channel: Option<std::path::PathBuf> = None;
+    let mut acp = false;
     // `None` asks the OS for a free port and publishes the answer, so nothing
     // collides with whatever else this machine is already running.
     let mut port: Option<u16> = None;
@@ -391,6 +411,8 @@ fn parse_args(args: impl Iterator<Item = String>) -> anyhow::Result<Parsed> {
             // where the workspace is known.
             "--desktop-stop" => desktop_stop = true,
             "--team-mcp" => team_mcp = true,
+            // Answered after the loop, before the workspace check.
+            "--acp" => acp = true,
             // Which conversation. A PATH, like --desktop-journal: this process
             // is told the one file it may append to rather than given a
             // workspace to find its own way around.
@@ -399,6 +421,48 @@ fn parse_args(args: impl Iterator<Item = String>) -> anyhow::Result<Parsed> {
             }
             other => anyhow::bail!("unknown argument `{other}`\n\n{USAGE}"),
         }
+    }
+
+    // FIRST, and before the workspace check: an ACP client launches this from
+    // whatever directory it has, and every session names its own `cwd`.
+    if acp {
+        let other_mode = task.is_some()
+            || serve
+            || admin_only
+            || desktop_mcp
+            || desktop_stop
+            || team_mcp
+            || check_findings.is_some()
+            || desktop_journal.is_some()
+            || team_channel.is_some();
+        if other_mode {
+            anyhow::bail!("`--acp` is its own mode and cannot be combined with another\n\n{USAGE}");
+        }
+        // Each is refused rather than ignored: the client picks the workspace
+        // and the conversation per session, and a flag that silently did
+        // nothing would be believed.
+        if config.resume_session.is_some() || !config.additional_dirs.is_empty() {
+            anyhow::bail!(
+                "`--resume` and `--add-dir` do not apply to `--acp`: the client names each \
+                 session's workspace\n\n{USAGE}"
+            );
+        }
+        // The modes a client can be offered. `prompt` and `allow` have no ACP
+        // mode to show as current, so a session could not say what it runs as.
+        if !matches!(
+            PermissionMode::parse(&config.permission_mode),
+            Some(
+                PermissionMode::ReadOnly
+                    | PermissionMode::WorkspaceWrite
+                    | PermissionMode::DangerFullAccess
+            )
+        ) {
+            anyhow::bail!(
+                "`--acp` runs as read-only, workspace-write or danger-full-access, not `{}`",
+                config.permission_mode
+            );
+        }
+        return Ok(Parsed::Acp(Box::new(config)));
     }
 
     // BEFORE the workspace check, unlike every other mode. This process edits
@@ -827,10 +891,62 @@ mod tests {
             | Parsed::DesktopMcp { .. }
             | Parsed::DesktopStop { .. }
             | Parsed::CheckFindings { .. }
-            | Parsed::TeamMcp { .. } => {
+            | Parsed::TeamMcp { .. }
+            | Parsed::Acp(_) => {
                 panic!("expected a runnable config")
             }
         }
+    }
+
+    /// **`--acp` IS ITS OWN MODE, AND IT DOES NOT CARE WHERE IT WAS STARTED.**
+    ///
+    /// An ACP client launches the agent from whatever directory it has; each
+    /// session names its own `cwd`. So a missing `-w` directory must not stop
+    /// it, and the flags that apply to every session must survive the parse.
+    #[test]
+    fn acp_is_its_own_mode_and_carries_the_session_flags() {
+        match parse(&[
+            "--acp",
+            "-p",
+            "read-only",
+            "-m",
+            "opus",
+            "-w",
+            "/no/such/directory/anywhere",
+        ])
+        .expect("valid")
+        {
+            Parsed::Acp(config) => {
+                assert_eq!(config.permission_mode, "read-only");
+                assert_eq!(config.model_from_flag.as_deref(), Some("opus"));
+            }
+            other => panic!("--acp must be its own mode, got {other:?}"),
+        }
+    }
+
+    /// A mode no ACP session can show as current is refused, not mapped.
+    #[test]
+    fn acp_refuses_a_permission_mode_it_cannot_offer() {
+        for mode in ["prompt", "allow"] {
+            assert!(
+                parse(&["--acp", "-p", mode]).is_err(),
+                "`-p {mode}` must be refused under --acp"
+            );
+        }
+    }
+
+    /// Combined with another mode, one of them would be silently dropped.
+    #[test]
+    fn acp_cannot_be_combined_with_another_mode() {
+        assert!(parse(&["--acp", "--task", "do a thing"]).is_err());
+        assert!(parse(&["--acp", "--serve"]).is_err());
+        assert!(parse(&["--acp", "--resume", "abc"]).is_err());
+        assert!(parse(&["--acp", "--add-dir", "."]).is_err());
+    }
+
+    #[test]
+    fn acp_appears_in_the_usage() {
+        assert!(USAGE.contains("--acp"));
     }
 
     /// **`--serve` names no port, so nothing can collide.**

@@ -376,6 +376,29 @@ impl AgentSession {
         on_text: &mut dyn FnMut(&str),
         on_status: &mut dyn FnMut(&crate::cli::activity::Status),
     ) -> Result<TurnOutcome, String> {
+        self.turn_observed(workspace, instruction, context, on_text, on_status, None)
+    }
+
+    /// [`Self::turn`], with every agent event also handed to `observer`.
+    ///
+    /// # Why a second entry point and not a second turn
+    ///
+    /// A front end that is not a terminal — `incode --acp`, where an editor
+    /// draws the turn — needs the tool calls and their results as STRUCTURE,
+    /// not as the panels this session draws into the text for a terminal. Both
+    /// front ends must run the same turn (snapshot, guards, sentinel, standby,
+    /// follow-up, questions), so the turn is shared and only the presentation
+    /// differs: with an observer, tool result panels and edit blocks are left
+    /// out of `on_text`, because the observer presents them itself.
+    pub fn turn_observed(
+        &mut self,
+        workspace: &Path,
+        instruction: &str,
+        context: &[String],
+        on_text: &mut dyn FnMut(&str),
+        on_status: &mut dyn FnMut(&crate::cli::activity::Status),
+        mut observer: Option<&mut dyn FnMut(&AgentEvent)>,
+    ) -> Result<TurnOutcome, String> {
         // Cleared first: a Ctrl-C pressed while the prompt was waiting belongs
         // to no turn, and letting it leak in would cancel the next one instantly.
         if let Some(token) = &self.cancel {
@@ -461,107 +484,126 @@ impl AgentSession {
                                        edited: &mut crate::cli::edits::Watcher,
                                        mid_line: &mut bool,
                                        on_text: &mut dyn FnMut(&str),
-                                       on_status: &mut dyn FnMut(&crate::cli::activity::Status)|
+                                       on_status: &mut dyn FnMut(&crate::cli::activity::Status),
+                                       observer: &mut Option<&mut dyn FnMut(&AgentEvent)>|
          -> Result<TurnOutcome, crate::agent::AgentError> {
             saw_deltas = false;
-            backend.run_turn(&prompt, &mut |event: &AgentEvent| match event {
-                AgentEvent::TextDelta(fragment) => {
-                    saw_deltas = true;
-                    let visible = filter.push(fragment);
-                    if !visible.is_empty() {
-                        *mid_line = !visible.ends_with('\n');
-                        on_text(&visible);
-                    }
+            backend.run_turn(&prompt, &mut |event: &AgentEvent| {
+                if let Some(observe) = observer.as_mut() {
+                    observe(event);
                 }
-                AgentEvent::Text(text) => {
-                    // For backends that do not stream deltas (e.g. whole-message responses),
-                    // render the text unless streaming deltas have already been displayed.
-                    if !saw_deltas {
-                        let visible = filter.push(text);
+                match event {
+                    AgentEvent::TextDelta(fragment) => {
+                        saw_deltas = true;
+                        let visible = filter.push(fragment);
                         if !visible.is_empty() {
                             *mid_line = !visible.ends_with('\n');
                             on_text(&visible);
                         }
                     }
-                }
-                AgentEvent::ToolResult {
-                    id,
-                    output,
-                    is_error,
-                } => {
-                    // Named by the call that asked for it: a result arrives with
-                    // only an id, and an unnamed result is a wall of text with
-                    // nothing saying which tool produced it.
-                    let (tool, on) = tool_calls
-                        .get(id.as_str())
-                        .cloned()
-                        .unwrap_or_else(|| ("tool".to_string(), None));
-                    let width = crate::cli::activity::terminal_width().min(RESULT_WIDTH);
-                    // The panel owns whole rows. Without this its rule was
-                    // appended to whatever the reply had left unfinished.
-                    if *mid_line {
-                        on_text("\n");
-                        *mid_line = false;
+                    AgentEvent::Text(text) => {
+                        // For backends that do not stream deltas (e.g. whole-message responses),
+                        // render the text unless streaming deltas have already been displayed.
+                        if !saw_deltas {
+                            let visible = filter.push(text);
+                            if !visible.is_empty() {
+                                *mid_line = !visible.ends_with('\n');
+                                on_text(&visible);
+                            }
+                        }
                     }
+                    AgentEvent::ToolResult {
+                        id,
+                        output,
+                        is_error,
+                    } => {
+                        // Named by the call that asked for it: a result arrives with
+                        // only an id, and an unnamed result is a wall of text with
+                        // nothing saying which tool produced it.
+                        let (tool, on) = tool_calls
+                            .get(id.as_str())
+                            .cloned()
+                            .unwrap_or_else(|| ("tool".to_string(), None));
+                        let width = crate::cli::activity::terminal_width().min(RESULT_WIDTH);
+                        // Claimed before anything is drawn, so the turn's tally of
+                        // changed files is the same whoever presents the result.
+                        let edit_block = edited.returned(id, *is_error, width);
+                        // An observer presents results itself, as structure; a
+                        // panel drawn into the reply as well would show it twice.
+                        if observer.is_some() {
+                            return;
+                        }
+                        // The panel owns whole rows. Without this its rule was
+                        // appended to whatever the reply had left unfinished.
+                        if *mid_line {
+                            on_text("\n");
+                            *mid_line = false;
+                        }
 
-                    // A SUCCESSFUL edit is shown as the change itself.
-                    //
-                    // Only on success, and only here: a write can be refused by
-                    // the guards, by the agent's own permission mode, or by the
-                    // file system, and a diff printed when the call was MADE
-                    // would claim a change that never landed. A failure keeps
-                    // the ordinary panel, because the error text is the part
-                    // worth reading.
-                    if let Some(shown) = edited.returned(id, *is_error, width) {
-                        for line in shown {
+                        // A SUCCESSFUL edit is shown as the change itself.
+                        //
+                        // Only on success, and only here: a write can be refused by
+                        // the guards, by the agent's own permission mode, or by the
+                        // file system, and a diff printed when the call was MADE
+                        // would claim a change that never landed. A failure keeps
+                        // the ordinary panel, because the error text is the part
+                        // worth reading.
+                        if let Some(shown) = edit_block {
+                            for line in shown {
+                                on_text(&format!("{line}\n"));
+                            }
+                            return;
+                        }
+
+                        for line in crate::cli::panel::result(
+                            &tool,
+                            on.as_deref(),
+                            output,
+                            *is_error,
+                            width,
+                        ) {
                             on_text(&format!("{line}\n"));
                         }
-                        return;
                     }
-
-                    for line in
-                        crate::cli::panel::result(&tool, on.as_deref(), output, *is_error, width)
-                    {
-                        on_text(&format!("{line}\n"));
+                    AgentEvent::ToolUse { id, name, input } => {
+                        tool_calls
+                            .insert(id.clone(), (name.clone(), crate::cli::panel::target(input)));
+                        // Kept for the result to claim. Parsed HERE because the
+                        // call is the only place both sides of the change exist.
+                        edited.called(id, input);
+                        activity = crate::cli::activity::Activity::from_tool(name, input);
+                        on_status(&crate::cli::activity::Status {
+                            activity: activity.clone(),
+                            elapsed: started.elapsed().as_secs(),
+                            tokens: u64::from(turn_usage.input_tokens)
+                                + u64::from(turn_usage.output_tokens),
+                            progress: None,
+                        });
                     }
+                    AgentEvent::Quota {
+                        status, resets_at, ..
+                    } => *turn_quota = Some((status.clone(), *resets_at)),
+                    AgentEvent::Usage {
+                        input_tokens,
+                        output_tokens,
+                        cache_creation_tokens,
+                        cache_read_tokens,
+                    } => {
+                        // Cumulative for the turn: the last event is the truth, so
+                        // this REPLACES rather than adds.
+                        turn_usage.input_tokens = *input_tokens;
+                        turn_usage.output_tokens = *output_tokens;
+                        turn_usage.cache_creation_input_tokens = *cache_creation_tokens;
+                        turn_usage.cache_read_input_tokens = *cache_read_tokens;
+                        on_status(&crate::cli::activity::Status {
+                            activity: activity.clone(),
+                            elapsed: started.elapsed().as_secs(),
+                            tokens: u64::from(*input_tokens) + u64::from(*output_tokens),
+                            progress: None,
+                        });
+                    }
+                    _ => {}
                 }
-                AgentEvent::ToolUse { id, name, input } => {
-                    tool_calls.insert(id.clone(), (name.clone(), crate::cli::panel::target(input)));
-                    // Kept for the result to claim. Parsed HERE because the
-                    // call is the only place both sides of the change exist.
-                    edited.called(id, input);
-                    activity = crate::cli::activity::Activity::from_tool(name, input);
-                    on_status(&crate::cli::activity::Status {
-                        activity: activity.clone(),
-                        elapsed: started.elapsed().as_secs(),
-                        tokens: u64::from(turn_usage.input_tokens)
-                            + u64::from(turn_usage.output_tokens),
-                        progress: None,
-                    });
-                }
-                AgentEvent::Quota {
-                    status, resets_at, ..
-                } => *turn_quota = Some((status.clone(), *resets_at)),
-                AgentEvent::Usage {
-                    input_tokens,
-                    output_tokens,
-                    cache_creation_tokens,
-                    cache_read_tokens,
-                } => {
-                    // Cumulative for the turn: the last event is the truth, so
-                    // this REPLACES rather than adds.
-                    turn_usage.input_tokens = *input_tokens;
-                    turn_usage.output_tokens = *output_tokens;
-                    turn_usage.cache_creation_input_tokens = *cache_creation_tokens;
-                    turn_usage.cache_read_input_tokens = *cache_read_tokens;
-                    on_status(&crate::cli::activity::Status {
-                        activity: activity.clone(),
-                        elapsed: started.elapsed().as_secs(),
-                        tokens: u64::from(*input_tokens) + u64::from(*output_tokens),
-                        progress: None,
-                    });
-                }
-                _ => {}
             })
         };
 
@@ -575,6 +617,7 @@ impl AgentSession {
             &mut mid_line,
             on_text,
             on_status,
+            &mut observer,
         );
         let (mut attempt, mut agent_failed) = judged(self.backend.as_ref(), first_result);
         let mut failed_agent = self.backend.id().to_string();
@@ -611,6 +654,7 @@ impl AgentSession {
                 &mut mid_line,
                 on_text,
                 on_status,
+                &mut observer,
             );
             (attempt, agent_failed) = judged(self.standby[index].as_ref(), standby_result);
             failed_agent = took_over;
@@ -660,6 +704,11 @@ impl AgentSession {
                 let _ = self
                     .backend
                     .run_turn(&instruction, &mut |event: &AgentEvent| {
+                        // The follow-up is part of this turn, so an observer
+                        // sees its tool calls as it saw the first pass's.
+                        if let Some(observe) = observer.as_mut() {
+                            observe(event);
+                        }
                         if let AgentEvent::TextDelta(fragment) = event {
                             on_text(fragment);
                         }
