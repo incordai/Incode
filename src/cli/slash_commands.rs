@@ -47,6 +47,9 @@ pub enum SlashCommand {
     Roadmap,
     /// Show which models, ceiling and check this session resolved to.
     Admin,
+    /// List the agent catalogue, or choose the lead (`<id>`) or the
+    /// sub-agents (`sub <id>`).
+    Agent(Option<String>),
     Jobs,
     Kill(u32),
     Background(String),
@@ -89,6 +92,7 @@ impl SlashCommand {
             "/run" => Self::Run,
             "/roadmap" => Self::Roadmap,
             "/admin" => Self::Admin,
+            "/agent" => Self::Agent(arg),
             "/tools" | "/t" => Self::Tools,
             "/skills" | "/sk" => Self::Skills,
             "/mcp" => Self::Mcp,
@@ -243,6 +247,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
     (
         "/admin",
         "Show the operator's settings and which layer decided each",
+    ),
+    (
+        "/agent [id | sub [id]]",
+        "List every agent, or choose the lead or the sub-agents",
     ),
     (
         "/roadmap",
@@ -862,6 +870,95 @@ pub fn handle_model(current: &str, new_model: Option<&str>, switched: bool) {
     }
 }
 
+/// `/agent`: list the catalogue, or choose the lead or the sub-agents.
+///
+/// A choice is saved to admin.json and applies from the next `/run` and the
+/// next session. This conversation's agent is not swapped mid-flight: its
+/// transcript lives inside the agent that holds it.
+pub fn handle_agent(
+    arg: Option<&str>,
+    catalogue: &crate::agent::catalogue::Catalogue,
+    lead: &crate::agent::DetectedAgent,
+    data_dir: &std::path::Path,
+) {
+    match agent_command(arg, catalogue, lead, data_dir) {
+        Ok(text) => outln!("{}", text.trim_end()),
+        Err(why) => render::print_error(&why),
+    }
+}
+
+/// What `/agent` does with its argument, and what it says.
+///
+/// - nothing: the catalogue, the lead, and the sub-agents with where they
+///   came from;
+/// - `<id>`: saves the lead;
+/// - `sub <id>`: saves the sub-agents; `sub` or `sub same` clears that back
+///   to the lead's default.
+///
+/// An id must be in the catalogue and usable, or nothing is written. The
+/// settings file is READ before it is written, and a malformed one is refused
+/// rather than replaced by a file holding only this one choice.
+fn agent_command(
+    arg: Option<&str>,
+    catalogue: &crate::agent::catalogue::Catalogue,
+    lead: &crate::agent::DetectedAgent,
+    data_dir: &std::path::Path,
+) -> Result<String, String> {
+    let mut admin = crate::admin::AdminConfig::load(data_dir)?;
+    let Some(arg) = arg.map(str::trim).filter(|a| !a.is_empty()) else {
+        let sub = catalogue.sub_agent(lead, admin.sub_agent.as_deref());
+        return Ok(catalogue.report(lead, &sub, admin.resolve_agent().value.as_deref()));
+    };
+    let (word, rest) = arg
+        .split_once(char::is_whitespace)
+        .map_or((arg, ""), |(word, rest)| (word, rest.trim()));
+    const APPLIES: &str = "Applies from the next /run and the next session.";
+
+    if word.eq_ignore_ascii_case("sub") {
+        if rest.is_empty() || rest.eq_ignore_ascii_case("same") {
+            admin.sub_agent = None;
+            admin.save(data_dir)?;
+            return Ok(format!(
+                "Sub-agents follow the lead's default again. {APPLIES}"
+            ));
+        }
+        let chosen = catalogue.route_for(rest)?;
+        admin.sub_agent = Some(chosen.id.clone());
+        admin.save(data_dir)?;
+        return Ok(format!(
+            "Sub-agents: {} (your choice), saved to admin.json. {APPLIES}",
+            chosen.id
+        ));
+    }
+    if !rest.is_empty() {
+        return Err("/agent [id | sub [id]]  (one id at a time)".to_string());
+    }
+
+    let chosen = catalogue.route_for(word)?;
+    admin.agent = Some(chosen.id.clone());
+    admin.save(data_dir)?;
+    let mut said = if chosen.id == lead.id {
+        format!(
+            "Lead: {} saved to admin.json — already this session's lead.",
+            chosen.id
+        )
+    } else {
+        format!(
+            "Lead: {} saved to admin.json. {APPLIES} This conversation stays on {}.",
+            chosen.id, lead.id
+        )
+    };
+    if crate::admin::AdminConfig::default().resolve_agent().source
+        == crate::admin::Source::Environment
+    {
+        said.push_str(&format!(
+            "\n{} is set in this shell and overrides the saved choice until it is unset.",
+            crate::admin::AGENT_ENV
+        ));
+    }
+    Ok(said)
+}
+
 // ---------------------------------------------------------------------------
 // Provider registry handler
 // ---------------------------------------------------------------------------
@@ -1177,6 +1274,190 @@ mod tests {
         assert_eq!(SlashCommand::parse("/undo"), Some(SlashCommand::Undo));
         assert_eq!(SlashCommand::parse("/u"), Some(SlashCommand::Undo));
         assert_eq!(SlashCommand::parse("/UNDO"), Some(SlashCommand::Undo));
+    }
+
+    fn agent_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::brief::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn installed(id: &str, protocol: crate::agent::Protocol) -> crate::agent::DetectedAgent {
+        crate::agent::DetectedAgent {
+            id: id.to_string(),
+            display_name: id.to_string(),
+            command: id.to_string(),
+            path: None,
+            version: Some("1.0".to_string()),
+            protocol,
+        }
+    }
+
+    /// Two usable local agents and one that is found but cannot be driven.
+    fn two_agents_and_one_unverified() -> crate::agent::catalogue::Catalogue {
+        crate::agent::catalogue::Catalogue::of_local(vec![
+            installed("claude-code", crate::agent::Protocol::ClaudeStreamJson),
+            installed(
+                crate::agent::registry::CODEX,
+                crate::agent::Protocol::CodexJson,
+            ),
+            installed("cursor", crate::agent::Protocol::Unverified),
+        ])
+    }
+
+    fn session_lead() -> crate::agent::DetectedAgent {
+        installed("claude-code", crate::agent::Protocol::ClaudeStreamJson)
+    }
+
+    #[test]
+    fn parses_agent() {
+        assert_eq!(
+            SlashCommand::parse("/agent"),
+            Some(SlashCommand::Agent(None))
+        );
+        assert_eq!(
+            SlashCommand::parse("/agent sub codex"),
+            Some(SlashCommand::Agent(Some("sub codex".to_string())))
+        );
+    }
+
+    /// **`/agent <unknown>` is refused, and nothing is written.** A choice that
+    /// saved a name nothing answers to would fall back in silence next session.
+    #[test]
+    fn an_unknown_agent_is_refused_and_nothing_is_written() {
+        let _guard = agent_lock();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let said = agent_command(
+            Some("no-such-agent"),
+            &two_agents_and_one_unverified(),
+            &session_lead(),
+            dir.path(),
+        );
+        assert!(
+            said.as_ref()
+                .is_err_and(|why| why.contains("not in the catalogue") && why.contains("codex")),
+            "it must refuse and name what exists: {said:?}"
+        );
+        assert!(
+            !crate::admin::AdminConfig::path_in(dir.path()).exists(),
+            "a refused choice wrote the settings file"
+        );
+    }
+
+    /// A known agent that cannot be used is refused with the reason, and
+    /// nothing is written either.
+    #[test]
+    fn an_agent_that_cannot_be_used_is_refused_with_the_reason() {
+        let _guard = agent_lock();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let said = agent_command(
+            Some("cursor"),
+            &two_agents_and_one_unverified(),
+            &session_lead(),
+            dir.path(),
+        );
+        assert!(
+            said.as_ref()
+                .is_err_and(|why| why.contains("cannot be used") && why.contains("protocol")),
+            "{said:?}"
+        );
+        assert!(!crate::admin::AdminConfig::path_in(dir.path()).exists());
+    }
+
+    /// **`/agent <known>` persists the lead to admin.json**, by its catalogue
+    /// id, and keeps every other setting already in the file.
+    #[test]
+    fn a_known_agent_is_saved_as_the_lead_in_admin_json() {
+        let _guard = agent_lock();
+        let dir = tempfile::tempdir().expect("temp dir");
+        crate::admin::AdminConfig {
+            model: Some("kept-model".to_string()),
+            ..Default::default()
+        }
+        .save(dir.path())
+        .expect("seed");
+
+        let said = agent_command(
+            Some("CODEX"),
+            &two_agents_and_one_unverified(),
+            &session_lead(),
+            dir.path(),
+        );
+        assert!(
+            said.as_ref()
+                .is_ok_and(|text| text.contains("next session")),
+            "{said:?}"
+        );
+        let saved = crate::admin::AdminConfig::load(dir.path()).expect("load");
+        assert_eq!(saved.agent.as_deref(), Some(crate::agent::registry::CODEX));
+        assert_eq!(saved.model.as_deref(), Some("kept-model"));
+    }
+
+    /// **`/agent sub <id>` saves the sub-agents; `/agent sub` puts them back
+    /// to the lead's default** — and bare `/agent` says which it is.
+    #[test]
+    fn the_sub_agent_is_saved_shown_and_cleared() {
+        let _guard = agent_lock();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let catalogue = two_agents_and_one_unverified();
+        let lead = session_lead();
+
+        agent_command(Some("sub codex"), &catalogue, &lead, dir.path()).expect("saves");
+        let saved = crate::admin::AdminConfig::load(dir.path()).expect("load");
+        assert_eq!(
+            saved.sub_agent.as_deref(),
+            Some(crate::agent::registry::CODEX)
+        );
+        assert_eq!(
+            saved.agent, None,
+            "choosing sub-agents must not move the lead"
+        );
+        let listing = agent_command(None, &catalogue, &lead, dir.path()).expect("lists");
+        assert!(
+            listing.contains("sub-agents   codex (your choice)"),
+            "{listing}"
+        );
+
+        assert!(agent_command(Some("sub cursor"), &catalogue, &lead, dir.path()).is_err());
+        assert_eq!(
+            crate::admin::AdminConfig::load(dir.path())
+                .expect("load")
+                .sub_agent
+                .as_deref(),
+            Some(crate::agent::registry::CODEX),
+            "a refused choice must leave the saved one alone"
+        );
+
+        agent_command(Some("sub same"), &catalogue, &lead, dir.path()).expect("clears");
+        assert_eq!(
+            crate::admin::AdminConfig::load(dir.path())
+                .expect("load")
+                .sub_agent,
+            None
+        );
+        let listing = agent_command(None, &catalogue, &lead, dir.path()).expect("lists");
+        assert!(
+            listing.contains("sub-agents   claude-code (default for claude-code)"),
+            "{listing}"
+        );
+    }
+
+    /// A settings file that does not parse is refused, not replaced by one
+    /// holding only this choice — that would erase every other setting.
+    #[test]
+    fn a_malformed_settings_file_is_not_overwritten() {
+        let _guard = agent_lock();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = crate::admin::AdminConfig::path_in(dir.path());
+        std::fs::write(&path, "{ not json").expect("write");
+        let said = agent_command(
+            Some("codex"),
+            &two_agents_and_one_unverified(),
+            &session_lead(),
+            dir.path(),
+        );
+        assert!(said.is_err(), "{said:?}");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "{ not json");
     }
 
     #[test]

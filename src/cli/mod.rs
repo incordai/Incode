@@ -396,7 +396,16 @@ impl CliApp {
         //
         // NEITHER means no way to do anything, which is fatal and said plainly
         // rather than discovered at the first prompt.
-        let agent = crate::agent::registry::require_route().map_err(|e| anyhow::anyhow!(e))?;
+        //
+        // Both routes are in ONE catalogue, read once here and kept for
+        // `/agent` and `/run`: the lead is the operator's choice when usable,
+        // else the first usable local agent, else a usable API agent.
+        let catalogue = timed("agent catalogue", || {
+            crate::agent::catalogue::Catalogue::gather(&admin.api_providers)
+        });
+        let agent = catalogue
+            .lead(crate::agent::registry::preferred_agent().as_deref())
+            .map_err(|e| anyhow::anyhow!(e))?;
         // Everything installed and drivable. With more than one, roles can route
         // between them and work can move when one runs out.
         let fleet = timed("agent discovery", || {
@@ -792,16 +801,35 @@ impl CliApp {
                         // down costs the note and never the work — see
                         // `runner::WorkJournal`.
                         let mut journal = crate::runner::MemoryJournal;
-                        let agent = match crate::agent::registry::require_route() {
+                        // The lead from the session's catalogue, by the choice
+                        // as it stands NOW — so a `/agent` made in this session
+                        // applies from the next `/run`.
+                        let agent = match catalogue
+                            .lead(crate::agent::registry::preferred_agent().as_deref())
+                        {
                             Ok(found) => found,
                             Err(why) => {
                                 render::print_error(&why);
                                 continue;
                             }
                         };
+                        // THE AGENT THAT WORKS THE TASKS: the lead's sub-agent,
+                        // which is the lead itself unless the operator chose
+                        // another (`/agent sub <id>`) or the built-in table
+                        // pairs it with one. Read fresh for the same reason.
+                        let sub = catalogue.sub_agent(
+                            &agent,
+                            crate::admin::AdminConfig::load_default()
+                                .sub_agent
+                                .as_deref(),
+                        );
+                        if let Some(note) = &sub.note {
+                            render::print_info(note);
+                        }
+                        let worker_agent = sub.agent;
                         render::print_info(&format!(
                             "Working the ledger with {} — its own loop, on your subscription. The check is still run by this harness, in its own process.",
-                            agent.display_name
+                            worker_agent.display_name
                         ));
                         // The protected paths go to the agent as deny rules it
                         // enforces ITSELF, so a write to one never happens. The
@@ -833,22 +861,28 @@ impl CliApp {
                         // It is one argument, and leaving it off is invisible
                         // from the outside, which is why it is worth a comment
                         // rather than a shrug.
-                        let backend: Box<dyn crate::agent::AgentBackend> =
-                            match crate::agent::api::Settings::from_env() {
-                                Some(settings) => Box::new(crate::agent::api::ApiBackend::new(
-                                    settings,
-                                    &workspace,
-                                    &system_prompt.join("\n\n"),
-                                    self.config.env_filter_enabled,
-                                )),
-                                None => run_backend(
+                        let backend: Box<dyn crate::agent::AgentBackend> = route_backend(
+                            &workspace,
+                            &worker_agent.id,
+                            &worker_agent.command,
+                            &run_guards,
+                            &system_prompt,
+                            self.config.env_filter_enabled,
+                        );
+                        // Planning is the lead's job. With the sub-agent the
+                        // lead itself, the one backend does both, as it always
+                        // has; only a different sub-agent needs a second.
+                        let mut lead_planner: Option<Box<dyn crate::agent::AgentBackend>> =
+                            (worker_agent.id != agent.id).then(|| {
+                                route_backend(
                                     &workspace,
                                     &agent.id,
                                     &agent.command,
                                     &run_guards,
                                     &system_prompt,
-                                ),
-                            };
+                                    self.config.env_filter_enabled,
+                                )
+                            });
                         // Every OTHER installed agent becomes somewhere the
                         // work can move when this one runs out of room. Two
                         // subscriptions are two separate allowances, and a
@@ -858,10 +892,12 @@ impl CliApp {
                         // separate allowances. A configured endpoint has no
                         // such sibling to move to, so it gets none rather than
                         // a list that could never help.
+                        //
+                        // The standby backs up the agent WORKING the tasks.
                         let standby: Vec<Box<dyn crate::agent::AgentBackend>> = fleet
                             .agents()
                             .iter()
-                            .filter(|a| a.id != agent.id)
+                            .filter(|a| a.id != worker_agent.id)
                             .map(|other| {
                                 run_backend(
                                     &workspace,
@@ -921,8 +957,11 @@ impl CliApp {
                             }
                             let mut planned: Vec<crate::ledger::Task> = Vec::new();
                             for task in &ledger.tasks {
-                                let steps =
-                                    crate::plan::split(backend.as_mut(), &roles, &task.title);
+                                let planner = match lead_planner.as_mut() {
+                                    Some(lead) => lead.as_mut(),
+                                    None => backend.as_mut(),
+                                };
+                                let steps = crate::plan::split(planner, &roles, &task.title);
                                 if steps.is_empty() {
                                     planned.push(task.clone());
                                     continue;
@@ -1062,8 +1101,9 @@ impl CliApp {
                             // is a git repository. One lane — the default —
                             // never reaches any of this.
                             &crate::cli::CliLaneWorkers {
-                                agent_id: agent.id.clone(),
-                                command: agent.command.clone(),
+                                // Lanes work tasks, so they run the sub-agent.
+                                agent_id: worker_agent.id.clone(),
+                                command: worker_agent.command.clone(),
                                 guards: run_guards.clone(),
                                 system_prompt: system_prompt.clone(),
                                 roles: admin.resolve_roles().value,
@@ -1134,6 +1174,14 @@ impl CliApp {
                         out!(
                             "{}",
                             admin.report(&workspace, self.config.model_from_flag.as_deref())
+                        );
+                    }
+                    SlashCommand::Agent(arg) => {
+                        slash_commands::handle_agent(
+                            arg.as_deref(),
+                            &catalogue,
+                            &agent,
+                            &incord_code_dir,
                         );
                     }
                     SlashCommand::Help => slash_commands::handle_help(),
@@ -1731,6 +1779,42 @@ impl crate::runner::TaskWorker for LaneAgent {
         // is dropped here.
         crate::runner::TaskWorker::release(&mut worker);
         report
+    }
+}
+
+/// The backend for one catalogue route: the configured API when the route is
+/// [`crate::agent::registry::API_ROUTE`], otherwise the installed CLI.
+///
+/// # The bug this closes
+///
+/// The API backend used to be chosen whenever the API variables were SET,
+/// whatever agent had been chosen — so exporting two variables replaced every
+/// installed agent, and a session that announced one agent drove another. The
+/// id decides now, and the catalogue lists that id as usable only when the
+/// same variables are present ([`crate::agent::api::Settings::from_lookup`]).
+pub(crate) fn route_backend(
+    workspace: &Path,
+    agent_id: &str,
+    binary: &str,
+    guards: &crate::guards::Guards,
+    system_prompt: &[String],
+    filter_env: bool,
+) -> Box<dyn crate::agent::AgentBackend> {
+    let api = if agent_id == crate::agent::registry::API_ROUTE {
+        crate::agent::api::Settings::from_env()
+    } else {
+        None
+    };
+    match api {
+        Some(settings) => Box::new(crate::agent::api::ApiBackend::new(
+            settings,
+            workspace,
+            // The same project context the CLI gets, as the standing
+            // instructions rather than repeated on every turn.
+            &system_prompt.join("\n\n"),
+            filter_env,
+        )),
+        None => run_backend(workspace, agent_id, binary, guards, system_prompt),
     }
 }
 

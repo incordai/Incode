@@ -16,6 +16,7 @@
 
 pub mod agy;
 pub mod api;
+pub mod catalogue;
 pub mod claude_code;
 pub mod codex;
 pub mod process_tree;

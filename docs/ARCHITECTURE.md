@@ -201,6 +201,51 @@ two disagree exactly when a fallback fires.
 never written to memory as finished, and a store that is unreachable costs the note
 and never the work.
 
+### Which agent — the catalogue
+
+`agent::catalogue` builds one list of every agent the session could use, once at
+session start: local CLIs found on the PATH, the API configured by `INCORD_API_URL` /
+`INCORD_API_KEY` / `INCORD_API_MODEL` (id `api`), and the agents each API provider in
+`admin.json` lists about itself. Every entry is marked usable, or not usable with the
+reason. `/agent` prints it; `/agent <id>` saves the lead (`agent`) and
+`/agent sub <id>` the sub-agents (`sub_agent`), both applying from the next `/run` and
+the next session.
+
+- **Lead**: `INCORD_AGENT`, else `admin.json` `agent`, when usable; else the first
+  usable local agent; else a usable API agent.
+- **Sub-agents** (the agent that works `/run`'s tasks, sequential and in lanes): the
+  saved `sub_agent` when usable; else the lead's entry in the table beside
+  `registry::KNOWN_AGENTS` (every agent maps to itself today); else the lead.
+
+#### The provider contract
+
+```json
+"api_providers": [{"name": "team", "url": "https://agents.example", "key_env": "TEAM_API_KEY"}]
+```
+
+`key_env` is the NAME of an environment variable; the key is read from it when needed
+and never written to disk or printed.
+
+- **Request**: `GET {url}/v1/agents` (trailing `/` on `url` removed) with
+  `Authorization: Bearer <value of key_env>`, finished within 3 seconds
+  (`catalogue::PROVIDER_TIMEOUT`). Providers are asked one after another.
+  The url must be `https`, or plain `http` to this machine only (`localhost`
+  or a loopback address); any other url is refused before the key is sent.
+- **Reply**: a 2xx status and `{"agents": [{"id": "coder", "name": "Coder", "model": "model-1"}]}`.
+  `agents` is required and may be empty. `id` is required, non-empty, free of
+  whitespace and control characters, and unique in the reply; `name` and `model` are
+  optional. Unknown fields are ignored. Control characters are stripped from `name` and
+  `model`, and both are cut to 80 characters.
+- **Catalogue id**: `<provider name>/<id>`, so a provider agent can never shadow a
+  local one.
+- **Failure**: a missing key variable, an unreachable provider, a non-2xx status, or a
+  reply that breaks the rules above lists the provider as ONE entry, not usable, with
+  the reason.
+
+Provider agents are listed but not driven yet: the contract does not say where an
+agent's turns go, so each is marked not usable ("driving provider agents is not wired
+yet") rather than routed to an endpoint nothing is known to answer.
+
 ---
 
 ## 5. On-disk state

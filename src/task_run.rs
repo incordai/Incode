@@ -79,13 +79,27 @@ pub fn run_task_with_model(
         Cli(crate::agent::registry::DetectedAgent),
     }
 
-    let candidates: Vec<Candidate> = match crate::agent::api::Settings::from_env() {
-        Some(settings) => vec![Candidate::Api(settings)],
-        None => {
-            let agents = crate::agent::registry::require_drivable_chain()?;
-            agents.into_iter().map(Candidate::Cli).collect()
-        }
-    };
+    // One catalogue for both routes: the chosen agent first, then every usable
+    // local agent, then a usable API. Setting the API variables no longer
+    // replaces the installed agents — it adds one more place to send the work.
+    let chain = crate::agent::catalogue::Catalogue::gather(
+        &crate::admin::AdminConfig::load_default().api_providers,
+    )
+    .usable_chain(crate::agent::registry::preferred_agent().as_deref())?;
+    let candidates: Vec<Candidate> = chain
+        .into_iter()
+        .map(|agent| {
+            let api = if agent.id == crate::agent::registry::API_ROUTE {
+                crate::agent::api::Settings::from_env()
+            } else {
+                None
+            };
+            match api {
+                Some(settings) => Candidate::Api(settings),
+                None => Candidate::Cli(agent),
+            }
+        })
+        .collect();
 
     let total_candidates = candidates.len();
     let mut failures = Vec::new();

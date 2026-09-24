@@ -105,6 +105,21 @@ pub struct AdminConfig {
     /// that quietly did not apply is the failure this field exists to end.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    /// Which agent takes the work the lead hands out, by its catalogue id.
+    ///
+    /// Unset means the lead's default from the built-in table beside
+    /// [`crate::agent::registry::KNOWN_AGENTS`], which today is the lead
+    /// itself. Written by `/agent sub <id>` and cleared by `/agent sub`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub_agent: Option<String>,
+    /// Services that list API agents about themselves.
+    ///
+    /// Each is asked for its agents when the catalogue is built — see
+    /// [`crate::agent::catalogue`] for the exact request. Only the NAME of the
+    /// variable holding a provider's key is kept here: the key itself is read
+    /// from the environment when it is needed and never written to this file.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub api_providers: Vec<ApiProvider>,
     /// The capability ladder, named by the operator.
     ///
     /// A tier is a list of models that can do the same JOB — `"top"` might hold
@@ -159,6 +174,18 @@ pub struct AdminConfig {
     /// Empty is the default and costs nothing.
     #[serde(default, skip_serializing_if = "crate::hooks::HookConfig::is_empty")]
     pub desktop_hooks: crate::hooks::HookConfig,
+}
+
+/// One service that serves API agents and lists them on request.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiProvider {
+    /// Unique among providers; prefixes each of its agents' catalogue ids as
+    /// `<name>/<agent id>`, so they cannot collide with a local agent's.
+    pub name: String,
+    /// The service's base URL. The agent list is read from `{url}/v1/agents`.
+    pub url: String,
+    /// The NAME of the environment variable holding the key — never the key.
+    pub key_env: String,
 }
 
 /// Which optional parts of the body are in use.
@@ -370,20 +397,11 @@ impl AdminConfig {
     /// claim about a pin that did not apply is exactly the thing worth testing.
     #[must_use]
     fn agent_line(&self) -> String {
-        let found = crate::agent::discover();
-        // DRIVABLE, not merely present. `Fleet::new` already filters this way,
-        // and reporting the raw list here claimed an agent whose protocol has
-        // never been verified would serve the work. It cannot.
-        let drivable: Vec<String> = found
-            .iter()
-            .filter(|a| a.is_drivable())
-            .map(|a| a.id.clone())
-            .collect();
-        let present_only: Vec<String> = found
-            .iter()
-            .filter(|a| !a.is_drivable())
-            .map(|a| a.id.clone())
-            .collect();
+        // DRIVABLE, not merely present, and from the same catalogue the lead
+        // is chosen from — so an API agent chosen with `/agent` is reported as
+        // the choice it is rather than as an agent that is not installed.
+        let catalogue = crate::agent::catalogue::Catalogue::gather(&self.api_providers);
+        let (drivable, present_only) = catalogue.ids_by_usability();
         Self::describe_agent(&self.resolve_agent(), &drivable, &present_only)
     }
 
@@ -414,7 +432,7 @@ impl AdminConfig {
             // billed against a different subscription.
             Some(want) if !drivable.iter().any(|i| i == want) => {
                 let why = if present_only.iter().any(|i| i == want) {
-                    "INSTALLED BUT NOT DRIVABLE - its protocol is unverified here".to_string()
+                    "FOUND BUT NOT DRIVABLE here - /agent says why".to_string()
                 } else if drivable.is_empty() {
                     "NOT INSTALLED, and nothing else is drivable".to_string()
                 } else {
@@ -437,7 +455,7 @@ impl AdminConfig {
         // drivable list needs to know the others WERE found.
         format!(
             "{line}
-                 also installed, not drivable: {}
+                 also found, not drivable: {}
 ",
             present_only.join(", ")
         )
@@ -1013,6 +1031,14 @@ mod tests {
             // A pinned agent has to survive the file too, or the setting is one
             // an operator can write and never get back.
             agent: Some("an-agent".to_string()),
+            // The sub-agent choice and the providers too — and a provider comes
+            // back holding the variable's NAME, which is all it ever holds.
+            sub_agent: Some("another-agent".to_string()),
+            api_providers: vec![ApiProvider {
+                name: "team".to_string(),
+                url: "http://127.0.0.1:9".to_string(),
+                key_env: "TEAM_KEY_VARIABLE".to_string(),
+            }],
             // The ladder has to survive the file too — a tier an operator
             // writes and cannot read back is a setting that does not exist.
             tiers: BTreeMap::from([(

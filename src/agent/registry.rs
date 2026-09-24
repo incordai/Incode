@@ -63,6 +63,15 @@ pub struct AgentProbe {
     pub commands: &'static [&'static str],
     pub version_args: &'static [&'static str],
     pub protocol: Protocol,
+    /// The agent that takes the work this one hands out, unless the operator
+    /// chose another (admin.json `sub_agent`, set with `/agent sub <id>`).
+    ///
+    /// The ONE table of these defaults, beside the agents it describes. Every
+    /// entry names itself today: a pairing across agents is a decision about
+    /// cost and judgement that belongs to the operator, and inventing one here
+    /// would make it for them. See [`crate::agent::catalogue`] for how the
+    /// value is resolved and what happens when it cannot be used.
+    pub default_sub_agent: &'static str,
 }
 
 /// Agents the harness knows how to look for. Presence here is not a claim of
@@ -74,6 +83,7 @@ pub const KNOWN_AGENTS: &[AgentProbe] = &[
         commands: &["claude"],
         version_args: &["--version"],
         protocol: Protocol::ClaudeStreamJson,
+        default_sub_agent: "claude-code",
     },
     AgentProbe {
         id: CODEX,
@@ -81,6 +91,7 @@ pub const KNOWN_AGENTS: &[AgentProbe] = &[
         commands: &["codex"],
         version_args: &["--version"],
         protocol: Protocol::CodexJson,
+        default_sub_agent: CODEX,
     },
     AgentProbe {
         id: "gemini",
@@ -88,6 +99,7 @@ pub const KNOWN_AGENTS: &[AgentProbe] = &[
         commands: &["gemini"],
         version_args: &["--version"],
         protocol: Protocol::Unverified,
+        default_sub_agent: "gemini",
     },
     AgentProbe {
         id: "opencode",
@@ -95,6 +107,7 @@ pub const KNOWN_AGENTS: &[AgentProbe] = &[
         commands: &["opencode"],
         version_args: &["--version"],
         protocol: Protocol::Unverified,
+        default_sub_agent: "opencode",
     },
     AgentProbe {
         id: ANTIGRAVITY,
@@ -109,6 +122,7 @@ pub const KNOWN_AGENTS: &[AgentProbe] = &[
         // other agent's format, which is why this line stayed `Unverified`
         // until somebody actually ran it.
         protocol: Protocol::AgyStreamJson,
+        default_sub_agent: ANTIGRAVITY,
     },
     AgentProbe {
         id: "cursor",
@@ -124,6 +138,7 @@ pub const KNOWN_AGENTS: &[AgentProbe] = &[
         commands: &["cursor-agent", "cursor"],
         version_args: &["--version"],
         protocol: Protocol::Unverified,
+        default_sub_agent: "cursor",
     },
 ];
 
@@ -137,19 +152,13 @@ pub struct DetectedAgent {
     pub protocol: Protocol,
 }
 
-/// The route the work takes: a configured API if there is one, otherwise an
-/// installed CLI.
+/// The catalogue id of the API route configured by environment variables
+/// ([`crate::agent::api::API_URL_ENV`] and its siblings).
 ///
-/// The API comes first because it is the operator's explicit choice — they set
-/// an endpoint, which nothing does by accident — and because it works on a
-/// machine with no agent installed at all, where `require_drivable` can only
-/// refuse.
-pub fn require_route() -> Result<DetectedAgent, String> {
-    match crate::agent::api::Settings::from_env() {
-        Some(settings) => Ok(DetectedAgent::over_api(&settings.model)),
-        None => require_drivable(),
-    }
-}
+/// One name for it, used both where the catalogue lists the route and where a
+/// backend is built for it, so the two cannot disagree about which id means
+/// "drive the configured API".
+pub const API_ROUTE: &str = "api";
 
 /// The agent that will do the work, or why there is none.
 ///
@@ -220,18 +229,6 @@ pub fn drivable_chain(found: &[DetectedAgent], preferred: Option<&str>) -> Vec<D
     chain
 }
 
-/// All drivable agents discovered on this machine, ordered with preferred first if set,
-/// or an explanation of why nothing can be driven.
-pub fn require_drivable_chain() -> Result<Vec<DetectedAgent>, String> {
-    let found = discover();
-    let chain = drivable_chain(&found, preferred_agent().as_deref());
-    if chain.is_empty() {
-        Err(no_drivable_reason(&found))
-    } else {
-        Ok(chain)
-    }
-}
-
 #[must_use]
 pub fn choose(found: &[DetectedAgent], preferred: Option<&str>) -> Option<DetectedAgent> {
     drivable_chain(found, preferred).into_iter().next()
@@ -271,7 +268,7 @@ impl DetectedAgent {
     #[must_use]
     pub fn over_api(model: &str) -> Self {
         Self {
-            id: "api".to_string(),
+            id: API_ROUTE.to_string(),
             display_name: "a model over the configured API".to_string(),
             // No binary: nothing is spawned on this route.
             command: String::new(),
@@ -465,6 +462,20 @@ mod tests {
             sample(Protocol::ClaudeStreamJson).is_drivable(),
             "an agent with a verified protocol must be drivable"
         );
+    }
+
+    /// **Every known agent's default sub-agent is itself, today.** A pairing
+    /// across agents is the operator's decision about cost and judgement; the
+    /// table must not quietly make it for them.
+    #[test]
+    fn every_known_agent_hands_its_work_to_itself_by_default() {
+        for probe in KNOWN_AGENTS {
+            assert_eq!(
+                probe.default_sub_agent, probe.id,
+                "`{}` defaults its sub-agents to another agent",
+                probe.id
+            );
+        }
     }
 
     /// Version banners are external input; truncating one by byte index panics

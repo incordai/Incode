@@ -118,20 +118,10 @@ impl AgentSession {
         system_context: Vec<String>,
     ) -> Self {
         let workspace_for_self = workspace.clone();
-        // WHICH ROUTE. An endpoint configured by the operator takes the work and
-        // needs no CLI installed; otherwise the installed agent takes it, which
-        // is what happens for anyone who has configured nothing.
-        let backend: Box<dyn AgentBackend> = match crate::agent::api::Settings::from_env() {
-            Some(settings) => Box::new(crate::agent::api::ApiBackend::new(
-                settings,
-                &workspace,
-                // The same project context the CLI gets, as the standing
-                // instructions rather than repeated on every turn.
-                &system_context.join("\n\n"),
-                true,
-            )),
-            None => crate::cli::run_backend(&workspace, agent_id, &binary, guards, &system_context),
-        };
+        // WHICH ROUTE is the agent's id, never whether API variables happen to
+        // be set: those used to replace the chosen agent outright.
+        let backend: Box<dyn AgentBackend> =
+            crate::cli::route_backend(&workspace, agent_id, &binary, guards, &system_context, true);
         Self {
             backend,
             standby: Vec::new(),
@@ -954,6 +944,48 @@ mod tests {
             &crate::guards::Guards::default(),
             Vec::new(),
         )
+    }
+
+    /// **The chosen agent gets its own backend even with the API variables
+    /// set.** Their presence used to replace whatever agent had been chosen,
+    /// so the banner named one agent while another did the work. Only the API
+    /// route's own id reaches the API backend now.
+    #[test]
+    fn the_api_variables_do_not_replace_the_chosen_local_agent() {
+        let _guard = crate::brief::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let names = [
+            crate::agent::api::API_URL_ENV,
+            crate::agent::api::API_KEY_ENV,
+        ];
+        let before: Vec<Option<std::ffi::OsString>> = names.iter().map(std::env::var_os).collect();
+        std::env::set_var(names[0], "http://127.0.0.1:9/v1/messages");
+        std::env::set_var(names[1], "not-a-real-key");
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let local = session(dir.path()).backend_id().to_string();
+        let api = AgentSession::new(
+            dir.path().to_path_buf(),
+            crate::agent::registry::API_ROUTE,
+            String::new(),
+            &crate::guards::Guards::default(),
+            Vec::new(),
+        )
+        .backend_id()
+        .to_string();
+
+        for (name, value) in names.iter().zip(before) {
+            match value {
+                Some(v) => std::env::set_var(name, v),
+                None => std::env::remove_var(name),
+            }
+        }
+        assert_eq!(
+            local, "claude-code",
+            "the API variables replaced the chosen local agent"
+        );
+        assert_eq!(api, crate::agent::registry::API_ROUTE);
     }
 
     /// **Context goes before the instruction.** Context placed after an

@@ -73,17 +73,29 @@ impl Settings {
     /// and demanding a name there would refuse a working setup.
     #[must_use]
     pub fn from_env() -> Option<Self> {
-        let endpoint = non_empty(API_URL_ENV)?;
-        let key = non_empty(API_KEY_ENV)?;
+        Self::from_lookup(&non_empty)
+    }
+
+    /// The same rule as [`Self::from_env`], reading variables through `get`.
+    ///
+    /// Split out so the agent catalogue lists this route by the one rule that
+    /// decides whether it can be driven, and a test can supply the variables
+    /// without changing the process environment. `get` answers a variable's
+    /// trimmed, non-empty value, as [`non_empty`] does.
+    #[must_use]
+    pub(crate) fn from_lookup(get: &dyn Fn(&str) -> Option<String>) -> Option<Self> {
+        let endpoint = get(API_URL_ENV)?;
+        let key = get(API_KEY_ENV)?;
         Some(Self {
             endpoint,
             key,
-            model: non_empty(API_MODEL_ENV).unwrap_or_default(),
+            model: get(API_MODEL_ENV).unwrap_or_default(),
         })
     }
 }
 
-fn non_empty(name: &str) -> Option<String> {
+/// A variable's value, trimmed, or `None` when it is unset or blank.
+pub(crate) fn non_empty(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
         .map(|v| v.trim().to_string())
@@ -802,7 +814,7 @@ impl Transport for Http {
 
 impl AgentBackend for ApiBackend {
     fn id(&self) -> &str {
-        "api"
+        crate::agent::registry::API_ROUTE
     }
 
     /// Both halves, and enforced more strongly here than on any CLI.
