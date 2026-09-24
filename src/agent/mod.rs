@@ -14,6 +14,7 @@
 //! The harness never reads, copies or transmits an agent's credentials. It
 //! detects that a binary exists and lets the agent authenticate itself.
 
+pub mod acp;
 pub mod agy;
 pub mod api;
 pub mod catalogue;

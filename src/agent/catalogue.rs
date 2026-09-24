@@ -1007,6 +1007,7 @@ mod tests {
             version_args: &[],
             protocol: Protocol::ClaudeStreamJson,
             default_sub_agent: CODEX,
+            acp_args: &[],
         }];
         let lead = local("claude-code", Protocol::ClaudeStreamJson);
         let sub = catalogue.sub_agent_by(&lead, Some("gemini"), &table);
@@ -1038,6 +1039,7 @@ mod tests {
             version_args: &[],
             protocol: Protocol::ClaudeStreamJson,
             default_sub_agent: ANTIGRAVITY,
+            acp_args: &[],
         }];
         let lead = local("claude-code", Protocol::ClaudeStreamJson);
         let sub = catalogue.sub_agent_by(&lead, None, &table);

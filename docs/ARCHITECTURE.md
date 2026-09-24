@@ -130,6 +130,31 @@ check, snapshot a tree so a turn can be undone, read the git context, report wha
 installed. `runtime/` is what outlived the loop: two error types, the token counter
 and the cancel flag.
 
+**Which adapter drives which agent.** `claude-code`, `codex` and `antigravity` keep
+their own native adapters (`claude_code.rs`, `codex.rs`, `agy.rs`). An agent the
+registry marks `Protocol::Acp` is driven by `acp.rs`, a client for the Agent Client
+Protocol: JSON-RPC 2.0, one message per line on the agent's stdin/stdout, typed with
+`agent-client-protocol-schema` and transported on threads — no second async runtime.
+Today that is **opencode** (`opencode acp`, verified by a live turn on 1.18.4).
+**gemini** has `--acp` recorded but stays `Unverified`: on this machine the account was
+refused at `session/new`, so no turn has succeeded. One process per turn, like the
+others; the session carries over through `session/resume` or `session/load` when the
+agent offers them. Bounded by a per-line cap (8 MiB), a handshake deadline (60 s) and
+an idle deadline between messages (10 min); cancel sends `session/cancel` and then
+kills the process tree.
+
+**ACP permission policy.** The client advertises no `fs` and no `terminal`
+capability; any request it does not provide is answered "method not found".
+`session/request_permission` is answered from the run's permission mode and the
+guards, on the same rungs as `PermissionPolicy::with_defaults`: read/search/think need
+read-only; edit/delete/move need workspace-write and every named path inside the
+workspace or an extra root and not protected; execute/fetch need full access; any
+other kind is refused. Approvals are one-off, never standing. This is **not
+enforcement** (`enforces()` is `NOTHING`): measured, opencode in its ordinary mode
+writes without asking. So a read-only turn also switches the session to the agent's
+own read-only mode (`plan`) and is refused when the agent has none, and protected
+paths remain the sentinel's job.
+
 `desktop/` and `team_mcp.rs` are the harness's two **MCP servers** — the only way a
 delegated agent gains a capability, since there is no model loop here to dispatch one.
 Both run as separate processes (`incode --desktop-mcp`, `incode --team-mcp`) so a crash
