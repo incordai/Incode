@@ -827,6 +827,18 @@ impl CliApp {
                             render::print_info(note);
                         }
                         let worker_agent = sub.agent;
+                        // THE ROLES AS THEY STAND NOW, read fresh for the same
+                        // reason: `admin` was loaded at startup, so a `/roles`
+                        // saved in this session would otherwise not reach the
+                        // run. A file broken since startup is said out loud,
+                        // and the settings the session started with are used.
+                        let run_roles = match crate::admin::AdminConfig::load(&incord_code_dir) {
+                            Ok(fresh) => fresh.resolve_roles().value,
+                            Err(e) => {
+                                render::print_error(&e);
+                                admin.resolve_roles().value
+                            }
+                        };
                         render::print_info(&format!(
                             "Working the ledger with {} — its own loop, on your subscription. The check is still run by this harness, in its own process.",
                             worker_agent.display_name
@@ -936,7 +948,7 @@ impl CliApp {
                         // it did before any of this existed.
                         let mut backend = backend;
                         if freshly_derived {
-                            let roles = admin.resolve_roles().value;
+                            let roles = run_roles.clone();
                             // THE CHECK EVERY PLANNED STEP IS JUDGED BY. The
                             // operator's, resolved the same way it is for any
                             // other task — never named by the model, which
@@ -995,7 +1007,7 @@ impl CliApp {
                             backend,
                             workspace.clone(),
                         )
-                        .with_roles(admin.resolve_roles().value)
+                        .with_roles(run_roles.clone())
                         .with_standby(standby)
                         .with_extra_dirs(extra_dirs.clone())
                         // Its OWN instance rather than the runner's: the channel
@@ -1068,7 +1080,7 @@ impl CliApp {
                                 &run_guards,
                                 &system_prompt,
                             ),
-                            roles: admin.resolve_roles().value,
+                            roles: run_roles.clone(),
                             verify: admin
                                 .resolve_verify(&workspace)
                                 .map(|resolved| resolved.value)
@@ -1106,7 +1118,7 @@ impl CliApp {
                                 command: worker_agent.command.clone(),
                                 guards: run_guards.clone(),
                                 system_prompt: system_prompt.clone(),
-                                roles: admin.resolve_roles().value,
+                                roles: run_roles,
                                 extra_dirs: extra_dirs.clone(),
                                 desktop: desktop_enabled_from_env(),
                                 permission_mode,
@@ -1183,6 +1195,9 @@ impl CliApp {
                             &agent,
                             &incord_code_dir,
                         );
+                    }
+                    SlashCommand::Roles(arg) => {
+                        slash_commands::handle_roles(arg.as_deref(), &incord_code_dir);
                     }
                     SlashCommand::Help => slash_commands::handle_help(),
                     SlashCommand::Status => {

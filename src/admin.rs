@@ -65,6 +65,17 @@ impl Source {
     }
 }
 
+/// What is said about a role naming a tier nobody defines.
+///
+/// One wording for `--admin` and `/roles`, so the same typo is not described
+/// two ways depending on where the operator looked.
+#[must_use]
+pub fn unknown_tier_warning(role: &str, reference: &str) -> String {
+    format!(
+        "role {role} names {reference}, which no tier defines — it will run on the session model"
+    )
+}
+
 /// A value and where it was decided.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Resolved<T> {
@@ -647,8 +658,8 @@ impl AdminConfig {
         // model, which reads as "never configured" — and a typo is invisible.
         for (role, reference) in self.unknown_tiers() {
             out.push_str(&format!(
-                "  !! role {role} names {reference}, which no tier defines — it will run on the session model
-"
+                "  !! {}\n",
+                unknown_tier_warning(&role, &reference)
             ));
         }
 
