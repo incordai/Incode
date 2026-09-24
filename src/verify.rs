@@ -233,11 +233,8 @@ fn tail(text: &str, max: usize) -> String {
     format!("[earlier output dropped]\n{kept}")
 }
 
-/// The file Windows would run for `program`: a path as given, or the first
-/// `.cmd`, `.bat` or `.exe` on `PATH`. Also used by [`crate::agent::acp`],
-/// whose agents are often `.cmd` script shims a bare name does not reach.
 #[cfg(windows)]
-pub(crate) fn resolve_windows_executable(program: &str, cwd: &Path) -> Option<std::path::PathBuf> {
+fn resolve_windows_executable(program: &str, cwd: &Path) -> Option<std::path::PathBuf> {
     let p = std::path::Path::new(program);
     let extensions = [".cmd", ".bat", ".exe", ""];
 

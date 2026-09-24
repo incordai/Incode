@@ -1866,23 +1866,6 @@ fn run_backend_with_desktop(
     desktop: bool,
     mode: crate::permissions::PermissionMode,
 ) -> Box<dyn crate::agent::AgentBackend> {
-    // An agent the registry lists as speaking ACP, started the way it says.
-    // The session's mode goes WITH it: this backend answers the agent's
-    // permission requests itself, so the mode is what those answers follow.
-    if let Some(args) = crate::agent::registry::acp_launch(agent_id) {
-        let mut backend =
-            crate::agent::acp::AcpBackend::new(agent_id, binary, args, workspace.to_path_buf())
-                .with_guards(guards)
-                .with_permission_mode(mode)
-                .with_system_context(system_prompt.to_vec());
-        // The same servers the other routes are handed, passed in
-        // `session/new` as stdio entries.
-        if let Some(config) = mcp_config_for(desktop, std::env::current_exe().ok(), workspace, mode)
-        {
-            backend = backend.with_mcp_config(config);
-        }
-        return Box::new(backend);
-    }
     match agent_id {
         // The registry ID, not the command name. `agy` is the binary; the agent
         // is `antigravity`. Matching the binary name here compiled, passed a
@@ -2491,20 +2474,9 @@ mod tests {
             &[],
         );
 
-        let opencode = run_backend(Path::new("."), "opencode", "opencode", &guards, &[]);
-
         assert_eq!(claude.id(), "claude-code");
         assert_eq!(agy.id(), "agy", "the backend reports the BINARY it drives");
         assert_eq!(codex.id(), "codex");
-        assert_eq!(
-            opencode.id(),
-            "opencode",
-            "an ACP agent gets the ACP backend"
-        );
-        assert!(
-            opencode.mcp_config().is_some(),
-            "the ACP route is handed the same MCP servers as the others"
-        );
         // And they do NOT claim the same enforcement, which is the whole point
         // of asking each backend rather than assuming one answer.
         assert_ne!(claude.enforces(), agy.enforces());

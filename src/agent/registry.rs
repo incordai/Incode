@@ -48,17 +48,6 @@ pub enum Protocol {
     /// OpenAI Codex CLI 0.153.4 and implemented by
     /// [`crate::agent::codex::CodexBackend`].
     CodexJson,
-    /// The Agent Client Protocol: JSON-RPC 2.0, one message per line, on the
-    /// agent's own stdin/stdout. Implemented by
-    /// [`crate::agent::acp::AcpBackend`].
-    ///
-    /// ONE variant for every agent that speaks it, unlike the stream formats
-    /// above: ACP is a published protocol with a typed schema, so reading it
-    /// IS the same job whoever is on the other end. What differs is only how
-    /// each agent is told to speak it — [`AgentProbe::acp_args`].
-    ///
-    /// Set on an agent only after a live turn succeeded on a real machine.
-    Acp,
     /// A model reached over an HTTP API, driven by this harness directly.
     ///
     /// Not discovered on the machine like the others — it exists because the
@@ -83,25 +72,6 @@ pub struct AgentProbe {
     /// would make it for them. See [`crate::agent::catalogue`] for how the
     /// value is resolved and what happens when it cannot be used.
     pub default_sub_agent: &'static str,
-    /// The arguments that make this agent speak ACP on stdio, when it can.
-    ///
-    /// Recorded even while `protocol` is still `Unverified`, so the one thing
-    /// already read from the agent's `--help` is not lost — but only
-    /// [`acp_launch`] hands them out, and it does so only for `Protocol::Acp`.
-    pub acp_args: &'static [&'static str],
-}
-
-/// How to start `agent_id` as an ACP agent, when the registry says it is one.
-///
-/// `None` for every agent whose protocol is not [`Protocol::Acp`] — including
-/// one with ACP arguments recorded but no live turn behind them.
-#[must_use]
-pub fn acp_launch(agent_id: &str) -> Option<&'static [&'static str]> {
-    KNOWN_AGENTS
-        .iter()
-        .find(|probe| probe.id.eq_ignore_ascii_case(agent_id))
-        .filter(|probe| probe.protocol == Protocol::Acp)
-        .map(|probe| probe.acp_args)
 }
 
 /// Agents the harness knows how to look for. Presence here is not a claim of
@@ -114,7 +84,6 @@ pub const KNOWN_AGENTS: &[AgentProbe] = &[
         version_args: &["--version"],
         protocol: Protocol::ClaudeStreamJson,
         default_sub_agent: "claude-code",
-        acp_args: &[],
     },
     AgentProbe {
         id: CODEX,
@@ -123,36 +92,22 @@ pub const KNOWN_AGENTS: &[AgentProbe] = &[
         version_args: &["--version"],
         protocol: Protocol::CodexJson,
         default_sub_agent: CODEX,
-        acp_args: &[],
     },
     AgentProbe {
         id: "gemini",
         display_name: "Gemini CLI",
         commands: &["gemini"],
         version_args: &["--version"],
-        // STILL UNVERIFIED, and not for want of a client: no live turn could
-        // be completed. On 0.58.0 here, driven through `agent::acp`, it
-        // answered `initialize` and then refused `session/new` with an
-        // authentication error saying this account's tier is no longer
-        // supported for this client. The account, not the protocol.
-        // Flip to `Protocol::Acp` after one real turn succeeds.
         protocol: Protocol::Unverified,
         default_sub_agent: "gemini",
-        // `gemini --help` on 0.58.0: `--acp` "Starts the agent in ACP mode";
-        // `--experimental-acp` is marked deprecated.
-        acp_args: &["--acp"],
     },
     AgentProbe {
         id: "opencode",
         display_name: "OpenCode",
         commands: &["opencode"],
         version_args: &["--version"],
-        // Verified by a live turn on 1.18.4 through `agent::acp`.
-        protocol: Protocol::Acp,
+        protocol: Protocol::Unverified,
         default_sub_agent: "opencode",
-        // `opencode acp --help` on 1.18.4: stdio needs nothing more. `--port`
-        // defaults to 0 and a live handshake over stdin/stdout ran without it.
-        acp_args: &["acp"],
     },
     AgentProbe {
         id: ANTIGRAVITY,
@@ -168,7 +123,6 @@ pub const KNOWN_AGENTS: &[AgentProbe] = &[
         // until somebody actually ran it.
         protocol: Protocol::AgyStreamJson,
         default_sub_agent: ANTIGRAVITY,
-        acp_args: &[],
     },
     AgentProbe {
         id: "cursor",
@@ -185,7 +139,6 @@ pub const KNOWN_AGENTS: &[AgentProbe] = &[
         version_args: &["--version"],
         protocol: Protocol::Unverified,
         default_sub_agent: "cursor",
-        acp_args: &[],
     },
 ];
 
@@ -522,28 +475,6 @@ mod tests {
                 "`{}` defaults its sub-agents to another agent",
                 probe.id
             );
-        }
-    }
-
-    /// **ACP launch arguments are handed out only for a verified ACP agent.**
-    ///
-    /// gemini's `--acp` is recorded, and it has never completed a live turn
-    /// here; building a backend for it on the strength of `--help` alone is
-    /// the guess this registry exists to refuse.
-    #[test]
-    fn acp_arguments_are_given_only_to_a_verified_acp_agent() {
-        assert_eq!(acp_launch("opencode"), Some(&["acp"][..]));
-        assert_eq!(acp_launch("gemini"), None, "unverified, so not driven");
-        assert_eq!(acp_launch("claude-code"), None, "stays on its own adapter");
-        assert_eq!(acp_launch("no-such-agent"), None);
-        for probe in KNOWN_AGENTS {
-            if probe.protocol == Protocol::Acp {
-                assert!(
-                    !probe.acp_args.is_empty(),
-                    "`{}` speaks ACP but says nothing about how to start it",
-                    probe.id
-                );
-            }
         }
     }
 
