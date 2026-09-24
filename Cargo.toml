@@ -63,6 +63,18 @@ regex = "1"
 # Image attachments travel to the provider base64-encoded. Already resolved to
 # 0.22.1 as a transitive dependency, so declaring it pins nothing new.
 base64 = "0.22"
+# The Agent Client Protocol's wire TYPES, for agent::acp. Types only: the
+# transport is ours (newline-delimited JSON-RPC over the child's stdio, on
+# threads, like every other adapter). The full `agent-client-protocol` crate is
+# NOT used — it brings a second async runtime beside tokio.
+#
+# A NEW PACKAGE, pinned exactly: Apache-2.0, `rust-version` 1.88 (matches ours).
+# `default-features = false` drops `schemars`, which only generates JSON Schema.
+# No `unstable_*` feature is enabled; nothing here needs one.
+#
+# NOTE: it turns on serde_json's `preserve_order` for the whole crate (feature
+# unification), so a `serde_json::Map` keeps insertion order instead of sorting.
+agent-client-protocol-schema = { version = "=1.9.1", default-features = false }
 
 # CLI-specific
 rustyline = { version = "15", features = ["derive"] }
