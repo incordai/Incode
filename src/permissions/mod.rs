@@ -40,10 +40,12 @@ impl PermissionMode {
 
     /// What this mode means to the agent that does the writing.
     ///
-    /// The harness dispatches no tools, so a mode set here only matters if it
-    /// REACHES the agent. It did not: `-p read-only` was shown in the banner and
-    /// never sent, so an operator who started that way believed nothing could be
-    /// written while the agent wrote freely.
+    /// A mode only matters if it REACHES whatever runs the tools. It did not:
+    /// `-p read-only` was shown in the banner and never sent, so an operator
+    /// who started that way believed nothing could be written while the agent
+    /// wrote freely. Where incode runs the tools itself — the claude route,
+    /// through [`crate::tool_bridge`] — this spelling is read back into a mode
+    /// that incode's toolbox enforces, and nothing is handed to the CLI.
     ///
     /// **`danger-full-access` deliberately does NOT map to the agent's
     /// permission bypass.** That bypass would drop the deny rules with

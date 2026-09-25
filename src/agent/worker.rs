@@ -13,10 +13,12 @@
 //! decides it, the contract check, the attempt and escalation bounds, the token
 //! ceiling, and the owner channel.
 //!
-//! **Enforced differently:** [`crate::guards`]. The backend brings its own file
-//! tools and never calls this crate's executor, so there is no door to put in
-//! front of it — [`crate::guards::Guards::refuse_write`] cannot reach this path
-//! at all. For a while that meant "you do not get to edit your own exam" was a
+//! **Enforced differently:** [`crate::guards`]. On the claude route the model's
+//! tools are incode's own (see [`crate::tool_bridge`]), so
+//! [`crate::guards::Guards::refuse_write`] refuses a protected write before it
+//! happens. The codex and antigravity routes still bring their own file tools
+//! and never call this crate's executor, so there is no door to put in front of
+//! them. For a while that meant "you do not get to edit your own exam" was a
 //! comment here rather than a rule.
 //!
 //! It is now enforced from the other side. [`crate::guards::Sentinel`]

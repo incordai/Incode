@@ -1971,12 +1971,16 @@ fn run_backend_with_desktop(
                     .with_binary(binary.to_string())
                     .with_guards(guards)
                     .streaming(true)
-                    .with_system_context(system_prompt.to_vec());
+                    .with_system_context(system_prompt.to_vec())
+                    // The model's tools are incode's own on this route, so the
+                    // memory engine's guard is asked before each, as it is on
+                    // the API route.
+                    .with_engine(crate::hooks::engine::Engine::locate());
 
-            // `--mcp-config` on the installed CLI, verified from its own
-            // `--help`. agy is the one backend left alone: it offers only a
-            // persistent `mcp add`, which edits the operator's machine rather
-            // than this spawn, and that is their decision to make.
+            // incode's other MCP servers, handed over beside the tool bridge
+            // the backend adds itself. agy is the one backend left alone: it
+            // offers only a persistent `mcp add`, which edits the operator's
+            // machine rather than this spawn, and that is their decision.
             if let Some(config) =
                 mcp_config_for(desktop, std::env::current_exe().ok(), workspace, mode)
             {

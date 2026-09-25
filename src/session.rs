@@ -3,7 +3,10 @@
 //! # Why this holds almost nothing
 //!
 //! Memory captures the work live — every message and every edit — through the
-//! hooks the agent already fires. Writing a second copy here would be a file
+//! hooks the agent fires. NOTE: the claude route now starts its CLI with no
+//! settings, and so with none of its hooks (see [`crate::tool_bridge`]); incode
+//! runs the engine's pre-tool hook itself, and the session-capture hooks are
+//! not yet run by incode on that route. Writing a second copy here would be a file
 //! that drifts from the one that actually gets replayed, and the harness has no
 //! way to replay its own copy anyway: `--resume` hands the id back to the agent
 //! and the AGENT restores the conversation.

@@ -23,9 +23,20 @@ for this audit, or by the engine contract stated in the task, is marked
 | 8 | Background-work awareness | NOT STARTED. |
 
 What still limits all of it: only calls that go through incode's own Toolbox reach the
-engine, and today that is the API route alone. A CLI child runs its own tools inside its
-own process; no call it makes passes this gate (see §0, and the owner principle that
-incode must be the harness).
+engine. **Phase 3 (2026-09-25) put the claude route on the Toolbox**: claude is started
+as a model only — `--tools ""`, `--strict-mcp-config`, `--setting-sources ""` — and its
+only tools are incode's, over the tool bridge (`src/tool_bridge.rs`; see
+`docs/ARCHITECTURE.md` §5a). On that route every call passes the operator's guards, the
+permission mode and the engine's pre-tool hook, and a PermissionRequest is raised to the
+REPL or the ACP client exactly as on the API route (measured live: `engine hook pre-tool
+… exit 0` in the parent's trace for the model's `Write`). The caveats in §0 about the
+CLI route no longer hold for claude. They still hold for **codex** and **antigravity**,
+which run their own tools (codex: not provable while its account is over its usage
+limit, and `apply_patch` has no off switch; agy: no flag exists).
+
+New caveat on the claude route: with the CLI's settings off, the engine's session hooks
+it used to fire from its own config (SessionStart, UserPromptSubmit, Stop) no longer
+fire, and incode does not run them yet (§5, §7).
 
 ---
 
@@ -41,6 +52,12 @@ incord-code runs a turn in one of two ways (`src/agent/mod.rs:1-15`):
 `incode --acp` (driven by the owner's desktop app) runs the same session and turn as
 the REPL (`src/acp_agent/mod.rs:649` `plan_turn`, `:667` `turn_observed`), so it
 inherits whichever route that session uses.
+
+> **Superseded for claude (phase 3, 2026-09-25).** The table above describes the audit
+> as it stood. claude now runs as a model only, with no settings and so no hooks of its
+> own, and its tool calls run in incode's Toolbox over the tool bridge — the "API route"
+> column applies to it. The rest of this section still describes codex and
+> antigravity.
 
 **So the gaps below are the API route (and ACP when it is on the API route).** On
 the CLI route, whether each feature works depends on the child CLI. Three facts

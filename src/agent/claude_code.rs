@@ -29,10 +29,8 @@ enum CliEvent {
     System(SystemEvent),
     #[serde(rename = "assistant")]
     Assistant(AssistantMsg),
-    /// Tool results come back addressed to the model, so the transport labels
-    /// them "user". They are the tools talking, not the operator.
-    #[serde(rename = "user")]
-    User(AssistantMsg),
+    // No `user` variant: those lines carry the results of tool calls, which
+    // are incode's own and were shown by incode when it ran them.
     #[serde(rename = "stream_event")]
     StreamEvent(StreamEvent),
     #[serde(rename = "rate_limit_event")]
@@ -94,26 +92,18 @@ struct InnerMessage {
     content: Vec<WireContentBlock>,
 }
 
+/// One block of a message on the wire.
+///
+/// Only text is read. The CLI also reports the tool calls it forwarded and
+/// their results, but every tool it has is incode's own, run by incode — which
+/// shows each call and its result itself, from its own toolbox (see
+/// [`crate::tool_bridge`]). Reading the CLI's copy as well would show every call
+/// twice, and would take the CLI's word for what incode did.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
 enum WireContentBlock {
     #[serde(rename = "text")]
     Text { text: String },
-    #[serde(rename = "tool_use")]
-    ToolUse {
-        id: String,
-        name: String,
-        input: serde_json::Value,
-    },
-    #[serde(rename = "tool_result")]
-    ToolResult {
-        tool_use_id: String,
-        /// A string on some results, a list of blocks on others.
-        #[serde(default)]
-        content: serde_json::Value,
-        #[serde(default)]
-        is_error: bool,
-    },
     #[serde(other)]
     Other,
 }
@@ -280,8 +270,17 @@ pub struct ClaudeCodeBackend {
     /// anchored to the first, and the agent wrote into a protected directory
     /// there unstopped.
     guards: crate::guards::Guards,
-    /// How much the agent may do on its own, if the caller has an opinion.
-    permission_mode: Option<String>,
+    /// Every tool the model has, run HERE.
+    ///
+    /// The CLI is started with its own tools switched off and handed only
+    /// these, through [`crate::tool_bridge`]: each call the model makes comes
+    /// back to this process and runs through the toolbox's guards, the memory
+    /// engine's hook, the permission mode and the person to ask — the same
+    /// path a model over an API takes.
+    tools: crate::toolbox::Toolbox,
+    /// How many calls this backend has run, so each gets an id no earlier
+    /// turn used.
+    calls: u64,
     /// Set when the user asks to stop.
     ///
     /// The agent runs as a CHILD PROCESS, so stopping it means killing that
@@ -295,25 +294,21 @@ pub struct ClaudeCodeBackend {
     /// turning this on would make it choose between two copies of the same
     /// text. An interactive caller turns it on and reads the deltas.
     partial_messages: bool,
-    /// Paths this agent must not write, in the CLI's own deny syntax.
+    /// The protected paths, in the CLI's own deny syntax — REPORTED, no longer
+    /// handed to the CLI.
     ///
-    /// **This is prevention, where the sentinel is only detection.** The agent
-    /// enforces these itself, so the write never happens — see
-    /// [`crate::guards::deny_rules`] for why the rules say `Edit` and not
-    /// `Write`, and for what was measured.
+    /// The CLI has no file tools of its own any more, so a rule in its syntax
+    /// would bind nothing. The paths are refused by the toolbox instead, before
+    /// the write (see [`crate::toolbox::Toolbox`]); these stay as the readable
+    /// statement of what the session protects.
     deny: Vec<String>,
-    /// An MCP server this agent should be handed, as `--mcp-config` JSON.
+    /// incode's other MCP servers (the team channel, and the desktop when it
+    /// is on), as `--mcp-config` JSON. The tool bridge is added beside them on
+    /// every turn.
     ///
-    /// Measured 2026-09-16: this backend passed NO MCP flag at all, so the
-    /// memory server reached Claude Code only through the operator's own global
-    /// configuration — the harness's reach depended on machine state it does
-    /// not control and cannot verify. See `docs/COMPUTER_USE.md` section 2.
-    ///
-    /// **`--strict-mcp-config` is deliberately NOT passed alongside it.** The
-    /// installed CLI 2.1.273 documents that flag as "only use MCP servers from
-    /// --mcp-config, ignoring all other MCP configurations" — which would
-    /// silently cut the agent off from the memory server it is expected to use.
-    /// Adding a capability must not remove one.
+    /// `--strict-mcp-config` goes with it: the CLI loads ONLY what incode
+    /// hands it. Memory is reached through incode's own tools, not through a
+    /// server the operator happened to configure for the CLI.
     desktop_mcp: Option<String>,
     /// Who this agent speaks as on the team channel, for the task in hand.
     team_identity: Option<String>,
@@ -365,6 +360,10 @@ impl ClaudeCodeBackend {
     pub fn new(workspace: PathBuf) -> Self {
         Self {
             binary: "claude".to_string(),
+            // The filtered environment for the shell tool: a command the model
+            // chose must not inherit this process's credentials.
+            tools: crate::toolbox::Toolbox::new(&workspace, true),
+            calls: 0,
             workspace,
             session_id: None,
             // Off unless a caller asks. Handing every run a desktop it did not
@@ -378,7 +377,6 @@ impl ClaudeCodeBackend {
             system_context: Vec::new(),
             extra_dirs: Vec::new(),
             guards: crate::guards::Guards::default(),
-            permission_mode: None,
             cancel: None,
             deny: Vec::new(),
         }
@@ -520,9 +518,28 @@ impl ClaudeCodeBackend {
         self.session_id = None;
     }
 
-    /// How much the agent may do without asking, e.g. `plan` or `acceptEdits`.
+    /// How much the model's tool calls may do without asking, as the session
+    /// spells it (`plan`, `default`, `acceptEdits`).
+    ///
+    /// Decided by incode's toolbox, never handed to the CLI: the CLI runs no
+    /// tools, so a mode given to it would govern nothing. A spelling nobody
+    /// recognises lands on read-only, like
+    /// [`crate::permissions::PermissionMode::from_str_lossy`].
     pub fn set_permission_mode(&mut self, mode: &str) {
-        self.permission_mode = Some(mode.to_string());
+        use crate::permissions::PermissionMode;
+        let decided = match mode {
+            "acceptEdits" => PermissionMode::WorkspaceWrite,
+            "default" => PermissionMode::Prompt,
+            _ => PermissionMode::ReadOnly,
+        };
+        self.tools.set_permission_mode(decided);
+    }
+
+    /// Ask the memory engine before every tool call this model makes.
+    #[must_use]
+    pub fn with_engine(mut self, engine: Option<crate::hooks::engine::Engine>) -> Self {
+        self.tools = self.tools.with_engine(engine);
+        self
     }
 
     /// Continue an existing agent session on the next turn.
@@ -534,6 +551,69 @@ impl ClaudeCodeBackend {
     #[must_use]
     pub fn model(&self) -> Option<&str> {
         self.model.as_deref()
+    }
+
+    /// The CLI's command for one turn, as a model and nothing else, with
+    /// `servers` as its only MCP servers and `allowed` the tool names it may
+    /// send without asking. The bridge's address and token are added by the
+    /// caller, which holds the bridge.
+    fn command(&self, prompt: &str, context: &str, servers: &str, allowed: &[String]) -> Command {
+        let mut cmd = Command::new(&self.binary);
+        cmd.arg("-p")
+            .arg(prompt)
+            .arg("--output-format")
+            .arg("stream-json")
+            .args(MODEL_ONLY_FLAGS)
+            .arg("--mcp-config")
+            .arg(servers)
+            .arg("--allowedTools")
+            .args(allowed);
+        for (key, value) in MODEL_ONLY_ENV {
+            cmd.env(key, value);
+        }
+
+        // Which model serves this turn. Absent, the CLI uses its own default,
+        // which is the right behaviour for a caller with no opinion.
+        if let Some(model) = &self.model {
+            cmd.arg("--model").arg(model);
+        }
+        if self.partial_messages {
+            cmd.arg("--include-partial-messages");
+        }
+        if !context.is_empty() {
+            cmd.arg("--append-system-prompt").arg(context);
+        }
+        if !self.fallbacks.is_empty() {
+            // One comma-separated list, tried in order — the CLI's own shape for
+            // the ordered chain the role table produces.
+            cmd.arg("--fallback-model").arg(self.fallbacks.join(","));
+        }
+
+        // Continue the existing session rather than starting a new one. A fresh
+        // session re-pays the entire prompt prefix; resuming does not.
+        if let Some(sid) = &self.session_id {
+            cmd.arg("--resume").arg(sid);
+        }
+
+        // Point the agent at a profile whose session is actually live.
+        //
+        // Skipped entirely when the operator has already said which profile to
+        // use: an explicit choice is a decision, and silently overriding it
+        // would be worse than the fallback this replaces.
+        if std::env::var_os(PROFILE_ENV).is_none() {
+            if let Some(profile) = usable_profile() {
+                cmd.env(PROFILE_ENV, &profile.dir);
+            }
+        }
+
+        // WHO THIS AGENT IS ON THE TEAM CHANNEL, for the task about to run.
+        // The team MCP server is a child of this process and reads it from
+        // here — see [`crate::agent::AgentBackend::set_team_identity`] for why
+        // it cannot come from the registration or from the model.
+        if let Some(role) = &self.team_identity {
+            cmd.env(crate::team_mcp::IDENTITY_ENV, role);
+        }
+        cmd
     }
 
     /// Whether this agent recognises a model id as one it can serve.
@@ -593,18 +673,8 @@ fn map_line(line: &str, outcome: &mut Option<TurnOutcome>) -> Vec<AgentEvent> {
                 return events;
             }
             for block in a.message.content {
-                match block {
-                    WireContentBlock::Text { text } => events.push(AgentEvent::Text(text)),
-                    WireContentBlock::ToolUse { id, name, input } => {
-                        events.push(AgentEvent::ToolUse {
-                            id,
-                            name,
-                            input: input.to_string(),
-                        });
-                    }
-                    // A result never arrives on an assistant message; it is
-                    // handled where it does, on the `user` one.
-                    WireContentBlock::ToolResult { .. } | WireContentBlock::Other => {}
+                if let WireContentBlock::Text { text } = block {
+                    events.push(AgentEvent::Text(text));
                 }
             }
         }
@@ -654,22 +724,6 @@ fn map_line(line: &str, outcome: &mut Option<TurnOutcome>) -> Vec<AgentEvent> {
                 // is the same on every run for the same turn.
                 served_by: r.model_usage.into_keys().collect(),
             });
-        }
-        CliEvent::User(u) => {
-            for block in u.message.content {
-                if let WireContentBlock::ToolResult {
-                    tool_use_id,
-                    content,
-                    is_error,
-                } = block
-                {
-                    events.push(AgentEvent::ToolResult {
-                        id: tool_use_id,
-                        output: flatten(&content),
-                        is_error,
-                    });
-                }
-            }
         }
         CliEvent::Other => {}
     }
@@ -813,25 +867,6 @@ fn home_dir() -> Option<std::path::PathBuf> {
         .map(std::path::PathBuf::from)
 }
 
-/// A tool result's content, whatever shape it arrived in.
-///
-/// Some tools return a plain string, others a list of blocks. Assuming either
-/// one loses the output of every tool that uses the other.
-fn flatten(content: &serde_json::Value) -> String {
-    match content {
-        serde_json::Value::String(text) => text.clone(),
-        serde_json::Value::Array(blocks) => blocks
-            .iter()
-            .filter_map(|b| b.get("text").and_then(serde_json::Value::as_str))
-            .collect::<Vec<_>>()
-            .join(
-                "
-",
-            ),
-        other => other.to_string(),
-    }
-}
-
 /// Where to write the agent's raw output, if the operator asked for it.
 ///
 /// `INCORD_DEBUG_STREAM=<path>` appends every line the agent sends. It is the
@@ -846,21 +881,79 @@ pub fn debug_stream_path() -> Option<String> {
 /// What a cancelled turn reports, so the caller can tell it apart from a crash.
 pub const CANCELLED: &str = "the turn was cancelled";
 
-fn consume_stream<R: BufRead>(
-    reader: R,
+/// What the turn's loop hears: a line the CLI printed, or a tool call the
+/// model made, forwarded by the bridge.
+enum Incoming {
+    Line(String),
+    ReadFailed(String),
+    Ended,
+    Tool(crate::tool_bridge::Request),
+}
+
+/// How long the loop waits for something to arrive before looking at the
+/// cancel flag again. A turn that has gone quiet — the model thinking, a long
+/// command running — still stops within this of being asked to.
+const POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Read the CLI's output on its own thread, one line at a time, into the loop.
+///
+/// Its own thread because the loop must also answer tool calls, and the CLI
+/// is BLOCKED on each of those until it is answered: a loop sitting in a read
+/// of the CLI's output would never see the call the CLI is waiting on.
+fn pump<R: BufRead + Send + 'static>(reader: R, to: std::sync::mpsc::Sender<Incoming>) {
+    std::thread::spawn(move || {
+        for line in reader.lines() {
+            let message = match line {
+                Ok(line) => Incoming::Line(line),
+                Err(e) => {
+                    let _ = to.send(Incoming::ReadFailed(e.to_string()));
+                    return;
+                }
+            };
+            if to.send(message).is_err() {
+                return;
+            }
+        }
+        let _ = to.send(Incoming::Ended);
+    });
+}
+
+/// The turn itself: the CLI's output mapped to events, and every tool call
+/// the model makes run by `tools`, until the CLI finishes or the turn is
+/// stopped.
+fn consume(
+    from: &std::sync::mpsc::Receiver<Incoming>,
     session: &mut Option<String>,
     on_event: &mut dyn FnMut(&AgentEvent),
     cancel: Option<&crate::runtime::cancel::CancelToken>,
+    tools: &mut crate::toolbox::Toolbox,
+    calls: &mut u64,
 ) -> Result<Option<TurnOutcome>, AgentError> {
+    let stopped = || cancel.is_some_and(crate::runtime::cancel::CancelToken::is_cancelled);
     let mut outcome = None;
 
-    for line in reader.lines() {
-        // Checked per line, which is where the flag can actually land: the read
-        // below blocks until the agent says something.
-        if cancel.is_some_and(crate::runtime::cancel::CancelToken::is_cancelled) {
+    loop {
+        if stopped() {
             return Err(AgentError::new(CANCELLED));
         }
-        let line = line.map_err(|e| AgentError::new(format!("reading agent output: {e}")))?;
+        let line = match from.recv_timeout(POLL) {
+            Ok(Incoming::Line(line)) => line,
+            Ok(Incoming::Tool(request)) => {
+                // Numbered per CALL: the list the server asks for first is
+                // not a call, and must not use up an id.
+                if matches!(request, crate::tool_bridge::Request::Call { .. }) {
+                    *calls += 1;
+                }
+                let id = format!("incode-{calls}");
+                crate::tool_bridge::answer(tools, request, &id, stopped(), on_event);
+                continue;
+            }
+            Ok(Incoming::ReadFailed(e)) => {
+                return Err(AgentError::new(format!("reading agent output: {e}")))
+            }
+            Ok(Incoming::Ended) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+        };
         // Every raw line, when asked for. A turn that fails for a reason the
         // harness cannot explain — "stopped without finishing: stop_sequence" —
         // is unanswerable without the bytes the agent actually sent, and
@@ -882,6 +975,9 @@ fn consume_stream<R: BufRead>(
             if let AgentEvent::SessionStarted { session_id, .. } = &event {
                 if !session_id.is_empty() {
                     *session = Some(session_id.clone());
+                    // The engine files its cards and backups under the
+                    // conversation, so it is told this one.
+                    tools.set_session(session_id);
                 }
             }
             on_event(&event);
@@ -891,13 +987,89 @@ fn consume_stream<R: BufRead>(
     Ok(outcome)
 }
 
+/// [`consume`] over a finished stream of bytes, for the tests that replay
+/// captured output.
+#[cfg(test)]
+fn consume_stream<R: BufRead>(
+    reader: R,
+    session: &mut Option<String>,
+    on_event: &mut dyn FnMut(&AgentEvent),
+    cancel: Option<&crate::runtime::cancel::CancelToken>,
+) -> Result<Option<TurnOutcome>, AgentError> {
+    let (to, from) = std::sync::mpsc::channel();
+    for line in reader.lines() {
+        let message = match line {
+            Ok(line) => Incoming::Line(line),
+            Err(e) => Incoming::ReadFailed(e.to_string()),
+        };
+        let _ = to.send(message);
+    }
+    let _ = to.send(Incoming::Ended);
+    let mut tools = crate::toolbox::Toolbox::new(std::path::Path::new("."), true);
+    consume(&from, session, on_event, cancel, &mut tools, &mut 0)
+}
+
+/// The flags that make the CLI a model and nothing else. Each was proved on
+/// the installed CLI before it was relied on — see `docs/ARCHITECTURE.md`,
+/// "Models only: incode runs every tool".
+///
+/// - `--tools ""`: none of its built-in tools. Its session then lists only the
+///   MCP tools incode hands it.
+/// - `--strict-mcp-config`: only the servers in `--mcp-config`, so nothing the
+///   operator configured for the CLI is reachable.
+/// - `--setting-sources ""`: no user, project or local settings — and with
+///   them none of their hooks, permission rules or default mode. Measured:
+///   thirteen hook events on a control run, none with this flag.
+/// - `--disable-slash-commands`: no skills of its own.
+///
+/// `--bare` would do most of this in one flag, and cannot be used: it reads
+/// only an API key, and a subscription login answers "Not logged in".
+const MODEL_ONLY_FLAGS: [&str; 7] = [
+    "--tools",
+    "",
+    "--strict-mcp-config",
+    "--setting-sources",
+    "",
+    "--disable-slash-commands",
+    "--verbose",
+];
+
+/// Environment that keeps the CLI's own memory out: no `CLAUDE.md` files and
+/// no auto-memory. Measured: a project canary in `CLAUDE.md` was repeated by a
+/// control run and unknown to a run with these set.
+const MODEL_ONLY_ENV: [(&str, &str); 2] = [
+    ("CLAUDE_CODE_DISABLE_CLAUDE_MDS", "1"),
+    ("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1"),
+];
+
+/// Every MCP server the CLI gets: incode's other servers, if any, and the
+/// tool bridge — as one `--mcp-config` document, and the tool names each
+/// server's calls may use without the CLI asking anyone.
+fn servers_for(others: Option<&str>, exe: &std::path::Path) -> (String, Vec<String>) {
+    let mut servers = others
+        .and_then(|config| serde_json::from_str::<serde_json::Value>(config).ok())
+        .and_then(|config| {
+            config
+                .get("mcpServers")
+                .and_then(|m| m.as_object().cloned())
+        })
+        .unwrap_or_default();
+    servers.insert(
+        crate::tool_bridge::CLIENT_KEY.to_string(),
+        crate::tool_bridge::client_entry(exe),
+    );
+    // Allowed by server, not by tool: the CLI would otherwise refuse each call
+    // for want of a person to ask. Whether a call may run is decided by incode
+    // when it arrives, not by the CLI before it is sent.
+    let allowed = servers.keys().map(|key| format!("mcp__{key}")).collect();
+    let config = serde_json::json!({ "mcpServers": servers }).to_string();
+    (config, allowed)
+}
+
 impl AgentBackend for ClaudeCodeBackend {
-    /// Both halves, and both MEASURED rather than assumed.
-    ///
-    /// Writes: a probe with `Edit(protected.txt)` in force left the file
-    /// untouched, including when a sub-agent was explicitly told to write it.
-    /// Sub-agents: a turn given the sub-agent tool on `--disallowedTools`
-    /// reported it ABSENT, not merely refused.
+    /// Both halves, by incode's own toolbox: a protected path is refused
+    /// before the write, and the model has no sub-agent tool but incode's,
+    /// which stops at its depth limit.
     fn enforces(&self) -> crate::guards::Enforcement {
         crate::guards::Enforcement::EVERYTHING
     }
@@ -931,7 +1103,20 @@ impl AgentBackend for ClaudeCodeBackend {
     }
 
     fn set_cancel(&mut self, token: crate::runtime::cancel::CancelToken) {
+        self.tools.set_cancel(token.clone());
         self.cancel = Some(token);
+    }
+
+    fn set_prompter(&mut self, prompter: std::sync::Arc<dyn crate::hooks::engine::Prompter>) {
+        self.tools.set_prompter(prompter);
+    }
+
+    fn children(&self) -> Vec<(String, String)> {
+        self.tools
+            .children()
+            .into_iter()
+            .map(|c| (c.session, c.title))
+            .collect()
     }
 
     fn model(&self) -> Option<&str> {
@@ -990,81 +1175,33 @@ impl AgentBackend for ClaudeCodeBackend {
         let (budgeted_prompt, budgeted_context) =
             crate::agent::budget_for_spawn(prompt, &self.system_context);
 
-        let mut cmd = Command::new(&self.binary);
-        cmd.arg("-p")
-            .arg(&budgeted_prompt)
-            .arg("--output-format")
-            .arg("stream-json")
-            .arg("--verbose");
+        // THE TOOLS ARE incode's. The CLI's own are switched off below and the
+        // model is handed incode's toolbox through the bridge, which this
+        // process answers for the whole turn. Without the bridge there would
+        // be no tools but the CLI's, so a bridge that cannot open stops the
+        // turn rather than falling back to them.
+        let exe = std::env::current_exe().map_err(|e| {
+            AgentError::new(format!(
+                "incode could not name its own binary, so it cannot offer its tools; \
+                 the turn was not started: {e}"
+            ))
+        })?;
+        let (to_loop, from_cli) = std::sync::mpsc::channel();
+        let bridge =
+            crate::tool_bridge::Bridge::open(to_loop.clone(), Incoming::Tool, self.cancel.clone())
+                .map_err(|e| {
+                    AgentError::new(format!(
+                        "incode could not open the channel its tools run over, so the turn \
+                         was not started: {e}"
+                    ))
+                })?;
+        let (servers, allowed) = servers_for(self.desktop_mcp.as_deref(), &exe);
 
-        // An MCP server the harness hands over, rather than one the operator
-        // happened to configure. NOT accompanied by --strict-mcp-config: see
-        // the field's documentation for why that would cut off memory.
-        if let Some(config) = &self.desktop_mcp {
-            cmd.arg("--mcp-config").arg(config);
-        }
-
-        // Which model serves this turn. Absent, the CLI uses its own default,
-        // which is the right behaviour for a caller with no opinion.
-        if let Some(model) = &self.model {
-            cmd.arg("--model").arg(model);
-        }
-        if self.partial_messages {
-            cmd.arg("--include-partial-messages");
-        }
-        if !self.extra_dirs.is_empty() {
-            cmd.arg("--add-dir");
-            for dir in &self.extra_dirs {
-                cmd.arg(dir);
-            }
-        }
-        if let Some(mode) = &self.permission_mode {
-            cmd.arg("--permission-mode").arg(mode);
-        }
-        if !budgeted_context.is_empty() {
-            cmd.arg("--append-system-prompt").arg(&budgeted_context);
-        }
-        // The protected paths, enforced by the agent's own permission layer
-        // before a write happens rather than caught after one.
-        if !self.deny.is_empty() {
-            cmd.arg("--disallowedTools");
-            for rule in &self.deny {
-                cmd.arg(rule);
-            }
-        }
-        if !self.fallbacks.is_empty() {
-            // One comma-separated list, tried in order — the CLI's own shape for
-            // the ordered chain the role table produces.
-            cmd.arg("--fallback-model").arg(self.fallbacks.join(","));
-        }
-
-        // Continue the existing session rather than starting a new one. A fresh
-        // session re-pays the entire prompt prefix; resuming does not.
-        if let Some(sid) = &self.session_id {
-            cmd.arg("--resume").arg(sid);
-        }
-
-        // Deliberately NOT --bare: bare mode never reads OAuth credentials or
-        // the system keychain, which drops the run off the user's subscription
-        // and onto an API key.
-        //
-        // Point the agent at a profile whose session is actually live.
-        //
-        // Skipped entirely when the operator has already said which profile to
-        // use: an explicit choice is a decision, and silently overriding it
-        // would be worse than the fallback this replaces.
-        if std::env::var_os(PROFILE_ENV).is_none() {
-            if let Some(profile) = usable_profile() {
-                cmd.env(PROFILE_ENV, &profile.dir);
-            }
-        }
-
-        // WHO THIS AGENT IS ON THE TEAM CHANNEL, for the task about to run.
-        // The team MCP server is a child of this process and reads it from
-        // here — see [`crate::agent::AgentBackend::set_team_identity`] for why
-        // it cannot come from the registration or from the model.
-        if let Some(role) = &self.team_identity {
-            cmd.env(crate::team_mcp::IDENTITY_ENV, role);
+        let mut cmd = self.command(&budgeted_prompt, &budgeted_context, &servers, &allowed);
+        // How the tool server finds this process: through the CLI's
+        // environment, which the servers it starts inherit — never its argv.
+        for (key, value) in bridge.env() {
+            cmd.env(key, value);
         }
 
         // WHAT WAS ACTUALLY SPAWNED, on the ordinary trace. The flags decide the
@@ -1135,12 +1272,18 @@ impl AgentBackend for ClaudeCodeBackend {
         // blocks on the write and never exits. See `stderr_tail`.
         let stderr = crate::agent::stderr_tail::StderrTail::capture(child.stderr.take());
 
-        let outcome = consume_stream(
-            BufReader::new(stdout),
+        pump(BufReader::new(stdout), to_loop);
+        let outcome = consume(
+            &from_cli,
             &mut self.session_id,
             on_event,
             self.cancel.as_ref(),
+            &mut self.tools,
+            &mut self.calls,
         );
+        // Closed as soon as the turn's loop is done: a call that arrives from
+        // here on is refused rather than left waiting on a loop that is gone.
+        drop(bridge);
 
         // Whatever happened, the child must not outlive this call. A cancelled
         // turn that left the agent running would keep writing files with
@@ -2009,5 +2152,231 @@ mod tests {
             !reason.contains("hunter2-not-a-real-secret"),
             "a secret-shaped value reached the error unredacted"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Models only: the CLI's tools off, incode's toolbox on.
+    // -----------------------------------------------------------------------
+
+    fn args_of(cmd: &Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn value_after(args: &[String], flag: &str) -> Option<String> {
+        let at = args.iter().position(|a| a == flag)?;
+        args.get(at + 1).cloned()
+    }
+
+    /// **THE CLI IS STARTED AS A MODEL AND NOTHING ELSE**: no tools of its
+    /// own, only incode's servers, none of its settings — and none of the
+    /// harness flags it used to be handed, because it has nothing left for
+    /// them to govern.
+    #[test]
+    fn the_cli_is_started_with_its_own_harness_switched_off() {
+        let mut backend = ClaudeCodeBackend::new(PathBuf::from("."))
+            .with_guards(&crate::guards::Guards::default());
+        backend.set_permission_mode("plan");
+        assert!(
+            !backend.deny_rules().is_empty(),
+            "control: there are deny rules that could leak onto the argv"
+        );
+        let (servers, allowed) = servers_for(None, std::path::Path::new("incode"));
+        let cmd = backend.command("hi", "", &servers, &allowed);
+        let args = args_of(&cmd);
+
+        assert_eq!(
+            value_after(&args, "--tools").as_deref(),
+            Some(""),
+            "{args:?}"
+        );
+        assert_eq!(
+            value_after(&args, "--setting-sources").as_deref(),
+            Some(""),
+            "{args:?}"
+        );
+        assert!(args.iter().any(|a| a == "--strict-mcp-config"), "{args:?}");
+        assert!(
+            args.iter().any(|a| a == "--disable-slash-commands"),
+            "{args:?}"
+        );
+        assert_eq!(
+            value_after(&args, "--allowedTools").as_deref(),
+            Some("mcp__incode")
+        );
+        for gone in [
+            "--permission-mode",
+            "--disallowedTools",
+            "--add-dir",
+            "--dangerously-skip-permissions",
+            "--bare",
+        ] {
+            assert!(
+                !args.iter().any(|a| a == gone),
+                "{gone} reached the CLI: {args:?}"
+            );
+        }
+        let envs: Vec<(String, String)> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| {
+                Some((
+                    k.to_string_lossy().into_owned(),
+                    v?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect();
+        for (key, value) in MODEL_ONLY_ENV {
+            assert!(
+                envs.iter().any(|(k, v)| k == key && v == value),
+                "{key} is not set: {envs:?}"
+            );
+        }
+    }
+
+    /// The bridge joins incode's other servers rather than replacing them,
+    /// and every server's tools are allowed by name.
+    #[test]
+    fn the_bridge_is_added_beside_incodes_other_servers() {
+        let team = r#"{"mcpServers":{"team":{"command":"incode","args":["--team-mcp"]}}}"#;
+        let (servers, allowed) = servers_for(Some(team), std::path::Path::new("incode"));
+        let parsed: serde_json::Value = serde_json::from_str(&servers).expect("json");
+        assert!(parsed["mcpServers"]["team"].is_object(), "{servers}");
+        assert_eq!(
+            parsed["mcpServers"][crate::tool_bridge::CLIENT_KEY]["args"][0],
+            crate::tool_bridge::SERVER_FLAG
+        );
+        assert!(allowed.contains(&"mcp__team".to_string()), "{allowed:?}");
+        assert!(allowed.contains(&"mcp__incode".to_string()), "{allowed:?}");
+    }
+
+    /// One request to the bridge, as the tool server sends it.
+    fn raw_call(
+        addr: &str,
+        token: &str,
+        name: &str,
+        input: serde_json::Value,
+    ) -> serde_json::Value {
+        use std::io::Write as _;
+        let mut stream = std::net::TcpStream::connect(addr).expect("connect");
+        let body = serde_json::json!({"token": token, "op": "call", "name": name, "input": input});
+        writeln!(stream, "{body}").expect("send");
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).expect("reply");
+        serde_json::from_str(&line).expect("json reply")
+    }
+
+    /// **A TOOL CALL MID-TURN IS RUN BY incode's TOOLBOX, AND SHOWN ONCE.**
+    ///
+    /// The CLI's stream carries its own record of the call it forwarded — the
+    /// `tool_use` and `tool_result` blocks. Those are not shown: the call is
+    /// shown as incode ran it, under incode's name for the tool.
+    #[test]
+    fn a_tool_call_mid_turn_runs_in_incodes_toolbox_and_is_shown_once() {
+        let ws = tempfile::tempdir().expect("ws");
+        let mut tools = crate::toolbox::Toolbox::new(ws.path(), true);
+        let (to, from) = std::sync::mpsc::channel();
+        let bridge =
+            crate::tool_bridge::Bridge::open(to.clone(), Incoming::Tool, None).expect("bridge");
+        let [(_, addr), (_, token)] = bridge.env();
+
+        let cli = std::thread::spawn(move || {
+            let say = |line: &str| {
+                let _ = to.send(Incoming::Line(line.to_string()));
+            };
+            say(r#"{"type":"system","subtype":"init","session_id":"s-bridge","model":"m"}"#);
+            say(
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"mcp__incode__Write","input":{"path":"hello.txt","content":"hi"}}]},"parent_tool_use_id":null}"#,
+            );
+            let reply = raw_call(
+                &addr,
+                &token,
+                "Write",
+                serde_json::json!({"path": "hello.txt", "content": "hi"}),
+            );
+            say(
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"wrote it","is_error":false}]},"parent_tool_use_id":null}"#,
+            );
+            say(
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"done"}]},"parent_tool_use_id":null}"#,
+            );
+            say(
+                r#"{"type":"result","is_error":false,"stop_reason":"end_turn","session_id":"s-bridge","usage":{"input_tokens":1,"output_tokens":1}}"#,
+            );
+            let _ = to.send(Incoming::Ended);
+            reply
+        });
+
+        let mut session = None;
+        let mut seen = Vec::new();
+        let mut calls = 0;
+        let outcome = consume(
+            &from,
+            &mut session,
+            &mut |e: &AgentEvent| seen.push(e.clone()),
+            None,
+            &mut tools,
+            &mut calls,
+        )
+        .expect("the turn completes");
+        drop(bridge);
+        let reply = cli.join().expect("the fake CLI");
+
+        assert_eq!(reply["ok"], true, "{reply}");
+        assert_eq!(
+            std::fs::read_to_string(ws.path().join("hello.txt")).expect("written by incode"),
+            "hi"
+        );
+        assert!(outcome.is_some_and(|o| !o.is_error));
+        let uses: Vec<&AgentEvent> = seen
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::ToolUse { .. }))
+            .collect();
+        assert_eq!(uses.len(), 1, "one call, shown once: {seen:?}");
+        assert!(
+            matches!(uses[0], AgentEvent::ToolUse { name, id, .. } if name == "Write" && id == "incode-1"),
+            "shown under incode's own name and id: {seen:?}"
+        );
+        let results: Vec<&AgentEvent> = seen
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::ToolResult { .. }))
+            .collect();
+        assert_eq!(results.len(), 1, "{seen:?}");
+        assert!(
+            matches!(results[0], AgentEvent::ToolResult { output, is_error: false, .. } if !output.contains("wrote it")),
+            "the result is incode's, not the CLI's echo: {seen:?}"
+        );
+    }
+
+    /// **A QUIET TURN STILL STOPS.** Nothing arrives — the model thinking, a
+    /// long command — and the stop lands within the poll, not at the next
+    /// line the CLI happens to print.
+    #[test]
+    fn a_quiet_turn_stops_promptly_when_cancelled() {
+        let token = crate::runtime::cancel::CancelToken::new();
+        let (to, from) = std::sync::mpsc::channel::<Incoming>();
+        let stopper = token.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            stopper.cancel();
+        });
+        let mut tools = crate::toolbox::Toolbox::new(std::path::Path::new("."), true);
+        let started = std::time::Instant::now();
+        let err = consume(
+            &from,
+            &mut None,
+            &mut |_| {},
+            Some(&token),
+            &mut tools,
+            &mut 0,
+        )
+        .expect_err("a stopped turn is not a finished one");
+        assert_eq!(err.to_string(), CANCELLED);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        drop(to);
     }
 }

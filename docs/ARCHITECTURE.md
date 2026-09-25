@@ -407,6 +407,105 @@ them at the start.
 
 ---
 
+## 5a. Models only: incode runs every tool
+
+The owner's rule: incode IS the harness. An installed agent CLI is used only as the
+model, headless. Its built-in tools, its hooks, its permission prompts and modes, its
+edit events and its settings are not relied on. Every tool call the model makes runs in
+incode's own `Toolbox` (`src/toolbox.rs`), so the guards, the memory engine's pre-tool
+hook, the permission mode, the Allow/Reject flow, the cancel token and the observer that
+draws the call apply the same way to every model.
+
+### The bridge
+
+```text
+incode (parent) ──spawns──▶ agent CLI (the model; its own tools off)
+     ▲                           │ starts, from --mcp-config
+     │ 127.0.0.1 + turn token    ▼
+     └──────────────────── incode --tool-server
+```
+
+- `incode --tool-server` (`src/tool_bridge.rs`) speaks MCP on stdio to the CLI, through
+  the framing shared with the team server (`src/mcp_stdio.rs`). It runs nothing: each
+  `tools/list` and `tools/call` is forwarded to the parent over a loopback socket.
+- The parent (`Bridge`, opened per turn by `src/agent/claude_code.rs` `run_turn`) binds
+  `127.0.0.1:0`, makes a 256-bit token, and passes both to the CLI through its
+  ENVIRONMENT (`INCODE_TOOL_BRIDGE`, `INCODE_TOOL_TOKEN`), never its argv. The CLI's
+  stdio servers inherit that environment (measured live).
+- Every request carries the token, compared in constant time. A request is bounded in
+  size (16 MiB) and arrival time (10 s); at most 8 are answered at once. A request after
+  the turn was stopped or ended is refused without reaching the toolbox. The server half
+  refuses to send its token to a non-loopback address.
+- In the parent, each call is run on the thread that owns the turn, through
+  `Toolbox::run_call`, and is reported as incode's own `ToolUse` / `ToolResult` events —
+  so the REPL panels, `incode --acp` tool-call updates and diffs come from incode, not
+  from the CLI's stream. The CLI's own `tool_use` / `tool_result` blocks are no longer
+  read.
+- The permission mode is incode's decision: the session's `plan` / `default` /
+  `acceptEdits` is read back into read-only / prompt / workspace-write and enforced in
+  `Toolbox::run_call` before the engine is asked. Nothing is handed to the CLI.
+
+### Per CLI, as measured on this machine (2026-09-25)
+
+**claude 2.1.282 — bridged.** Each flag was proved with a scratch MCP probe server and
+a live `-p` run before it was relied on:
+
+| Need | Flag | Evidence |
+|---|---|---|
+| No built-in tools | `--tools ""` | session `init` listed only `mcp__probe__Read`, `mcp__probe__Write`; asked for its tools it named only those two; the Write went to the probe. |
+| Only incode's MCP servers | `--strict-mcp-config` + `--mcp-config` | `mcp_servers` held only the servers passed. |
+| No hooks, settings or modes | `--setting-sources ""` | control run: 13 hook events (SessionStart, UserPromptSubmit, PreToolUse ×2, Stop) and `permissionMode: auto` from user settings; with the flag: 0 hook events, `permissionMode: default`. |
+| No CLAUDE.md, no auto-memory | env `CLAUDE_CODE_DISABLE_CLAUDE_MDS=1`, `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` | a canary in the workspace `CLAUDE.md` was repeated by the control run, unknown with these set. |
+| No skills | `--disable-slash-commands` | `init` listed 18 skills without it, `skills: []` and `slash_commands: []` with it. Its agent list is still reported, but with no `Task`/`Agent` tool of its own nothing can start one. |
+| Calls reach incode without a CLI prompt | `--allowedTools mcp__incode mcp__team …` | 0 `permission_denials`. |
+| NOT usable | `--bare` | reads only an API key; with a subscription login it returned `Not logged in · Please run /login`. |
+
+Live, through incode: "create hello.txt containing hi" ran `Write` in incode's toolbox
+(trace `tool Write <- {"path":"hello.txt","content":"hi"}`, engine pre-tool 3.2 s, exit
+0); a `Write` to `tests/probe.txt` was refused by incode's guard and nothing was created;
+under `incode --acp` the `tool_call` (`incode-N`, kind `edit`) and the diff came from
+incode, with stdout still pure JSON-RPC.
+
+What cannot be switched off: two built-in plugins still load (`agents-md`,
+`telemetry`); the CLI still reports its own token usage and quota, which incode shows
+because only the model's biller knows them.
+
+**codex 0.153.4 — NOT bridged; its own tools still run.** Found in `codex exec --help`,
+`codex features list` and the binary:
+`--ignore-user-config` (hooks.json still loads — the control run warned about it),
+`--ignore-rules`, `--disable shell_tool`, `--disable unified_exec`, `--disable view_image`,
+`--disable multi_agent`, `--disable hooks`, `-c web_search="disabled"`, and
+`-c mcp_servers.<name>.command/args/env` (an MCP probe registered this way received
+`initialize` and `tools/list`). NOT proved: whether these leave the model with only MCP
+tools — every live turn returned "You've hit your usage limit … try again at Oct 8th,
+2026", so no tool list could be observed. `apply_patch` and `update_plan` have no
+feature flag or config key (only the model catalogue's `apply_patch_tool_type`); no way
+to switch them off was found. Until both are proved, codex keeps its own tools, the
+Sentinel remains detection-only there, and its edit events still feed the diff.
+
+**agy 1.2.11 (antigravity) — NOT bridged; cannot be.** `agy --help` has no flag to
+remove or restrict its built-in tools, no per-run MCP configuration (only a persistent
+`agy mcp add`, which edits the operator's machine), and no way to skip its settings. A
+live run listed its tools as `view_file, run_command, manage_task, send_message,
+schedule, invoke_subagent, define_subagent, manage_subagents, write_to_file,
+replace_file_content, generate_image, read_url_content, search_web, ask_question,
+call_mcp_tool, list_resources, read_resource`. It stays on its own harness, with the
+Sentinel as detection.
+
+### Known limitations on the bridged route
+
+- `--add-dir` roots: the toolbox writes only inside the workspace, so a root added with
+  `--add-dir` is no longer writable by the claude route.
+- incode's team and desktop MCP servers still run their own tools in their own
+  processes; they are incode's code, but those calls do not pass through `Toolbox`.
+- The engine's session-capture hooks (SessionStart, UserPromptSubmit, Stop) used to fire
+  inside the CLI from its settings; with settings off they no longer fire, and incode
+  does not run them yet.
+- Project instruction files (`CLAUDE.md`) are no longer read by the CLI and are not yet
+  read by incode.
+
+---
+
 ## 6. The invariants
 
 A change that breaks one of these is a change to the architecture, not a bug fix.

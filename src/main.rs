@@ -40,6 +40,10 @@ OPTIONS:
         --team-mcp            Speak MCP on stdin/stdout so a running agent can
                               reach its teammates. Needs --team-channel
         --team-channel <P>    The conversation --team-mcp joins
+        --tool-server         Speak MCP on stdin/stdout, offering incode's tools to
+                              an agent CLI that incode started. Runs nothing
+                              itself: every call goes back to that incode.
+                              Launched BY the agent CLI, not by hand
         --check-findings <P>  Exit 0 if P holds real findings, non-zero if not.
                               This is the CHECK for a research task, run by the
                               harness against its own deliverable — see
@@ -129,6 +133,12 @@ fn main() -> anyhow::Result<()> {
             // when none is ambient. Nothing may reach stdout — `run_stdio`
             // moves the standard handles before anything is printed.
             return incord_code::acp_agent::run_stdio(*config);
+        }
+        Parsed::ToolServer => {
+            // stdout is the protocol channel; this process prints nothing
+            // else there, and runs no tool itself.
+            incord_code::tool_bridge::run_stdio()?;
+            return Ok(());
         }
         Parsed::TeamMcp { channel } => {
             let speaking_as = incord_code::team_mcp::Server::identity_from_env();
@@ -305,6 +315,12 @@ enum Parsed {
         channel: std::path::PathBuf,
     },
 
+    /// Offer incode's tools to the agent CLI incode started, over MCP.
+    ///
+    /// Carries nothing: which incode to answer to, and the turn's token, come
+    /// from the environment that incode gave the CLI and the CLI passed on.
+    ToolServer,
+
     /// Be an Agent Client Protocol agent on stdio.
     ///
     /// Carries the config for the flags that apply to every session it opens
@@ -332,6 +348,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> anyhow::Result<Parsed> {
     let mut team_mcp = false;
     let mut team_channel: Option<std::path::PathBuf> = None;
     let mut acp = false;
+    let mut tool_server = false;
     // `None` asks the OS for a free port and publishes the answer, so nothing
     // collides with whatever else this machine is already running.
     let mut port: Option<u16> = None;
@@ -413,6 +430,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> anyhow::Result<Parsed> {
             "--team-mcp" => team_mcp = true,
             // Answered after the loop, before the workspace check.
             "--acp" => acp = true,
+            "--tool-server" => tool_server = true,
             // Which conversation. A PATH, like --desktop-journal: this process
             // is told the one file it may append to rather than given a
             // workspace to find its own way around.
@@ -421,6 +439,27 @@ fn parse_args(args: impl Iterator<Item = String>) -> anyhow::Result<Parsed> {
             }
             other => anyhow::bail!("unknown argument `{other}`\n\n{USAGE}"),
         }
+    }
+
+    // Before everything, and alone: the agent CLI starts this with whatever
+    // cwd it has, and a flag beside it would be one this mode ignores.
+    if tool_server {
+        let alone = !acp
+            && task.is_none()
+            && !serve
+            && !admin_only
+            && !desktop_mcp
+            && !desktop_stop
+            && !team_mcp
+            && check_findings.is_none()
+            && desktop_journal.is_none()
+            && team_channel.is_none();
+        if !alone {
+            anyhow::bail!(
+                "`--tool-server` is its own mode and cannot be combined with another\n\n{USAGE}"
+            );
+        }
+        return Ok(Parsed::ToolServer);
     }
 
     // FIRST, and before the workspace check: an ACP client launches this from
@@ -793,6 +832,19 @@ mod tests {
         assert!(USAGE.contains("--team-mcp"));
     }
 
+    /// The tool server is its own mode, needs no workspace, and takes no
+    /// other flag: one it ignored would be believed.
+    #[test]
+    fn the_tool_server_is_its_own_mode() {
+        assert!(matches!(
+            parse(&["--tool-server", "-w", "/no/such/directory/anywhere"]).expect("valid"),
+            Parsed::ToolServer
+        ));
+        assert!(parse(&["--tool-server", "--acp"]).is_err());
+        assert!(parse(&["--tool-server", "--team-mcp"]).is_err());
+        assert!(USAGE.contains("--tool-server"));
+    }
+
     /// It must not care about the workspace.
     ///
     /// An MCP client launches this process with whatever cwd it happens to
@@ -892,6 +944,7 @@ mod tests {
             | Parsed::DesktopStop { .. }
             | Parsed::CheckFindings { .. }
             | Parsed::TeamMcp { .. }
+            | Parsed::ToolServer
             | Parsed::Acp(_) => {
                 panic!("expected a runnable config")
             }

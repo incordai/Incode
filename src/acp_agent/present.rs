@@ -265,9 +265,11 @@ pub(crate) fn tool_diff(id: &str, diff: acp::Diff) -> acp::ToolCallUpdate {
 ///
 /// # Where the two sides come from
 ///
-/// The agent CLI edits files itself, so nothing here can watch the write.
-/// What is in hand is the call, its result, and the snapshot the turn took
-/// before it started ([`TurnStart`]):
+/// The calls and results are incode's own: on the API route and on the
+/// bridged CLI route (see [`crate::tool_bridge`]) incode's toolbox ran them and
+/// reported them. On a route whose CLI still edits with its own tools they are
+/// that CLI's reports. Either way what is in hand is the call, its result, and
+/// the snapshot the turn took before it started ([`TurnStart`]):
 ///
 /// - a SPLICE — part of a file replaced — is shown as the call carries it:
 ///   the text taken out and the text put in. Exactly what changed, with no

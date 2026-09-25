@@ -28,8 +28,6 @@
 //! is the property that makes this work at all: an agent CLI's MCP servers are
 //! configured once, and the role is not.
 
-use std::io::{BufRead, Write};
-
 use serde_json::{json, Value};
 
 use crate::team::{Channel, Kind};
@@ -37,21 +35,10 @@ use crate::team::{Channel, Kind};
 /// Where the harness tells this server who it is speaking for.
 pub const IDENTITY_ENV: &str = "INCORD_TEAM_AS";
 
-/// Negotiated down to this by the live server when asked for a newer one —
-/// the same version [`crate::desktop::mcp`] measured.
-const PROTOCOL_VERSION: &str = "2024-11-05";
 const SERVER_NAME: &str = "incord-team";
-const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The name a client sees this server under.
 pub const CLIENT_KEY: &str = "team";
-
-mod code {
-    pub const PARSE_ERROR: i64 = -32700;
-    pub const INVALID_REQUEST: i64 = -32600;
-    pub const METHOD_NOT_FOUND: i64 = -32601;
-    pub const INVALID_PARAMS: i64 = -32602;
-}
 
 /// What the other agents say is data, not instruction.
 ///
@@ -74,7 +61,6 @@ pub struct Server {
     /// The last message `team_read` has shown, so the next read starts after
     /// it. Open questions ignore it — see [`Channel::waiting_for`].
     heard_up_to: Option<u64>,
-    initialised: bool,
 }
 
 impl Server {
@@ -85,7 +71,6 @@ impl Server {
             channel,
             speaking_as,
             heard_up_to: None,
-            initialised: false,
         }
     }
 
@@ -106,80 +91,7 @@ impl Server {
 
     /// Handle one line of JSON-RPC. `None` for a notification.
     pub fn handle_line(&mut self, line: &str) -> Option<String> {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        let request: Value = match serde_json::from_str(trimmed) {
-            Ok(value) => value,
-            Err(e) => {
-                return Some(error_response(
-                    Value::Null,
-                    code::PARSE_ERROR,
-                    &format!("invalid JSON: {e}"),
-                ))
-            }
-        };
-
-        let id = request.get("id").cloned();
-        let Some(method) = request.get("method").and_then(Value::as_str) else {
-            return Some(error_response(
-                id.unwrap_or(Value::Null),
-                code::INVALID_REQUEST,
-                "no method",
-            ));
-        };
-        let params = request.get("params").cloned().unwrap_or(Value::Null);
-
-        // A notification has no id and must not be answered.
-        let Some(id) = id else {
-            if method == "notifications/initialized" {
-                self.initialised = true;
-            }
-            return None;
-        };
-
-        Some(match self.dispatch(method, &params) {
-            Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string(),
-            Err(failure) => error_response(id, failure.code, &failure.message),
-        })
-    }
-
-    fn dispatch(&mut self, method: &str, params: &Value) -> Result<Value, Failure> {
-        match method {
-            "initialize" => {
-                self.initialised = true;
-                Ok(json!({
-                    "protocolVersion": PROTOCOL_VERSION,
-                    "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
-                    "capabilities": {"tools": {"listChanged": false}},
-                    "instructions": UNTRUSTED,
-                }))
-            }
-            "ping" => Ok(json!({})),
-            "tools/list" => Ok(json!({"tools": tool_definitions()})),
-            "tools/call" => self.call_tool(params),
-            other => Err(Failure {
-                code: code::METHOD_NOT_FOUND,
-                message: format!("method '{other}' not found"),
-            }),
-        }
-    }
-
-    fn call_tool(&mut self, params: &Value) -> Result<Value, Failure> {
-        let name = params.get("name").and_then(Value::as_str).ok_or(Failure {
-            code: code::INVALID_PARAMS,
-            message: "tools/call needs a tool name".to_string(),
-        })?;
-        let args = params.get("arguments").cloned().unwrap_or(json!({}));
-
-        // A refused tool is not a protocol error: the call arrived and the
-        // tool said no. Reporting it as a transport failure would make the
-        // agent retry the connection instead of reading the reason.
-        Ok(match self.run_tool(name, &args) {
-            Ok(body) => json!({"content": [text(body)], "isError": false}),
-            Err(why) => json!({"content": [text(why)], "isError": true}),
-        })
+        crate::mcp_stdio::handle_line(self, line)
     }
 
     fn run_tool(&mut self, name: &str, args: &Value) -> Result<String, String> {
@@ -284,22 +196,23 @@ impl Server {
     }
 }
 
-struct Failure {
-    code: i64,
-    message: String,
-}
+/// The shared framing asks; this server's tools answer.
+impl crate::mcp_stdio::Handler for Server {
+    fn name(&self) -> &str {
+        SERVER_NAME
+    }
 
-fn text(body: String) -> Value {
-    json!({"type": "text", "text": body})
-}
+    fn instructions(&self) -> Option<&str> {
+        Some(UNTRUSTED)
+    }
 
-fn error_response(id: Value, code: i64, message: &str) -> String {
-    json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "error": {"code": code, "message": message},
-    })
-    .to_string()
+    fn tools(&mut self) -> Result<Vec<Value>, String> {
+        Ok(tool_definitions())
+    }
+
+    fn call(&mut self, name: &str, args: &Value) -> Result<String, String> {
+        self.run_tool(name, args)
+    }
 }
 
 fn tool_definitions() -> Vec<Value> {
@@ -414,22 +327,9 @@ pub fn codex_config_overrides(exe: &std::path::Path, channel: &std::path::Path) 
 /// outlives its client can do no harm beyond holding a file handle.
 pub fn run_stdio(mut server: Server) -> std::io::Result<()> {
     let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout();
-    let mut line = String::new();
-
-    loop {
-        line.clear();
-        match stdin.lock().read_line(&mut line) {
-            Ok(0) => return Ok(()),
-            Ok(_) => {
-                if let Some(reply) = server.handle_line(&line) {
-                    writeln!(stdout, "{reply}")?;
-                    stdout.flush()?;
-                }
-            }
-            Err(e) => return Err(e),
-        }
-    }
+    let mut input = stdin.lock();
+    let mut output = std::io::stdout();
+    crate::mcp_stdio::serve(&mut server, &mut input, &mut output)
 }
 
 #[cfg(test)]
@@ -463,7 +363,10 @@ mod tests {
             &mut s,
             r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
         );
-        assert_eq!(reply["result"]["protocolVersion"], PROTOCOL_VERSION);
+        assert_eq!(
+            reply["result"]["protocolVersion"],
+            crate::mcp_stdio::PROTOCOL_VERSION
+        );
         assert_eq!(reply["result"]["serverInfo"]["name"], SERVER_NAME);
     }
 

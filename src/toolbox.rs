@@ -147,6 +147,10 @@ pub struct Toolbox {
     /// Tripped when the operator stops the turn: a wait on the engine or on a
     /// person ends then rather than at its ten-minute bound.
     cancel: Option<crate::runtime::cancel::CancelToken>,
+    /// How much the session lets a call do, when the session said. `None`
+    /// leaves every call to the guards and the engine alone — the route whose
+    /// caller has no mode to give.
+    mode: Option<crate::permissions::PermissionMode>,
 }
 
 impl Toolbox {
@@ -168,7 +172,17 @@ impl Toolbox {
             session: String::new(),
             prompter: None,
             cancel: None,
+            mode: None,
         }
+    }
+
+    /// The session's permission mode, decided HERE for every call.
+    ///
+    /// Read-only refuses what changes the workspace or runs code; `prompt`
+    /// asks the person before each of those; the writing modes leave them to
+    /// the guards and the engine.
+    pub fn set_permission_mode(&mut self, mode: crate::permissions::PermissionMode) {
+        self.mode = Some(mode);
     }
 
     /// Ask this engine before every call. Opt-in here, and done by the one
@@ -627,6 +641,12 @@ impl Toolbox {
             crate::trace!("tool", "{name} REFUSED by guards: {refusal}");
             return Err(refusal);
         }
+        // The session's mode, before the engine: it is decided here, costs
+        // nothing, and a call it refuses need not cost an engine process.
+        if let Err(refusal) = self.mode_allows(call_id, name, input) {
+            crate::trace!("tool", "{name} REFUSED by the permission mode: {refusal}");
+            return Err(refusal);
+        }
         // AFTER the operator's own guards, which are free: a call they refuse
         // never costs an engine process. BEFORE the snapshot and the dispatch,
         // because this is the last point where refusing still prevents.
@@ -649,6 +669,70 @@ impl Toolbox {
                 .map(|said| format!("{said}\n\n{context}"))
                 .map_err(|why| format!("{why}\n\n{context}")),
             None => outcome,
+        }
+    }
+
+    /// Whether the session's permission mode lets this call run.
+    ///
+    /// Only the calls that change the workspace or run code are governed:
+    /// writing, editing, the shell, the project's check and the brief. Reading
+    /// and searching run under every mode. A subagent is refused wherever the
+    /// mode restricts anything, because the agent it would start does not
+    /// carry this mode and could do what this one may not.
+    fn mode_allows(&self, call_id: &str, name: &str, input: &Value) -> Result<(), String> {
+        use crate::permissions::PermissionMode;
+        let Some(mode) = self.mode else {
+            return Ok(());
+        };
+        let changes = matches!(name, WRITE | EDIT | BASH)
+            || name == crate::verify::VERIFY_TOOL
+            || name == crate::brief::SAVE_TOOL;
+        let restricted = matches!(mode, PermissionMode::ReadOnly | PermissionMode::Prompt);
+        if name == AGENT && restricted {
+            return Err(format!(
+                "this session is {}, and a subagent would not be held to that. Do the \
+                 work here instead.",
+                mode.as_str()
+            ));
+        }
+        if !changes {
+            return Ok(());
+        }
+        match mode {
+            PermissionMode::ReadOnly => Err(format!(
+                "NOT RUN — this session is read-only, and {name} changes the workspace or runs \
+                 code. Describe the change instead of making it."
+            )),
+            PermissionMode::Prompt => {
+                let shown = self.event_input(name, input);
+                let reason = format!("the session asks before every {name}");
+                let ask = crate::hooks::engine::Ask {
+                    call_id,
+                    tool_name: name,
+                    tool_input: &shown,
+                    reason: &reason,
+                };
+                let stopped = || {
+                    self.cancel
+                        .as_ref()
+                        .is_some_and(crate::runtime::cancel::CancelToken::is_cancelled)
+                };
+                match self
+                    .prompter
+                    .as_ref()
+                    .and_then(|p| p.confirm(&ask, &stopped))
+                {
+                    Some(crate::hooks::engine::Verdict::Allow) => Ok(()),
+                    Some(crate::hooks::engine::Verdict::Deny(why)) => Err(why),
+                    None => Err(format!(
+                        "NOT RUN — this session asks before every {name}, and nobody could be \
+                         asked."
+                    )),
+                }
+            }
+            PermissionMode::WorkspaceWrite
+            | PermissionMode::DangerFullAccess
+            | PermissionMode::Allow => Ok(()),
         }
     }
 
@@ -1680,6 +1764,91 @@ mod tests {
             events[0]["tool_input"]["questions"][0]["options"],
             database_question()["questions"][0]["options"]
         );
+    }
+
+    /// **READ-ONLY IS DECIDED HERE.** A write is refused and nothing lands; a
+    /// read still runs. The control is the same write with no mode set.
+    #[test]
+    fn a_read_only_session_refuses_changes_and_allows_reads() {
+        use crate::permissions::PermissionMode;
+        let dir = tempfile::tempdir().expect("tmp");
+        std::fs::write(dir.path().join("r.txt"), "readable").expect("seed");
+        let mut box_ = toolbox(dir.path());
+        box_.set_permission_mode(PermissionMode::ReadOnly);
+
+        let refused = box_
+            .run(WRITE, &json!({"path": "w.txt", "content": "x"}))
+            .expect_err("read-only refuses a write");
+        assert!(refused.contains("read-only"), "{refused}");
+        assert!(!dir.path().join("w.txt").exists(), "nothing was written");
+        let refused = box_
+            .run(BASH, &json!({"command": "echo ran > ran.txt"}))
+            .expect_err("read-only refuses the shell");
+        assert!(refused.contains("read-only"), "{refused}");
+        assert!(!dir.path().join("ran.txt").exists());
+        assert!(box_
+            .run(READ, &json!({"path": "r.txt"}))
+            .expect("reading is not changing")
+            .contains("readable"));
+
+        // The control: no mode, the same write lands.
+        toolbox(dir.path())
+            .run(WRITE, &json!({"path": "w.txt", "content": "x"}))
+            .expect("no mode, no refusal");
+        assert!(dir.path().join("w.txt").exists());
+    }
+
+    /// **`prompt` ASKS THE PERSON**, and their answer decides.
+    #[test]
+    fn a_prompt_session_asks_before_a_write_and_obeys_the_answer() {
+        use crate::permissions::PermissionMode;
+        let dir = tempfile::tempdir().expect("tmp");
+
+        let yes = Arc::new(Person {
+            confirm: Some(Verdict::Allow),
+            ..Person::default()
+        });
+        let mut box_ = toolbox(dir.path());
+        box_.set_permission_mode(PermissionMode::Prompt);
+        box_.set_prompter(yes.clone());
+        box_.run(WRITE, &json!({"path": "yes.txt", "content": "x"}))
+            .expect("allowed by the person");
+        assert!(dir.path().join("yes.txt").exists());
+        assert_eq!(yes.asked.load(Ordering::SeqCst), 1, "asked once");
+
+        let no = Arc::new(Person {
+            confirm: Some(Verdict::Deny("not now".to_string())),
+            ..Person::default()
+        });
+        box_.set_prompter(no.clone());
+        let refused = box_
+            .run(WRITE, &json!({"path": "no.txt", "content": "x"}))
+            .expect_err("refused by the person");
+        assert_eq!(refused, "not now");
+        assert!(!dir.path().join("no.txt").exists());
+
+        // A read is not asked about.
+        let _ = box_.run(GLOB, &json!({"pattern": "*.txt"}));
+        assert_eq!(
+            no.asked.load(Ordering::SeqCst),
+            1,
+            "only the write was asked"
+        );
+    }
+
+    /// A subagent would not carry the mode, so a restricted session keeps
+    /// the work.
+    #[test]
+    fn a_restricted_session_does_not_delegate() {
+        use crate::permissions::PermissionMode;
+        let dir = tempfile::tempdir().expect("tmp");
+        let mut box_ = toolbox(dir.path());
+        box_.set_permission_mode(PermissionMode::ReadOnly);
+        let refused = box_
+            .run(AGENT, &json!({"task": "go and do a thing"}))
+            .expect_err("no delegation");
+        assert!(refused.contains("subagent"), "{refused}");
+        assert!(box_.children().is_empty());
     }
 
     #[test]
