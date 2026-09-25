@@ -845,6 +845,13 @@ pub trait AgentBackend {
     /// Stop the turn when this token is tripped.
     fn set_cancel(&mut self, _token: crate::runtime::cancel::CancelToken) {}
 
+    /// Who to ask when a tool call needs a person's confirmation, or a
+    /// question needs the owner's answer.
+    ///
+    /// Defaulted to nothing: only a backend whose tools this harness runs
+    /// itself ([`crate::toolbox::Toolbox`]) has a moment at which to ask.
+    fn set_prompter(&mut self, _prompter: std::sync::Arc<dyn crate::hooks::engine::Prompter>) {}
+
     /// The model this backend was asked for, when it was asked for one.
     fn model(&self) -> Option<&str> {
         None
@@ -934,6 +941,10 @@ impl AgentBackend for Box<dyn AgentBackend> {
 
     fn set_cancel(&mut self, token: crate::runtime::cancel::CancelToken) {
         (**self).set_cancel(token);
+    }
+
+    fn set_prompter(&mut self, prompter: std::sync::Arc<dyn crate::hooks::engine::Prompter>) {
+        (**self).set_prompter(prompter);
     }
 
     fn model(&self) -> Option<&str> {

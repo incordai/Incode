@@ -159,6 +159,15 @@ pub struct AdminConfig {
     /// Where the memory service listens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_url: Option<String>,
+    /// Where the memory engine's binary is, for the lifecycle hooks this
+    /// harness runs itself (`hook pre-tool`, `hook permission-request`).
+    ///
+    /// Unset means the engine's own install location; the environment
+    /// variable [`crate::hooks::engine::ENGINE_BIN_ENV`] wins over both. See
+    /// [`crate::hooks::engine`] for the order and for what a missing binary
+    /// does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_bin: Option<String>,
     /// Which parts of the body this harness uses.
     ///
     /// Every one is a PLUGIN, not a requirement. The harness runs without the
@@ -1060,6 +1069,9 @@ mod tests {
             budget_tokens: Some(50_000),
             verify_command: Some(vec!["cargo".to_string(), "test".to_string()]),
             memory_url: Some("http://127.0.0.1:9180".to_string()),
+            // The engine the harness runs its own hooks through: a path the
+            // operator chose must come back, or the default quietly replaces it.
+            engine_bin: Some("C:\\engine\\incord-memory-service.exe".to_string()),
             plugins: Plugins::default(),
             // A guard on the desktop has to survive the file too. An operator
             // who writes one and gets it back empty has no guard and no way

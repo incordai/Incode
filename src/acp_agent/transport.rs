@@ -8,8 +8,10 @@
 //! end — an editor now, sending requests, where it used to be an agent sending
 //! replies.
 
+use std::collections::HashMap;
 use std::io::{BufRead, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::Mutex;
 
 use agent_client_protocol_schema::v1 as acp;
@@ -190,9 +192,13 @@ pub(crate) enum Incoming {
         method: String,
         params: Option<Value>,
     },
-    /// A reply from the client. This agent sends the client no requests, so
-    /// there is nothing to match one to; it is dropped.
-    Response,
+    /// The client's answer to a request this agent sent it — a
+    /// `session/request_permission`. Handed to [`Outbox::resolve`], which
+    /// passes it to whoever is waiting on that id.
+    Response {
+        id: acp::RequestId,
+        outcome: Result<Value, acp::Error>,
+    },
 }
 
 /// A line that is not a message, and the error it is owed.
@@ -231,8 +237,22 @@ pub(crate) fn classify(line: &str) -> Result<Incoming, Box<Refusal>> {
     };
     let id = fields.get("id").map(id_of);
     if !fields.contains_key("method") {
-        if fields.contains_key("result") || fields.contains_key("error") {
-            return Ok(Incoming::Response);
+        if let Some(error) = fields.get("error") {
+            let error = serde_json::from_value::<acp::Error>(error.clone()).unwrap_or_else(|e| {
+                acp::Error::internal_error().data(Value::String(format!(
+                    "the client's error could not be read: {e}"
+                )))
+            });
+            return Ok(Incoming::Response {
+                id: id.unwrap_or(acp::RequestId::Null),
+                outcome: Err(error),
+            });
+        }
+        if let Some(result) = fields.get("result") {
+            return Ok(Incoming::Response {
+                id: id.unwrap_or(acp::RequestId::Null),
+                outcome: Ok(result.clone()),
+            });
         }
         return Err(refuse(
             id.unwrap_or(acp::RequestId::Null),
@@ -290,14 +310,81 @@ pub(crate) struct Outbox {
     /// Set once a write fails. The client is gone; every later message is
     /// dropped instead of failing the same way again.
     broken: AtomicBool,
+    /// Requests this agent sent the client, waiting for its answer, by id.
+    waiting: Mutex<HashMap<acp::RequestId, SyncSender<Reply>>>,
+    /// The number in the next request id. Ids are `incode-<n>`, their own
+    /// namespace: the client's ids name ITS requests, and a response is told
+    /// apart from a request by having no method, not by its id.
+    next_id: AtomicU64,
 }
+
+/// The client's answer to one request: its `result`, or its `error`.
+pub(crate) type Reply = Result<Value, acp::Error>;
 
 impl Outbox {
     pub(crate) fn new(writer: Box<dyn Write + Send>) -> Self {
         Self {
             writer: Mutex::new(writer),
             broken: AtomicBool::new(false),
+            waiting: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(1),
         }
+    }
+
+    fn waiting(&self) -> std::sync::MutexGuard<'_, HashMap<acp::RequestId, SyncSender<Reply>>> {
+        self.waiting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Send the client a request. Its answer arrives on the receiver, once the
+    /// reader hands it to [`Self::resolve`].
+    ///
+    /// The receiver disconnects — never hangs — when the request could not be
+    /// sent, when [`Self::forget`] withdraws it, and when the client goes
+    /// ([`Self::abandon_all`]).
+    pub(crate) fn request<P: Serialize>(
+        &self,
+        method: &str,
+        params: P,
+    ) -> (acp::RequestId, Receiver<Reply>) {
+        let n = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let id = acp::RequestId::Str(format!("incode-{n}"));
+        let (answer, answered) = std::sync::mpsc::sync_channel(1);
+        // Registered BEFORE it is written: a quick client can answer before
+        // the write call has even returned.
+        self.waiting().insert(id.clone(), answer);
+        let message = acp::JsonRpcMessage::wrap(acp::Request {
+            id: id.clone(),
+            method: method.into(),
+            params: Some(params),
+        });
+        match serde_json::to_string(&message) {
+            Ok(line) => self.send_line(line),
+            Err(e) => eprintln!("incode acp: a {method} request could not be encoded: {e}"),
+        }
+        if self.broken.load(Ordering::SeqCst) {
+            self.forget(&id);
+        }
+        (id, answered)
+    }
+
+    /// The client answered request `id`. An answer nobody waits for — the
+    /// request was withdrawn, or never ours — is dropped.
+    pub(crate) fn resolve(&self, id: &acp::RequestId, reply: Reply) {
+        if let Some(waiter) = self.waiting().remove(id) {
+            let _ = waiter.try_send(reply);
+        }
+    }
+
+    /// Stop waiting for request `id`: the answer came from somewhere else.
+    pub(crate) fn forget(&self, id: &acp::RequestId) {
+        self.waiting().remove(id);
+    }
+
+    /// The client has gone: nothing it was asked will be answered.
+    pub(crate) fn abandon_all(&self) {
+        self.waiting().clear();
     }
 
     /// Answer one request.
@@ -458,6 +545,34 @@ mod tests {
             "answered with its own id"
         );
         assert_eq!(refused.error.code, acp::ErrorCode::InvalidRequest);
+    }
+
+    /// A response from the client is routed by its id to the request that
+    /// asked, and an answer to a request nobody waits for is dropped.
+    #[test]
+    fn a_response_reaches_the_request_that_asked() {
+        let outbox = Outbox::new(Box::new(std::io::sink()));
+        let (id, answered) = outbox.request("session/request_permission", Value::Null);
+        let line = serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"ok": 1}}).to_string();
+        match classify(&line) {
+            Ok(Incoming::Response { id: got, outcome }) => {
+                assert_eq!(got, id);
+                outbox.resolve(&got, outcome);
+            }
+            other => panic!("got {other:?}"),
+        }
+        assert_eq!(
+            answered.try_recv().expect("answered"),
+            Ok(serde_json::json!({"ok": 1}))
+        );
+
+        // Withdrawn: the waiter is told nothing more is coming.
+        let (gone, waiting) = outbox.request("session/request_permission", Value::Null);
+        outbox.forget(&gone);
+        assert!(matches!(
+            waiting.recv_timeout(std::time::Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+        ));
     }
 
     #[test]

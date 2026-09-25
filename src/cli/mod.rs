@@ -10,6 +10,7 @@ pub mod logo;
 pub mod markdown;
 pub mod paint;
 pub mod panel;
+pub mod prompt;
 pub mod render;
 pub mod slash_commands;
 pub mod viewport;
@@ -68,7 +69,16 @@ impl CliApp {
         // stopping it means killing that process — the token is checked between
         // output lines and the child is killed when it is set.
         let cancel = crate::runtime::cancel::CancelToken::new();
-        let prepared = prepare_session(&self.config, cancel.clone(), booted_at)?;
+        let mut prepared = prepare_session(&self.config, cancel.clone(), booted_at)?;
+        // Someone is at the keyboard only when both ends are a terminal; piped,
+        // a mid-turn question would wait on input nobody can give.
+        if std::io::IsTerminal::is_terminal(&std::io::stdin())
+            && std::io::IsTerminal::is_terminal(&std::io::stdout())
+        {
+            prepared
+                .session
+                .set_prompter(std::sync::Arc::new(prompt::Terminal));
+        }
         self.repl(prepared, cancel, booted_at)
     }
 }
@@ -1873,14 +1883,19 @@ pub(crate) fn route_backend(
         None
     };
     match api {
-        Some(settings) => Box::new(crate::agent::api::ApiBackend::new(
-            settings,
-            workspace,
-            // The same project context the CLI gets, as the standing
-            // instructions rather than repeated on every turn.
-            &system_prompt.join("\n\n"),
-            filter_env,
-        )),
+        Some(settings) => Box::new(
+            crate::agent::api::ApiBackend::new(
+                settings,
+                workspace,
+                // The same project context the CLI gets, as the standing
+                // instructions rather than repeated on every turn.
+                &system_prompt.join("\n\n"),
+                filter_env,
+            )
+            // The memory engine's guard, asked before each of the harness's own
+            // tools runs.
+            .with_engine(crate::hooks::engine::Engine::locate()),
+        ),
         None => run_backend(workspace, agent_id, binary, guards, system_prompt),
     }
 }

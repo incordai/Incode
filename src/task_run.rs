@@ -107,9 +107,13 @@ pub fn run_task_with_model(
     for (idx, candidate) in candidates.into_iter().enumerate() {
         let (mut backend, route): (Box<dyn AgentBackend>, String) = match candidate {
             Candidate::Api(settings) => (
-                Box::new(crate::agent::api::ApiBackend::new(
-                    settings, workspace, "", true,
-                )),
+                Box::new(
+                    crate::agent::api::ApiBackend::new(settings, workspace, "", true)
+                        // Nobody is at an unattended run: a call the engine
+                        // wants confirmed is the owner's app's to answer, or
+                        // refused.
+                        .with_engine(crate::hooks::engine::Engine::locate()),
+                ),
                 "a model over the configured API".to_string(),
             ),
             Candidate::Cli(agent) => {

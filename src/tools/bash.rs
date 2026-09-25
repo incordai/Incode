@@ -108,8 +108,22 @@ pub fn execute_bash(workspace: &Path, input: &str, filter_env: bool) -> Result<S
 /// exited, so a verbose check was killed at the deadline and reported as a
 /// hang. Measured: 4,000 lines of output, "command timed out after 30s".
 pub(crate) fn wait_with_timeout(
+    child: std::process::Child,
+    timeout: Duration,
+) -> Result<std::process::Output> {
+    wait_with_timeout_or(child, timeout, &|| false)
+}
+
+/// [`wait_with_timeout`], which also kills the tree as soon as `abandon`
+/// answers true.
+///
+/// For a wait whose answer can arrive from somewhere else first — the engine's
+/// permission hook racing the person at the prompt — so the losing side is
+/// ended at once instead of running to its bound.
+pub(crate) fn wait_with_timeout_or(
     mut child: std::process::Child,
     timeout: Duration,
+    abandon: &dyn Fn() -> bool,
 ) -> Result<std::process::Output> {
     let tree = crate::agent::process_tree::Tree::adopt(&child);
     let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
@@ -129,6 +143,11 @@ pub(crate) fn wait_with_timeout(
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
+                if abandon() {
+                    tree.kill(&mut child);
+                    let _ = child.wait();
+                    anyhow::bail!("stopped before it finished: the answer came from elsewhere");
+                }
                 if start.elapsed() > timeout {
                     tree.kill(&mut child);
                     let _ = child.wait();

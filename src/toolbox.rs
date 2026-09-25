@@ -54,6 +54,24 @@ pub const BASH: &str = "Bash";
 pub const SKILL: &str = "Skill";
 /// Hand a self-contained piece of work to a fresh agent.
 pub const AGENT: &str = "Agent";
+/// Put a multiple-choice question to the owner.
+///
+/// THIS EXACT NAME. The memory engine routes a question to the owner's app
+/// only for a tool it recognises by name, so a rename here silently turns
+/// every question back into a local-only one.
+pub const ASK_USER_QUESTION: &str = "AskUserQuestion";
+
+/// What the memory engine decided about one call, before it runs.
+enum Gate {
+    /// Run it; `context` is guidance for this action, handed to the model with
+    /// the result.
+    Run { context: Option<String> },
+    /// Do not run it; the model is told why, as an error.
+    Refused(String),
+    /// A question the owner already answered in their app: the answer IS the
+    /// result, and it is not an error.
+    Answered(String),
+}
 
 /// How deep subagents may nest.
 ///
@@ -118,6 +136,17 @@ pub struct Toolbox {
     children: std::sync::Mutex<Vec<Spawned>>,
     checkpoints:
         Option<std::sync::Arc<std::sync::Mutex<crate::tools::checkpoint::CheckpointStore>>>,
+    /// The memory engine, asked before every call once the operator's guards
+    /// have passed it. `None` when none is named or installed.
+    engine: Option<crate::hooks::engine::Engine>,
+    /// The conversation these calls belong to, as the engine is told it.
+    session: String,
+    /// Who can be asked when the engine wants a person — the terminal, or the
+    /// ACP client. `None` when nobody is there.
+    prompter: Option<std::sync::Arc<dyn crate::hooks::engine::Prompter>>,
+    /// Tripped when the operator stops the turn: a wait on the engine or on a
+    /// person ends then rather than at its ten-minute bound.
+    cancel: Option<crate::runtime::cancel::CancelToken>,
 }
 
 impl Toolbox {
@@ -135,7 +164,35 @@ impl Toolbox {
             depth: 0,
             children: std::sync::Mutex::new(Vec::new()),
             checkpoints: None,
+            engine: None,
+            session: String::new(),
+            prompter: None,
+            cancel: None,
         }
+    }
+
+    /// Ask this engine before every call. Opt-in here, and done by the one
+    /// place that builds a backend for real work, so a toolbox built for a
+    /// test never reaches the owner's engine.
+    #[must_use]
+    pub fn with_engine(mut self, engine: Option<crate::hooks::engine::Engine>) -> Self {
+        self.engine = engine;
+        self
+    }
+
+    /// The conversation id the engine is given with each call.
+    pub fn set_session(&mut self, session: &str) {
+        self.session = session.to_string();
+    }
+
+    /// Who is asked when the engine wants a person to confirm a call.
+    pub fn set_prompter(&mut self, prompter: std::sync::Arc<dyn crate::hooks::engine::Prompter>) {
+        self.prompter = Some(prompter);
+    }
+
+    /// The token that stops the turn, so a wait on the engine stops with it.
+    pub fn set_cancel(&mut self, token: crate::runtime::cancel::CancelToken) {
+        self.cancel = Some(token);
     }
 
     /// Attach a checkpoint store so that writes and edits snapshot files before modifying them.
@@ -244,9 +301,18 @@ impl Toolbox {
             SUBAGENT_SYSTEM,
             self.filter_env,
         )
-        .at_depth(self.depth + 1);
+        .at_depth(self.depth + 1)
+        // The same guard, the same person to ask, the same stop: a subagent's
+        // write is a write in this workspace.
+        .with_engine(self.engine.clone());
         if let Some(cp) = &self.checkpoints {
             child = child.with_checkpoints(cp.clone());
+        }
+        if let Some(prompter) = &self.prompter {
+            child.set_prompter(std::sync::Arc::clone(prompter));
+        }
+        if let Some(cancel) = &self.cancel {
+            child.set_cancel(cancel.clone());
         }
 
         let mut said = String::new();
@@ -472,6 +538,47 @@ impl Toolbox {
                     "required": ["task"]
                 }
             }),
+            json!({
+                "name": ASK_USER_QUESTION,
+                "description": "Put a decision that is genuinely the owner's to them as options. \
+                    Use it only when the answer changes what you build and you cannot choose \
+                    responsibly yourself; routine judgement calls are yours. Each option needs \
+                    the one line that makes it decidable. The owner may answer in their app or \
+                    at the terminal; the answer comes back as this tool's result. If nobody can \
+                    be asked, the result says so and nothing was chosen.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "questions": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "question": {"type": "string", "description": "The question, ending with a question mark."},
+                                    "header": {"type": "string", "description": "A very short label for it, a word or two."},
+                                    "options": {
+                                        "type": "array",
+                                        "minItems": 2,
+                                        "maxItems": crate::ask::MAX_OPTIONS,
+                                        "items": {
+                                            "type": "object",
+                                            "properties": {
+                                                "label": {"type": "string", "description": "The choice, in a few words."},
+                                                "description": {"type": "string", "description": "What choosing it means."}
+                                            },
+                                            "required": ["label", "description"]
+                                        }
+                                    },
+                                    "multiSelect": {"type": "boolean", "description": "Whether more than one option may be chosen."}
+                                },
+                                "required": ["question", "header", "options"]
+                            }
+                        }
+                    },
+                    "required": ["questions"]
+                }
+            }),
             crate::verify::tool_definition(),
             crate::recall::index_tool_definition(),
             crate::recall::get_tool_definition(),
@@ -502,6 +609,12 @@ impl Toolbox {
     /// success — a model told a write succeeded when it did not will build on
     /// the file it thinks it wrote.
     pub fn run(&self, name: &str, input: &Value) -> Result<String, String> {
+        self.run_call("", name, input)
+    }
+
+    /// [`Self::run`], for the call the model numbered `call_id` — the id a
+    /// person is shown if the call has to be confirmed.
+    pub fn run_call(&self, call_id: &str, name: &str, input: &Value) -> Result<String, String> {
         crate::trace!(
             "tool",
             "{name} <- {}",
@@ -514,6 +627,115 @@ impl Toolbox {
             crate::trace!("tool", "{name} REFUSED by guards: {refusal}");
             return Err(refusal);
         }
+        // AFTER the operator's own guards, which are free: a call they refuse
+        // never costs an engine process. BEFORE the snapshot and the dispatch,
+        // because this is the last point where refusing still prevents.
+        let context = match self.engine_gate(call_id, name, input) {
+            Gate::Run { context } => context,
+            Gate::Refused(why) => {
+                crate::trace!("tool", "{name} REFUSED by the engine: {why}");
+                return Err(why);
+            }
+            Gate::Answered(said) => {
+                crate::trace!("tool", "{name} answered in the owner's app");
+                return Ok(said);
+            }
+        };
+        let outcome = self.dispatch(name, input);
+        // The engine's guidance for THIS action travels with its result, which
+        // is the one place the model reads it at the moment it applies.
+        match context {
+            Some(context) => outcome
+                .map(|said| format!("{said}\n\n{context}"))
+                .map_err(|why| format!("{why}\n\n{context}")),
+            None => outcome,
+        }
+    }
+
+    /// What the memory engine says about this call.
+    ///
+    /// # The failure policy (the owner's decision)
+    ///
+    /// When the engine cannot decide — it is missing where it was named, it
+    /// crashed, it ran past its bound — a `Write`, `Edit` or `Bash` is
+    /// REFUSED: the guard is a safety function, and a change made because the
+    /// guard was down is the one it exists to stop. Every other tool changes
+    /// nothing and runs, traced. The same rule as the guards file above: an
+    /// unreadable guard must not read as no guard.
+    fn engine_gate(&self, call_id: &str, name: &str, input: &Value) -> Gate {
+        let Some(engine) = &self.engine else {
+            return Gate::Run { context: None };
+        };
+        let shown = self.event_input(name, input);
+        let cancel = self.cancel.as_ref();
+        match engine.pre_tool(&self.session, &self.workspace, name, &shown, cancel) {
+            crate::hooks::engine::PreTool::Allow { context } => Gate::Run { context },
+            // Exit 2 on a question is the owner's ANSWER, given in the app.
+            crate::hooks::engine::PreTool::Block(said) if name == ASK_USER_QUESTION => {
+                Gate::Answered(said)
+            }
+            crate::hooks::engine::PreTool::Block(reason) => Gate::Refused(reason),
+            crate::hooks::engine::PreTool::Ask { reason, context } => {
+                let ask = crate::hooks::engine::Ask {
+                    call_id,
+                    tool_name: name,
+                    tool_input: &shown,
+                    reason: &reason,
+                };
+                let prompter = self.prompter.as_deref();
+                match engine.settle(&ask, &self.session, &self.workspace, prompter, cancel) {
+                    crate::hooks::engine::Verdict::Allow => Gate::Run { context },
+                    crate::hooks::engine::Verdict::Deny(why) => Gate::Refused(why),
+                }
+            }
+            crate::hooks::engine::PreTool::Failed(why) if matches!(name, WRITE | EDIT | BASH) => {
+                Gate::Refused(format!(
+                    "NOT RUN — the Incord guard could not decide on this {name}, and a change \
+                     is not made unguarded: {why}"
+                ))
+            }
+            crate::hooks::engine::PreTool::Failed(why) => {
+                crate::trace!("tool", "{name} runs unguarded, the engine failed: {why}");
+                Gate::Run { context: None }
+            }
+        }
+    }
+
+    /// The call as the engine is shown it: the model's input, with a file
+    /// named relative to the workspace made absolute, because the engine keys
+    /// its backups and its cards by path. Everything else is passed unchanged.
+    fn event_input(&self, name: &str, input: &Value) -> Value {
+        let mut shown = input.clone();
+        if matches!(name, READ | WRITE | EDIT) {
+            if let Some(path) = input.get("path").and_then(Value::as_str) {
+                if Path::new(path).is_relative() {
+                    shown["path"] = json!(self.workspace.join(path).to_string_lossy());
+                }
+            }
+        }
+        shown
+    }
+
+    /// An `AskUserQuestion` the owner's app did not answer, answered here.
+    ///
+    /// By whoever is at the session — the terminal — and otherwise reported
+    /// as unanswered, with the options, so the model does not take silence
+    /// for a choice.
+    fn ask_here(&self, input: &Value) -> Result<String, String> {
+        let questions = crate::ask::from_tool_input(input)?;
+        let answers = self.prompter.as_ref().and_then(|p| p.choose(&questions));
+        if let Some(answers) = answers {
+            let pairs: Vec<_> = questions.iter().cloned().zip(answers).collect();
+            if let Some(reply) = crate::ask::reply(&pairs) {
+                return Ok(reply);
+            }
+        }
+        Ok(crate::ask::unattended_note(&questions)
+            .unwrap_or_else(|| "Nobody could be asked, and nothing was chosen.".to_string()))
+    }
+
+    /// Run the tool itself: guards and the engine have already passed it.
+    fn dispatch(&self, name: &str, input: &Value) -> Result<String, String> {
         // The file and shell tools parse their own JSON from a string, which is
         // the interface they were written to; re-serialising here keeps that
         // contract rather than rewriting six working implementations.
@@ -545,6 +767,7 @@ impl Toolbox {
             crate::recall::GET_TOOL => crate::recall::run_get_tool(&raw),
             SKILL => self.read_skill(input),
             AGENT => self.run_subagent(input),
+            ASK_USER_QUESTION => self.ask_here(input),
             crate::brief::SAVE_TOOL => self.save_brief(&raw),
             other => crate::knowledge::handle_tool(other, input)
                 .or_else(|| crate::web::handle_tool(other, input))
@@ -962,6 +1185,501 @@ mod tests {
                 "{expected} is not offered; have {names:?}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // The memory engine's gate: pre-tool, the ask, and questions.
+    // -----------------------------------------------------------------------
+
+    use crate::hooks::engine::fake::{self, Reply};
+    use crate::hooks::engine::{Ask, Prompter, Verdict};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    const ASK_JSON: &str = r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"ask","permissionDecisionReason":"git push needs the owner"}}"#;
+    const ALLOW_JSON: &str = r#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}"#;
+    const DENY_JSON: &str = r#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny","message":"no"}}}"#;
+
+    /// A toolbox over `root` whose engine is the fake in `engine`.
+    fn guarded(root: &Path, engine: &Path, replies: &[(&str, Reply)], cap: u64) -> Toolbox {
+        let bin = fake::write(engine, replies);
+        let mut toolbox = Toolbox::new(root, true)
+            .with_engine(Some(fake::engine(bin).capped(Duration::from_secs(cap))));
+        toolbox.set_session("api-test-session");
+        toolbox
+    }
+
+    /// Someone at the session, scripted.
+    #[derive(Default)]
+    struct Person {
+        /// What they answer to a confirmation; `None` waits for the answer to
+        /// come from elsewhere instead.
+        confirm: Option<Verdict>,
+        choose: Option<Vec<crate::ask::Answer>>,
+        asked: AtomicUsize,
+        chose: AtomicUsize,
+    }
+
+    impl Prompter for Person {
+        fn confirm(&self, _ask: &Ask<'_>, settled: &dyn Fn() -> bool) -> Option<Verdict> {
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            if self.confirm.is_some() {
+                return self.confirm.clone();
+            }
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !settled() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            None
+        }
+
+        fn choose(&self, _questions: &[crate::ask::Question]) -> Option<Vec<crate::ask::Answer>> {
+            self.chose.fetch_add(1, Ordering::SeqCst);
+            self.choose.clone()
+        }
+    }
+
+    /// §3 test 1. **EXIT 2 IS A REFUSAL, AND NOTHING IS WRITTEN.**
+    #[test]
+    fn a_blocked_write_is_not_made_and_the_model_is_told_why() {
+        let (ws, engine) = (
+            tempfile::tempdir().expect("ws"),
+            tempfile::tempdir().expect("engine"),
+        );
+        std::fs::write(ws.path().join("notes.txt"), "before").expect("seed");
+        let toolbox = guarded(
+            ws.path(),
+            engine.path(),
+            &[("pre-tool", Reply::exit(2).stderr("no backup of notes.txt"))],
+            30,
+        );
+        let refused = toolbox
+            .run(WRITE, &json!({"path": "notes.txt", "content": "after"}))
+            .expect_err("a block is an error");
+        assert!(refused.contains("no backup"), "{refused}");
+        assert_eq!(
+            std::fs::read_to_string(ws.path().join("notes.txt")).expect("read"),
+            "before",
+            "the file is unchanged on disk"
+        );
+    }
+
+    /// §3 test 2. **SILENCE IS AN ALLOW.**
+    #[test]
+    fn an_engine_that_says_nothing_lets_the_tool_run() {
+        let (ws, engine) = (
+            tempfile::tempdir().expect("ws"),
+            tempfile::tempdir().expect("engine"),
+        );
+        let toolbox = guarded(
+            ws.path(),
+            engine.path(),
+            &[("pre-tool", Reply::exit(0))],
+            30,
+        );
+        toolbox
+            .run(WRITE, &json!({"path": "made.txt", "content": "made"}))
+            .expect("allowed");
+        assert_eq!(
+            std::fs::read_to_string(ws.path().join("made.txt")).expect("the tool ran"),
+            "made"
+        );
+        assert_eq!(fake::calls(engine.path(), "pre-tool"), 1);
+    }
+
+    /// The rules the engine attaches to an allowed action reach the model,
+    /// with the result it acts on.
+    #[test]
+    fn the_engines_guidance_travels_with_the_result() {
+        let (ws, engine) = (
+            tempfile::tempdir().expect("ws"),
+            tempfile::tempdir().expect("engine"),
+        );
+        std::fs::write(ws.path().join("r.txt"), "the contents").expect("seed");
+        let toolbox = guarded(
+            ws.path(),
+            engine.path(),
+            &[(
+                "pre-tool",
+                Reply::exit(0).stdout(
+                    r#"{"hookSpecificOutput":{"permissionDecision":"allow","additionalContext":"RULE-7: read before you write"}}"#,
+                ),
+            )],
+            30,
+        );
+        let said = toolbox.run(READ, &json!({"path": "r.txt"})).expect("read");
+        assert!(said.contains("the contents"), "{said}");
+        assert!(said.contains("RULE-7"), "{said}");
+    }
+
+    /// §3 test 3 and §6's unattended case. **AN ASK WITH NOBODY TO ASK IS A
+    /// REFUSAL**, when the owner's app does not answer either — and the
+    /// engine's reason reaches the model.
+    #[test]
+    fn an_ask_nobody_answers_is_refused_with_the_reason() {
+        let (ws, engine) = (
+            tempfile::tempdir().expect("ws"),
+            tempfile::tempdir().expect("engine"),
+        );
+        let toolbox = guarded(
+            ws.path(),
+            engine.path(),
+            &[
+                ("pre-tool", Reply::exit(0).stdout(ASK_JSON)),
+                ("permission-request", Reply::exit(0)),
+            ],
+            30,
+        );
+        let refused = toolbox
+            .run(WRITE, &json!({"path": "asked.txt", "content": "x"}))
+            .expect_err("nobody confirmed it");
+        assert!(refused.contains("git push needs the owner"), "{refused}");
+        assert!(
+            !ws.path().join("asked.txt").exists(),
+            "the tool did not run"
+        );
+        assert_eq!(fake::calls(engine.path(), "permission-request"), 1);
+    }
+
+    /// §3 test 4. **A CALL THE OPERATOR'S GUARDS REFUSE NEVER STARTS THE
+    /// ENGINE.**
+    #[test]
+    fn a_native_refusal_never_spawns_the_engine() {
+        let (ws, engine) = (
+            tempfile::tempdir().expect("ws"),
+            tempfile::tempdir().expect("engine"),
+        );
+        std::fs::create_dir_all(ws.path().join("tests")).expect("dir");
+        let toolbox = guarded(
+            ws.path(),
+            engine.path(),
+            &[("pre-tool", Reply::exit(0))],
+            30,
+        );
+        let refused = toolbox
+            .run(WRITE, &json!({"path": "tests/it.rs", "content": "x"}))
+            .expect_err("protected");
+        assert!(refused.contains("protected"), "{refused}");
+        assert_eq!(
+            fake::calls(engine.path(), "pre-tool"),
+            0,
+            "the engine was spawned for a call already refused"
+        );
+    }
+
+    /// The owner's failure policy: an engine that cannot decide stops a
+    /// change, and lets a read through.
+    #[test]
+    fn an_engine_that_cannot_decide_stops_writes_and_lets_reads_through() {
+        let (ws, engine) = (
+            tempfile::tempdir().expect("ws"),
+            tempfile::tempdir().expect("engine"),
+        );
+        std::fs::write(ws.path().join("r.txt"), "readable").expect("seed");
+        let toolbox = guarded(
+            ws.path(),
+            engine.path(),
+            &[("pre-tool", Reply::exit(1))],
+            30,
+        );
+        let refused = toolbox
+            .run(BASH, &json!({"command": "echo should-not-run > ran.txt"}))
+            .expect_err("fail closed");
+        assert!(refused.contains("could not decide"), "{refused}");
+        assert!(!ws.path().join("ran.txt").exists());
+        let read = toolbox
+            .run(READ, &json!({"path": "r.txt"}))
+            .expect("fail open");
+        assert!(read.contains("readable"), "{read}");
+    }
+
+    /// The same policy for an engine that runs past its bound: killed, and
+    /// the write refused.
+    #[test]
+    fn an_engine_past_its_bound_stops_the_write() {
+        let (ws, engine) = (
+            tempfile::tempdir().expect("ws"),
+            tempfile::tempdir().expect("engine"),
+        );
+        let toolbox = guarded(
+            ws.path(),
+            engine.path(),
+            &[("pre-tool", Reply::exit(0).after(20))],
+            2,
+        );
+        let started = Instant::now();
+        let refused = toolbox
+            .run(WRITE, &json!({"path": "late.txt", "content": "x"}))
+            .expect_err("timed out");
+        assert!(refused.contains("timed out"), "{refused}");
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(!ws.path().join("late.txt").exists());
+    }
+
+    /// A named engine that is not there is the same failure, not a quiet
+    /// "no guard".
+    #[test]
+    fn a_named_engine_that_is_missing_stops_the_write() {
+        let ws = tempfile::tempdir().expect("ws");
+        let toolbox = Toolbox::new(ws.path(), true)
+            .with_engine(Some(fake::engine(ws.path().join("no-such-engine.exe"))));
+        let refused = toolbox
+            .run(WRITE, &json!({"path": "x.txt", "content": "x"}))
+            .expect_err("missing engine");
+        assert!(refused.contains("could not start"), "{refused}");
+        assert!(!ws.path().join("x.txt").exists());
+    }
+
+    /// §6 test 1. **THE OWNER'S APP ANSWERS FIRST**: allowed there, the tool
+    /// runs, and the person at the session did not have to answer.
+    #[test]
+    fn an_allow_from_the_owners_app_runs_the_tool_with_no_local_answer() {
+        let (ws, engine) = (
+            tempfile::tempdir().expect("ws"),
+            tempfile::tempdir().expect("engine"),
+        );
+        let mut toolbox = guarded(
+            ws.path(),
+            engine.path(),
+            &[
+                ("pre-tool", Reply::exit(0).stdout(ASK_JSON)),
+                ("permission-request", Reply::exit(0).stdout(ALLOW_JSON)),
+            ],
+            30,
+        );
+        let person = Arc::new(Person::default());
+        toolbox.set_prompter(person.clone());
+        toolbox
+            .run(WRITE, &json!({"path": "ok.txt", "content": "ok"}))
+            .expect("allowed in the app");
+        assert!(ws.path().join("ok.txt").exists());
+        assert_eq!(
+            person.asked.load(Ordering::SeqCst),
+            1,
+            "the prompt was shown"
+        );
+    }
+
+    /// §6 test 2. A refusal in the app is the model's error, in the app's
+    /// words.
+    #[test]
+    fn a_deny_from_the_owners_app_is_the_error() {
+        let (ws, engine) = (
+            tempfile::tempdir().expect("ws"),
+            tempfile::tempdir().expect("engine"),
+        );
+        let toolbox = guarded(
+            ws.path(),
+            engine.path(),
+            &[
+                ("pre-tool", Reply::exit(0).stdout(ASK_JSON)),
+                ("permission-request", Reply::exit(0).stdout(DENY_JSON)),
+            ],
+            30,
+        );
+        let refused = toolbox
+            .run(WRITE, &json!({"path": "no.txt", "content": "x"}))
+            .expect_err("denied");
+        assert_eq!(refused, "no");
+        assert!(!ws.path().join("no.txt").exists());
+    }
+
+    /// §6 test 4. **THE PERMISSION EVENT NAMES THE SAME CALL**: its
+    /// `tool_input` is byte-identical to the pre-tool event's, which is how the
+    /// engine finds the card the pre-tool raised.
+    #[test]
+    fn the_permission_event_carries_the_pre_tool_events_input() {
+        let (ws, engine) = (
+            tempfile::tempdir().expect("ws"),
+            tempfile::tempdir().expect("engine"),
+        );
+        let toolbox = guarded(
+            ws.path(),
+            engine.path(),
+            &[
+                ("pre-tool", Reply::exit(0).stdout(ASK_JSON)),
+                ("permission-request", Reply::exit(0).stdout(DENY_JSON)),
+            ],
+            30,
+        );
+        let _ = toolbox.run(
+            EDIT,
+            &json!({"path": "e.txt", "old_string": "a", "new_string": "b"}),
+        );
+        let pre = fake::events(engine.path(), "pre-tool");
+        let permission = fake::events(engine.path(), "permission-request");
+        assert_eq!(pre.len(), 1);
+        assert_eq!(permission.len(), 1);
+        assert_eq!(permission[0]["hook_event_name"], "PermissionRequest");
+        assert_eq!(
+            pre[0]["tool_input"].to_string(),
+            permission[0]["tool_input"].to_string()
+        );
+        // And the file is named absolutely, since the engine keys by path.
+        let named = pre[0]["tool_input"]["path"].as_str().expect("a path");
+        assert!(Path::new(named).is_absolute(), "{named}");
+    }
+
+    /// The race, the terminal's way round: the person answers first, and the
+    /// hook still waiting on the owner's app is stopped rather than left to
+    /// run out its ten minutes.
+    #[test]
+    fn a_local_answer_wins_and_stops_the_hook() {
+        let (ws, engine) = (
+            tempfile::tempdir().expect("ws"),
+            tempfile::tempdir().expect("engine"),
+        );
+        let mut toolbox = guarded(
+            ws.path(),
+            engine.path(),
+            &[
+                ("pre-tool", Reply::exit(0).stdout(ASK_JSON)),
+                (
+                    "permission-request",
+                    Reply::exit(0).stdout(DENY_JSON).after(20),
+                ),
+            ],
+            60,
+        );
+        toolbox.set_prompter(Arc::new(Person {
+            confirm: Some(Verdict::Allow),
+            ..Person::default()
+        }));
+        let started = Instant::now();
+        toolbox
+            .run(WRITE, &json!({"path": "mine.txt", "content": "x"}))
+            .expect("allowed here");
+        assert!(ws.path().join("mine.txt").exists());
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "waited on the losing hook: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// §4 test 4. **THE EXACT NAME**: the engine recognises a question tool by
+    /// it, so a rename turns routing off without a sound.
+    #[test]
+    fn the_question_tool_is_offered_under_its_exact_name() {
+        assert_eq!(ASK_USER_QUESTION, "AskUserQuestion");
+        let dir = tempfile::tempdir().expect("tmp");
+        assert!(toolbox(dir.path())
+            .names()
+            .iter()
+            .any(|n| n == "AskUserQuestion"));
+    }
+
+    fn database_question() -> Value {
+        json!({"questions": [{
+            "question": "Which database should this use?",
+            "header": "Database",
+            "options": [
+                {"label": "Postgres", "description": "relational; the document implies joins"},
+                {"label": "SQLite", "description": "one file, nothing to operate"}
+            ],
+            "multiSelect": false
+        }]})
+    }
+
+    /// §4 test 1. **AN ANSWER GIVEN IN THE APP IS THE RESULT, NOT AN ERROR**,
+    /// and nobody is asked again here.
+    #[test]
+    fn a_question_answered_in_the_app_returns_the_answer() {
+        let (ws, engine) = (
+            tempfile::tempdir().expect("ws"),
+            tempfile::tempdir().expect("engine"),
+        );
+        let answered = "The owner answered your question: Postgres\nContinue with that answer — do not ask it again.";
+        let mut toolbox = guarded(
+            ws.path(),
+            engine.path(),
+            &[("pre-tool", Reply::exit(2).stderr(answered))],
+            30,
+        );
+        let person = Arc::new(Person::default());
+        toolbox.set_prompter(person.clone());
+        let said = toolbox
+            .run(ASK_USER_QUESTION, &database_question())
+            .expect("an answer is not an error");
+        assert_eq!(said, answered);
+        assert_eq!(person.chose.load(Ordering::SeqCst), 0, "no local prompt");
+    }
+
+    /// §4 test 2. Not answered in the app, and nobody here who can answer —
+    /// the ACP client, which has no question request, or a run with nobody at
+    /// it: the model is told so, with the options.
+    #[test]
+    fn a_question_nobody_can_answer_says_so_with_its_options() {
+        let (ws, engine) = (
+            tempfile::tempdir().expect("ws"),
+            tempfile::tempdir().expect("engine"),
+        );
+        let mut toolbox = guarded(
+            ws.path(),
+            engine.path(),
+            &[("pre-tool", Reply::exit(0))],
+            30,
+        );
+        toolbox.set_prompter(Arc::new(Person::default()));
+        let said = toolbox
+            .run(ASK_USER_QUESTION, &database_question())
+            .expect("a note, not an error");
+        assert!(said.contains("nobody is at the prompt"), "{said}");
+        assert!(
+            said.contains("Postgres") && said.contains("SQLite"),
+            "{said}"
+        );
+    }
+
+    /// Answered at the terminal: the pick goes back as the result.
+    #[test]
+    fn a_question_answered_here_returns_the_pick() {
+        let (ws, engine) = (
+            tempfile::tempdir().expect("ws"),
+            tempfile::tempdir().expect("engine"),
+        );
+        let mut toolbox = guarded(
+            ws.path(),
+            engine.path(),
+            &[("pre-tool", Reply::exit(0))],
+            30,
+        );
+        toolbox.set_prompter(Arc::new(Person {
+            choose: Some(vec![crate::ask::Answer::Chose("SQLite".to_string())]),
+            ..Person::default()
+        }));
+        let said = toolbox
+            .run(ASK_USER_QUESTION, &database_question())
+            .expect("answered");
+        assert!(said.contains("A: SQLite"), "{said}");
+    }
+
+    /// §4 test 3. The labels reach the engine unchanged: it turns them into
+    /// the buttons in the owner's app.
+    #[test]
+    fn the_questions_labels_reach_the_engine_unchanged() {
+        let (ws, engine) = (
+            tempfile::tempdir().expect("ws"),
+            tempfile::tempdir().expect("engine"),
+        );
+        let toolbox = guarded(
+            ws.path(),
+            engine.path(),
+            &[("pre-tool", Reply::exit(0))],
+            30,
+        );
+        let _ = toolbox.run(ASK_USER_QUESTION, &database_question());
+        let events = fake::events(engine.path(), "pre-tool");
+        assert_eq!(events[0]["tool_name"], "AskUserQuestion");
+        assert_eq!(
+            events[0]["tool_input"]["questions"][0]["options"],
+            database_question()["questions"][0]["options"]
+        );
     }
 
     #[test]

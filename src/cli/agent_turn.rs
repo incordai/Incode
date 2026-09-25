@@ -353,6 +353,16 @@ impl AgentSession {
         }
     }
 
+    /// Who is asked, mid-turn, when a tool call needs a person or a question
+    /// needs the owner: the terminal for the REPL, the client under ACP.
+    /// Standbys get the same one, since a failover keeps the same person.
+    pub fn set_prompter(&mut self, prompter: std::sync::Arc<dyn crate::hooks::engine::Prompter>) {
+        self.backend.set_prompter(std::sync::Arc::clone(&prompter));
+        for s in &mut self.standby {
+            s.set_prompter(std::sync::Arc::clone(&prompter));
+        }
+    }
+
     /// The conversations subagents opened, as `(session id, what it was asked)`.
     ///
     /// Empty on a route whose subagents live inside another process — there is

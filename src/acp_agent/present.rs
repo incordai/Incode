@@ -192,10 +192,7 @@ fn within(path: &Path, workspace: &Path) -> Option<PathBuf> {
 /// A tool call as the client shows it: named, classified, in progress.
 pub(crate) fn tool_call(id: &str, name: &str, input: &str) -> acp::ToolCall {
     let raw: Option<Value> = serde_json::from_str(input).ok();
-    let title = match crate::cli::panel::target(input) {
-        Some(target) => format!("{name} {target}"),
-        None => name.to_string(),
-    };
+    let title = title_of(name, input);
     let locations: Vec<acp::ToolCallLocation> = raw
         .as_ref()
         .and_then(|value| {
@@ -210,6 +207,14 @@ pub(crate) fn tool_call(id: &str, name: &str, input: &str) -> acp::ToolCall {
         .status(acp::ToolCallStatus::InProgress)
         .locations(locations)
         .raw_input(raw)
+}
+
+/// A call's title as the client shows it: the tool and what it acts on.
+pub(crate) fn title_of(name: &str, input: &str) -> String {
+    match crate::cli::panel::target(input) {
+        Some(target) => format!("{name} {target}"),
+        None => name.to_string(),
+    }
 }
 
 /// `text`, cut to `limit` bytes with the cut said — never silently.

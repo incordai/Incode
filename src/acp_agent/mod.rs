@@ -34,6 +34,12 @@
 //! Any other request is answered "method not found"; a notification nothing
 //! handles is dropped, as JSON-RPC requires. See `docs/ARCHITECTURE.md`.
 //!
+//! # Requests sent to the client
+//!
+//! - `session/request_permission` — when the memory engine says a call on
+//!   incode's own tools needs a person ([`permission`]). The client's response
+//!   comes back on the reader and is handed to the waiting turn.
+//!
 //! # Threads
 //!
 //! The reader — the calling thread — parses and dispatches and never runs a
@@ -47,6 +53,7 @@
 //! anything else happens — see [`stdio`].
 
 mod commands;
+mod permission;
 mod present;
 mod stdio;
 mod transport;
@@ -309,7 +316,10 @@ impl<F: SessionFactory> Server<F> {
                 let transport::Refusal { id, error } = *refused;
                 self.outbox.respond::<Value>(id, Err(error));
             }
-            Ok(Incoming::Response) => {}
+            // The answer to a request a session's turn sent the client, and is
+            // waiting on. Handed over here, on the reader, because the turn's
+            // own thread is the one waiting.
+            Ok(Incoming::Response { id, outcome }) => self.outbox.resolve(&id, outcome),
             Ok(Incoming::Notification { method, params }) => self.notification(&method, params),
             Ok(Incoming::Request { id, method, params }) => self.request(id, &method, params),
         }
@@ -522,6 +532,9 @@ impl<F: SessionFactory> Server<F> {
 
     /// The client has gone: stop every turn, and give them a moment to stop.
     fn shutdown(self) {
+        // Nothing the client was asked will be answered now; a turn waiting on
+        // an answer stops waiting and refuses the call.
+        self.outbox.abandon_all();
         let mut threads = Vec::new();
         for (_, handle) in self.sessions {
             handle.shared.cancel_running();
@@ -545,7 +558,7 @@ impl<F: SessionFactory> Server<F> {
 /// until the reader lets go.
 fn drive<F: SessionFactory>(
     factory: &F,
-    outbox: &Outbox,
+    outbox: &Arc<Outbox>,
     opened_by: acp::RequestId,
     session_id: &acp::SessionId,
     workspace: &Path,
@@ -580,6 +593,12 @@ fn drive<F: SessionFactory>(
         session.set_permission_mode(PermissionMode::ReadOnly.agent_mode());
         PermissionMode::ReadOnly
     };
+    // The person using this session is at the client: a tool call that needs
+    // confirming is put to them there, as `session/request_permission`.
+    session.set_prompter(Arc::new(permission::ClientPrompter::new(
+        Arc::clone(outbox),
+        session_id.clone(),
+    )));
     outbox.respond(
         opened_by,
         Ok(acp::NewSessionResponse::new(session_id.clone()).modes(mode_state(applied))),
@@ -908,13 +927,21 @@ mod tests {
         /// Real edits in the workspace, each written before its result is
         /// reported, as an agent CLI does — see [`edit_the_workspace`].
         Edits,
+        /// One `Write` through incode's own Toolbox, with the fake engine in
+        /// [`Script::engine`] asked first — see [`GUARDED_FILE`].
+        Guarded,
     }
+
+    /// The file [`Behaviour::Guarded`] writes, when it is allowed to.
+    const GUARDED_FILE: &str = "guarded.txt";
 
     #[derive(Clone)]
     struct Script {
         behaviour: Behaviour,
         /// Every agent mode the session set on the backend, in order.
         modes: Arc<Mutex<Vec<String>>>,
+        /// The fake engine a [`Behaviour::Guarded`] toolbox asks.
+        engine: Option<PathBuf>,
     }
 
     impl Script {
@@ -922,6 +949,14 @@ mod tests {
             Self {
                 behaviour,
                 modes: Arc::default(),
+                engine: None,
+            }
+        }
+
+        fn guarded(engine: PathBuf) -> Self {
+            Self {
+                engine: Some(engine),
+                ..Self::new(Behaviour::Guarded)
             }
         }
     }
@@ -930,6 +965,8 @@ mod tests {
         script: Script,
         cancel: Option<CancelToken>,
         workspace: PathBuf,
+        /// incode's own tools, for [`Behaviour::Guarded`].
+        tools: Option<crate::toolbox::Toolbox>,
     }
 
     fn ended(stop_reason: &str) -> TurnOutcome {
@@ -1114,6 +1151,29 @@ mod tests {
                     stream(on_event)
                 }
                 Behaviour::Edits => edit_the_workspace(&self.workspace, on_event),
+                Behaviour::Guarded => {
+                    let tools = self
+                        .tools
+                        .as_ref()
+                        .ok_or_else(|| AgentError::new("a guarded script needs its toolbox"))?;
+                    let input = json!({"path": GUARDED_FILE, "content": "written\n"});
+                    on_event(&AgentEvent::ToolUse {
+                        id: "g1".to_string(),
+                        name: crate::toolbox::WRITE.to_string(),
+                        input: input.to_string(),
+                    });
+                    let (output, is_error) =
+                        match tools.run_call("g1", crate::toolbox::WRITE, &input) {
+                            Ok(said) => (said, false),
+                            Err(why) => (why, true),
+                        };
+                    on_event(&AgentEvent::ToolResult {
+                        id: "g1".to_string(),
+                        output,
+                        is_error,
+                    });
+                    Ok(ended("end_turn"))
+                }
             }
         }
 
@@ -1122,7 +1182,16 @@ mod tests {
         }
 
         fn set_cancel(&mut self, token: CancelToken) {
+            if let Some(tools) = &mut self.tools {
+                tools.set_cancel(token.clone());
+            }
             self.cancel = Some(token);
+        }
+
+        fn set_prompter(&mut self, prompter: Arc<dyn crate::hooks::engine::Prompter>) {
+            if let Some(tools) = &mut self.tools {
+                tools.set_prompter(prompter);
+            }
         }
 
         fn set_permission_mode(&mut self, mode: &str) {
@@ -1158,6 +1227,14 @@ mod tests {
                 script: self.script.clone(),
                 cancel: None,
                 workspace: workspace.to_path_buf(),
+                tools: self.script.engine.as_ref().map(|bin| {
+                    let engine = crate::hooks::engine::fake::engine(bin.clone())
+                        .capped(Duration::from_secs(30));
+                    let mut tools =
+                        crate::toolbox::Toolbox::new(workspace, true).with_engine(Some(engine));
+                    tools.set_session("acp-test-session");
+                    tools
+                }),
             }))
             .with_cancel(cancel);
             session.set_permission_mode(self.mode.agent_mode());
@@ -1846,6 +1923,120 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(workspace.join("old.txt")).expect("old.txt"),
             "before\n"
+        );
+        client.close();
+    }
+
+    /// A session whose one `Write` the fake engine says needs a person, and
+    /// whose owner's app gives no answer — so the client decides it.
+    fn guarded_client(engine: &Path) -> Client {
+        use crate::hooks::engine::fake::{self, Reply};
+        let bin = fake::write(
+            engine,
+            &[
+                (
+                    "pre-tool",
+                    Reply::exit(0).stdout(
+                        r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"ask","permissionDecisionReason":"writing here needs the owner"}}"#,
+                    ),
+                ),
+                ("permission-request", Reply::exit(0)),
+            ],
+        );
+        Client::start(
+            Script::guarded(bin),
+            PermissionMode::WorkspaceWrite,
+            transport::MAX_LINE_BYTES,
+        )
+    }
+
+    /// Run the guarded prompt, answer the client's permission request with
+    /// `option`, and return the request, the updates and the prompt's reply.
+    fn answer_the_permission_request(
+        client: &mut Client,
+        session: &str,
+        option: &str,
+    ) -> (Value, Vec<Value>, Value) {
+        let prompt = client.request(
+            "session/prompt",
+            json!({"sessionId": session, "prompt": [{"type": "text", "text": "write the file"}]}),
+        );
+        let asked = loop {
+            let message = client.next();
+            if message["method"] == "session/request_permission" {
+                break message;
+            }
+        };
+        client.send_raw(
+            &json!({"jsonrpc": "2.0", "id": asked["id"],
+                    "result": {"outcome": {"outcome": "selected", "optionId": option}}})
+            .to_string(),
+        );
+        let (streamed, reply) = client.until_response(prompt);
+        (asked, streamed, reply)
+    }
+
+    /// **A CALL THE ENGINE HOLDS FOR A PERSON IS PUT TO THE CLIENT — ALLOW.**
+    ///
+    /// The request is the shape the owner's app answers: the session, the
+    /// call by its own id with a title naming the reason, and an allow-once and
+    /// a reject-once option. Allowed there, the write happens.
+    #[test]
+    fn a_held_call_is_asked_of_the_client_and_runs_when_allowed() {
+        let engine = tempfile::tempdir().expect("engine");
+        let mut client = guarded_client(engine.path());
+        let ws = tempfile::tempdir().expect("workspace");
+        let session = client.open_session(ws.path());
+
+        let (asked, streamed, reply) =
+            answer_the_permission_request(&mut client, &session, "allow");
+        let params = &asked["params"];
+        assert_eq!(params["sessionId"], session, "{asked}");
+        assert_eq!(params["toolCall"]["toolCallId"], "g1", "{asked}");
+        assert!(
+            params["toolCall"]["title"]
+                .as_str()
+                .is_some_and(|t| t.contains("writing here needs the owner")),
+            "{asked}"
+        );
+        let kinds: Vec<&str> = params["options"]
+            .as_array()
+            .expect("options")
+            .iter()
+            .filter_map(|o| o["kind"].as_str())
+            .collect();
+        assert_eq!(kinds, ["allow_once", "reject_once"], "{asked}");
+
+        assert_eq!(reply["result"]["stopReason"], "end_turn", "{reply}");
+        assert_eq!(
+            std::fs::read_to_string(ws.path().join(GUARDED_FILE)).expect("written"),
+            "written\n"
+        );
+        let result = result_for(&updates_of(&streamed), "g1").clone();
+        assert_eq!(result["status"], "completed", "{result}");
+        client.close();
+    }
+
+    /// **— AND REJECT.** Refused in the client, nothing is written and the
+    /// call is reported failed.
+    #[test]
+    fn a_held_call_the_client_rejects_is_not_run() {
+        let engine = tempfile::tempdir().expect("engine");
+        let mut client = guarded_client(engine.path());
+        let ws = tempfile::tempdir().expect("workspace");
+        let session = client.open_session(ws.path());
+
+        let (_, streamed, reply) = answer_the_permission_request(&mut client, &session, "reject");
+        assert_eq!(reply["result"]["stopReason"], "end_turn", "{reply}");
+        assert!(
+            !ws.path().join(GUARDED_FILE).exists(),
+            "a rejected write was made"
+        );
+        let result = result_for(&updates_of(&streamed), "g1").clone();
+        assert_eq!(result["status"], "failed", "{result}");
+        assert!(
+            result.to_string().contains("refused in the client"),
+            "{result}"
         );
         client.close();
     }

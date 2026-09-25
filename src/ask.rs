@@ -544,6 +544,58 @@ Do NOT proceed on this point. Set out the trade-off in a few lines — what each
     Some(out)
 }
 
+/// The questions an `AskUserQuestion` tool call carries.
+///
+/// The call's input is the shape the memory engine turns into buttons in the
+/// owner's app: `questions[].question`, `.options[].label` and
+/// `.options[].description`. Options past [`MAX_OPTIONS`] are dropped for the
+/// same reason [`parse`] drops them.
+///
+/// # Errors
+///
+/// When there is no question with both a prompt and an option: that is not a
+/// choice, and the model is told so rather than shown an empty menu.
+pub fn from_tool_input(input: &serde_json::Value) -> Result<Vec<Question>, String> {
+    let text = |value: &serde_json::Value, key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string()
+    };
+    let questions: Vec<Question> = input
+        .get("questions")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|q| {
+            let prompt = text(q, "question");
+            let options: Vec<Choice> = q
+                .get("options")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .map(|o| Choice {
+                    label: text(o, "label"),
+                    detail: text(o, "description"),
+                })
+                .filter(|c| !c.label.is_empty())
+                .take(MAX_OPTIONS)
+                .collect();
+            (!prompt.is_empty() && !options.is_empty()).then_some(Question { prompt, options })
+        })
+        .collect();
+    if questions.is_empty() {
+        return Err(
+            "AskUserQuestion needs at least one question with a `question` and labelled \
+             `options`"
+                .to_string(),
+        );
+    }
+    Ok(questions)
+}
+
 /// What to say when nobody can be asked.
 ///
 /// An unattended run has no one at the prompt, and a harness that blocked there

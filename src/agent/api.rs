@@ -527,6 +527,9 @@ impl ApiBackend {
     /// A backend over one workspace.
     #[must_use]
     pub fn new(settings: Settings, workspace: &Path, system: &str, filter_env: bool) -> Self {
+        let session = new_session_id();
+        let mut tools = Toolbox::new(workspace, filter_env);
+        tools.set_session(&session);
         Self {
             settings,
             system: system.to_string(),
@@ -536,11 +539,21 @@ impl ApiBackend {
                 vec![system.to_string()]
             },
             messages: Vec::new(),
-            session: new_session_id(),
-            tools: Toolbox::new(workspace, filter_env),
+            session,
+            tools,
             served_by: Vec::new(),
             cancel: None,
         }
+    }
+
+    /// Ask this memory engine before each tool runs — see
+    /// [`crate::hooks::engine`]. Given by the code that builds a backend for
+    /// real work; a backend built without it runs its tools behind the
+    /// operator's guards alone.
+    #[must_use]
+    pub fn with_engine(mut self, engine: Option<crate::hooks::engine::Engine>) -> Self {
+        self.tools = self.tools.with_engine(engine);
+        self
     }
 
     /// The same backend, one level further down the tree of agents.
@@ -647,7 +660,8 @@ impl ApiBackend {
                     name: call.name.clone(),
                     input: call.input.to_string(),
                 });
-                let (output, failed) = match self.tools.run(&call.name, &call.input) {
+                let (output, failed) = match self.tools.run_call(&call.id, &call.name, &call.input)
+                {
                     Ok(out) => (out, false),
                     // Handed BACK to the model rather than ending the turn: a
                     // failed tool is something to recover from, and the model
@@ -872,10 +886,18 @@ impl AgentBackend for ApiBackend {
         self.messages.clear();
         self.served_by.clear();
         self.session = new_session_id();
+        // The engine is told the NEW conversation from here on, or its cards
+        // and backups would be filed under the one the operator just ended.
+        self.tools.set_session(&self.session);
     }
 
     fn set_cancel(&mut self, token: crate::runtime::cancel::CancelToken) {
+        self.tools.set_cancel(token.clone());
         self.cancel = Some(token);
+    }
+
+    fn set_prompter(&mut self, prompter: std::sync::Arc<dyn crate::hooks::engine::Prompter>) {
+        self.tools.set_prompter(prompter);
     }
 
     /// The harness context this route carries, as the one block it was given.
@@ -1506,6 +1528,55 @@ mod tests {
         assert!(body.get("model").is_none(), "{body}");
         let named = request_body("m", "sys", &[], &[]);
         assert_eq!(named["model"], "m");
+    }
+
+    /// §3 test 5. **THE ENGINE IS TOLD WHICH CONVERSATION, WHERE, AND WHAT.**
+    /// The event on its stdin carries the tool, its command, the workspace as
+    /// an absolute path, and THIS backend's session id — and after a clear,
+    /// the new one.
+    #[test]
+    fn the_engine_is_told_the_call_the_workspace_and_this_session() {
+        use crate::hooks::engine::fake::{self, Reply};
+        let (dir, engine) = (
+            tempfile::tempdir().expect("ws"),
+            tempfile::tempdir().expect("engine"),
+        );
+        let bin = fake::write(engine.path(), &[("pre-tool", Reply::exit(0))]);
+        let mut agent = backend(dir.path())
+            .with_engine(Some(fake::engine(bin).capped(Duration::from_secs(30))));
+        let transport = Canned::new(&[
+            &asked_for(
+                "c1",
+                crate::toolbox::BASH,
+                json!({"command": "echo guarded"}),
+            ),
+            &said("done"),
+            &asked_for("c2", crate::toolbox::BASH, json!({"command": "echo again"})),
+            &said("done"),
+        ]);
+        agent
+            .run_turn_with(&transport, "run it", &mut |_| {})
+            .expect("a turn");
+        let first = agent.session_id().map(str::to_string).expect("a session");
+        agent.clear_session();
+        agent
+            .run_turn_with(&transport, "run it again", &mut |_| {})
+            .expect("a turn");
+        let second = agent.session_id().map(str::to_string).expect("a session");
+
+        let events = fake::events(engine.path(), "pre-tool");
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0]["tool_name"], "Bash");
+        assert_eq!(events[0]["tool_input"]["command"], "echo guarded");
+        let cwd = events[0]["cwd"].as_str().expect("cwd");
+        assert!(Path::new(cwd).is_absolute(), "{cwd}");
+        assert_eq!(events[0]["session_id"], json!(first));
+        assert_eq!(
+            events[1]["session_id"],
+            json!(second),
+            "the cleared session's id"
+        );
+        assert_ne!(first, second);
     }
 
     #[test]

@@ -30,6 +30,8 @@
 //! The redaction still applies to everything else. What a hook does with what
 //! it is shown is the operator's decision, made when they wrote the command.
 
+pub mod engine;
+
 use std::process::Command;
 use std::time::Duration;
 

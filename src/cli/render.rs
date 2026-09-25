@@ -37,6 +37,58 @@ pub struct LiveStatus {
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
+/// Set while a prompt raised in the middle of a turn reads the keyboard. The
+/// status line's ticker, which otherwise reads every key for Esc and Ctrl-C,
+/// leaves them alone meanwhile — two readers would each get half the answer.
+static KEYS_LENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The status line drawing right now, if one is, so a mid-turn prompt can
+/// take the terminal from it under the same lock every other writer uses.
+static ACTIVE: std::sync::Mutex<Option<std::sync::Arc<std::sync::Mutex<Screen>>>> =
+    std::sync::Mutex::new(None);
+
+/// The terminal, lent to a prompt raised in the middle of a turn: the status
+/// line is cleared, the keys are the prompt's, and what it says goes through
+/// the status line's own lock. Handed back when dropped.
+pub(crate) struct PromptLease {
+    screen: Option<std::sync::Arc<std::sync::Mutex<Screen>>>,
+}
+
+impl PromptLease {
+    /// Take the keys and the screen from the running turn's status line.
+    pub(crate) fn begin() -> Self {
+        KEYS_LENT.store(true, std::sync::atomic::Ordering::SeqCst);
+        let screen = ACTIVE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(screen) = &screen {
+            if let Ok(mut screen) = screen.lock() {
+                screen.text.clear();
+                screen.erase();
+            }
+        }
+        Self { screen }
+    }
+
+    /// Say something to the person being asked.
+    pub(crate) fn say(&self, text: &str) {
+        match &self.screen {
+            Some(screen) => Writer(std::sync::Arc::clone(screen)).write_text(text),
+            None => {
+                crate::cli::console::emit(text);
+                let _ = io::stdout().flush();
+            }
+        }
+    }
+}
+
+impl Drop for PromptLease {
+    fn drop(&mut self) {
+        KEYS_LENT.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// The terminal, and everything anyone is allowed to do to it.
 ///
 /// # One writer
@@ -332,11 +384,17 @@ impl LiveStatus {
             let _ = io::stdout().flush();
         }
 
+        *ACTIVE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(std::sync::Arc::clone(&inner));
         let shared = std::sync::Arc::clone(&inner);
         let alive = std::sync::Arc::clone(&running);
         let handle = std::thread::spawn(move || {
             while alive.load(std::sync::atomic::Ordering::Relaxed) {
-                if crossterm::event::poll(std::time::Duration::from_millis(0)).unwrap_or(false) {
+                if !KEYS_LENT.load(std::sync::atomic::Ordering::SeqCst)
+                    && crossterm::event::poll(std::time::Duration::from_millis(0)).unwrap_or(false)
+                {
                     match crossterm::event::read() {
                         Ok(crossterm::event::Event::Key(key)) => {
                             if key.code == crossterm::event::KeyCode::Esc
@@ -518,6 +576,17 @@ impl Drop for LiveStatus {
     fn drop(&mut self) {
         self.running
             .store(false, std::sync::atomic::Ordering::Relaxed);
+        // No longer the screen a mid-turn prompt should take.
+        let mut active = ACTIVE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if active
+            .as_ref()
+            .is_some_and(|screen| std::sync::Arc::ptr_eq(screen, &self.inner))
+        {
+            *active = None;
+        }
+        drop(active);
         let mouse_capture = crate::cli::footer::mouse_capture_enabled_from(
             std::env::var("INCORD_MOUSE").as_deref().ok(),
         );

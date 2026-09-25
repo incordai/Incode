@@ -113,10 +113,67 @@ completion reported by the REPL loop), and the terminal-session commands (`/quit
 `/clear`, `/resume`, `/model`, `/add-dir`, `/forget`, `/help`, `/status` and the other
 information screens). Anything else starting with `/` is answered with the list.
 
+**Permission requests (agent → client).** When the memory engine's `pre-tool` says a
+call on incode's own Toolbox needs a person (see "The engine's hooks" below), the
+client is sent `session/request_permission`: the session, a `toolCall` update carrying
+the call's own id, a title (`<tool> <target> — <engine's reason>`), kind, status
+`pending` and the raw input, and two options — `allow` (`allow_once`) and `reject`
+(`reject_once`). The answer `{"outcome":{"outcome":"selected","optionId":…}}` allows
+only on `allow`; `reject` or `cancelled` refuses. Outgoing requests are numbered
+`incode-<n>` by the `Outbox`, registered before they are written, and the reader hands
+each response to its waiter (`Outbox::resolve`); at end of input every waiter is
+released and the call refused. The engine's `hook permission-request` races the
+client; if it decides first, the client's request is withdrawn on this side only —
+the protocol has no agent-side cancel the owner's app acts on, so its card stays until
+answered and the late answer is dropped. `AskUserQuestion` is NOT sent to the client:
+the owner's app answers every agent request other than `session/request_permission`
+with `-32601`, so the model is told the question went unanswered, with its options.
+
 Not offered: `session/load` and `session/resume` (the agent CLI owns the transcript and
 an ACP session id has no stored mapping to it), the client's MCP servers
 (no seam in the backends, and a stdio server is a program the client would have this
-machine run), and `session/request_permission` / fs / terminal.
+machine run), elicitation, and fs / terminal.
+
+### The engine's hooks, run by incode for its own tools
+
+`hooks::engine` runs the memory engine's lifecycle hooks at the moment incode's own
+Toolbox is about to act. Only calls that go through the Toolbox are covered: today
+that is the API route (`agent::api`). A CLI child (Claude, Codex, Antigravity) runs
+its own tools inside its own process, so no call it makes passes this gate.
+
+- **Binary:** `INCORD_ENGINE_BIN`, then `engine_bin` in `admin.json`, then the engine's
+  install location — `%LOCALAPPDATA%\Incord Memory\incord-memory-service.exe`, which is
+  what the engine's installer writes into Claude's and Codex's hooks, then the spaceless
+  copy at `%USERPROFILE%\.incord\` it makes for Antigravity. No default elsewhere. A
+  NAMED path that is missing is a spawn failure (the failure policy below); nothing
+  named and nothing installed skips the hooks.
+- **Call:** `<bin> hook <event>` (no agent flag: the engine's default contract), cwd the
+  workspace, the event JSON written to a PIPED stdin that is then closed — never an
+  inherited one, which under `--acp` is the protocol stream — stdout and stderr piped,
+  the tree contained by `process_tree` and bounded by `tools::bash::wait_with_timeout_or`.
+- **Bounds:** 610 s for `pre-tool`, `permission-request` and (pinned for later)
+  `capture` — the engine's own 600 s registration plus a margin, so the engine's
+  deadline fires first. Not the operator hooks' 10 s. A stopped turn (the cancel token)
+  ends a wait at once.
+- **Order in `Toolbox::run_call`:** the operator's guards → `hook pre-tool` → snapshot →
+  dispatch. A guard refusal never spawns the engine.
+- **Replies:** exit 2 → refused, stderr is the reason (for `AskUserQuestion`, exit 2 is
+  the owner's answer and returned as a NON-error result); exit 0 silent → run; exit 0
+  `permissionDecision: allow` → run, and `additionalContext` is appended to the result;
+  `ask` → the permission flow below; any other exit, a timeout, or a spawn failure →
+  **fail closed for `Write`/`Edit`/`Bash`, fail open for everything else** (owner's
+  decision).
+- **The permission flow (`Engine::settle`):** `hook permission-request` runs with the
+  byte-identical `tool_input`, on a thread, while the session's `Prompter` asks here.
+  The first answer wins and the loser is stopped (the hook's tree is killed; the prompt
+  is told `settled`). Prompters: the REPL's terminal (`cli::prompt::Terminal`, one key,
+  y/n, installed only when stdin and stdout are terminals; it borrows the keys and the
+  screen from the status line through `render::PromptLease`), and the ACP client
+  (`acp_agent::permission::ClientPrompter`). With no prompter (`--task`), only the hook
+  can answer, and silence is a refusal carrying the engine's reason.
+- **`AskUserQuestion`** (Toolbox tool, that exact name): goes through `pre-tool` like any
+  call; not answered in the app (exit 0), it is answered by the prompter (the terminal's
+  one-key menu from `ask::Question`), or reported unanswered with its options.
 
 ---
 
@@ -182,7 +239,7 @@ That is why the fallback is traced rather than silent.
 | `findings.rs` | **Work that produces information is judged by its artifact, never by the build.** A research task writes a findings file at a path fixed before it ran, and the check reads that file. It proves the deliverable exists and is not a shrug; it does not, and cannot, prove the findings are right. See `RUNNER.md` §6d. |
 | `wiring.rs` | **A capability nothing calls is not a capability.** Counts production mentions of every `pub fn`; a declaration mentioned only once is dead. Ratcheted, so the number can fall and never rise. See `CONVENTIONS.md` §13. |
 | `permissions.rs` | **What the session may do reaches every place that does it.** A mode governs the agent's file writing *and* the desktop: `-p read-only` means the agent may look at the screen and not touch it. The policy applies at `desktop::mcp::call_tool`, the one tool dispatcher left in this process. |
-| `hooks.rs` | **The operator can put their own command in front of an action.** Pre-tool hooks run on the desktop server and refuse with exit code 2; post-tool hooks run only for calls that happened and cannot deny. Bounded at 10s, because a hook runs between the agent asking and the screen moving. |
+| `hooks.rs` | **The operator can put their own command in front of an action.** Pre-tool hooks run on the desktop server and refuse with exit code 2; post-tool hooks run only for calls that happened and cannot deny. Bounded at 10s, because a hook runs between the agent asking and the screen moving. `hooks/engine.rs` is the other half: the memory engine's own hooks, run before each Toolbox call with a piped stdin and the engine's 600 s bounds — see §2, "The engine's hooks". |
 | `admin.rs` | One settings file, one precedence ladder, every value able to say which layer decided it. |
 | `research.rs` | A dependency the build links and the document never argued for is a decision nobody recorded. |
 | `identity.rs` | **The agent is the identity; the model is an attribute of the attempt.** A fallback changes what answered without changing who asked, so an identity built on the model would split one worker's history the first time a provider was busy. |
