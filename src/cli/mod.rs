@@ -720,20 +720,7 @@ impl CliApp {
                         slash_commands::handle_guards(&workspace);
                     }
                     SlashCommand::Undo => {
-                        match session.undo(&workspace) {
-                            Ok(outcome) => {
-                                outln!("Undid: {}", outcome.label);
-                                for path in &outcome.restored {
-                                    outln!("  restored {path}");
-                                }
-                                // Never swallowed: a partial undo the user
-                                // believes was complete is worse than none.
-                                for failure in &outcome.failed {
-                                    render::print_error(&format!("  could NOT restore {failure}"));
-                                }
-                            }
-                            Err(e) => render::print_error(&e),
-                        }
+                        slash_commands::handle_undo(&mut session, &workspace);
                     }
                     SlashCommand::Roadmap => {
                         slash_commands::handle_roadmap(&workspace);
@@ -1448,20 +1435,8 @@ impl CliApp {
                     SlashCommand::Memories(query) => {
                         slash_commands::handle_memories(query.as_deref());
                     }
-                    SlashCommand::Plan => {
-                        // The agent enforces this itself, for its own tools —
-                        // which is the only place it can be enforced now.
-                        session.set_permission_mode(crate::cli::agent_turn::PLAN_MODE);
-                        render::print_info(
-                            "Plan mode: the agent will propose changes without making them.",
-                        );
-                    }
-                    SlashCommand::Act => {
-                        session.set_permission_mode(crate::cli::agent_turn::ACT_MODE);
-                        render::print_info(
-                            "Act mode: the agent applies changes, within the guards.",
-                        );
-                    }
+                    SlashCommand::Plan => slash_commands::handle_plan(&mut session),
+                    SlashCommand::Act => slash_commands::handle_act(&mut session),
                     SlashCommand::Jobs => {
                         slash_commands::handle_jobs(&job_mgr);
                     }
@@ -1494,9 +1469,7 @@ impl CliApp {
                     // A real command, one word short. Say what it needs — the
                     // operator is closer to success than "unknown command"
                     // suggests, and /help does not name the missing part.
-                    SlashCommand::Usage(usage) => {
-                        render::print_error(&format!("Usage: {usage}"));
-                    }
+                    SlashCommand::Usage(usage) => slash_commands::handle_usage(&usage),
                     SlashCommand::Unknown(cmd) => {
                         render::print_error(&format!(
                             "Unknown command: {cmd}. Type /help for commands."

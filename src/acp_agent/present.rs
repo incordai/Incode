@@ -5,10 +5,14 @@
 //! Every payload here is a type from `agent-client-protocol-schema`, built with
 //! its own constructors, so the wire shape is the schema's and never a copy.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use agent_client_protocol_schema::v1 as acp;
 use serde_json::Value;
+
+use crate::cli::agent_turn::{Before, TurnStart};
+use crate::cli::edits::Asked;
 
 /// The most of one tool's output sent to the client, in bytes.
 ///
@@ -19,6 +23,13 @@ use serde_json::Value;
 /// whole output stays in the agent's transcript; only the copy sent here is
 /// cut, and the cut says so.
 pub(crate) const MAX_TOOL_OUTPUT_BYTES: usize = 64 * 1024;
+
+/// The most of EACH side of an edit's diff sent to the client, in bytes.
+///
+/// Half of [`MAX_TOOL_OUTPUT_BYTES`], so one `tool_call_update` carrying a
+/// diff is no larger than one carrying a tool's output. A side over it is cut
+/// the way output is, and the cut says so.
+pub(crate) const MAX_DIFF_TEXT_BYTES: usize = MAX_TOOL_OUTPUT_BYTES / 2;
 
 /// The tool whose input is the agent's task list, reported as a plan.
 const TASK_LIST_TOOL: &str = "TodoWrite";
@@ -201,17 +212,25 @@ pub(crate) fn tool_call(id: &str, name: &str, input: &str) -> acp::ToolCall {
         .raw_input(raw)
 }
 
+/// `text`, cut to `limit` bytes with the cut said — never silently.
+fn bounded(text: &str, limit: usize, rest_is: &str) -> String {
+    if text.len() <= limit {
+        return text.to_string();
+    }
+    let head = crate::text::head_bytes(text, limit);
+    format!(
+        "{head}\n[… {} more bytes not shown here; {rest_is}]",
+        text.len() - head.len()
+    )
+}
+
 /// What a tool returned, as an update to its call.
 pub(crate) fn tool_result(id: &str, output: &str, is_error: bool) -> acp::ToolCallUpdate {
-    let shown = if output.len() > MAX_TOOL_OUTPUT_BYTES {
-        format!(
-            "{}\n[… {} more bytes not shown here; the agent has the whole output]",
-            crate::text::head_bytes(output, MAX_TOOL_OUTPUT_BYTES),
-            output.len() - crate::text::head_bytes(output, MAX_TOOL_OUTPUT_BYTES).len()
-        )
-    } else {
-        output.to_string()
-    };
+    let shown = bounded(
+        output,
+        MAX_TOOL_OUTPUT_BYTES,
+        "the agent has the whole output",
+    );
     let status = if is_error {
         acp::ToolCallStatus::Failed
     } else {
@@ -223,6 +242,124 @@ pub(crate) fn tool_result(id: &str, output: &str, is_error: bool) -> acp::ToolCa
             .status(status)
             .content(vec![acp::ToolCallContent::from(shown)]),
     )
+}
+
+/// An edit that landed, as an update to its call: the change as a diff, which
+/// the client draws red and green and lists under the files changed.
+pub(crate) fn tool_diff(id: &str, diff: acp::Diff) -> acp::ToolCallUpdate {
+    acp::ToolCallUpdate::new(
+        id.to_string(),
+        acp::ToolCallUpdateFields::new()
+            .status(acp::ToolCallStatus::Completed)
+            .content(vec![acp::ToolCallContent::from(diff)]),
+    )
+}
+
+/// Follows one prompt's edit calls, and turns each one that LANDED into a
+/// diff.
+///
+/// # Where the two sides come from
+///
+/// The agent CLI edits files itself, so nothing here can watch the write.
+/// What is in hand is the call, its result, and the snapshot the turn took
+/// before it started ([`TurnStart`]):
+///
+/// - a SPLICE — part of a file replaced — is shown as the call carries it:
+///   the text taken out and the text put in. Exactly what changed, with no
+///   read of the file that could race the agent.
+/// - a WHOLE-FILE write shows the body written against what the file held
+///   before: the snapshot's copy for the first edit of that file in the
+///   prompt, or what the file held after the edit before it. A file the
+///   snapshot shows did not exist has no old text — the protocol's "new
+///   file". A file whose before is not known gets no diff at all, only its
+///   output, rather than being called new.
+///
+/// Only a SUCCESSFUL result makes a diff: a write can be refused, and a diff
+/// for it would claim a change that never happened. Only a path that is
+/// inside the workspace once resolved is named, and it is named absolutely.
+pub(crate) struct Edits {
+    workspace: PathBuf,
+    /// Edit calls seen, keyed by call id, until their result arrives.
+    pending: HashMap<String, Asked>,
+    /// What each file held after the last edit of it this prompt saw land;
+    /// `None` when that is not known. Keyed by the absolute path sent.
+    latest: HashMap<PathBuf, Option<String>>,
+}
+
+impl Edits {
+    pub(crate) fn new(workspace: &Path) -> Self {
+        Self {
+            workspace: workspace.to_path_buf(),
+            pending: HashMap::new(),
+            latest: HashMap::new(),
+        }
+    }
+
+    /// A tool was called; remembered when it is an edit.
+    pub(crate) fn called(&mut self, id: &str, input: &str) {
+        if let Some(asked) = crate::cli::edits::asked_in(input) {
+            self.pending.insert(id.to_string(), asked);
+        }
+    }
+
+    /// The diff a result makes, or `None` when it shows as ordinary output.
+    pub(crate) fn landed(
+        &mut self,
+        id: &str,
+        is_error: bool,
+        start: &TurnStart<'_>,
+    ) -> Option<acp::Diff> {
+        let asked = self.pending.remove(id)?;
+        if is_error {
+            return None;
+        }
+        match asked {
+            Asked::Splice { path, old, new } => {
+                let path = self.inside(&path)?;
+                // What the file holds now, for a later whole write's "before".
+                let now = std::fs::read_to_string(&path).ok();
+                self.latest.insert(path.clone(), now);
+                Some(acp::Diff::new(path, side(&new)).old_text(side(&old)))
+            }
+            Asked::Whole { path, body } => {
+                let path = self.inside(&path)?;
+                let before = match self.latest.get(&path) {
+                    Some(Some(text)) => Before::Held(text.clone()),
+                    Some(None) => Before::Unknown,
+                    None => start.before(&path),
+                };
+                let diff = match before {
+                    Before::Held(old) => {
+                        Some(acp::Diff::new(&path, side(&body)).old_text(side(&old)))
+                    }
+                    Before::Absent => Some(acp::Diff::new(&path, side(&body))),
+                    Before::Unknown => None,
+                };
+                self.latest.insert(path, Some(body));
+                diff
+            }
+        }
+    }
+
+    /// `named` as an absolute path inside the workspace, or `None`.
+    ///
+    /// Resolved the way prompt links are ([`within`]), so `..` and links
+    /// cannot walk out. The workspace part keeps the session's own spelling,
+    /// which is how the turn's snapshot names the same file.
+    fn inside(&self, named: &str) -> Option<PathBuf> {
+        let given = Path::new(named);
+        let absolute = if given.is_absolute() {
+            given.to_path_buf()
+        } else {
+            self.workspace.join(given)
+        };
+        within(&absolute, &self.workspace).map(|relative| self.workspace.join(relative))
+    }
+}
+
+/// One side of a diff, cut to [`MAX_DIFF_TEXT_BYTES`].
+fn side(text: &str) -> String {
+    bounded(text, MAX_DIFF_TEXT_BYTES, "the file on disk has all of it")
 }
 
 /// What kind of work a tool does, from its name.
@@ -399,6 +536,15 @@ mod tests {
         assert_eq!(plan.entries.len(), 2);
         assert_eq!(plan.entries[1].status, acp::PlanEntryStatus::InProgress);
         assert!(plan_of("Read", input).is_none());
+    }
+
+    /// Each side of a diff is bounded like tool output, and the cut is said.
+    #[test]
+    fn a_huge_diff_side_is_cut_and_says_so() {
+        let shown = side(&"y".repeat(MAX_DIFF_TEXT_BYTES + 5));
+        assert!(shown.len() < MAX_DIFF_TEXT_BYTES + 200, "{}", shown.len());
+        assert!(shown.contains("5 more bytes"), "the cut must be named");
+        assert_eq!(side("small\n"), "small\n");
     }
 
     /// The client gets a bounded copy; the cut is said, not silent.

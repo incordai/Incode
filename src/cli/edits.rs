@@ -99,11 +99,29 @@ fn lines_of(text: &str) -> Vec<String> {
     text.lines().map(str::to_string).collect()
 }
 
-/// The change a tool call describes, or `None` when it is not an edit.
+/// A file change exactly as the call carries it, text untouched.
+///
+/// [`Change`] is the same thing cut into lines for a terminal block, which
+/// loses whether the text ended in a newline. A front end that shows the
+/// before and after text itself — `incode --acp` — needs it as sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Asked {
+    /// Part of the file replaced: `old` taken out, `new` put in its place.
+    Splice {
+        path: String,
+        old: String,
+        new: String,
+    },
+    /// The whole file written with `body`.
+    Whole { path: String, body: String },
+}
+
+/// The change a tool call asks for, or `None` when it is not an edit.
 ///
 /// See the module note: recognised by the keys present, never by tool name.
+/// The one place those keys are known; [`change_from`] is built on it.
 #[must_use]
-pub fn change_from(input: &str) -> Option<Change> {
+pub fn asked_in(input: &str) -> Option<Asked> {
     let call: serde_json::Value = serde_json::from_str(input).ok()?;
     let path = path_in(&call)?;
 
@@ -112,26 +130,44 @@ pub fn change_from(input: &str) -> Option<Change> {
     let old = call.get("old_string").and_then(serde_json::Value::as_str);
     let new = call.get("new_string").and_then(serde_json::Value::as_str);
     if old.is_some() || new.is_some() {
-        return Some(Change {
+        return Some(Asked::Splice {
             path,
-            removed: lines_of(old.unwrap_or_default()),
-            added: lines_of(new.unwrap_or_default()),
-            whole_file: false,
+            old: old.unwrap_or_default().to_string(),
+            new: new.unwrap_or_default().to_string(),
         });
     }
 
     // A whole body. `content` is the common key; `new_source` is a notebook's.
     for key in ["content", "new_source"] {
         if let Some(body) = call.get(key).and_then(serde_json::Value::as_str) {
-            return Some(Change {
+            return Some(Asked::Whole {
                 path,
-                removed: Vec::new(),
-                added: lines_of(body),
-                whole_file: true,
+                body: body.to_string(),
             });
         }
     }
     None
+}
+
+/// The change a tool call describes, or `None` when it is not an edit.
+///
+/// See the module note: recognised by the keys present, never by tool name.
+#[must_use]
+pub fn change_from(input: &str) -> Option<Change> {
+    Some(match asked_in(input)? {
+        Asked::Splice { path, old, new } => Change {
+            path,
+            removed: lines_of(&old),
+            added: lines_of(&new),
+            whole_file: false,
+        },
+        Asked::Whole { path, body } => Change {
+            path,
+            removed: Vec::new(),
+            added: lines_of(&body),
+            whole_file: true,
+        },
+    })
 }
 
 /// The 1-based line where `needle` begins in `text`, if it is there.

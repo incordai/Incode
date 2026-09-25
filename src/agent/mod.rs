@@ -84,6 +84,15 @@ pub enum AgentEvent {
         cache_creation_tokens: u32,
         cache_read_tokens: u32,
     },
+    /// How full the agent's context window is, when the agent reports BOTH
+    /// numbers: the tokens its latest request held (`used`) and the window
+    /// that request ran in (`size`).
+    ///
+    /// Emitted only when both were reported. A backend that reports token
+    /// counts and no window sends [`Self::Usage`] alone; nothing here fills
+    /// in a window from a table, because a guessed window is a wrong
+    /// percentage on the owner's screen.
+    Context { used: u64, size: u64 },
 }
 
 /// How a turn ended.

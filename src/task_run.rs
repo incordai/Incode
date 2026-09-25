@@ -190,7 +190,7 @@ pub fn run_task_with_model(
                     outln!("{line}");
                 }
             }
-            AgentEvent::TextDelta(_) => {}
+            AgentEvent::TextDelta(_) | AgentEvent::Context { .. } => {}
         });
 
         let outcome = match turn_res {

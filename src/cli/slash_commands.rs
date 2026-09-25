@@ -277,6 +277,47 @@ pub fn command_name(entry: &str) -> &str {
     entry.split(' ').next().unwrap_or(entry)
 }
 
+/// A real command typed without what it needs: say what it needs.
+pub fn handle_usage(usage: &str) {
+    render::print_error(&format!("Usage: {usage}"));
+}
+
+/// `/undo`: put back the files the last turn changed.
+pub fn handle_undo(
+    session: &mut crate::cli::agent_turn::AgentSession,
+    workspace: &std::path::Path,
+) {
+    match session.undo(workspace) {
+        Ok(outcome) => {
+            outln!("Undid: {}", outcome.label);
+            for path in &outcome.restored {
+                outln!("  restored {path}");
+            }
+            // Never swallowed: a partial undo the user believes was complete
+            // is worse than none.
+            for failure in &outcome.failed {
+                render::print_error(&format!("  could NOT restore {failure}"));
+            }
+        }
+        Err(e) => render::print_error(&e),
+    }
+}
+
+/// `/plan`: the agent proposes changes without making them.
+///
+/// The agent enforces this itself, for its own tools — which is the only place
+/// it can be enforced now.
+pub fn handle_plan(session: &mut crate::cli::agent_turn::AgentSession) {
+    session.set_permission_mode(crate::cli::agent_turn::PLAN_MODE);
+    render::print_info("Plan mode: the agent will propose changes without making them.");
+}
+
+/// `/act`: the agent applies changes, within the guards.
+pub fn handle_act(session: &mut crate::cli::agent_turn::AgentSession) {
+    session.set_permission_mode(crate::cli::agent_turn::ACT_MODE);
+    render::print_info("Act mode: the agent applies changes, within the guards.");
+}
+
 pub fn handle_help() {
     render::print_header("Incord Code Commands");
     for (cmd, desc) in COMMANDS {

@@ -64,8 +64,8 @@ runs. The code is `src/acp_agent/`; payloads are `agent-client-protocol-schema` 
 |---|---|
 | `initialize` | protocol version 1; prompts take text and embedded context; no session loading, no client MCP servers, no auth methods |
 | `authenticate` | invalid params — no method was offered; the CLIs hold their own logins |
-| `session/new` | `cwd` must be absolute and an existing directory; it becomes the workspace. The session is built on its own thread |
-| `session/prompt` | one turn: text as `agent_message_chunk`, tool calls and results as `tool_call` / `tool_call_update`, the task list as `plan`; replies with the stop reason, or a JSON-RPC error if the turn failed |
+| `session/new` | `cwd` must be absolute and an existing directory; it becomes the workspace. The session is built on its own thread; after the answer, `available_commands_update` lists its slash commands |
+| `session/prompt` | one turn: text as `agent_message_chunk`, tool calls and results as `tool_call` / `tool_call_update`, an edit that landed as a `diff`, the task list as `plan`, the context window's fill as `usage_update`; replies with the stop reason, or a JSON-RPC error if the turn failed. A prompt that is a slash command runs that command instead |
 | `session/cancel` | trips the session's cancel token; the prompt answers `cancelled` |
 | `session/set_mode` | `read-only`, `workspace-write`, `danger-full-access`; applied from the next turn |
 | `session/close` | cancels the session's turn and frees its slot (at most 16 sessions open at once) |
@@ -79,8 +79,42 @@ the client's messages. A test drives a whole handshake and prompt through a real
 process whose backend prints to stdout every way the crate can, and requires every
 stdout line to be JSON-RPC.
 
+**Edits as diffs.** A successful edit call's `tool_call_update` carries one `diff`
+content block instead of the tool's output text (`acp_agent::present::Edits`). The
+agent CLI writes files itself, so nothing is read at the moment of the write: a splice
+(`old_string` / `new_string`) is sent as the call carries it; a whole-file write
+(`content`) is sent against what the file held before — the pre-turn snapshot the turn
+already takes for `/undo` (`AgentSession::turn_observed` hands it to the observer as
+`TurnStart`), or what the previous edit of that file in the same prompt left. A file
+the snapshot shows did not exist has `oldText` null; a file whose before is not known
+(snapshot capped or skipped, not text) gets its output, never a false "new file". The
+path is absolute and must resolve inside `cwd`, or no diff is sent. Each side is cut at
+`MAX_DIFF_TEXT_BYTES` (32 KiB, half of `MAX_TOOL_OUTPUT_BYTES`) and the cut is said.
+Edits a backend does not report as a call with those keys (codex's file changes, a
+shell command that writes) are not diffs.
+
+**Usage.** `usage_update` carries `used` and `size` only when the agent reported both:
+today the Claude CLI's result line (`usage.iterations`' last request for `used`,
+`modelUsage[*].contextWindow` for `size`, as `AgentEvent::Context`). No other backend
+reports a window, so none sends one. No `cost` is sent: on a subscription the CLI's
+`costUSD` is a list-price figure, not money spent. Per-turn token counts would go on
+the prompt result's `usage`, which the schema only has behind
+`unstable_end_turn_token_usage`; it is not enabled.
+
+**Slash commands.** `/undo`, `/plan`, `/act`, `/diff`, `/links`, `/roadmap`, `/doctor`,
+`/memories`, `/remember`, `/worktree`, `/agent` and `/roles` are announced, with the
+description and argument hint from `slash_commands::COMMANDS`. A prompt that parses as
+a slash command runs the REPL's own handler inside `console::capture`, which returns
+what the handler printed on that thread; that text is the reply, and the agent is not
+run. `/plan` and `/act` also move the session to `read-only` / `workspace-write` and
+send `current_mode_update`. Not offered: `/run` (long, must stream and honour cancel —
+next step), `/bg` / `/jobs` / `/kill` (shell jobs outside the permission mode, with
+completion reported by the REPL loop), and the terminal-session commands (`/quit`,
+`/clear`, `/resume`, `/model`, `/add-dir`, `/forget`, `/help`, `/status` and the other
+information screens). Anything else starting with `/` is answered with the list.
+
 Not offered: `session/load` and `session/resume` (the agent CLI owns the transcript and
-an ACP session id has no stored mapping to it), slash commands, the client's MCP servers
+an ACP session id has no stored mapping to it), the client's MCP servers
 (no seam in the backends, and a stdio server is a program the client would have this
 machine run), and `session/request_permission` / fs / terminal.
 

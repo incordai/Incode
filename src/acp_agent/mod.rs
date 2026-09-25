@@ -19,9 +19,12 @@
 //!   `initialize` advertised, and none is. The subscription CLIs hold their
 //!   own logins.
 //! - `session/new` — `cwd` must be an absolute path to an existing directory;
-//!   it becomes the workspace. The session is built on its own thread.
-//! - `session/prompt` — one turn; its text, tool calls, tool results and task
-//!   list stream as `session/update`, and the reply carries the stop reason.
+//!   it becomes the workspace. The session is built on its own thread, and
+//!   its slash commands follow the answer as `available_commands_update`.
+//! - `session/prompt` — one turn; its text, tool calls, tool results, task
+//!   list, the diff of each edit that landed and the context window's fill
+//!   stream as `session/update`, and the reply carries the stop reason. A
+//!   prompt that is a slash command runs that command instead ([`commands`]).
 //! - `session/cancel` — trips the session's cancel token; the pending prompt
 //!   answers `cancelled`.
 //! - `session/set_mode` — `read-only`, `workspace-write` or
@@ -43,6 +46,7 @@
 //! Protocol only. [`run_stdio`] moves the process's standard handles before
 //! anything else happens — see [`stdio`].
 
+mod commands;
 mod present;
 mod stdio;
 mod transport;
@@ -61,7 +65,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::agent::AgentEvent;
-use crate::cli::agent_turn::AgentSession;
+use crate::cli::agent_turn::{AgentSession, TurnStart};
 use crate::config::IncordCodeConfig;
 use crate::permissions::PermissionMode;
 use crate::runtime::cancel::CancelToken;
@@ -130,6 +134,8 @@ pub(crate) struct Opened {
     pub(crate) session: AgentSession,
     /// The permission mode already applied to it.
     pub(crate) mode: PermissionMode,
+    /// What the slash commands need beyond the session.
+    pub(crate) settings: commands::Settings,
 }
 
 /// Builds the session a `session/new` asks for.
@@ -154,6 +160,11 @@ impl SessionFactory for CliSessions {
         Ok(Opened {
             session: prepared.session,
             mode: prepared.permission_mode,
+            settings: commands::Settings {
+                data_dir: prepared.incord_code_dir,
+                catalogue: prepared.catalogue,
+                lead: prepared.agent,
+            },
         })
     }
 }
@@ -548,7 +559,11 @@ fn drive<F: SessionFactory>(
         factory.open(workspace, shared.cancel.clone())
     }))
     .unwrap_or_else(|_| Err("building it panicked".to_string()));
-    let Opened { mut session, mode } = match opened {
+    let Opened {
+        mut session,
+        mode,
+        settings,
+    } = match opened {
         Ok(opened) => opened,
         Err(why) => {
             return outbox.respond::<Value>(
@@ -559,7 +574,7 @@ fn drive<F: SessionFactory>(
     };
     // A mode that is not offered cannot be shown as current. It fails CLOSED,
     // like `PermissionMode::from_str_lossy`.
-    let mut applied = if MODES.contains(&mode) {
+    let applied = if MODES.contains(&mode) {
         mode
     } else {
         session.set_permission_mode(PermissionMode::ReadOnly.agent_mode());
@@ -569,12 +584,26 @@ fn drive<F: SessionFactory>(
         opened_by,
         Ok(acp::NewSessionResponse::new(session_id.clone()).modes(mode_state(applied))),
     );
+    // After the answer, so the client knows the session the list belongs to.
+    outbox.notify(
+        acp::CLIENT_METHOD_NAMES.session_update,
+        acp::SessionNotification::new(
+            session_id.clone(),
+            acp::SessionUpdate::AvailableCommandsUpdate(acp::AvailableCommandsUpdate::new(
+                commands::available(),
+            )),
+        ),
+    );
+    let mut held = Held {
+        session,
+        applied,
+        settings,
+    };
 
     while let Ok(prompt) = prompts.recv() {
         let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_prompt(
-                &mut session,
-                &mut applied,
+                &mut held,
                 workspace,
                 outbox,
                 session_id,
@@ -602,10 +631,18 @@ fn drive<F: SessionFactory>(
     }
 }
 
-/// One prompt: the same turn an interactive line runs, streamed as updates.
+/// One open session, as its thread holds it.
+struct Held {
+    session: AgentSession,
+    /// The permission mode the session is running under now.
+    applied: PermissionMode,
+    settings: commands::Settings,
+}
+
+/// One prompt: the same turn an interactive line runs, streamed as updates —
+/// or, when the prompt is a slash command, that command.
 fn run_prompt(
-    session: &mut AgentSession,
-    applied: &mut PermissionMode,
+    held: &mut Held,
     workspace: &Path,
     outbox: &Outbox,
     session_id: &acp::SessionId,
@@ -616,15 +653,16 @@ fn run_prompt(
     if text.trim().is_empty() {
         return Err(invalid_params("the prompt has no text"));
     }
+    let session = &mut held.session;
 
     // The mode the client chose, sent to the thing that does the writing —
     // as `-p` is at startup. Before the turn, because a running agent's mode
     // was fixed when it was started.
     let wanted = shared.state().mode;
     if let Some(wanted) = wanted {
-        if wanted != *applied {
+        if wanted != held.applied {
             session.set_permission_mode(wanted.agent_mode());
-            *applied = wanted;
+            held.applied = wanted;
         }
     }
 
@@ -646,6 +684,27 @@ fn run_prompt(
         }
     };
 
+    // A slash command is run here, as the REPL runs it, and never reaches the
+    // agent. It runs to the end: a cancel that lands meanwhile decides the
+    // answer, as it does for a turn.
+    if let Some(ran) = commands::run(&text, session, workspace, &held.settings) {
+        say_text(&ran.said);
+        if let Some(mode) = ran.mode {
+            // The command switched the mode; the client's picker, and the
+            // mode the next prompt asks for, follow it.
+            held.applied = mode;
+            shared.state().mode = Some(mode);
+            say(acp::SessionUpdate::CurrentModeUpdate(
+                acp::CurrentModeUpdate::new(mode.as_str()),
+            ));
+        }
+        return Ok(if shared.cancelled() {
+            acp::StopReason::Cancelled
+        } else {
+            acp::StopReason::EndTurn
+        });
+    }
+
     let (instruction, context) = match crate::cli::plan_turn(session, workspace, &text, &text) {
         crate::cli::TurnPlan::NextQuestion(reply) | crate::cli::TurnPlan::Greeting(reply) => {
             say_text(&reply);
@@ -664,6 +723,7 @@ fn run_prompt(
         return Ok(acp::StopReason::Cancelled);
     }
 
+    let mut edits = present::Edits::new(workspace);
     let outcome = session.turn_observed(
         workspace,
         &instruction,
@@ -673,9 +733,9 @@ fn run_prompt(
             say_text(fragment);
         },
         &mut |_status| {},
-        Some(&mut |event: &AgentEvent| {
+        Some(&mut |event: &AgentEvent, start: &TurnStart<'_>| {
             shared.hold_cancel();
-            for update in updates_for(event) {
+            for update in updates_for(event, &mut edits, start) {
                 say(update);
             }
         }),
@@ -702,9 +762,23 @@ fn run_prompt(
 
 /// The `session/update`s one agent event becomes. Text is not here: it comes
 /// through the turn's text callback, after the question block is filtered out.
-fn updates_for(event: &AgentEvent) -> Vec<acp::SessionUpdate> {
+///
+/// An edit's result becomes a diff when [`present::Edits`] can name both
+/// sides; any other result, and an edit it cannot, is the tool's output.
+///
+/// Token counts ([`AgentEvent::Usage`]) and quota ([`AgentEvent::Quota`]) have
+/// no place in the stable protocol: `usage_update` needs the window size too,
+/// and the prompt result's token usage is still an unstable field. Only
+/// [`AgentEvent::Context`] — both numbers, as the agent reported them — goes
+/// out, and without a cost: on a subscription no per-token money is spent.
+fn updates_for(
+    event: &AgentEvent,
+    edits: &mut present::Edits,
+    start: &TurnStart<'_>,
+) -> Vec<acp::SessionUpdate> {
     match event {
         AgentEvent::ToolUse { id, name, input } => {
+            edits.called(id, input);
             let mut updates = vec![acp::SessionUpdate::ToolCall(present::tool_call(
                 id, name, input,
             ))];
@@ -717,9 +791,16 @@ fn updates_for(event: &AgentEvent) -> Vec<acp::SessionUpdate> {
             id,
             output,
             is_error,
-        } => vec![acp::SessionUpdate::ToolCallUpdate(present::tool_result(
-            id, output, *is_error,
-        ))],
+        } => {
+            let update = match edits.landed(id, *is_error, start) {
+                Some(diff) => present::tool_diff(id, diff),
+                None => present::tool_result(id, output, *is_error),
+            };
+            vec![acp::SessionUpdate::ToolCallUpdate(update)]
+        }
+        AgentEvent::Context { used, size } => vec![acp::SessionUpdate::UsageUpdate(
+            acp::UsageUpdate::new(*used, *size),
+        )],
         _ => Vec::new(),
     }
 }
@@ -824,6 +905,9 @@ mod tests {
         /// [`Behaviour::Stream`], after printing to stdout every way this
         /// crate can.
         Noisy,
+        /// Real edits in the workspace, each written before its result is
+        /// reported, as an agent CLI does — see [`edit_the_workspace`].
+        Edits,
     }
 
     #[derive(Clone)]
@@ -845,6 +929,7 @@ mod tests {
     struct FakeBackend {
         script: Script,
         cancel: Option<CancelToken>,
+        workspace: PathBuf,
     }
 
     fn ended(stop_reason: &str) -> TurnOutcome {
@@ -876,6 +961,112 @@ mod tests {
             input: r#"{"todos":[{"content":"read a.txt","status":"completed","activeForm":"reading"}]}"#
                 .to_string(),
         });
+        // Both numbers, as the agent reports them at the end of a turn.
+        on_event(&AgentEvent::Usage {
+            input_tokens: 2,
+            output_tokens: 4,
+            cache_creation_tokens: 164,
+            cache_read_tokens: 38_663,
+        });
+        on_event(&AgentEvent::Context {
+            used: 38_833,
+            size: 1_000_000,
+        });
+        Ok(ended("end_turn"))
+    }
+
+    /// One tool call and its result, with `act` done in between — the order
+    /// an agent CLI works in: the call is announced, the tool runs, the
+    /// result follows.
+    fn tool(
+        on_event: &mut dyn FnMut(&AgentEvent),
+        id: &str,
+        name: &str,
+        input: &Value,
+        act: impl FnOnce() -> Result<(), String>,
+    ) {
+        on_event(&AgentEvent::ToolUse {
+            id: id.to_string(),
+            name: name.to_string(),
+            input: input.to_string(),
+        });
+        let (output, is_error) = match act() {
+            Ok(()) => (format!("{name} done"), false),
+            Err(why) => (why, true),
+        };
+        on_event(&AgentEvent::ToolResult {
+            id: id.to_string(),
+            output,
+            is_error,
+        });
+    }
+
+    /// The edits [`Behaviour::Edits`] makes. The workspace holds `old.txt`
+    /// (`before\n`) when the turn starts; its parent is scratch space the
+    /// test owns.
+    fn edit_the_workspace(
+        workspace: &Path,
+        on_event: &mut dyn FnMut(&AgentEvent),
+    ) -> Result<TurnOutcome, AgentError> {
+        let hello = workspace.join("hello.txt");
+        let write = |path: PathBuf, text: &'static str| {
+            move || std::fs::write(&path, text).map_err(|e| e.to_string())
+        };
+        // A new file, named absolutely.
+        tool(
+            on_event,
+            "w1",
+            "Write",
+            &json!({"file_path": hello, "content": "hi\n"}),
+            write(hello.clone(), "hi\n"),
+        );
+        // A splice of it.
+        tool(
+            on_event,
+            "w2",
+            "Edit",
+            &json!({"file_path": hello, "old_string": "hi", "new_string": "hello"}),
+            write(hello.clone(), "hello\n"),
+        );
+        // A whole write over a file that was there before the turn, named
+        // relative to the workspace.
+        tool(
+            on_event,
+            "w3",
+            "Write",
+            &json!({"file_path": "old.txt", "content": "after\n"}),
+            write(workspace.join("old.txt"), "after\n"),
+        );
+        // An edit that was refused: nothing changed.
+        tool(
+            on_event,
+            "w4",
+            "Edit",
+            &json!({"file_path": hello, "old_string": "zzz", "new_string": "q"}),
+            || Err("old_string not found".to_string()),
+        );
+        // A splice that landed OUTSIDE the workspace. A splice, because it
+        // needs no "before" — so only the workspace check can keep it out.
+        let outside = workspace
+            .parent()
+            .map(|parent| parent.join("outside.txt"))
+            .ok_or_else(|| AgentError::new("the test workspace has no parent"))?;
+        tool(
+            on_event,
+            "w5",
+            "Edit",
+            &json!({"file_path": outside, "old_string": "in", "new_string": "escaped"}),
+            write(outside.clone(), "escaped\n"),
+        );
+        // A whole write to the file spliced above: its before is what the
+        // splice left.
+        tool(
+            on_event,
+            "w6",
+            "Write",
+            &json!({"file_path": hello, "content": "bye\n"}),
+            write(hello, "bye\n"),
+        );
         Ok(ended("end_turn"))
     }
 
@@ -922,6 +1113,7 @@ mod tests {
                     assert!(child.is_ok_and(|s| s.success()), "the noisy child must run");
                     stream(on_event)
                 }
+                Behaviour::Edits => edit_the_workspace(&self.workspace, on_event),
             }
         }
 
@@ -948,6 +1140,9 @@ mod tests {
     struct FakeSessions {
         script: Script,
         mode: PermissionMode,
+        /// Where `/agent` and `/roles` keep settings: a scratch directory,
+        /// never the operator's own.
+        data_dir: PathBuf,
     }
 
     impl SessionFactory for FakeSessions {
@@ -962,12 +1157,25 @@ mod tests {
             .with_backend(Box::new(FakeBackend {
                 script: self.script.clone(),
                 cancel: None,
+                workspace: workspace.to_path_buf(),
             }))
             .with_cancel(cancel);
             session.set_permission_mode(self.mode.agent_mode());
             Ok(Opened {
                 session,
                 mode: self.mode,
+                settings: commands::Settings {
+                    data_dir: self.data_dir.clone(),
+                    catalogue: crate::agent::catalogue::Catalogue::of_local(Vec::new()),
+                    lead: crate::agent::DetectedAgent {
+                        id: "claude-code".to_string(),
+                        display_name: "Claude Code".to_string(),
+                        command: "claude".to_string(),
+                        path: None,
+                        version: None,
+                        protocol: crate::agent::Protocol::ClaudeStreamJson,
+                    },
+                },
             })
         }
     }
@@ -994,19 +1202,22 @@ mod tests {
         from_agent: Receiver<String>,
         server: JoinHandle<()>,
         next_id: i64,
+        /// The sessions' settings directory, removed with the client.
+        _data_dir: tempfile::TempDir,
     }
 
     impl Client {
         fn start(script: Script, mode: PermissionMode, max_line: usize) -> Self {
             let (agent_in, to_agent) = std::io::pipe().expect("pipe");
             let (from_agent_raw, agent_out) = std::io::pipe().expect("pipe");
+            let data_dir = tempfile::tempdir().expect("data dir");
+            let sessions = FakeSessions {
+                script,
+                mode,
+                data_dir: data_dir.path().to_path_buf(),
+            };
             let server = std::thread::spawn(move || {
-                serve(
-                    agent_in,
-                    Box::new(agent_out),
-                    FakeSessions { script, mode },
-                    max_line,
-                );
+                serve(agent_in, Box::new(agent_out), sessions, max_line);
             });
             let (lines, from_agent) = mpsc::channel();
             std::thread::spawn(move || {
@@ -1022,6 +1233,7 @@ mod tests {
                 from_agent,
                 server,
                 next_id: 0,
+                _data_dir: data_dir,
             }
         }
 
@@ -1385,6 +1597,259 @@ mod tests {
         client.close();
     }
 
+    fn prompt_in(client: &mut Client, session: &str, text: &str) -> (Vec<Value>, Value) {
+        let id = client.request(
+            "session/prompt",
+            json!({"sessionId": session, "prompt": [{"type": "text", "text": text}]}),
+        );
+        client.until_response(id)
+    }
+
+    /// **CONTEXT FILL REACHES THE CLIENT AS `usage_update`, WITH NO COST.**
+    ///
+    /// The shape the desktop app reads: `used` and `size` as numbers. No cost
+    /// is invented: the agent's token counts alone never make a
+    /// `usage_update`, and nothing here puts a price on a subscription.
+    #[test]
+    fn the_context_window_reaches_the_client_as_usage_update() {
+        let mut client = client(Behaviour::Stream);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let session = client.open_session(dir.path());
+        let (streamed, reply) = prompt_in(&mut client, &session, "read a.txt and report");
+        assert_eq!(reply["result"]["stopReason"], "end_turn", "{reply}");
+        let usage: Vec<&Value> = updates_of(&streamed)
+            .into_iter()
+            .filter(|u| u["sessionUpdate"] == "usage_update")
+            .collect();
+        assert_eq!(usage.len(), 1, "{streamed:#?}");
+        assert_eq!(usage[0]["used"], 38_833, "{}", usage[0]);
+        assert_eq!(usage[0]["size"], 1_000_000, "{}", usage[0]);
+        assert!(usage[0].get("cost").is_none(), "{}", usage[0]);
+        client.close();
+    }
+
+    /// The `tool_call_update` for one call id.
+    fn result_for<'a>(updates: &[&'a Value], id: &str) -> &'a Value {
+        updates
+            .iter()
+            .find(|u| u["sessionUpdate"] == "tool_call_update" && u["toolCallId"] == id)
+            .unwrap_or_else(|| panic!("no result for {id}: {updates:#?}"))
+    }
+
+    /// **AN EDIT THAT LANDED IS A DIFF; ANYTHING ELSE IS ITS OUTPUT.**
+    ///
+    /// Six edits, each written before its result arrives, as an agent CLI
+    /// does. The diff names the file absolutely; a new file has no old text; a
+    /// splice shows what it took out and put in; a whole write over a file
+    /// that existed before the turn shows what the file held then, from the
+    /// turn's snapshot; a second write to a spliced file shows what the
+    /// splice left. A refused edit and a write outside the workspace are not
+    /// diffs.
+    #[test]
+    fn an_edit_that_landed_is_sent_as_a_diff() {
+        let mut client = client(Behaviour::Edits);
+        let scratch = tempfile::tempdir().expect("scratch");
+        let workspace = scratch.path().join("ws");
+        std::fs::create_dir(&workspace).expect("workspace");
+        std::fs::write(workspace.join("old.txt"), "before\n").expect("old.txt");
+        let session = client.open_session(&workspace);
+
+        let (streamed, reply) = prompt_in(&mut client, &session, "make the edits please");
+        assert_eq!(reply["result"]["stopReason"], "end_turn", "{reply}");
+        let updates = updates_of(&streamed);
+        let diff_of = |id: &str| -> Value {
+            let update = result_for(&updates, id);
+            assert_eq!(update["status"], "completed", "{update}");
+            let content = update["content"].as_array().expect("content");
+            assert_eq!(content.len(), 1, "{update}");
+            assert_eq!(content[0]["type"], "diff", "{update}");
+            content[0].clone()
+        };
+        let hello = workspace.join("hello.txt").to_string_lossy().to_string();
+
+        let created = diff_of("w1");
+        assert_eq!(created["path"], hello, "{created}");
+        assert!(
+            created.get("oldText").is_none_or(Value::is_null),
+            "a new file has no old text: {created}"
+        );
+        assert_eq!(created["newText"], "hi\n", "{created}");
+
+        let spliced = diff_of("w2");
+        assert_eq!(spliced["path"], hello, "{spliced}");
+        assert_eq!(spliced["oldText"], "hi", "{spliced}");
+        assert_eq!(spliced["newText"], "hello", "{spliced}");
+
+        let overwritten = diff_of("w3");
+        assert_eq!(
+            overwritten["path"],
+            workspace.join("old.txt").to_string_lossy().to_string(),
+            "a relative name is sent absolute: {overwritten}"
+        );
+        assert_eq!(
+            overwritten["oldText"], "before\n",
+            "the before is the turn's snapshot: {overwritten}"
+        );
+        assert_eq!(overwritten["newText"], "after\n", "{overwritten}");
+
+        let refused = result_for(&updates, "w4");
+        assert_eq!(refused["status"], "failed", "{refused}");
+        assert_eq!(refused["content"][0]["type"], "content", "{refused}");
+
+        let escaped = result_for(&updates, "w5");
+        assert_eq!(escaped["status"], "completed", "{escaped}");
+        assert_eq!(
+            escaped["content"][0]["type"], "content",
+            "a path outside the workspace is never named in a diff: {escaped}"
+        );
+
+        let rewritten = diff_of("w6");
+        assert_eq!(rewritten["oldText"], "hello\n", "{rewritten}");
+        assert_eq!(rewritten["newText"], "bye\n", "{rewritten}");
+        client.close();
+    }
+
+    fn commands_announced(messages: &[Value]) -> Option<Vec<String>> {
+        updates_of(messages)
+            .into_iter()
+            .find(|u| u["sessionUpdate"] == "available_commands_update")
+            .map(|u| {
+                u["availableCommands"]
+                    .as_array()
+                    .expect("list")
+                    .iter()
+                    .filter_map(|c| c["name"].as_str().map(str::to_string))
+                    .collect()
+            })
+    }
+
+    /// **`session/new` IS FOLLOWED BY THE COMMANDS OFFERED**, in the shape the
+    /// desktop app reads — and `/run` is not among them.
+    #[test]
+    fn a_new_session_announces_its_commands() {
+        let mut client = client(Behaviour::Stream);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let session = client.open_session(dir.path());
+        let announced = client.next();
+        assert_eq!(announced["params"]["sessionId"], session, "{announced}");
+        let names = commands_announced(std::slice::from_ref(&announced)).expect("a command list");
+        assert_eq!(
+            names,
+            [
+                "undo", "plan", "act", "diff", "links", "roadmap", "doctor", "memories",
+                "remember", "worktree", "agent", "roles"
+            ],
+            "{announced}"
+        );
+        assert!(!names.iter().any(|n| n == "run"));
+        client.close();
+    }
+
+    /// **A SLASH COMMAND RUNS ITS HANDLER AND NEVER REACHES THE AGENT.**
+    ///
+    /// What the handler printed is the reply; the fake agent's words and tool
+    /// calls never appear. A command that is not offered is not run either.
+    #[test]
+    fn a_slash_command_runs_here_and_never_reaches_the_agent() {
+        let mut client = client(Behaviour::Stream);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let session = client.open_session(dir.path());
+
+        for (typed, expected) in [
+            ("/remember", "Usage: /remember <what to remember>"),
+            ("/roles", "Roles (candidates"),
+            ("/run", "/run is not a command offered here"),
+        ] {
+            let (streamed, reply) = prompt_in(&mut client, &session, typed);
+            assert_eq!(
+                reply["result"]["stopReason"], "end_turn",
+                "{typed}: {reply}"
+            );
+            let said = text_of(&streamed);
+            assert!(said.contains(expected), "{typed} said: {said:?}");
+            assert!(
+                !said.contains("Hello"),
+                "{typed} reached the agent: {said:?}"
+            );
+            assert!(
+                !updates_of(&streamed)
+                    .iter()
+                    .any(|u| u["sessionUpdate"] == "tool_call"),
+                "{typed} ran a turn: {streamed:#?}"
+            );
+        }
+        client.close();
+    }
+
+    /// **`/plan` AND `/act` SWITCH THE MODE, AND THE CLIENT IS TOLD.** The
+    /// next turn runs in the mode the command chose, and the client's mode
+    /// picker follows through `current_mode_update`.
+    #[test]
+    fn plan_and_act_switch_the_mode_and_say_so() {
+        let script = Script::new(Behaviour::Stream);
+        let mut client = Client::start(
+            script.clone(),
+            PermissionMode::WorkspaceWrite,
+            transport::MAX_LINE_BYTES,
+        );
+        let dir = tempfile::tempdir().expect("temp dir");
+        let session = client.open_session(dir.path());
+
+        let (streamed, _) = prompt_in(&mut client, &session, "/plan");
+        let switched = updates_of(&streamed)
+            .into_iter()
+            .find(|u| u["sessionUpdate"] == "current_mode_update")
+            .unwrap_or_else(|| panic!("no mode update: {streamed:#?}"))
+            .clone();
+        assert_eq!(switched["currentModeId"], "read-only", "{switched}");
+        let _ = prompt_in(&mut client, &session, "look around the code");
+        assert_eq!(
+            script
+                .modes
+                .lock()
+                .expect("modes")
+                .last()
+                .map(String::as_str),
+            Some(PermissionMode::ReadOnly.agent_mode()),
+        );
+
+        let (streamed, _) = prompt_in(&mut client, &session, "/act");
+        assert!(
+            updates_of(&streamed)
+                .iter()
+                .any(|u| u["sessionUpdate"] == "current_mode_update"
+                    && u["currentModeId"] == "workspace-write"),
+            "{streamed:#?}"
+        );
+        client.close();
+    }
+
+    /// **`/undo` PUTS THE LAST TURN'S FILES BACK**, through the REPL's own
+    /// handler. (A file the turn CREATED stays: the pre-turn snapshot holds
+    /// the files that existed, so the REPL's undo leaves it too.)
+    #[test]
+    fn undo_puts_the_last_turns_files_back() {
+        let mut client = client(Behaviour::Edits);
+        let scratch = tempfile::tempdir().expect("scratch");
+        let workspace = scratch.path().join("ws");
+        std::fs::create_dir(&workspace).expect("workspace");
+        std::fs::write(workspace.join("old.txt"), "before\n").expect("old.txt");
+        let session = client.open_session(&workspace);
+        let _ = prompt_in(&mut client, &session, "make the edits please");
+        assert!(workspace.join("hello.txt").exists());
+
+        let (streamed, reply) = prompt_in(&mut client, &session, "/undo");
+        assert_eq!(reply["result"]["stopReason"], "end_turn", "{reply}");
+        let said = text_of(&streamed);
+        assert!(said.contains("Undid"), "{said:?}");
+        assert!(said.contains("restored old.txt"), "{said:?}");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("old.txt")).expect("old.txt"),
+            "before\n"
+        );
+        client.close();
+    }
+
     /// Set only in the child process [`the_protocol_channel_carries_nothing_else`]
     /// starts; it names the workspace the child serves.
     const PURITY_CHILD: &str = "INCODE_ACP_PURITY_CHILD";
@@ -1402,15 +1867,18 @@ mod tests {
             return;
         }
         let claimed = stdio::claim().expect("claim stdin/stdout");
+        let data_dir = tempfile::tempdir().expect("data dir");
         serve(
             claimed.input,
             Box::new(claimed.output),
             FakeSessions {
                 script: Script::new(Behaviour::Noisy),
                 mode: PermissionMode::WorkspaceWrite,
+                data_dir: data_dir.path().to_path_buf(),
             },
             transport::MAX_LINE_BYTES,
         );
+        drop(data_dir);
         std::process::exit(0);
     }
 
@@ -1497,6 +1965,14 @@ mod tests {
                                                 "prompt": [{"type": "text", "text": "read a.txt"}]}}),
         );
         assert_eq!(prompt["result"]["stopReason"], "end_turn", "{prompt}");
+        // A slash command's handler writes for a terminal; here its words
+        // must arrive as protocol messages, and nothing else.
+        let command = exchange(
+            json!({"jsonrpc": "2.0", "id": 4, "method": "session/prompt",
+                   "params": {"sessionId": session,
+                              "prompt": [{"type": "text", "text": "/links"}]}}),
+        );
+        assert_eq!(command["result"]["stopReason"], "end_turn", "{command}");
         drop(to_child);
 
         let deadline = Instant::now() + WAIT;
@@ -1523,6 +1999,12 @@ mod tests {
         assert!(
             protocol.iter().any(|l| l.contains("agent_message_chunk")),
             "the turn streamed on stdout: {seen:#?}"
+        );
+        assert!(
+            protocol
+                .iter()
+                .any(|l| l.contains("agent_message_chunk") && l.contains("source file(s) indexed")),
+            "the command's words went out as a message: {seen:#?}"
         );
         for stray in [
             "STRAY println",

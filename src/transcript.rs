@@ -124,9 +124,10 @@ pub fn line_for(event: &AgentEvent) -> Option<serde_json::Value> {
             "is_error": is_error,
             "output": clip(output),
         }),
-        AgentEvent::TextDelta(_) | AgentEvent::Quota { .. } | AgentEvent::Usage { .. } => {
-            return None
-        }
+        AgentEvent::TextDelta(_)
+        | AgentEvent::Quota { .. }
+        | AgentEvent::Usage { .. }
+        | AgentEvent::Context { .. } => return None,
     };
     Some(value)
 }

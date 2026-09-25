@@ -73,6 +73,20 @@ impl UndoOutcome {
     }
 }
 
+/// What the newest checkpoint holds for one file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recorded<'a> {
+    /// Its contents when the checkpoint first saw it.
+    Contents(&'a [u8]),
+    /// It did not exist then.
+    Absent,
+    /// It was seen and could not be held: too large, or unreadable.
+    Unheld,
+    /// The checkpoint never saw it — which is NOT the same as absent: a
+    /// snapshot that stopped early, or skipped the directory, never looked.
+    NotSeen,
+}
+
 /// The stack of checkpoints for one session.
 #[derive(Debug, Default)]
 pub struct CheckpointStore {
@@ -110,6 +124,24 @@ impl CheckpointStore {
             .rev()
             .find(|c| !c.files.is_empty())
             .map(|c| c.label.as_str())
+    }
+
+    /// What the newest checkpoint recorded for `path`, matched exactly as
+    /// [`Self::snapshot`] stored it.
+    ///
+    /// The newest, because it is the one the running turn opened: a turn's
+    /// "before" is the state that turn began from.
+    #[must_use]
+    pub fn recorded(&self, path: &Path) -> Recorded<'_> {
+        let Some(checkpoint) = self.checkpoints.last() else {
+            return Recorded::NotSeen;
+        };
+        match checkpoint.files.iter().find(|(known, _)| known == path) {
+            Some((_, FileSnapshot::Existed(contents))) => Recorded::Contents(contents),
+            Some((_, FileSnapshot::Absent)) => Recorded::Absent,
+            Some((_, FileSnapshot::Unrecoverable(_))) => Recorded::Unheld,
+            None => Recorded::NotSeen,
+        }
     }
 
     /// Record what `path` looks like now, before something changes it.

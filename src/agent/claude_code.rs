@@ -178,6 +178,66 @@ struct WireUsage {
     cache_creation_input_tokens: u32,
     #[serde(default)]
     cache_read_input_tokens: u32,
+    /// Per request. Measured on a two-request turn: this held ONE entry, the
+    /// last request's, while the fields above were the sum of both.
+    #[serde(default)]
+    iterations: Vec<WireIteration>,
+}
+
+/// One request's tokens, as `usage.iterations` reports it.
+#[derive(Debug, Default, Deserialize)]
+struct WireIteration {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+    #[serde(default)]
+    cache_creation_input_tokens: u64,
+    #[serde(default)]
+    cache_read_input_tokens: u64,
+}
+
+/// How full the context window was when the turn ended, when the result
+/// reports both halves.
+///
+/// `used` is the LAST request's tokens — input, both cache kinds and its
+/// output, which is what the next request starts from. The turn's top-level
+/// usage cannot stand in for it: it sums every request, counting the same
+/// cached prefix once per request.
+///
+/// `size` is the `contextWindow` the CLI put on the result. With more than one
+/// model listed, it is the window of the model given the most input — the one
+/// that held the conversation; a side model sees a fragment of it.
+fn context_of(
+    usage: &WireUsage,
+    model_usage: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> Option<AgentEvent> {
+    let last = usage.iterations.last()?;
+    let input_of = |entry: &serde_json::Value| -> u64 {
+        [
+            "inputTokens",
+            "cacheReadInputTokens",
+            "cacheCreationInputTokens",
+        ]
+        .iter()
+        .filter_map(|key| entry.get(*key).and_then(serde_json::Value::as_u64))
+        .sum()
+    };
+    let size = model_usage
+        .values()
+        .filter_map(|entry| {
+            let window = entry.get("contextWindow")?.as_u64()?;
+            (window > 0).then_some((input_of(entry), window))
+        })
+        .max_by_key(|(input, _)| *input)
+        .map(|(_, window)| window)?;
+    Some(AgentEvent::Context {
+        used: last.input_tokens
+            + last.cache_read_input_tokens
+            + last.cache_creation_input_tokens
+            + last.output_tokens,
+        size,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -561,6 +621,9 @@ fn map_line(line: &str, outcome: &mut Option<TurnOutcome>) -> Vec<AgentEvent> {
                 cache_creation_tokens: r.usage.cache_creation_input_tokens,
                 cache_read_tokens: r.usage.cache_read_input_tokens,
             });
+            if let Some(context) = context_of(&r.usage, &r.model_usage) {
+                events.push(context);
+            }
             // NOTE: the result line also carries a `result` field holding the
             // final assembled text. It repeats what the assistant content
             // blocks already delivered, so emitting both duplicates every
@@ -1434,6 +1497,66 @@ mod tests {
                 cache_creation_tokens: 36371,
                 cache_read_tokens: 23432,
             }]
+        );
+    }
+
+    /// A result line from a real two-request turn (`claude -p … --output-format
+    /// stream-json --verbose`, 2026-09-25), trimmed to the fields read here.
+    /// The top-level usage is the SUM of both requests; `iterations` holds the
+    /// last request only; `modelUsage` carries the window.
+    const REAL_TWO_REQUEST_RESULT: &str = r#"{"type":"result","subtype":"success","is_error":false,"num_turns":2,"stop_reason":"end_turn","session_id":"sess-probe","total_cost_usd":0.19127059999999999,"usage":{"input_tokens":4,"cache_creation_input_tokens":22197,"cache_read_input_tokens":55293,"output_tokens":131,"iterations":[{"input_tokens":2,"output_tokens":4,"cache_read_input_tokens":38663,"cache_creation_input_tokens":164,"type":"message"}]},"modelUsage":{"claude-opus-5-5":{"inputTokens":4,"outputTokens":131,"cacheReadInputTokens":55293,"cacheCreationInputTokens":22197,"webSearchRequests":0,"costUSD":0.19127059999999999,"contextWindow":1000000,"maxOutputTokens":128000,"thinkingTokens":0,"canonicalModel":"claude-opus-5-5","provider":"firstParty","costBasis":"list"}},"result":"banana"}"#;
+
+    /// **CONTEXT USED IS THE LAST REQUEST, NOT THE TURN'S SUM.**
+    ///
+    /// The sum counts the same cached prefix once per request — 77 494 input
+    /// tokens here for a context that held 38 829 — so it would show a window
+    /// twice as full as it is. The window is the one the CLI reported.
+    #[test]
+    fn a_result_reports_the_last_requests_context_and_the_reported_window() {
+        let (events, _) = map(REAL_TWO_REQUEST_RESULT);
+        let context: Vec<&AgentEvent> = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::Context { .. }))
+            .collect();
+        assert_eq!(
+            context,
+            vec![&AgentEvent::Context {
+                used: 2 + 38_663 + 164 + 4,
+                size: 1_000_000,
+            }]
+        );
+    }
+
+    /// With more than one model on the result, the window is the one of the
+    /// model that held the conversation: the one given the most input. A side
+    /// model sees a fragment of it. (The second entry is added to the real
+    /// line for this test.)
+    #[test]
+    fn the_window_is_the_conversations_model_not_a_side_one() {
+        let line = REAL_TWO_REQUEST_RESULT.replace(
+            r#""modelUsage":{"#,
+            r#""modelUsage":{"side-model":{"inputTokens":900,"cacheReadInputTokens":0,"cacheCreationInputTokens":0,"contextWindow":200000},"#,
+        );
+        let (events, _) = map(&line);
+        assert!(
+            events.contains(&AgentEvent::Context {
+                used: 38_833,
+                size: 1_000_000
+            }),
+            "{events:?}"
+        );
+    }
+
+    /// No window reported, no context event — the token counts still go out
+    /// as [`AgentEvent::Usage`].
+    #[test]
+    fn no_window_means_no_context_event() {
+        let (events, _) = map(REAL_RESULT);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Context { .. })),
+            "{events:?}"
         );
     }
 

@@ -107,6 +107,70 @@ pub struct AgentSession {
 /// How wide a tool result panel is drawn in a conversation.
 const RESULT_WIDTH: usize = 100;
 
+/// The files as they stood when the running turn began.
+///
+/// Handed to a turn's observer beside every event, so a front end that shows
+/// an edit as its before and after — `incode --acp` — can name the "before"
+/// from the snapshot this turn took anyway. Reading the file when the call is
+/// SEEN would race the agent: an agent CLI writes on its own, and the read can
+/// land after the write.
+pub struct TurnStart<'a> {
+    checkpoints: &'a CheckpointStore,
+    /// Whether the snapshot walked the whole tree. When it did not, a file it
+    /// never saw may still have existed.
+    complete: bool,
+    roots: &'a [PathBuf],
+}
+
+/// What [`AgentSession::turn_observed`] hands each agent event to, with the
+/// [`TurnStart`] beside it.
+type Observer<'o> = &'o mut dyn FnMut(&AgentEvent, &TurnStart<'_>);
+
+/// What a file held when the turn began.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Before {
+    /// These contents.
+    Held(String),
+    /// Nothing: the file did not exist.
+    Absent,
+    /// Not known — the snapshot could not hold it, did not look there, or it
+    /// is not text. Never reported as absent: that would call an existing
+    /// file new.
+    Unknown,
+}
+
+impl TurnStart<'_> {
+    /// What `path` held when the turn began. `path` is spelled as the
+    /// snapshot spelled it: a root joined with the names on disk.
+    #[must_use]
+    pub fn before(&self, path: &Path) -> Before {
+        use crate::tools::checkpoint::Recorded;
+        match self.checkpoints.recorded(path) {
+            Recorded::Contents(bytes) => {
+                String::from_utf8(bytes.to_vec()).map_or(Before::Unknown, Before::Held)
+            }
+            Recorded::Absent => Before::Absent,
+            Recorded::Unheld => Before::Unknown,
+            // The snapshot records the files that EXIST. Not among them means
+            // absent only when the walk was complete and would have gone there.
+            Recorded::NotSeen => {
+                let walked = self.roots.iter().any(|root| {
+                    path.strip_prefix(root).is_ok_and(|inside| {
+                        !inside.components().any(|part| {
+                            SKIP_DIRS.contains(&part.as_os_str().to_string_lossy().as_ref())
+                        })
+                    })
+                });
+                if self.complete && walked {
+                    Before::Absent
+                } else {
+                    Before::Unknown
+                }
+            }
+        }
+    }
+}
+
 impl AgentSession {
     /// Start a session against a discovered agent.
     #[must_use]
@@ -390,6 +454,9 @@ impl AgentSession {
     /// follow-up, questions), so the turn is shared and only the presentation
     /// differs: with an observer, tool result panels and edit blocks are left
     /// out of `on_text`, because the observer presents them itself.
+    ///
+    /// Each event comes with the [`TurnStart`]: what the files held when this
+    /// turn began, for an observer that shows an edit as before and after.
     pub fn turn_observed(
         &mut self,
         workspace: &Path,
@@ -397,7 +464,7 @@ impl AgentSession {
         context: &[String],
         on_text: &mut dyn FnMut(&str),
         on_status: &mut dyn FnMut(&crate::cli::activity::Status),
-        mut observer: Option<&mut dyn FnMut(&AgentEvent)>,
+        mut observer: Option<Observer<'_>>,
     ) -> Result<TurnOutcome, String> {
         // Cleared first: a Ctrl-C pressed while the prompt was waiting belongs
         // to no turn, and letting it leak in would cancel the next one instantly.
@@ -422,6 +489,14 @@ impl AgentSession {
         let watched = crate::guards::Guards::load(&self.workspace)
             .ok()
             .map(|guards| (crate::guards::Sentinel::over_roots(&roots, &guards), guards));
+        // What the snapshot above holds, for an observer showing edits as
+        // before and after. Borrows only the checkpoints, so the backends can
+        // still be driven while it is held.
+        let start = TurnStart {
+            checkpoints: &self.checkpoints,
+            complete: self.snapshot_complete == Some(true),
+            roots: &roots,
+        };
 
         let prompt = assemble_prompt(instruction, context);
 
@@ -485,12 +560,12 @@ impl AgentSession {
                                        mid_line: &mut bool,
                                        on_text: &mut dyn FnMut(&str),
                                        on_status: &mut dyn FnMut(&crate::cli::activity::Status),
-                                       observer: &mut Option<&mut dyn FnMut(&AgentEvent)>|
+                                       observer: &mut Option<Observer<'_>>|
          -> Result<TurnOutcome, crate::agent::AgentError> {
             saw_deltas = false;
             backend.run_turn(&prompt, &mut |event: &AgentEvent| {
                 if let Some(observe) = observer.as_mut() {
-                    observe(event);
+                    observe(event, &start);
                 }
                 match event {
                     AgentEvent::TextDelta(fragment) => {
@@ -707,7 +782,7 @@ impl AgentSession {
                         // The follow-up is part of this turn, so an observer
                         // sees its tool calls as it saw the first pass's.
                         if let Some(observe) = observer.as_mut() {
-                            observe(event);
+                            observe(event, &start);
                         }
                         if let AgentEvent::TextDelta(fragment) = event {
                             on_text(fragment);

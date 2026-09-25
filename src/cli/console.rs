@@ -95,11 +95,73 @@ fn console() -> &'static Mutex<Console> {
     CONSOLE.get_or_init(|| Mutex::new(Console::new()))
 }
 
+thread_local! {
+    /// What this thread has written since [`capture`] began, when one is
+    /// running here. `None` when output goes to the console as usual.
+    static CAPTURED: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Hand `text` to the capture running on this thread, if there is one.
+/// `true` when it was taken.
+fn captured(text: &str) -> bool {
+    CAPTURED
+        .try_with(|slot| match slot.borrow_mut().as_mut() {
+            Some(held) => {
+                held.push_str(text);
+                true
+            }
+            None => false,
+        })
+        .unwrap_or(false)
+}
+
+/// Run `f`, and return what it wrote through this module on THIS thread
+/// instead of showing it.
+///
+/// # Why
+///
+/// The slash-command handlers write for a terminal, through this module.
+/// `incode --acp` answers the same commands as message text, so it runs the
+/// SAME handler inside a capture rather than keeping a second copy of each
+/// one that returns a string.
+///
+/// Per thread, because each ACP session runs on a thread of its own and
+/// another session may be writing at the same moment. Styling is dropped:
+/// colour is a terminal instruction, not part of what was said.
+pub fn capture<T>(f: impl FnOnce() -> T) -> (T, String) {
+    /// Puts back whatever was capturing before, even if `f` panics.
+    struct Restore(Option<Option<String>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            if let Some(previous) = self.0.take() {
+                let _ = CAPTURED.try_with(|slot| *slot.borrow_mut() = previous);
+            }
+        }
+    }
+
+    let previous = CAPTURED
+        .try_with(|slot| slot.borrow_mut().replace(String::new()))
+        .unwrap_or(None);
+    let restore = Restore(Some(previous));
+    let value = f();
+    let text = CAPTURED
+        .try_with(|slot| slot.borrow_mut().take())
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    drop(restore);
+    (value, text)
+}
+
 /// Write text exactly as given, with no newline added.
 ///
 /// Every `print!` in the codebase becomes this, so streaming replies are
 /// recorded as they arrive rather than only once they end.
 pub fn emit(text: &str) {
+    if captured(text) {
+        return;
+    }
     let Ok(mut console) = console().lock() else {
         // A poisoned lock must not silence the program. Printing beats losing
         // the output, and the record is only an optimisation for the screen.
@@ -126,6 +188,14 @@ pub fn emit(text: &str) {
 /// library would have — no hand-written escape codes to drift out of step with
 /// what the rest of the program draws.
 pub fn style<T: std::fmt::Display>(command: T) {
+    // Inside a capture the text is what is wanted; an escape code in it would
+    // reach a client that is not a terminal as noise.
+    if CAPTURED
+        .try_with(|slot| slot.borrow().is_some())
+        .unwrap_or(false)
+    {
+        return;
+    }
     emit(&command.to_string());
 }
 
@@ -243,6 +313,56 @@ mod tests {
         reset();
         set_mode(Mode::Buffered);
         guard
+    }
+
+    /// **CAPTURED TEXT IS RETURNED, NOT SHOWN, AND ONLY ON ITS OWN THREAD.**
+    ///
+    /// What a slash command says over `incode --acp` is this: the command's
+    /// own handler, run inside [`capture`]. It must come back whole, without
+    /// its colours, and without reaching the console another thread is
+    /// writing to at the same moment.
+    #[test]
+    fn capture_returns_what_this_thread_wrote_and_nothing_else() {
+        let _g = fresh();
+        emit("before\n");
+        let (value, text) = capture(|| {
+            style(crossterm::style::SetForegroundColor(
+                crossterm::style::Color::Red,
+            ));
+            emit("Error: ");
+            emit_line("it failed");
+            // Another thread writing during the capture goes to the console.
+            std::thread::spawn(|| emit_line("elsewhere"))
+                .join()
+                .expect("thread");
+            7
+        });
+        assert_eq!(value, 7);
+        assert_eq!(text, "Error: it failed\n", "text only, styling dropped");
+        assert_eq!(lines(), vec!["before", "elsewhere"]);
+
+        // Once it returns, writing reaches the console again.
+        emit_line("after");
+        assert_eq!(lines(), vec!["before", "elsewhere", "after"]);
+    }
+
+    /// A capture inside a capture keeps each one's text to itself, and a
+    /// panic inside one does not leave the thread capturing for good.
+    #[test]
+    fn nested_and_panicking_captures_restore_the_outer_state() {
+        let _g = fresh();
+        let ((), outer) = capture(|| {
+            emit("outer ");
+            let ((), inner) = capture(|| emit("inner"));
+            assert_eq!(inner, "inner");
+            emit("again");
+        });
+        assert_eq!(outer, "outer again");
+
+        let panicked = std::panic::catch_unwind(|| capture(|| panic!("boom")));
+        assert!(panicked.is_err());
+        emit_line("visible");
+        assert_eq!(lines(), vec!["visible"], "the panic left capture on");
     }
 
     #[test]
