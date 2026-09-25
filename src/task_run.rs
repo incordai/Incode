@@ -62,7 +62,65 @@ pub fn run_task_with_model(
     })?;
     let sentinel = crate::guards::Sentinel::over(workspace, &guards);
 
-    let prompt = build_prompt(workspace, instruction);
+    // The memory engine's session, fired by incode: the model underneath runs
+    // with no hooks of its own. One instruction is one session — it starts,
+    // takes the person's line, stops, and ends.
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let mut memory = crate::hooks::memory::MemoryHooks::new(
+        crate::hooks::engine::Engine::locate(),
+        workspace,
+        &session_id,
+    );
+    let start = memory.start("startup");
+    let turn = memory.prompt(instruction);
+    let prompt = build_prompt(workspace, instruction, start.is_some(), turn.as_deref());
+    // What rides the system context rather than the prompt: the project's
+    // own instruction files, and the engine's session-start block.
+    let system: Vec<String> = crate::instructions::project_block(workspace)
+        .into_iter()
+        .chain(start)
+        .collect();
+    let task = Task {
+        workspace,
+        instruction,
+        model,
+        guards: &guards,
+        sentinel: &sentinel,
+        prompt: &prompt,
+        system: &system,
+    };
+    let ran = drive(&task, &mut memory);
+    memory.end("other");
+    ran
+}
+
+/// One instruction, as it is handed to each agent that might run it.
+struct Task<'a> {
+    workspace: &'a Path,
+    instruction: &'a str,
+    model: Option<&'a str>,
+    guards: &'a crate::guards::Guards,
+    sentinel: &'a crate::guards::Sentinel,
+    /// What the agent is sent.
+    prompt: &'a str,
+    /// What rides its system context.
+    system: &'a [String],
+}
+
+/// The instruction, through each usable agent in turn until one runs it.
+fn drive(
+    task: &Task<'_>,
+    memory: &mut crate::hooks::memory::MemoryHooks,
+) -> Result<String, String> {
+    let Task {
+        workspace,
+        instruction,
+        model,
+        guards,
+        sentinel,
+        prompt,
+        system,
+    } = *task;
     // WHICH ROUTE, and the CLI requirement belongs INSIDE the choice.
     //
     // An API endpoint needs no installed agent, so asking for a drivable one
@@ -108,22 +166,29 @@ pub fn run_task_with_model(
         let (mut backend, route): (Box<dyn AgentBackend>, String) = match candidate {
             Candidate::Api(settings) => (
                 Box::new(
-                    crate::agent::api::ApiBackend::new(settings, workspace, "", true)
-                        // Nobody is at an unattended run: a call the engine
-                        // wants confirmed is the owner's app's to answer, or
-                        // refused.
-                        .with_engine(crate::hooks::engine::Engine::locate()),
+                    crate::agent::api::ApiBackend::new(
+                        settings,
+                        workspace,
+                        &system.join("\n\n"),
+                        true,
+                    )
+                    // Nobody is at an unattended run: a call the engine
+                    // wants confirmed is the owner's app's to answer, or
+                    // refused.
+                    .with_engine(crate::hooks::engine::Engine::locate()),
                 ),
                 "a model over the configured API".to_string(),
             ),
             Candidate::Cli(agent) => {
                 let named = agent.display_name.clone();
                 (
-                    crate::cli::run_backend(workspace, &agent.id, &agent.command, &guards, &[]),
+                    crate::cli::run_backend(workspace, &agent.id, &agent.command, guards, system),
                     named,
                 )
             }
         };
+        // Its calls are filed under this run's session, as its stop is.
+        backend.set_memory_session(memory.session());
 
         if let Some(m) = model {
             backend.set_models(&[m.to_string()]);
@@ -155,46 +220,11 @@ pub fn run_task_with_model(
         let mut tool_calls: std::collections::HashMap<String, (String, Option<String>)> =
             std::collections::HashMap::new();
 
-        let turn_res = backend.run_turn(&prompt, &mut |event: &AgentEvent| match event {
-            AgentEvent::Text(text) => {
-                outln!("{text}");
-                said.push(text.clone());
-            }
-            // Printed as it happens rather than summarised at the end: a long
-            // task with no output is indistinguishable from a hung one.
-            AgentEvent::ToolUse { id, name, input } => {
-                tool_calls.insert(id.clone(), (name.clone(), crate::cli::panel::target(input)));
-                outln!("  · {name}");
-            }
-            AgentEvent::SessionStarted { model, .. } => outln!("  · session on {model}"),
-            AgentEvent::Usage {
-                input_tokens,
-                output_tokens,
-                ..
-            } => {
-                outln!("  · {input_tokens} in / {output_tokens} out");
-            }
-            AgentEvent::Quota { status, .. } => outln!("  · quota: {status}"),
-            AgentEvent::ToolResult {
-                id,
-                output,
-                is_error,
-            } => {
-                let (tool, on) = tool_calls
-                    .get(id.as_str())
-                    .cloned()
-                    .unwrap_or_else(|| ("tool".to_string(), None));
-                for line in crate::cli::panel::result(
-                    &tool,
-                    on.as_deref(),
-                    output,
-                    *is_error,
-                    TASK_PANEL_WIDTH,
-                ) {
-                    outln!("{line}");
-                }
-            }
-            AgentEvent::TextDelta(_) | AgentEvent::Context { .. } => {}
+        // What the model said, rebuilt for the memory engine's transcript.
+        let mut heard = crate::hooks::memory::Said::default();
+        let turn_res = backend.run_turn(prompt, &mut |event: &AgentEvent| {
+            heard.hear(event);
+            show(event, &mut said, &mut tool_calls);
         });
 
         let outcome = match turn_res {
@@ -257,10 +287,40 @@ pub fn run_task_with_model(
             });
         }
 
+        // The turn is ending: the memory engine records it, and may say to
+        // carry on — sent to the same agent as its next prompt, bounded as in
+        // a session. Before the sentinel, so what a continuation writes is
+        // checked too.
+        memory.said(crate::hooks::memory::Speaker::Agent, &heard.whole());
+        let mut last = heard.last().to_string();
+        while let Some(reason) = memory.stop(&last, None) {
+            outln!("  · memory engine: carry on — {reason}");
+            let mut more = Vec::new();
+            let mut heard = crate::hooks::memory::Said::default();
+            match backend.run_turn(&reason, &mut |event: &AgentEvent| {
+                heard.hear(event);
+                show(event, &mut more, &mut tool_calls);
+            }) {
+                Ok(next) if !next.is_error => {
+                    memory.said(crate::hooks::memory::Speaker::Agent, &heard.whole());
+                    last = heard.last().to_string();
+                    said.extend(more);
+                }
+                Ok(next) => {
+                    outln!("  · the continuation failed: {}", next.failure());
+                    break;
+                }
+                Err(e) => {
+                    outln!("  · the continuation could not run: {e}");
+                    break;
+                }
+            }
+        }
+
         // Checked before the run is reported as successful. There is no ledger on
         // this path, so the breach IS the outcome: a non-zero exit and the files
         // named, left exactly as the agent left them for a person to look at.
-        let breaches = sentinel.breaches(workspace, &guards);
+        let breaches = sentinel.breaches(workspace, guards);
         if let Some(refusal) = crate::guards::Sentinel::refusal(&breaches) {
             return Err(refusal);
         }
@@ -299,14 +359,71 @@ pub fn run_task_with_model(
     })
 }
 
+/// One agent event, printed as it happens; the model's words are kept in
+/// `said`, and each call's name in `tool_calls` for the result that follows.
+fn show(
+    event: &AgentEvent,
+    said: &mut Vec<String>,
+    tool_calls: &mut std::collections::HashMap<String, (String, Option<String>)>,
+) {
+    match event {
+        AgentEvent::Text(text) => {
+            outln!("{text}");
+            said.push(text.clone());
+        }
+        // Printed as it happens rather than summarised at the end: a long
+        // task with no output is indistinguishable from a hung one.
+        AgentEvent::ToolUse { id, name, input } => {
+            tool_calls.insert(id.clone(), (name.clone(), crate::cli::panel::target(input)));
+            outln!("  · {name}");
+        }
+        AgentEvent::SessionStarted { model, .. } => outln!("  · session on {model}"),
+        AgentEvent::Usage {
+            input_tokens,
+            output_tokens,
+            ..
+        } => {
+            outln!("  · {input_tokens} in / {output_tokens} out");
+        }
+        AgentEvent::Quota { status, .. } => outln!("  · quota: {status}"),
+        AgentEvent::ToolResult {
+            id,
+            output,
+            is_error,
+        } => {
+            let (tool, on) = tool_calls
+                .get(id.as_str())
+                .cloned()
+                .unwrap_or_else(|| ("tool".to_string(), None));
+            for line in
+                crate::cli::panel::result(&tool, on.as_deref(), output, *is_error, TASK_PANEL_WIDTH)
+            {
+                outln!("{line}");
+            }
+        }
+        AgentEvent::TextDelta(_) | AgentEvent::Context { .. } => {}
+    }
+}
+
 /// Wrap the instruction in what the harness knows about this project.
 ///
 /// Assembled in the same order a session would: what must be obeyed, then what
 /// is already known, then the instruction itself. The instruction goes LAST
 /// because it is what the agent acts on, and context after an instruction reads
 /// as an afterthought.
+///
+/// `engine_started` says the memory engine's session-start block rides the
+/// system context: the recorder's handoff and the auditor's findings are in
+/// it, so they are not added here too. `engine_turn` is the engine's context
+/// for this instruction, which carries the rules; with it, incode's own
+/// per-turn rules are not fetched as well.
 #[must_use]
-pub fn build_prompt(workspace: &Path, instruction: &str) -> String {
+pub fn build_prompt(
+    workspace: &Path,
+    instruction: &str,
+    engine_started: bool,
+    engine_turn: Option<&str>,
+) -> String {
     let admin = crate::admin::AdminConfig::load_default();
     let mut parts = Vec::new();
 
@@ -315,8 +432,13 @@ pub fn build_prompt(workspace: &Path, instruction: &str) -> String {
             parts.push(block);
         }
     }
-    if let Some(block) = crate::rules::context_for_turn(instruction) {
-        parts.push(block);
+    match engine_turn {
+        Some(block) => parts.push(block.to_string()),
+        None => {
+            if let Some(block) = crate::rules::context_for_turn(instruction) {
+                parts.push(block);
+            }
+        }
     }
 
     // The skills index, on this path too. A one-shot task is the same work as a
@@ -348,12 +470,12 @@ pub fn build_prompt(workspace: &Path, instruction: &str) -> String {
         parts.push(note);
     }
 
-    if admin.plugins.auditor {
+    if admin.plugins.auditor && !engine_started {
         if let Some(block) = crate::auditor::context_for_session(workspace) {
             parts.push(block);
         }
     }
-    if admin.plugins.recorder {
+    if admin.plugins.recorder && !engine_started {
         if let Some(block) = crate::recorder::context_for_session(workspace) {
             parts.push(block);
         }
@@ -427,7 +549,7 @@ mod tests {
         // is about ORDER rather than about what any one service returned.
         std::env::set_var(crate::brief::MEMORY_URL_ENV, "http://127.0.0.1:1");
         let dir = tempfile::tempdir().expect("temp dir");
-        let prompt = build_prompt(dir.path(), "write the PRD");
+        let prompt = build_prompt(dir.path(), "write the PRD", false, None);
         std::env::remove_var(crate::brief::MEMORY_URL_ENV);
 
         assert!(prompt.ends_with("write the PRD"), "got: {prompt}");
@@ -443,7 +565,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         std::env::set_var(crate::brief::MEMORY_URL_ENV, "http://127.0.0.1:1");
         let dir = tempfile::tempdir().expect("temp dir");
-        let prompt = build_prompt(dir.path(), "do the thing");
+        let prompt = build_prompt(dir.path(), "do the thing", false, None);
         std::env::remove_var(crate::brief::MEMORY_URL_ENV);
 
         assert!(prompt.contains("do the thing"));

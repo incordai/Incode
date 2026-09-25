@@ -304,6 +304,13 @@ impl AgentBackend for AgyBackend {
         &self.system_context
     }
 
+    fn set_system_context(&mut self, blocks: Vec<String>) {
+        self.system_context = blocks
+            .into_iter()
+            .filter(|b| !b.trim().is_empty())
+            .collect();
+    }
+
     /// This agent's own ladder, in ITS namespace.
     ///
     /// The ids are taken from `agy models` on v1.1.23, not guessed. The shape

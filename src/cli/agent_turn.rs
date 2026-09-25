@@ -102,6 +102,19 @@ pub struct AgentSession {
     /// turn's contribution rather than adding to it — adding would count the
     /// same tokens once per event and show a total that never matches the bill.
     usage: crate::runtime::usage::TokenUsage,
+    /// The memory engine's session lifecycle, fired by this session: the
+    /// session's start and end, each person's line, and each turn's stop.
+    /// Fires nothing until [`Self::start_memory`] gives it an engine.
+    memory: crate::hooks::memory::MemoryHooks,
+    /// The standing context, less the blocks the engine's session-start
+    /// replaces.
+    base_context: Vec<String>,
+    /// incode's own blocks that the engine's session-start block replaces when
+    /// it answers — the rules, the recorder's handoff, the auditor's findings —
+    /// so the two are never both sent.
+    native_context: Vec<String>,
+    /// What the engine's session-start handed this session, when it answered.
+    start_block: Option<String>,
 }
 
 /// How wide a tool result panel is drawn in a conversation.
@@ -189,6 +202,10 @@ impl AgentSession {
         Self {
             backend,
             standby: Vec::new(),
+            memory: crate::hooks::memory::MemoryHooks::off(&workspace),
+            base_context: system_context,
+            native_context: Vec::new(),
+            start_block: None,
             workspace: workspace_for_self,
             checkpoints: CheckpointStore::new(),
             snapshot_complete: None,
@@ -338,10 +355,86 @@ impl AgentSession {
     ///
     /// Really cleared: the id is dropped, so the next turn does not resume the
     /// conversation the user just asked to be rid of.
+    ///
+    /// For the memory engine this is one session ending and another opening:
+    /// the end names the OLD id, and the new session's context replaces the
+    /// old one's in what every backend carries.
     pub fn clear(&mut self) {
         self.backend.clear_session();
         for s in &mut self.standby {
             s.clear_session();
+        }
+        let next = uuid::Uuid::new_v4().to_string();
+        self.start_block = self.memory.restart(&next, "clear");
+        self.name_memory_session();
+        self.carry_context();
+    }
+
+    /// Open the memory engine's lifecycle for this session: every backend
+    /// files its calls under the session's id, and the engine's session-start
+    /// is fired with `source` (`startup`, `resume`).
+    ///
+    /// `native` are the blocks of the standing context that the engine's
+    /// session-start block replaces: when it answers they are dropped and its
+    /// block carried instead, so the same rules are never sent twice. When it
+    /// does not, they stay.
+    pub fn start_memory(
+        &mut self,
+        memory: crate::hooks::memory::MemoryHooks,
+        native: Vec<String>,
+        source: &str,
+    ) {
+        self.base_context.retain(|block| !native.contains(block));
+        self.native_context = native;
+        self.memory = memory;
+        self.name_memory_session();
+        self.start_block = self.memory.start(source);
+        if self.start_block.is_some() {
+            self.carry_context();
+        }
+    }
+
+    /// The person's line is about to go to the model: written to the session's
+    /// transcript, and the engine's context for it returned.
+    pub fn memory_prompt(&mut self, line: &str) -> Option<String> {
+        self.memory.prompt(line)
+    }
+
+    /// How many of incode's background jobs are running as the next turn
+    /// starts. A stop while any are is a wait, not an end.
+    pub fn set_background_jobs(&mut self, running: usize) {
+        self.memory.set_background(running);
+    }
+
+    /// The session is over; `reason` says why.
+    pub fn end_memory(&mut self, reason: &str) {
+        self.memory.end(reason);
+    }
+
+    /// Tell every backend the session's id for the engine.
+    fn name_memory_session(&mut self) {
+        let id = self.memory.session().to_string();
+        if id.is_empty() {
+            return;
+        }
+        self.backend.set_memory_session(&id);
+        for s in &mut self.standby {
+            s.set_memory_session(&id);
+        }
+    }
+
+    /// Hand every backend the standing context as it now stands: the base,
+    /// then the engine's session-start block — or, without one, incode's own
+    /// blocks it would have replaced.
+    fn carry_context(&mut self) {
+        let mut blocks = self.base_context.clone();
+        match &self.start_block {
+            Some(block) => blocks.push(block.clone()),
+            None => blocks.extend(self.native_context.iter().cloned()),
+        }
+        self.backend.set_system_context(blocks.clone());
+        for s in &mut self.standby {
+            s.set_system_context(blocks.clone());
         }
     }
 
@@ -559,6 +652,8 @@ impl AgentSession {
         }
         let mut saw_deltas = false;
         let mut run_backend_attempt = |backend: &mut Box<dyn AgentBackend>,
+                                       prompt: &str,
+                                       said: &mut crate::hooks::memory::Said,
                                        filter: &mut crate::ask::StreamFilter,
                                        turn_usage: &mut crate::runtime::usage::TokenUsage,
                                        turn_quota: &mut Option<(String, i64)>,
@@ -573,10 +668,14 @@ impl AgentSession {
                                        observer: &mut Option<Observer<'_>>|
          -> Result<TurnOutcome, crate::agent::AgentError> {
             saw_deltas = false;
-            backend.run_turn(&prompt, &mut |event: &AgentEvent| {
+            *said = crate::hooks::memory::Said::default();
+            backend.run_turn(prompt, &mut |event: &AgentEvent| {
                 if let Some(observe) = observer.as_mut() {
                     observe(event, &start);
                 }
+                // What the model said this run, for the transcript and the
+                // stop.
+                said.hear(event);
                 match event {
                     AgentEvent::TextDelta(fragment) => {
                         saw_deltas = true;
@@ -692,8 +791,11 @@ impl AgentSession {
             })
         };
 
+        let mut said = crate::hooks::memory::Said::default();
         let first_result = run_backend_attempt(
             &mut self.backend,
+            &prompt,
+            &mut said,
             &mut filter,
             &mut turn_usage,
             &mut turn_quota,
@@ -731,6 +833,8 @@ impl AgentSession {
 
             let standby_result = run_backend_attempt(
                 &mut self.standby[index],
+                &prompt,
+                &mut said,
                 &mut filter,
                 &mut turn_usage,
                 &mut turn_quota,
@@ -754,18 +858,10 @@ impl AgentSession {
             self.standby.push(failed_primary);
         }
 
-        let outcome = attempt;
-
-        // HOW MUCH MOVED, in one line, once the turn is over.
-        //
-        // The per-change blocks answer "what changed here"; after a dozen of
-        // them nobody can answer "how much changed in total", which is the
-        // question that decides whether a turn is reviewable at a glance or
-        // needs a diff tool. Files are counted once however often each was
-        // edited — see [`crate::cli::edits::Tally`].
-        if let Some(summary) = edited.summary() {
-            start_new_line!(on_text);
-            on_text(&format!("{summary}\n"));
+        let mut outcome = attempt;
+        if outcome.is_ok() {
+            self.memory
+                .said(crate::hooks::memory::Speaker::Agent, &said.whole());
         }
 
         // What the change left behind — handed BACK TO THE AGENT, which is
@@ -786,6 +882,9 @@ impl AgentSession {
                     "Connected files were left untouched — asking the agent to check them."
                         .to_string(),
                 );
+                self.memory
+                    .said(crate::hooks::memory::Speaker::Person, &instruction);
+                let mut replied = crate::hooks::memory::Said::default();
                 let _ = self
                     .backend
                     .run_turn(&instruction, &mut |event: &AgentEvent| {
@@ -794,10 +893,16 @@ impl AgentSession {
                         if let Some(observe) = observer.as_mut() {
                             observe(event, &start);
                         }
+                        replied.hear(event);
                         if let AgentEvent::TextDelta(fragment) = event {
                             on_text(fragment);
                         }
                     });
+                if !replied.last().is_empty() {
+                    self.memory
+                        .said(crate::hooks::memory::Speaker::Agent, &replied.whole());
+                    said = replied;
+                }
 
                 // What the follow-up itself left behind is REPORTED, not chased.
                 let after = links.changed_since(&roots);
@@ -805,6 +910,53 @@ impl AgentSession {
                     self.notices.push(note);
                 }
             }
+        }
+
+        // THE TURN IS ENDING, and the memory engine is told — it records the
+        // turn, and may answer that the agent should carry on. Its answer is
+        // then the next thing the model is sent, in the same conversation, on
+        // every route: a CLI model resumes its session with it as the next
+        // prompt, the API route appends it to the conversation. Bounded by the
+        // engine's own brake and by `MAX_CONTINUATIONS`; not asked at all once
+        // the turn was stopped or while a background job runs.
+        while outcome.is_ok() {
+            let last = said.last().to_string();
+            let Some(reason) = self.memory.stop(&last, self.cancel.as_ref()) else {
+                break;
+            };
+            start_new_line!(on_text);
+            on_text(&format!("\n[memory engine: carry on — {reason}]\n\n"));
+            let next = run_backend_attempt(
+                &mut self.backend,
+                &reason,
+                &mut said,
+                &mut filter,
+                &mut turn_usage,
+                &mut turn_quota,
+                &mut tool_calls,
+                &mut edited,
+                &mut mid_line,
+                on_text,
+                on_status,
+                &mut observer,
+            );
+            outcome = judged(self.backend.as_ref(), next).0;
+            if outcome.is_ok() {
+                self.memory
+                    .said(crate::hooks::memory::Speaker::Agent, &said.whole());
+            }
+        }
+
+        // HOW MUCH MOVED, in one line, once the turn is over.
+        //
+        // The per-change blocks answer "what changed here"; after a dozen of
+        // them nobody can answer "how much changed in total", which is the
+        // question that decides whether a turn is reviewable at a glance or
+        // needs a diff tool. Files are counted once however often each was
+        // edited — see [`crate::cli::edits::Tally`].
+        if let Some(summary) = edited.summary() {
+            start_new_line!(on_text);
+            on_text(&format!("{summary}\n"));
         }
 
         // Anything the agent put to the owner. Printed as ordinary output, not
@@ -1367,5 +1519,334 @@ mod tests {
         let err = outcome.expect_err("must error when no standby exists");
         assert!(err.contains("weekly limit"), "got: {err}");
         assert!(!output.contains("took over"));
+    }
+
+    // -----------------------------------------------------------------------
+    // The memory engine's session lifecycle, fired by the session.
+    // -----------------------------------------------------------------------
+
+    use crate::hooks::engine::fake::{self, Reply};
+    use crate::hooks::memory::{MemoryHooks, MAX_CONTINUATIONS};
+    use std::sync::{Arc, Mutex};
+
+    const CARRY_ON: &str = r#"{"decision":"block","reason":"now run the tests"}"#;
+
+    /// What a [`Recording`] backend was sent and told.
+    #[derive(Default)]
+    struct Seen {
+        prompts: Vec<String>,
+        context: Vec<String>,
+        memory_sessions: Vec<String>,
+    }
+
+    /// A backend that writes down every prompt and answers each with text.
+    /// `on_run` is called with the run's number before it answers.
+    struct Recording {
+        seen: Arc<Mutex<Seen>>,
+        on_run: Box<dyn FnMut(usize)>,
+    }
+
+    impl AgentBackend for Recording {
+        fn id(&self) -> &str {
+            "claude-code"
+        }
+        fn run_turn(
+            &mut self,
+            prompt: &str,
+            on_event: &mut dyn FnMut(&AgentEvent),
+        ) -> Result<TurnOutcome, crate::agent::AgentError> {
+            let n = {
+                let mut seen = self.seen.lock().expect("seen");
+                seen.prompts.push(prompt.to_string());
+                seen.prompts.len()
+            };
+            (self.on_run)(n);
+            on_event(&AgentEvent::Text(format!("reply {n}")));
+            Ok(TurnOutcome {
+                session_id: String::new(),
+                stop_reason: "end_turn".to_string(),
+                is_error: false,
+                detail: None,
+                served_by: Vec::new(),
+            })
+        }
+        fn session_id(&self) -> Option<&str> {
+            None
+        }
+        fn set_system_context(&mut self, blocks: Vec<String>) {
+            self.seen.lock().expect("seen").context = blocks;
+        }
+        fn set_memory_session(&mut self, session: &str) {
+            self.seen
+                .lock()
+                .expect("seen")
+                .memory_sessions
+                .push(session.to_string());
+        }
+    }
+
+    /// A session over `ws` whose backend records into `seen`, with the
+    /// memory lifecycle opened on the fake engine in `engine`.
+    fn with_memory(
+        ws: &Path,
+        engine: &Path,
+        replies: &[(&str, Reply)],
+        seen: &Arc<Mutex<Seen>>,
+        on_run: Box<dyn FnMut(usize)>,
+    ) -> AgentSession {
+        let bin = fake::write(engine, replies);
+        let engine = fake::engine(bin).capped(std::time::Duration::from_secs(20));
+        let mut s = AgentSession::new(
+            ws.to_path_buf(),
+            "claude-code",
+            "claude".to_string(),
+            &crate::guards::Guards::default(),
+            vec!["BASE".to_string(), "NATIVE-RULES".to_string()],
+        )
+        .with_backend(Box::new(Recording {
+            seen: Arc::clone(seen),
+            on_run,
+        }));
+        s.start_memory(
+            MemoryHooks::new(Some(engine), ws, "sess-old"),
+            vec!["NATIVE-RULES".to_string()],
+            "startup",
+        );
+        s
+    }
+
+    fn start_context(text: &str) -> String {
+        serde_json::json!({
+            "hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text}
+        })
+        .to_string()
+    }
+
+    /// One turn, as the REPL and ACP run it: the person's line is handed to
+    /// the engine first, then the turn.
+    fn one_turn(s: &mut AgentSession, ws: &Path, line: &str) -> String {
+        let _ = s.memory_prompt(line);
+        let mut shown = String::new();
+        let outcome = s.turn(ws, line, &[], &mut |t| shown.push_str(t), &mut |_| {});
+        assert!(outcome.is_ok(), "{outcome:?}");
+        shown
+    }
+
+    /// **THE SESSION-START BLOCK REACHES WHAT THE MODEL IS SENT, IN PLACE OF
+    /// THE NATIVE BLOCKS IT OVERLAPS.** Every backend is told the session's id.
+    #[test]
+    fn the_session_start_context_replaces_the_native_blocks() {
+        let (ws, engine) = (
+            tempfile::tempdir().expect("ws"),
+            tempfile::tempdir().expect("e"),
+        );
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let _s = with_memory(
+            ws.path(),
+            engine.path(),
+            &[(
+                "session-start",
+                Reply::exit(0).stdout(&start_context("START-X")),
+            )],
+            &seen,
+            Box::new(|_| {}),
+        );
+        let seen = seen.lock().expect("seen");
+        assert_eq!(seen.context.len(), 2, "{:?}", seen.context);
+        assert_eq!(seen.context[0], "BASE");
+        assert!(seen.context[1].ends_with("START-X"), "{:?}", seen.context);
+        assert!(
+            seen.context[1].contains("`sess-old`"),
+            "the model is told the session's id: {:?}",
+            seen.context
+        );
+        assert_eq!(seen.memory_sessions, vec!["sess-old".to_string()]);
+        let start = &fake::events(engine.path(), "session-start")[0];
+        assert_eq!(start["source"], "startup");
+    }
+
+    /// And when the engine says nothing, the native blocks stay where they
+    /// were: nothing is replaced by nothing.
+    #[test]
+    fn without_a_session_start_answer_the_native_blocks_stay() {
+        let (ws, engine) = (
+            tempfile::tempdir().expect("ws"),
+            tempfile::tempdir().expect("e"),
+        );
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let _s = with_memory(
+            ws.path(),
+            engine.path(),
+            &[("session-start", Reply::exit(0))],
+            &seen,
+            Box::new(|_| {}),
+        );
+        assert!(
+            seen.lock().expect("seen").context.is_empty(),
+            "the backend's context was not touched"
+        );
+    }
+
+    /// **A STOP THAT SAYS CARRY ON CONTINUES THE TURN ONCE, THEN ENDS.** The
+    /// engine's words are the next prompt to the same backend; the second
+    /// stop carries the brake; when the engine says nothing the turn ends.
+    #[test]
+    fn a_stop_block_continues_the_turn_once_then_ends() {
+        let (ws, engine) = (
+            tempfile::tempdir().expect("ws"),
+            tempfile::tempdir().expect("e"),
+        );
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let answers = engine.path().join("capture.out");
+        let mut s = with_memory(
+            ws.path(),
+            engine.path(),
+            &[
+                ("user-prompt", Reply::exit(0)),
+                ("capture", Reply::exit(0).stdout(CARRY_ON)),
+            ],
+            &seen,
+            // The continuation empties the engine's answer: its stop ends it.
+            Box::new(move |n| {
+                if n == 2 {
+                    std::fs::write(&answers, "").expect("quiet the engine");
+                }
+            }),
+        );
+        let shown = one_turn(&mut s, ws.path(), "go");
+
+        let prompts = seen.lock().expect("seen").prompts.clone();
+        assert_eq!(
+            prompts,
+            vec!["go".to_string(), "now run the tests".to_string()]
+        );
+        let stops = fake::events(engine.path(), "capture");
+        assert_eq!(stops.len(), 2, "{stops:?}");
+        assert_eq!(stops[0]["stop_hook_active"], false);
+        assert_eq!(stops[0]["last_assistant_message"], "reply 1");
+        assert_eq!(stops[1]["stop_hook_active"], true);
+        assert_eq!(stops[1]["last_assistant_message"], "reply 2");
+        assert!(shown.contains("now run the tests"), "{shown}");
+    }
+
+    /// **THE CAP HOLDS.** An engine that always says carry on gets
+    /// `MAX_CONTINUATIONS` more runs and no more.
+    #[test]
+    fn the_continuation_cap_holds_in_a_turn() {
+        let (ws, engine) = (
+            tempfile::tempdir().expect("ws"),
+            tempfile::tempdir().expect("e"),
+        );
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let mut s = with_memory(
+            ws.path(),
+            engine.path(),
+            &[
+                ("user-prompt", Reply::exit(0)),
+                ("capture", Reply::exit(0).stdout(CARRY_ON)),
+            ],
+            &seen,
+            Box::new(|_| {}),
+        );
+        let _ = one_turn(&mut s, ws.path(), "go");
+        let runs = seen.lock().expect("seen").prompts.len();
+        assert_eq!(runs, 1 + usize::from(MAX_CONTINUATIONS));
+    }
+
+    /// **A TURN STOPPED BEFORE ITS STOP SPAWNS NOTHING.**
+    #[test]
+    fn a_cancelled_turn_never_starts_the_stop_hook() {
+        let (ws, engine) = (
+            tempfile::tempdir().expect("ws"),
+            tempfile::tempdir().expect("e"),
+        );
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let token = crate::runtime::cancel::CancelToken::new();
+        let pressed = token.clone();
+        let mut s = with_memory(
+            ws.path(),
+            engine.path(),
+            &[
+                ("user-prompt", Reply::exit(0)),
+                ("capture", Reply::exit(0).stdout(CARRY_ON)),
+            ],
+            &seen,
+            // The person presses stop while the model is working.
+            Box::new(move |_| pressed.cancel()),
+        )
+        .with_cancel(token);
+        let _ = one_turn(&mut s, ws.path(), "go");
+        // Counted at the spawn: a process killed before its first line would
+        // never have counted itself.
+        assert_eq!(fake::spawned(engine.path(), "capture"), 0);
+        assert_eq!(seen.lock().expect("seen").prompts.len(), 1);
+    }
+
+    /// **WHILE A BACKGROUND JOB RUNS THE STOP IS NOT SENT**; with none
+    /// running it is.
+    #[test]
+    fn a_running_background_job_holds_the_stop() {
+        let (ws, engine) = (
+            tempfile::tempdir().expect("ws"),
+            tempfile::tempdir().expect("e"),
+        );
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let mut s = with_memory(
+            ws.path(),
+            engine.path(),
+            &[("user-prompt", Reply::exit(0)), ("capture", Reply::exit(0))],
+            &seen,
+            Box::new(|_| {}),
+        );
+        s.set_background_jobs(1);
+        let _ = one_turn(&mut s, ws.path(), "start the build");
+        assert_eq!(fake::calls(engine.path(), "capture"), 0);
+        s.set_background_jobs(0);
+        let _ = one_turn(&mut s, ws.path(), "is it done");
+        assert_eq!(fake::calls(engine.path(), "capture"), 1);
+    }
+
+    /// **`/clear` ENDS THE OLD SESSION BY ITS OWN ID**, opens the next as a
+    /// clear, and every backend files what follows under the new id — with
+    /// the new session's context in place of the old one's.
+    #[test]
+    fn clearing_ends_the_old_id_and_starts_a_new_one() {
+        let (ws, engine) = (
+            tempfile::tempdir().expect("ws"),
+            tempfile::tempdir().expect("e"),
+        );
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let mut s = with_memory(
+            ws.path(),
+            engine.path(),
+            &[
+                ("session-end", Reply::exit(0)),
+                (
+                    "session-start",
+                    Reply::exit(0).stdout(&start_context("START-X")),
+                ),
+            ],
+            &seen,
+            Box::new(|_| {}),
+        );
+        s.clear();
+
+        let end = &fake::events(engine.path(), "session-end")[0];
+        assert_eq!(end["session_id"], "sess-old");
+        assert_eq!(end["reason"], "clear");
+        let starts = fake::events(engine.path(), "session-start");
+        assert_eq!(starts.len(), 2);
+        assert_eq!(starts[1]["source"], "clear");
+        let fresh = starts[1]["session_id"].as_str().expect("an id").to_string();
+        assert_ne!(fresh, "sess-old");
+        let seen = seen.lock().expect("seen");
+        assert_eq!(seen.memory_sessions.last(), Some(&fresh));
+        assert_eq!(seen.context.len(), 2, "{:?}", seen.context);
+        assert_eq!(seen.context[0], "BASE");
+        assert!(
+            seen.context[1].ends_with("START-X") && seen.context[1].contains(&fresh),
+            "{:?}",
+            seen.context
+        );
     }
 }

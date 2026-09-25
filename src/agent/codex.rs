@@ -308,6 +308,13 @@ impl AgentBackend for CodexBackend {
         &self.system_context
     }
 
+    fn set_system_context(&mut self, blocks: Vec<String>) {
+        self.system_context = blocks
+            .into_iter()
+            .filter(|b| !b.trim().is_empty())
+            .collect();
+    }
+
     /// Model ladder in Codex / OpenAI namespace.
     fn ladder_for(&self, role: &str) -> Vec<String> {
         let ids: &[&str] = match role {

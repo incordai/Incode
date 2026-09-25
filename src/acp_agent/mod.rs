@@ -99,6 +99,11 @@ const PROMPT_QUEUE: usize = 1;
 /// End of input means the client has gone. Every running turn is cancelled
 /// first, and a backend kills its process tree on cancel, which takes well
 /// under a second. Two seconds bounds the exit without cutting that short.
+///
+/// Each session's thread then tells the memory engine the session ended, and
+/// the wait allows for that too, up to the engine hook's own bound
+/// ([`crate::hooks::engine::SESSION_END_BOUND`]): a process that returned
+/// first would kill the hook with it.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
 /// How often the shutdown looks at the session threads while it waits.
@@ -150,7 +155,14 @@ pub(crate) struct Opened {
 /// Called on the thread that will drive the session, because a session cannot
 /// cross threads. `cancel` is the token `session/cancel` trips.
 pub(crate) trait SessionFactory: Send + Sync + 'static {
-    fn open(&self, workspace: &Path, cancel: CancelToken) -> Result<Opened, String>;
+    /// `session_id` is the protocol's id for the session, which is also the id
+    /// the memory engine files it under.
+    fn open(
+        &self,
+        workspace: &Path,
+        cancel: CancelToken,
+        session_id: &str,
+    ) -> Result<Opened, String>;
 }
 
 /// The production factory: the interactive CLI's own session builder.
@@ -159,10 +171,15 @@ struct CliSessions {
 }
 
 impl SessionFactory for CliSessions {
-    fn open(&self, workspace: &Path, cancel: CancelToken) -> Result<Opened, String> {
+    fn open(
+        &self,
+        workspace: &Path,
+        cancel: CancelToken,
+        session_id: &str,
+    ) -> Result<Opened, String> {
         let mut config = self.config.clone();
         config.workspace = workspace.to_path_buf();
-        let prepared = crate::cli::prepare_session(&config, cancel, Instant::now())
+        let prepared = crate::cli::prepare_session(&config, cancel, Instant::now(), session_id)
             .map_err(|e| e.to_string())?;
         Ok(Opened {
             session: prepared.session,
@@ -542,7 +559,7 @@ impl<F: SessionFactory> Server<F> {
             drop(handle.prompts);
             threads.push(handle.thread);
         }
-        let deadline = Instant::now() + SHUTDOWN_GRACE;
+        let deadline = Instant::now() + SHUTDOWN_GRACE + crate::hooks::engine::SESSION_END_BOUND;
         while threads.iter().any(|t| !t.is_finished()) && Instant::now() < deadline {
             std::thread::sleep(SHUTDOWN_POLL);
         }
@@ -569,7 +586,7 @@ fn drive<F: SessionFactory>(
     // request that was running is owed an answer, and an unwound thread would
     // leave the client waiting for it forever.
     let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        factory.open(workspace, shared.cancel.clone())
+        factory.open(workspace, shared.cancel.clone(), &session_id.0)
     }))
     .unwrap_or_else(|_| Err("building it panicked".to_string()));
     let Opened {
@@ -648,6 +665,10 @@ fn drive<F: SessionFactory>(
         shared.finish();
         outbox.respond(prompt.id, answer.map(acp::PromptResponse::new));
     }
+    // The reader let go: `session/close`, or the client went away. Either way
+    // the session is over, and the memory engine is told — on this thread,
+    // which owns the session, bounded by the engine runner.
+    held.session.end_memory("other");
 }
 
 /// One open session, as its thread holds it.
@@ -1215,7 +1236,12 @@ mod tests {
     }
 
     impl SessionFactory for FakeSessions {
-        fn open(&self, workspace: &Path, cancel: CancelToken) -> Result<Opened, String> {
+        fn open(
+            &self,
+            workspace: &Path,
+            cancel: CancelToken,
+            _session_id: &str,
+        ) -> Result<Opened, String> {
             let mut session = AgentSession::new(
                 workspace.to_path_buf(),
                 "claude-code",

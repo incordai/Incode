@@ -10,17 +10,20 @@ Every claim cites `file:line`. Paths under `src/` are incord-code unless prefixe
 for this audit, or by the engine contract stated in the task, is marked
 **UNVERIFIED**.
 
-## Build status (phase 2, 2026-09-25)
+## Build status (phases 2–4, 2026-09-25)
 
 | § | Feature | Status |
 |---|---|---|
-| 2 | Shared engine-hook runner | **DONE** — `src/hooks/engine.rs`. Piped-and-closed stdin, piped stdout/stderr, `process_tree` + `tools::bash::wait_with_timeout_or`, bounds 610 s for pre-tool / permission-request / capture. Binary: `INCORD_ENGINE_BIN` → `AdminConfig.engine_bin` → install location (see the correction under §2). Only `pre-tool` and `permission-request` are called so far. |
+| 2 | Shared engine-hook runner | **DONE** — `src/hooks/engine.rs`. Piped-and-closed stdin, piped stdout/stderr, `process_tree` + `tools::bash::wait_with_timeout_or`, bounds 610 s for pre-tool / permission-request / capture. Binary: `INCORD_ENGINE_BIN` → `AdminConfig.engine_bin` → install location (see the correction under §2). Phase 4 added `session-start`, `user-prompt`, `code-edit` (bound 70 s), `capture` (610 s) and `session-end` (130 s). |
 | 3 | Pre-tool guard | **DONE** in `Toolbox::run_call`: operator guards → engine → snapshot → dispatch. Failure policy taken by the owner: fail CLOSED for `Write`/`Edit`/`Bash`, fail OPEN for the rest. |
 | 4 | `AskUserQuestion` tool | **DONE** — Toolbox tool of that exact name. Exit 2 = the owner's answer, returned as a non-error result. Exit 0: the REPL answers with a one-key menu; under ACP and unattended the model is told it went unanswered (the owner's app has no question/elicitation request — see §4). |
-| 5 | Stop channel | NOT STARTED (phase 3). |
+| 5 | Stop channel | **DONE (phase 4)**, on every route, from `AgentSession::turn_observed` and `task_run` (not from `ApiBackend` as §5 first proposed, so that the CLI routes get it too). `hook capture` with `last_assistant_message`, `stop_hook_active` and `transcript_path`; a `block` reply is sent to the same backend as the next prompt; cap `MAX_CONTINUATIONS` = 3 per turn; not spawned once the turn was stopped. |
 | 6 | PermissionRequest | **DONE**, on the pre-tool `ask` branch only, with a byte-identical `tool_input`, racing the REPL prompt or the ACP client's `session/request_permission`; unattended, silence is a refusal. |
-| 7 | Context injection / code-edit / session-end / pre-compact | NOT STARTED. |
-| 8 | Background-work awareness | NOT STARTED. |
+| 7 | 5a SessionStart / UserPromptSubmit | **DONE (phase 4), Option A.** SessionStart in `prepare_session` (`startup`/`resume`) and on `/clear` (`clear`); its block replaces the native rules/recorder/auditor blocks in every backend's system context. UserPromptSubmit in `plan_turn` after the greeting check, replacing `rules::context_for_turn`. Measured on this machine: session-start 8.2–9.9 s, user-prompt 8.2 s on every turn (see §7 5a). |
+| 7 | 5b code-edit | **DONE (phase 4)** in `Toolbox::run_call`, only after a Write/Edit that landed; on its own thread, bounded 70 s. Covers the claude bridge. |
+| 7 | 5c pre-compact | NOT APPLICABLE — nothing compacts. |
+| 7 | 5d SessionEnd | **DONE (phase 4)**: REPL exit, `/clear` (old id), the end of an ACP session thread (`session/close` and shutdown), the end of `--task`. |
+| 8 | Background-work awareness | **DONE (phase 4)** as the harness gate: while a `/bg` job runs the stop is not sent. incode also writes the Claude-shaped transcript (`.incord/transcripts/<session>.jsonl`), which is what `hook capture` records the conversation from. |
 
 What still limits all of it: only calls that go through incode's own Toolbox reach the
 engine. **Phase 3 (2026-09-25) put the claude route on the Toolbox**: claude is started
@@ -34,9 +37,18 @@ CLI route no longer hold for claude. They still hold for **codex** and **antigra
 which run their own tools (codex: not provable while its account is over its usage
 limit, and `apply_patch` has no off switch; agy: no flag exists).
 
-New caveat on the claude route: with the CLI's settings off, the engine's session hooks
+~~New caveat on the claude route: with the CLI's settings off, the engine's session hooks
 it used to fire from its own config (SessionStart, UserPromptSubmit, Stop) no longer
-fire, and incode does not run them yet (§5, §7).
+fire, and incode does not run them yet (§5, §7).~~ **Closed in phase 4:** incode fires
+the whole lifecycle itself (`src/hooks/memory.rs`), keyed by incode's own session id
+(the ACP `sessionId`, or a UUID the REPL / `--task` makes), and writes the transcript the
+engine records from. Measured live, 2026-09-25: `incode -t "create a.txt with hi"` on the
+claude route created `a.txt`, and the service then answered
+`GET /v1/memory/conversations/<id>/messages` with both turns,
+`GET /v1/memory/session?session_id=<id>` with a `Touched` entry for `a.txt` (from
+`code-edit`), and `GET /v1/memory/session/catchup?cwd=<workspace>` with the request.
+Codex and antigravity still load their own hooks files, so on those routes the engine
+may hear a session twice — once from incode, once from the CLI under the CLI's id.
 
 ---
 
@@ -432,6 +444,15 @@ No incord-code module was found calling the equivalent endpoints for project fac
 - **Bound:** 60 s (see the table in §2). This conflicts with the fast per-turn budget that native rules have (`src/rules.rs:128-129`): **measure it before choosing.**
 
 **Option B:** keep the native path and add the missing endpoints. That needs endpoint paths this audit did not verify.
+
+**Measured (phase 4, Option A built).** Real engine, scratch workspace, three runs each:
+`hook session-start` 8.5 / 9.7 / 9.8 s (32 KB), `hook user-prompt` 8.25 / 8.24 / 8.25 s
+(30 KB on a session's first prompt — full rule bodies — then 13 KB). In live incode runs:
+session-start 8.2 s, 9.1 s, 9.9 s; user-prompt 8.2 s every turn; capture 18.9–24.4 s;
+session-end 0.1–0.2 s; code-edit 0.1 s. The per-turn 8.2 s is what an agent CLI already
+paid for this hook from its own settings; it is kept, not dropped, and reported here as
+the cost. The near-constant 8.2 s suggests an internal timeout in the engine's per-turn
+path — **UNVERIFIED**, not investigated (the engine was not to be edited).
 
 **Acceptance tests (Option A):**
 1. A fake engine printing `additionalContext: "RULES-X"` → the assembled prompt (`assemble_prompt`, `src/cli/agent_turn.rs:860`) contains `RULES-X` before the instruction.

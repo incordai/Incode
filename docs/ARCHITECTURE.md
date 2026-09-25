@@ -174,6 +174,41 @@ its own tools inside its own process, so no call it makes passes this gate.
 - **`AskUserQuestion`** (Toolbox tool, that exact name): goes through `pre-tool` like any
   call; not answered in the app (exit 0), it is answered by the prompter (the terminal's
   one-key menu from `ask::Question`), or reported unanswered with its options.
+- **`code-edit`:** after a `Write`/`Edit` that LANDED, from `Toolbox::run_call`, on a
+  thread of its own (not waited on, still bounded). A refused or failed write fires
+  nothing.
+
+### The engine's session lifecycle, fired by incode
+
+`hooks::memory::MemoryHooks`, one per incode session, owned by `AgentSession` (REPL and
+`--acp`) and by `task_run` (`--task`). It fires on every route — claude, the API, codex,
+agy — because it is fired from incode's session and turn code, never from a CLI.
+
+- **Session id:** incode's own — the ACP `sessionId`, or a v4 UUID the REPL / `--task`
+  makes the same way. Every backend is told it (`AgentBackend::set_memory_session`), and
+  a toolbox pins it (`Toolbox::pin_session`), so `pre-tool`, `permission-request`,
+  `code-edit` and the lifecycle events all name one session. The model is told it too,
+  at the top of the session-start block.
+- **`session-start`** (60 + 10 s): in `prepare_session` (`startup`, or `resume` with
+  `--resume`) and on `/clear` (`clear`, new id). Its block replaces incode's own rules,
+  recorder and auditor blocks (Option A) in every backend's system context
+  (`AgentBackend::set_system_context`); with no answer those stay.
+- **`user-prompt`** (60 + 10 s): in `plan_turn`, after the greeting short-circuit; its
+  block replaces `rules::context_for_turn` for the turn.
+- **Oversized blocks:** over 12 KB (start) or 6 KB (turn) the head is given inline and the
+  whole written to `.incord/context/<session>-{start,turn}.md`, which the model can Read.
+- **`capture`** (the stop, 610 s): at the end of every successful turn, with
+  `last_assistant_message` and `stop_hook_active`. A `{"decision":"block","reason":R}`
+  reply sends R to the same backend as the next prompt — a CLI resumes its session, the
+  API appends to its conversation. At most `MAX_CONTINUATIONS` (3) per turn; not sent at
+  all when the turn was stopped or while a `/bg` job runs.
+- **`session-end`** (120 + 10 s): REPL exit (`prompt_input_exit`), `/clear` (old id,
+  `clear`), the end of an ACP session's thread (`session/close` or the client going
+  away — shutdown waits for it, up to the bound), and the end of `--task`.
+- **Transcript:** the engine records a conversation only from `transcript_path`, so
+  incode writes `.incord/transcripts/<session>.jsonl` in the engine's shape (`type`,
+  `uuid`, `timestamp`, `cwd`, `message.content`; the model's text as text blocks), only
+  when an engine is present. Both directories keep their newest 200 files.
 
 ---
 
@@ -494,15 +529,18 @@ Sentinel as detection.
 
 ### Known limitations on the bridged route
 
-- `--add-dir` roots: the toolbox writes only inside the workspace, so a root added with
-  `--add-dir` is no longer writable by the claude route.
+- `--add-dir` roots: **fixed (phase 4).** The toolbox acts inside an added root when a
+  file tool names an absolute path in it, under the workspace's guards (matched on the
+  path within the root); the intake gate stays the workspace's own.
 - incode's team and desktop MCP servers still run their own tools in their own
   processes; they are incode's code, but those calls do not pass through `Toolbox`.
-- The engine's session-capture hooks (SessionStart, UserPromptSubmit, Stop) used to fire
-  inside the CLI from its settings; with settings off they no longer fire, and incode
-  does not run them yet.
-- Project instruction files (`CLAUDE.md`) are no longer read by the CLI and are not yet
-  read by incode.
+- The engine's session-capture hooks: **fixed (phase 4)** — incode fires them itself on
+  every route; see "The engine's session lifecycle, fired by incode" in §2.
+- Project instruction files: **fixed (phase 4)** — `instructions::project_block` reads
+  `CLAUDE.md` and `AGENTS.md` from the workspace root (8 KB each, the rest pointed at)
+  into the session's system context for every model, and for `--task`.
+- A prompt over the command-line budget now loses its MIDDLE, not its end: the
+  instruction is last in every prompt incode assembles (`budget_for_spawn`).
 
 ---
 

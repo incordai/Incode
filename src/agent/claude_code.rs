@@ -395,6 +395,9 @@ impl ClaudeCodeBackend {
 
     /// The same, for a caller that already owns the backend in place.
     pub fn set_extra_dirs(&mut self, dirs: Vec<std::path::PathBuf>) {
+        // incode's toolbox does the writing on this route, so it is the toolbox
+        // that must be able to reach the added roots — under the same guards.
+        self.tools.set_extra_dirs(dirs.clone());
         self.extra_dirs = dirs;
         // Reach and guard move together, by construction rather than by anyone
         // remembering to call something afterwards.
@@ -1133,6 +1136,19 @@ impl AgentBackend for ClaudeCodeBackend {
 
     fn set_session_id(&mut self, session_id: &str) {
         ClaudeCodeBackend::set_session_id(self, session_id);
+    }
+
+    /// The engine hears incode's session id with every call, not the CLI's
+    /// conversation id: incode's is the one its session events carry too.
+    fn set_memory_session(&mut self, session: &str) {
+        self.tools.pin_session(session);
+    }
+
+    fn set_system_context(&mut self, blocks: Vec<String>) {
+        self.system_context = blocks
+            .into_iter()
+            .filter(|b| !b.trim().is_empty())
+            .collect();
     }
 
     fn session_id(&self) -> Option<&str> {

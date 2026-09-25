@@ -69,7 +69,10 @@ impl CliApp {
         // stopping it means killing that process — the token is checked between
         // output lines and the child is killed when it is set.
         let cancel = crate::runtime::cancel::CancelToken::new();
-        let mut prepared = prepare_session(&self.config, cancel.clone(), booted_at)?;
+        // The REPL's own id for this session, made the way `incode --acp`
+        // makes one for each `session/new`.
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let mut prepared = prepare_session(&self.config, cancel.clone(), booted_at, &session_id)?;
         // Someone is at the keyboard only when both ends are a terminal; piped,
         // a mid-turn question would wait on input nobody can give.
         if std::io::IsTerminal::is_terminal(&std::io::stdin())
@@ -118,10 +121,15 @@ pub(crate) struct Prepared {
 /// Everything it prints goes through [`render`], i.e. the console. Under
 /// `--acp` the process's stdout is already pointed at stderr by the time this
 /// runs (see `acp_agent::stdio`), so none of it can reach the protocol channel.
+///
+/// `session_id` is incode's id for the session — the ACP session's own id, or
+/// one the REPL made for itself — and the memory engine files the session
+/// under it.
 pub(crate) fn prepare_session(
     config: &IncordCodeConfig,
     cancel: crate::runtime::cancel::CancelToken,
     booted_at: std::time::Instant,
+    session_id: &str,
 ) -> anyhow::Result<Prepared> {
     let workspace = config.workspace.clone();
     // The intake gate. Nothing is blocked by it: an incomplete brief makes
@@ -318,11 +326,22 @@ pub(crate) fn prepare_session(
     // manual for tools it does not have, which is worse than sending
     // nothing. The agent is already a coding agent; it needs the PROJECT.
     let mut system_prompt: Vec<String> = Vec::new();
+    // The blocks below that the memory engine's session-start block carries
+    // too — the rules, the recorder's handoff, the auditor's findings. Kept
+    // in the prompt, and named here, so that when the engine answers they
+    // are dropped rather than sent twice (see `AgentSession::start_memory`).
+    let mut native: Vec<String> = Vec::new();
 
     // How to put a decision to the owner as OPTIONS rather than an open
     // question. Enumerating the choices is most of the work of deciding,
     // and the agent has just done it — an open question throws it away.
     system_prompt.push(crate::ask::prompt_block());
+
+    // The project's own instruction files. An agent CLI no longer reads them
+    // for itself — it runs as a model only — and no other model ever did.
+    if let Some(block) = crate::instructions::project_block(&workspace) {
+        system_prompt.push(block);
+    }
 
     // The intake task rides the system prompt rather than one turn's
     // context: it is not finished until the brief is, which may take several
@@ -354,6 +373,7 @@ pub(crate) fn prepare_session(
     // and dropped before this, so the agent never saw them at all; in the
     // cached prefix they cost almost nothing after the first turn.
     if let Some(block) = timed("rules (always)", crate::rules::session_context) {
+        native.push(block.clone());
         system_prompt.push(block);
     }
 
@@ -390,6 +410,7 @@ pub(crate) fn prepare_session(
                 "auditor: {} open finding(s) in this project",
                 block.lines().count().saturating_sub(1)
             ));
+            native.push(block.clone());
             system_prompt.push(block);
         }
     }
@@ -409,6 +430,7 @@ pub(crate) fn prepare_session(
                         "recorder: no past handoff recorded yet (live session facts capture real-time state)",
                     );
             }
+            native.push(block.clone());
             system_prompt.push(block);
         }
     }
@@ -526,6 +548,23 @@ pub(crate) fn prepare_session(
     // writing. Shown in the banner and never sent, `-p read-only` let an
     // operator believe nothing could be written while the agent wrote.
     session.set_permission_mode(permission_mode.agent_mode());
+
+    // The memory engine's session, opened by incode: the agent CLI used to
+    // fire these hooks from its own settings, and it runs as a model only now.
+    // Its session-start context replaces the native blocks it overlaps.
+    let memory = crate::hooks::memory::MemoryHooks::new(
+        crate::hooks::engine::Engine::locate(),
+        &workspace,
+        session_id,
+    );
+    let source = if config.resume_session.is_some() {
+        "resume"
+    } else {
+        "startup"
+    };
+    timed("memory session-start", || {
+        session.start_memory(memory, native, source);
+    });
 
     // `-m` first, then the role table. A model named on the command line is
     // the most specific thing the operator said, and it was previously
@@ -1549,6 +1588,9 @@ impl CliApp {
             // every time, contributing nothing and costing 1.2s of the
             // operator's wait per message. What memory has to say is fetched
             // once per session instead, into the cached prefix.
+            // A `/bg` job still running makes the turn's stop a wait rather
+            // than an end: the memory engine is not asked about it.
+            session.set_background_jobs(job_mgr.running_count());
             // Context, checkpoint, turn and streaming all live in one place
             // now, shared with the one-shot path above so the two cannot drift.
             if let Err(e) = run_one_turn(&mut session, &workspace, &augmented_input, &line) {
@@ -1594,6 +1636,10 @@ impl CliApp {
                 crate::session::save(&incord_code_dir, record);
             }
         }
+
+        // The memory engine's end of the session, bounded by the engine
+        // runner, before the operator's own end-of-session command.
+        session.end_memory("prompt_input_exit");
 
         // Run session end lifecycle hook (Feature 7)
         if let Some(result) = lifecycle_hooks.run_session_end(&workspace) {
@@ -2147,9 +2193,12 @@ pub(crate) fn plan_turn(
             return TurnPlan::NextQuestion(menu);
         }
         crate::cli::agent_turn::Answered::Ready(instruction) => {
+            // The answers are the person's line for this turn: the engine
+            // hears it, and its context for it rides the turn.
+            let context = session.memory_prompt(&instruction).into_iter().collect();
             return TurnPlan::Agent {
                 instruction,
-                context: Vec::new(),
+                context,
             };
         }
     }
@@ -2179,9 +2228,18 @@ pub(crate) fn plan_turn(
         return TurnPlan::Greeting(crate::text::greeting_reply(workspace));
     }
 
+    // The memory engine's context for this line, which carries the rules
+    // itself: when it answers, incode's own per-turn rules are not fetched as
+    // well, so the rules are never sent twice. When it does not — no engine,
+    // or nothing to say — incode's own are.
     let mut context = Vec::new();
-    if let Some(rules) = crate::rules::context_for_turn(line) {
-        context.push(rules);
+    match session.memory_prompt(line) {
+        Some(block) => context.push(block),
+        None => {
+            if let Some(rules) = crate::rules::context_for_turn(line) {
+                context.push(rules);
+            }
+        }
     }
 
     TurnPlan::Agent {

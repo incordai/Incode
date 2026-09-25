@@ -912,6 +912,28 @@ impl AgentBackend for ApiBackend {
         &self.context
     }
 
+    /// The engine hears incode's session id with every call from here on.
+    fn set_memory_session(&mut self, session: &str) {
+        self.tools.pin_session(session);
+    }
+
+    /// The standing instructions for the following requests, as the one block
+    /// the constructor makes of them.
+    fn set_system_context(&mut self, blocks: Vec<String>) {
+        let joined = blocks
+            .iter()
+            .map(|b| b.trim())
+            .filter(|b| !b.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        self.context = if joined.is_empty() {
+            Vec::new()
+        } else {
+            vec![joined.clone()]
+        };
+        self.system = joined;
+    }
+
     // set_extra_dirs, deny_rules, set_permission_mode and set_session_id keep
     // the defaults, and the defaults are the truth. The toolbox works in one
     // workspace, it checks the guards itself rather than handing rules to

@@ -67,9 +67,18 @@ pub const PRE_TOOL_BOUND: Duration = Duration::from_secs(600 + MARGIN.as_secs())
 /// the prompt for at most 540 s.
 pub const PERMISSION_REQUEST_BOUND: Duration = Duration::from_secs(600 + MARGIN.as_secs());
 
-/// `hook capture`, the stop channel. Registered for 600 s. Not called yet: the
-/// bound is pinned now so the stop channel cannot arrive with a shorter one.
+/// `hook capture`, the stop channel. Registered for 600 s: the engine may hold
+/// a stop open while the owner decides whether the agent carries on.
 pub const CAPTURE_BOUND: Duration = Duration::from_secs(600 + MARGIN.as_secs());
+
+/// `hook session-end`. Registered for 120 s: it may write a handoff for the
+/// session, which is a model call.
+pub const SESSION_END_BOUND: Duration = Duration::from_secs(120 + MARGIN.as_secs());
+
+/// `hook session-start`, `hook user-prompt` and `hook code-edit`. The engine
+/// registers no timeout for these three, so the agent's default applies; its
+/// own hooks file for the one agent that needs a number says 60.
+pub const CONTEXT_BOUND: Duration = Duration::from_secs(60 + MARGIN.as_secs());
 
 /// One hook this harness runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +87,16 @@ pub enum Event {
     PreTool,
     /// A person is being asked about a call: the owner's app may answer first.
     PermissionRequest,
+    /// A session opened, or was cleared: the engine hands back its context.
+    SessionStart,
+    /// A person sent a line: the engine hands back the context for it.
+    UserPrompt,
+    /// A file was written or edited, and the write landed.
+    CodeEdit,
+    /// The turn is ending: the engine records it, and may say to carry on.
+    Capture,
+    /// The session is over.
+    SessionEnd,
 }
 
 impl Event {
@@ -85,6 +104,11 @@ impl Event {
         match self {
             Self::PreTool => "pre-tool",
             Self::PermissionRequest => "permission-request",
+            Self::SessionStart => "session-start",
+            Self::UserPrompt => "user-prompt",
+            Self::CodeEdit => "code-edit",
+            Self::Capture => "capture",
+            Self::SessionEnd => "session-end",
         }
     }
 
@@ -93,6 +117,11 @@ impl Event {
         match self {
             Self::PreTool => "PreToolUse",
             Self::PermissionRequest => "PermissionRequest",
+            Self::SessionStart => "SessionStart",
+            Self::UserPrompt => "UserPromptSubmit",
+            Self::CodeEdit => "PostToolUse",
+            Self::Capture => "Stop",
+            Self::SessionEnd => "SessionEnd",
         }
     }
 
@@ -100,8 +129,24 @@ impl Event {
         match self {
             Self::PreTool => PRE_TOOL_BOUND,
             Self::PermissionRequest => PERMISSION_REQUEST_BOUND,
+            Self::Capture => CAPTURE_BOUND,
+            Self::SessionEnd => SESSION_END_BOUND,
+            Self::SessionStart | Self::UserPrompt | Self::CodeEdit => CONTEXT_BOUND,
         }
     }
+}
+
+/// The conversation a lifecycle event belongs to, as every event names it.
+#[derive(Debug, Clone, Copy)]
+pub struct Conversation<'a> {
+    /// incode's id for the session — the same one the engine's pre-tool
+    /// events carry, so its cards, its capture and its context agree.
+    pub session: &'a str,
+    /// The workspace.
+    pub cwd: &'a Path,
+    /// The session's transcript, in the shape the engine reads, when one is
+    /// being written. The engine records the conversation from it.
+    pub transcript: Option<&'a Path>,
 }
 
 /// The engine binary, once found.
@@ -314,6 +359,78 @@ impl Engine {
         }
     }
 
+    /// The context the engine hands a session as it opens: `source` is
+    /// `startup`, `resume` or `clear`. `None` when it had nothing to add, or
+    /// could not be asked — a session starts either way.
+    #[must_use]
+    pub fn session_start(&self, at: Conversation<'_>, source: &str) -> Option<String> {
+        let event = lifecycle(Event::SessionStart, at, json!({ "source": source }));
+        read_context(self.run(Event::SessionStart, &event, at.cwd, &|| false))
+    }
+
+    /// The context the engine hands this turn, for the line the person sent.
+    #[must_use]
+    pub fn user_prompt(&self, at: Conversation<'_>, prompt: &str) -> Option<String> {
+        let event = lifecycle(Event::UserPrompt, at, json!({ "prompt": prompt }));
+        read_context(self.run(Event::UserPrompt, &event, at.cwd, &|| false))
+    }
+
+    /// Tell the engine a write landed, and do not wait for it.
+    ///
+    /// Bookkeeping, not a decision: the engine files the path under the
+    /// session and queues the file to be read again. It runs on a thread of its
+    /// own, bounded like the rest, so the model's next call is not held up by
+    /// it and a stuck engine is still killed at the bound.
+    pub fn code_edit(&self, at: Conversation<'_>, tool_name: &str, tool_input: &Value, said: &str) {
+        let event = lifecycle(
+            Event::CodeEdit,
+            at,
+            json!({
+                "tool_name": tool_name,
+                "tool_input": tool_input,
+                "tool_response": said,
+            }),
+        );
+        let engine = self.clone();
+        let cwd = at.cwd.to_path_buf();
+        std::thread::spawn(move || {
+            let _ = engine.run(Event::CodeEdit, &event, &cwd, &|| false);
+        });
+    }
+
+    /// The turn is ending: the engine records it, and may answer that the
+    /// agent should carry on — with the words it is to carry on with.
+    ///
+    /// `active` is true on a stop reached after a continuation this hook
+    /// ordered, which is the engine's own brake. A stopped turn abandons the
+    /// wait: a person who pressed stop is not held for ten minutes.
+    #[must_use]
+    pub fn stop(
+        &self,
+        at: Conversation<'_>,
+        last_message: &str,
+        active: bool,
+        cancel: Option<&CancelToken>,
+    ) -> Option<String> {
+        let event = lifecycle(
+            Event::Capture,
+            at,
+            json!({
+                "last_assistant_message": last_message,
+                "stop_hook_active": active,
+            }),
+        );
+        let abandon = || cancel.is_some_and(CancelToken::is_cancelled);
+        read_stop(self.run(Event::Capture, &event, at.cwd, &abandon))
+    }
+
+    /// The session is over. `reason` is why: `clear`, `prompt_input_exit`,
+    /// `other`.
+    pub fn session_end(&self, at: Conversation<'_>, reason: &str) {
+        let event = lifecycle(Event::SessionEnd, at, json!({ "reason": reason }));
+        let _ = self.run(Event::SessionEnd, &event, at.cwd, &|| false);
+    }
+
     fn run(&self, event: Event, payload: &Value, cwd: &Path, abandon: &dyn Fn() -> bool) -> Ran {
         let bound = self.cap.unwrap_or_else(|| event.bound());
         let began = std::time::Instant::now();
@@ -348,6 +465,8 @@ impl Engine {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         crate::agent::process_tree::prepare(&mut command);
+        #[cfg(test)]
+        fake::note_spawn(&self.bin, event.subcommand());
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(e) => {
@@ -449,6 +568,52 @@ fn payload(event: Event, session: &str, cwd: &Path, tool_name: &str, tool_input:
         "tool_name": tool_name,
         "tool_input": tool_input,
     })
+}
+
+/// A lifecycle event: the fields every event carries, then its own.
+fn lifecycle(event: Event, at: Conversation<'_>, own: Value) -> Value {
+    let mut out = json!({
+        "hook_event_name": event.name(),
+        "session_id": at.session,
+        "cwd": at.cwd.to_string_lossy(),
+    });
+    if let Some(path) = at.transcript {
+        out["transcript_path"] = json!(path.to_string_lossy());
+    }
+    if let (Some(fields), Value::Object(own)) = (out.as_object_mut(), own) {
+        fields.extend(own);
+    }
+    out
+}
+
+/// The `additionalContext` a session-start or user-prompt hook printed.
+/// Anything else — nothing, not JSON, a failure — is no context.
+fn read_context(ran: Ran) -> Option<String> {
+    let Ran::Exited {
+        code: 0, stdout, ..
+    } = ran
+    else {
+        return None;
+    };
+    let reply: Value = serde_json::from_str(stdout.trim()).ok()?;
+    text_at(&reply["hookSpecificOutput"], "additionalContext").map(str::to_string)
+}
+
+/// `{"decision":"block","reason":R}` is the engine saying the agent should
+/// carry on with `R`. Anything else lets the turn end: a stop hook never
+/// keeps a turn alive by failing.
+fn read_stop(ran: Ran) -> Option<String> {
+    let Ran::Exited {
+        code: 0, stdout, ..
+    } = ran
+    else {
+        return None;
+    };
+    let reply: Value = serde_json::from_str(stdout.trim()).ok()?;
+    if reply.get("decision").and_then(Value::as_str) != Some("block") {
+        return None;
+    }
+    text_at(&reply, "reason").map(str::to_string)
 }
 
 /// A non-blank string field.
@@ -637,6 +802,30 @@ pub(crate) mod fake {
                 .expect("make it runnable");
             path
         }
+    }
+
+    /// Every engine process the runner started, as (binary, subcommand).
+    static SPAWNS: std::sync::Mutex<Vec<(PathBuf, &'static str)>> =
+        std::sync::Mutex::new(Vec::new());
+
+    /// Noted by the runner just before it starts a process.
+    pub(crate) fn note_spawn(bin: &Path, sub: &'static str) {
+        SPAWNS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((bin.to_path_buf(), sub));
+    }
+
+    /// How many times the runner STARTED the fake in `dir` for `sub` —
+    /// counted before the process exists, so a process stopped before its
+    /// first line still counts. [`calls`] cannot say that.
+    pub(crate) fn spawned(dir: &Path, sub: &str) -> usize {
+        SPAWNS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|(bin, s)| *s == sub && bin.parent() == Some(dir))
+            .count()
     }
 
     /// How many times the fake ran `sub`.

@@ -31,6 +31,7 @@
 //! it is shown is the operator's decision, made when they wrote the command.
 
 pub mod engine;
+pub mod memory;
 
 use std::process::Command;
 use std::time::Duration;

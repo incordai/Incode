@@ -18,6 +18,7 @@ pub mod goal;
 pub mod guards;
 pub mod hooks;
 pub mod identity;
+pub mod instructions;
 pub mod knowledge;
 pub mod ledger;
 pub mod lessons;

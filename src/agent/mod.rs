@@ -337,6 +337,10 @@ pub const MAX_PROMPT_BUDGET: usize = 12_000;
 /// Minimum context budget preserved when budgeting payload.
 pub const MIN_CONTEXT_BUDGET: usize = 4_000;
 
+/// How much of the START of an over-budget prompt is kept; the rest of the
+/// budget goes to its END, where the instruction is.
+const PROMPT_HEAD: usize = 2_000;
+
 /// Compacts / budgets prompt and system context so external agent CLI processes
 /// spawned via `Command::new` stay safely within OS command-line limits.
 ///
@@ -358,12 +362,20 @@ pub fn budget_for_spawn(prompt: &str, system_context: &[String]) -> (String, Str
     } else {
         prompt.len()
     };
+    // THE END OF A PROMPT IS THE INSTRUCTION. Every prompt this harness
+    // assembles puts its context first and what was asked last, so cutting
+    // from the end cut exactly the part the agent was meant to act on —
+    // measured: an agent handed only the head of an 18,084-character prompt
+    // answered by asking what the task was. The middle goes instead.
     let budgeted_prompt = if prompt.len() > prompt_budget {
-        let cutoff = crate::text::head_bytes(prompt, prompt_budget.saturating_sub(60));
-        format!(
-            "{}\n\n[...prompt truncated for OS command line limit...]",
-            cutoff
-        )
+        const MARKER: &str = "\n\n[...prompt truncated for OS command line limit...]\n\n";
+        let head = crate::text::head_bytes(prompt, PROMPT_HEAD);
+        let room = prompt_budget.saturating_sub(head.len() + MARKER.len());
+        let mut from = prompt.len().saturating_sub(room);
+        while !prompt.is_char_boundary(from) {
+            from += 1;
+        }
+        format!("{head}{MARKER}{}", &prompt[from..])
     } else {
         prompt.to_string()
     };
@@ -393,6 +405,7 @@ pub fn budget_for_spawn(prompt: &str, system_context: &[String]) -> (String, Str
             || lower.contains("<intake>")
             || lower.contains("<asking>")
             || lower.contains("<roles>")
+            || lower.contains("<project-instructions")
             || lower.contains("disallowedtools")
         {
             high_priority.push(trimmed);
@@ -674,6 +687,28 @@ mod handover_tests {
         assert!(p.contains("prompt truncated for OS command line limit"));
         assert!(c.contains("<guards>safe</guards>"));
     }
+
+    /// **AN OVER-BUDGET PROMPT KEEPS ITS INSTRUCTION.** Context comes first
+    /// and the instruction last, so the cut is taken from the middle: an
+    /// agent once got only the head and asked what it was meant to do.
+    #[test]
+    fn budget_for_spawn_keeps_the_instruction_at_the_end() {
+        let prompt = format!(
+            "<guards>g</guards>\n\n{}\n\nNow do this:\n\ncreate a.txt with hi",
+            "context é ".repeat(MAX_CMDLINE_PAYLOAD_LEN / 10)
+        );
+        let context = vec!["x".repeat(20_000)];
+        let (p, c) = budget_for_spawn(&prompt, &context);
+        assert!(p.len() + c.len() <= MAX_CMDLINE_PAYLOAD_LEN);
+        assert!(p.len() <= MAX_PROMPT_BUDGET, "{}", p.len());
+        assert!(
+            p.ends_with("Now do this:\n\ncreate a.txt with hi"),
+            "{}",
+            &p[p.len() - 80..]
+        );
+        assert!(p.starts_with("<guards>g</guards>"));
+        assert!(p.contains("prompt truncated for OS command line limit"));
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -866,6 +901,18 @@ pub trait AgentBackend {
     /// Continue the conversation with this id.
     fn set_session_id(&mut self, _session_id: &str) {}
 
+    /// incode's id for the session, which the memory engine files everything
+    /// under — its pre-tool cards as well as the session's capture.
+    ///
+    /// Defaulted to nothing: only a backend whose tool calls this harness runs
+    /// itself sends the engine anything per call.
+    fn set_memory_session(&mut self, _session: &str) {}
+
+    /// Replace the harness context this backend carries into its turns.
+    ///
+    /// Defaulted to nothing for a backend that carries none.
+    fn set_system_context(&mut self, _blocks: Vec<String>) {}
+
     /// The conversations subagents opened, as `(session id, what it was asked)`.
     ///
     /// Empty for a backend that does not delegate, and for one whose subagents
@@ -961,6 +1008,14 @@ impl AgentBackend for Box<dyn AgentBackend> {
 
     fn set_session_id(&mut self, session_id: &str) {
         (**self).set_session_id(session_id);
+    }
+
+    fn set_memory_session(&mut self, session: &str) {
+        (**self).set_memory_session(session);
+    }
+
+    fn set_system_context(&mut self, blocks: Vec<String>) {
+        (**self).set_system_context(blocks);
     }
 
     fn children(&self) -> Vec<(String, String)> {

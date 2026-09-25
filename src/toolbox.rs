@@ -141,6 +141,13 @@ pub struct Toolbox {
     engine: Option<crate::hooks::engine::Engine>,
     /// The conversation these calls belong to, as the engine is told it.
     session: String,
+    /// Set once the session's own id was given ([`Self::pin_session`]): from
+    /// then on a backend's id for its conversation does not replace it, so
+    /// every engine event of the session names the same one.
+    session_pinned: bool,
+    /// Directories beyond the workspace the session may work in. A file tool
+    /// given an absolute path inside one acts there, under the same guards.
+    extra_dirs: Vec<PathBuf>,
     /// Who can be asked when the engine wants a person — the terminal, or the
     /// ACP client. `None` when nobody is there.
     prompter: Option<std::sync::Arc<dyn crate::hooks::engine::Prompter>>,
@@ -170,6 +177,8 @@ impl Toolbox {
             checkpoints: None,
             engine: None,
             session: String::new(),
+            session_pinned: false,
+            extra_dirs: Vec::new(),
             prompter: None,
             cancel: None,
             mode: None,
@@ -194,9 +203,48 @@ impl Toolbox {
         self
     }
 
-    /// The conversation id the engine is given with each call.
+    /// The conversation id the engine is given with each call — unless the
+    /// session's own id was pinned, which wins.
     pub fn set_session(&mut self, session: &str) {
+        if !self.session_pinned {
+            self.session = session.to_string();
+        }
+    }
+
+    /// The session's own id, given to the engine with every call from now
+    /// on. The engine's session-start, prompt and stop events carry it too,
+    /// so a card raised here and the capture of the turn name one session.
+    pub fn pin_session(&mut self, session: &str) {
         self.session = session.to_string();
+        self.session_pinned = true;
+    }
+
+    /// Directories beyond the workspace where the file tools may act. The
+    /// operator's guards apply inside them as in the workspace.
+    pub fn set_extra_dirs(&mut self, dirs: Vec<PathBuf>) {
+        self.extra_dirs = dirs;
+    }
+
+    /// The root a file tool call acts under: an extra directory when the call
+    /// names an absolute path inside one, otherwise the workspace. Containment
+    /// is decided by the same check the file tools apply, so a path this
+    /// picks a root for is a path the tool will accept there.
+    fn root_for(&self, input: &Value) -> &Path {
+        let Some(path) = input.get("path").and_then(Value::as_str) else {
+            return &self.workspace;
+        };
+        if self.extra_dirs.is_empty() || !Path::new(path).is_absolute() {
+            return &self.workspace;
+        }
+        let probe = json!({ "path": path }).to_string();
+        let inside = |root: &Path| crate::tools::file_ops::target_path(root, &probe).is_ok();
+        if inside(&self.workspace) {
+            return &self.workspace;
+        }
+        self.extra_dirs
+            .iter()
+            .find(|root| inside(root))
+            .map_or(self.workspace.as_path(), PathBuf::as_path)
     }
 
     /// Who is asked when the engine wants a person to confirm a call.
@@ -420,6 +468,17 @@ impl Toolbox {
             return guards.refuse_command(command);
         }
         let path = input.get("path").and_then(Value::as_str).unwrap_or("");
+        let root = self.root_for(input);
+        if root != self.workspace.as_path() {
+            // An added directory: the operator's protected paths apply inside
+            // it as they do in the workspace, matched against the path WITHIN
+            // it, so a parent directory's name cannot decide. The intake gate
+            // does not: it is about this workspace's own specification.
+            let inside = Path::new(path)
+                .strip_prefix(root)
+                .map_or_else(|_| path.to_string(), |p| p.to_string_lossy().into_owned());
+            return guards.refuse_write(&inside);
+        }
         if let Some(reason) = guards.refuse_write(path) {
             return Some(reason);
         }
@@ -662,6 +721,19 @@ impl Toolbox {
             }
         };
         let outcome = self.dispatch(name, input);
+        // A write that LANDED is news to the engine — it files the path under
+        // the session and queues the file to be read again. Only a write that
+        // happened: a refused or failed one changed nothing. Not waited on.
+        if matches!(name, WRITE | EDIT) {
+            if let (Some(engine), Ok(said)) = (&self.engine, &outcome) {
+                let at = crate::hooks::engine::Conversation {
+                    session: &self.session,
+                    cwd: &self.workspace,
+                    transcript: None,
+                };
+                engine.code_edit(at, name, &self.event_input(name, input), said);
+            }
+        }
         // The engine's guidance for THIS action travels with its result, which
         // is the one place the model reads it at the moment it applies.
         match context {
@@ -824,7 +896,12 @@ impl Toolbox {
         // the interface they were written to; re-serialising here keeps that
         // contract rather than rewriting six working implementations.
         let raw = input.to_string();
-        let ws = self.workspace.as_path();
+        // The workspace, or the added directory the call names a path in.
+        let ws = if matches!(name, READ | WRITE | EDIT | GLOB | GREP) {
+            self.root_for(input)
+        } else {
+            self.workspace.as_path()
+        };
 
         // Snapshot before file-modifying operations if checkpoints are enabled.
         if matches!(name, WRITE | EDIT) {
@@ -1925,5 +2002,125 @@ mod tests {
             std::fs::read_to_string(ws.join("existing.txt")).unwrap(),
             "before edit\n"
         );
+    }
+
+    /// How many whole events the fake was given for `sub`, waiting up to
+    /// `bound` for `want` — the code-edit hook is not waited on by the
+    /// toolbox, so it lands a moment after the call returns.
+    fn calls_within(dir: &Path, sub: &str, want: usize, bound: Duration) -> usize {
+        let deadline = Instant::now() + bound;
+        loop {
+            let whole = fake::events_raw(dir, sub)
+                .iter()
+                .filter(|line| serde_json::from_str::<Value>(line).is_ok())
+                .count();
+            if whole >= want || Instant::now() >= deadline {
+                return whole;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// **CODE-EDIT FIRES ONLY FOR A WRITE THAT LANDED.** One spawn for a
+    /// successful Write, carrying the session and the absolute path; none for
+    /// a Write the guards refused, an Edit that failed, or a Read.
+    #[test]
+    fn code_edit_fires_only_for_a_successful_write() {
+        let (ws, engine) = (
+            tempfile::tempdir().expect("ws"),
+            tempfile::tempdir().expect("engine"),
+        );
+        let tools = guarded(
+            ws.path(),
+            engine.path(),
+            &[("pre-tool", Reply::exit(0)), ("code-edit", Reply::exit(0))],
+            20,
+        );
+        tools
+            .run(WRITE, &json!({"path": "notes.txt", "content": "hi"}))
+            .expect("the write lands");
+        assert_eq!(
+            calls_within(engine.path(), "code-edit", 1, Duration::from_secs(20)),
+            1
+        );
+        let event = &fake::events(engine.path(), "code-edit")[0];
+        assert_eq!(event["hook_event_name"], "PostToolUse");
+        assert_eq!(event["session_id"], "api-test-session");
+        assert_eq!(event["tool_name"], WRITE);
+        assert_eq!(
+            event["tool_input"]["path"],
+            ws.path().join("notes.txt").to_string_lossy().as_ref()
+        );
+
+        // Refused by the guards, failed in the tool, and a read: none of them
+        // changed a file, so none of them is news.
+        assert!(tools
+            .run(WRITE, &json!({"path": "tests/x.txt", "content": "no"}))
+            .is_err());
+        assert!(tools
+            .run(
+                EDIT,
+                &json!({"path": "notes.txt", "old_string": "absent", "new_string": "x"})
+            )
+            .is_err());
+        tools
+            .run(READ, &json!({"path": "notes.txt"}))
+            .expect("the read works");
+        std::thread::sleep(Duration::from_millis(1500));
+        assert_eq!(
+            fake::calls(engine.path(), "code-edit"),
+            1,
+            "only the write that landed"
+        );
+    }
+
+    /// **AN ADDED DIRECTORY IS WRITABLE, AND GUARDED.** A write inside it by
+    /// absolute path lands there; a protected path inside it is refused as it
+    /// would be in the workspace, and nothing is written; a directory nobody
+    /// added stays out of reach.
+    #[test]
+    fn an_extra_directory_is_writable_under_the_same_guards() {
+        let (ws, extra, elsewhere) = (
+            tempfile::tempdir().expect("ws"),
+            tempfile::tempdir().expect("extra"),
+            tempfile::tempdir().expect("elsewhere"),
+        );
+        let mut tools = toolbox(ws.path());
+        tools.set_extra_dirs(vec![extra.path().to_path_buf()]);
+
+        let allowed = extra.path().join("notes").join("plan.txt");
+        tools
+            .run(
+                WRITE,
+                &json!({"path": allowed.to_string_lossy(), "content": "added root"}),
+            )
+            .expect("a write inside an added directory lands");
+        assert_eq!(
+            std::fs::read_to_string(&allowed).expect("written"),
+            "added root"
+        );
+        let read = tools
+            .run(READ, &json!({"path": allowed.to_string_lossy()}))
+            .expect("and reads back");
+        assert!(read.contains("added root"), "{read}");
+
+        let guarded_path = extra.path().join("tests").join("check.txt");
+        let refused = tools
+            .run(
+                WRITE,
+                &json!({"path": guarded_path.to_string_lossy(), "content": "rewritten"}),
+            )
+            .expect_err("a protected path in an added directory is refused");
+        assert!(refused.contains("protected"), "{refused}");
+        assert!(!guarded_path.exists(), "nothing was written");
+
+        let outside = elsewhere.path().join("x.txt");
+        assert!(tools
+            .run(
+                WRITE,
+                &json!({"path": outside.to_string_lossy(), "content": "no"})
+            )
+            .is_err());
+        assert!(!outside.exists());
     }
 }
