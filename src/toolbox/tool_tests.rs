@@ -732,14 +732,29 @@ fn diagnostics_says_when_no_checker_is_known_and_is_refused_read_only() {
 fn a_lookup_needs_a_tool_and_its_input() {
     let dir = tempfile::tempdir().expect("tmp");
     let tools = toolbox(dir.path());
+    // Refused by the tool's own schema, before the lookup is reached.
     let refused = tools
         .run(crate::recorder::LOOKUP_TOOL, &json!({"input": {}}))
         .expect_err("no tool");
-    assert!(refused.contains("`tool` is required"), "{refused}");
+    assert!(
+        refused.contains("\"tool\" is a required property"),
+        "{refused}"
+    );
     let refused = tools
         .run(crate::recorder::LOOKUP_TOOL, &json!({"tool": "Read"}))
         .expect_err("no input");
-    assert!(refused.contains("`input` is required"), "{refused}");
+    assert!(
+        refused.contains("\"input\" is a required property"),
+        "{refused}"
+    );
+    // A blank tool name passes the schema and is caught by the tool itself.
+    let refused = tools
+        .run(
+            crate::recorder::LOOKUP_TOOL,
+            &json!({"tool": " ", "input": {}}),
+        )
+        .expect_err("blank tool");
+    assert!(refused.contains("`tool` is required"), "{refused}");
 }
 
 /// **THE TEAM TOOLS ARE THE TOOLBOX'S**: a message lands on the channel

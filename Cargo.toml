@@ -80,10 +80,56 @@ agent-client-protocol-schema = { version = "=1.9.1", default-features = false }
 # CLI-specific
 rustyline = { version = "15", features = ["derive"] }
 crossterm = "0.28"
-glob = "0.3"
-walkdir = "2"
 similar = "2"
 pulldown-cmark = "0.12"
+
+# ---------------------------------------------------------------------------
+# The toolbox's search, outline, document and validation engines (phase 6a).
+# NEW PACKAGES, vetted in scratch crates and approved by the owner; each pinned
+# exactly. See docs/ARCHITECTURE.md "Dependencies" for why each one.
+# ---------------------------------------------------------------------------
+
+# Search: ripgrep's own walker and searcher, for Grep, Glob and LS.
+# The directory walker that honours .gitignore, .ignore and .git/info/exclude.
+ignore = "=0.4.33"
+# Line-oriented search with context lines, binary detection and BOM transcoding.
+grep-searcher = "=0.1.17"
+# The regex matcher grep-searcher drives.
+grep-regex = "=0.1.14"
+# The model's own glob, applied AFTER the walk so it only narrows what the
+# ignore rules allowed (an override or type filter would re-admit hidden files).
+globset = "=0.4.20"
+
+# Outline: symbols from a syntax tree.
+# The parser runtime and its query engine.
+tree-sitter = "=0.26.13"
+# Held at 0.1.7: 0.1.8 declares rust-version 1.90, above this crate's floor.
+tree-sitter-language = "=0.1.7"
+# One grammar per language, each behind its own `lang-*` feature below.
+tree-sitter-rust = { version = "=0.24.2", optional = true }
+tree-sitter-typescript = { version = "=0.23.2", optional = true }
+tree-sitter-python = { version = "=0.25.0", optional = true }
+tree-sitter-go = { version = "=0.25.0", optional = true }
+tree-sitter-javascript = { version = "=0.25.0", optional = true }
+
+# Documents: Read returns markdown for these.
+# PDF text. It can panic on a malformed file, so every call is caught.
+pdf-extract = "=0.12.1"
+# Spreadsheets: xlsx, xls, ods.
+calamine = { version = "=0.36.1", default-features = false }
+# The archive under docx, pptx, odt (and the bomb check before calamine).
+zip = { version = "=8.6.0", default-features = false, features = ["deflate"] }
+# The XML inside those archives. 0.41 is already in the lock; not bumped.
+quick-xml = { version = "=0.41.0", default-features = false }
+# Readability for an HTML article, as markdown.
+dom_smoothie = { version = "=0.18.2", default-features = false }
+# Whole-page HTML to markdown, for a page that is not an article.
+dom_query = { version = "=0.28.0", default-features = false, features = ["markdown"] }
+
+# Validation: each tool call's input against its own schema, before it runs.
+# Default features off: they pull a network resolver and a TLS stack, and a
+# `$ref` must never make this process fetch anything.
+jsonschema = { version = "=0.58.0", default-features = false }
 
 # Computer use — see docs/COMPUTER_USE.md. THESE ARE NEW PACKAGES, unlike every
 # other entry in this file, and the vetting is recorded in .incord/RULE_ACK:
@@ -158,7 +204,14 @@ libc = "0.2"
 # ---------------------------------------------------------------------------
 
 [features]
-default = []
+# Every Outline grammar is on by default; each can be dropped to shrink the
+# binary, and Outline then says that language was not built in.
+default = ["lang-rust", "lang-ts", "lang-python", "lang-go", "lang-js"]
+lang-rust = ["dep:tree-sitter-rust"]
+lang-ts = ["dep:tree-sitter-typescript"]
+lang-python = ["dep:tree-sitter-python"]
+lang-go = ["dep:tree-sitter-go"]
+lang-js = ["dep:tree-sitter-javascript"]
 
 [dev-dependencies]
 tempfile = "3"

@@ -12,14 +12,35 @@ pub fn read_file(workspace: &Path, input: &str) -> Result<String> {
     let path_str = parsed["path"].as_str().context("missing 'path' field")?;
     let path = resolve_path(workspace, path_str)?;
 
-    let content = std::fs::read_to_string(&path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
-
     let offset = parsed["offset"].as_u64().unwrap_or(0) as usize;
     let limit = parsed["limit"].as_u64().map(|l| l as usize);
 
+    // A document is read as markdown: always for a binary format, and for
+    // HTML, CSV and TSV — which are also source someone edits — when asked.
+    if let Some(kind) = super::documents::Kind::of(&path) {
+        let render = parsed["render"].as_bool().unwrap_or(false);
+        if kind.converts_by_default() || render {
+            let markdown =
+                super::documents::to_markdown(&path, kind).map_err(anyhow::Error::msg)?;
+            return Ok(super::documents::page(
+                &path, kind, &markdown, offset, limit,
+            ));
+        }
+    }
+
+    let content = std::fs::read_to_string(&path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+
     let lines: Vec<&str> = content.lines().collect();
-    let end = limit.map_or(lines.len(), |l| (offset + l).min(lines.len()));
+    // The offset comes from the model; slicing past the end would panic.
+    if offset > lines.len() {
+        anyhow::bail!(
+            "offset {offset} is past the end of {}, which has {} line(s)",
+            path.display(),
+            lines.len()
+        );
+    }
+    let end = limit.map_or(lines.len(), |l| offset.saturating_add(l).min(lines.len()));
 
     let mut result = String::new();
     for (i, line) in lines[offset..end].iter().enumerate() {
@@ -119,96 +140,6 @@ pub fn edit_file(workspace: &Path, input: &str) -> Result<String> {
         result.push_str(&diff);
     }
     Ok(result)
-}
-
-/// Search for files matching a glob pattern.
-pub fn glob_search(workspace: &Path, input: &str) -> Result<String> {
-    let parsed: serde_json::Value =
-        serde_json::from_str(input).unwrap_or_else(|_| serde_json::json!({"pattern": input}));
-
-    let pattern = parsed["pattern"].as_str().context("missing 'pattern'")?;
-    let base = parsed["path"]
-        .as_str()
-        .map(|p| resolve_path(workspace, p))
-        .transpose()?
-        .unwrap_or_else(|| workspace.to_path_buf());
-
-    let base_str = base.to_string_lossy().replace('\\', "/");
-    let base_str = base_str.trim_end_matches('/');
-    let full_pattern = format!("{base_str}/{pattern}");
-    let mut results = Vec::new();
-
-    // A path the glob could not read is skipped rather than failing the search:
-    // one unreadable entry must not hide every other match.
-    for path in glob::glob(&full_pattern)
-        .context("invalid glob pattern")?
-        .flatten()
-    {
-        results.push(path.display().to_string());
-    }
-
-    results.sort();
-    if results.is_empty() {
-        Ok("No files found.".to_string())
-    } else {
-        Ok(results.join("\n"))
-    }
-}
-
-/// Search file contents using regex.
-pub fn grep_search(workspace: &Path, input: &str) -> Result<String> {
-    let parsed: serde_json::Value =
-        serde_json::from_str(input).unwrap_or_else(|_| serde_json::json!({"pattern": input}));
-
-    let pattern_str = parsed["pattern"].as_str().context("missing 'pattern'")?;
-    let base = parsed["path"]
-        .as_str()
-        .map(|p| resolve_path(workspace, p))
-        .transpose()?
-        .unwrap_or_else(|| workspace.to_path_buf());
-    let file_glob = parsed["glob"].as_str().unwrap_or("**/*");
-
-    let re = regex::Regex::new(pattern_str).context("invalid regex")?;
-    let base_str = base.to_string_lossy().replace('\\', "/");
-    let base_str = base_str.trim_end_matches('/');
-    let full_pattern = format!("{base_str}/{file_glob}");
-
-    let mut results = Vec::new();
-    let max_results = 50;
-
-    // A BAD PATTERN IS AN ERROR, NOT AN EMPTY RESULT. This used to fall back to
-    // `glob("")` — which matches nothing — so a mistyped `glob` argument came
-    // back as "no matches found", indistinguishable from a search that genuinely
-    // found nothing. The caller then concludes the code it was looking for does
-    // not exist. Saying which pattern failed costs one line and ends the whole
-    // class of wrong answer. (It also removed this file's only `unwrap`.)
-    let entries =
-        glob::glob(&full_pattern).with_context(|| format!("invalid glob pattern `{file_glob}`"))?;
-    for entry in entries {
-        let Ok(path) = entry else { continue };
-        if !path.is_file() {
-            continue;
-        }
-        let Ok(content) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-
-        for (line_num, line) in content.lines().enumerate() {
-            if re.is_match(line) {
-                results.push(format!("{}:{}: {}", path.display(), line_num + 1, line));
-                if results.len() >= max_results {
-                    results.push(format!("... (truncated at {max_results} matches)"));
-                    return Ok(results.join("\n"));
-                }
-            }
-        }
-    }
-
-    if results.is_empty() {
-        Ok("No matches found.".to_string())
-    } else {
-        Ok(results.join("\n"))
-    }
 }
 
 /// Compute a unified diff between old and new content.
@@ -333,39 +264,6 @@ mod tests {
         (root, workspace)
     }
 
-    /// **A bad glob is an error, not "no matches".** It used to fall back to
-    /// `glob("")`, which matches nothing — so a mistyped pattern came back
-    /// looking exactly like a search that found nothing, and the caller
-    /// concluded the code it was hunting for did not exist.
-    ///
-    /// `a[` is unterminated, which is what `glob` rejects.
-    #[test]
-    fn a_malformed_glob_is_refused_rather_than_reported_as_no_matches() {
-        let (_root, workspace) = workspace_with_outside_secret();
-        std::fs::write(workspace.join("found.txt"), "NEEDLE").unwrap();
-
-        let input = serde_json::json!({ "pattern": "NEEDLE", "glob": "a[" }).to_string();
-        let error = grep_search(&workspace, &input)
-            .expect_err("an unparseable pattern must not read as an empty result");
-        let message = format!("{error:#}");
-        assert!(
-            message.contains("invalid glob pattern"),
-            "the error must say the pattern was the problem; got: {message}"
-        );
-    }
-
-    /// The same call with a valid pattern still finds things — so the test above
-    /// is failing on the pattern and not on a search that never worked.
-    #[test]
-    fn a_valid_glob_still_finds_matches() {
-        let (_root, workspace) = workspace_with_outside_secret();
-        std::fs::write(workspace.join("found.txt"), "NEEDLE").unwrap();
-
-        let input = serde_json::json!({ "pattern": "NEEDLE", "glob": "**/*" }).to_string();
-        let out = grep_search(&workspace, &input).expect("a valid pattern must work");
-        assert!(out.contains("found.txt"), "got: {out}");
-    }
-
     /// Traversal out of the workspace must be refused. Reading proves it: if
     /// containment fails, the call returns the secret's contents.
     #[test]
@@ -385,54 +283,23 @@ mod tests {
         );
     }
 
-    /// The search tools take a `path` too, and it goes through the same
-    /// resolution. Containment was fixed for all call sites at once but only
-    /// proven on read and write; these two were the untested half.
-    ///
-    /// A search that escapes leaks more than a read: it enumerates and greps
-    /// files anywhere on disk.
+    /// **An offset past the end is refused, not a panic.** The offset comes
+    /// from the model, and slicing the line list past its end panicked.
     #[test]
-    fn searching_cannot_escape_the_workspace() {
-        let (root, workspace) = workspace_with_outside_secret();
-        let outside_dir = root.path().to_str().unwrap().to_string();
-
-        for base in ["..", outside_dir.as_str()] {
-            let glob_input = serde_json::json!({ "pattern": "*.txt", "path": base }).to_string();
-            match glob_search(&workspace, &glob_input) {
-                Ok(found) => panic!("glob escaped to `{base}` and listed: {found}"),
-                Err(e) => assert!(
-                    e.to_string().contains("escapes the workspace"),
-                    "refusal must say why; got: {e}"
-                ),
-            }
-
-            let grep_input = serde_json::json!({ "pattern": "SECRET", "path": base }).to_string();
-            match grep_search(&workspace, &grep_input) {
-                Ok(found) => panic!("grep escaped to `{base}` and matched: {found}"),
-                Err(e) => assert!(
-                    e.to_string().contains("escapes the workspace"),
-                    "refusal must say why; got: {e}"
-                ),
-            }
-        }
-    }
-
-    /// Searching inside the workspace must keep working, or containment has
-    /// simply broken the tools instead of securing them.
-    #[test]
-    fn searching_inside_the_workspace_still_works() {
+    fn an_offset_past_the_end_is_refused_not_a_panic() {
         let (_root, workspace) = workspace_with_outside_secret();
-        std::fs::create_dir_all(workspace.join("sub")).unwrap();
-        std::fs::write(workspace.join("sub/found.txt"), "INSIDE-MARKER").unwrap();
+        std::fs::write(workspace.join("short.txt"), "one\ntwo\n").unwrap();
 
-        let glob_input = serde_json::json!({ "pattern": "*.txt", "path": "sub" }).to_string();
-        let listed = glob_search(&workspace, &glob_input).expect("glob inside must work");
-        assert!(listed.contains("found.txt"), "got: {listed}");
+        let past = serde_json::json!({ "path": "short.txt", "offset": 9 }).to_string();
+        match read_file(&workspace, &past) {
+            Ok(contents) => panic!("an offset past the end must be refused, got: {contents}"),
+            Err(e) => assert!(e.to_string().contains("past the end"), "got: {e}"),
+        }
 
-        let grep_input =
-            serde_json::json!({ "pattern": "INSIDE-MARKER", "path": "sub" }).to_string();
-        let matched = grep_search(&workspace, &grep_input).expect("grep inside must work");
-        assert!(matched.contains("found.txt"), "got: {matched}");
+        let huge_limit =
+            serde_json::json!({ "path": "short.txt", "offset": 1, "limit": u64::MAX }).to_string();
+        let tail = read_file(&workspace, &huge_limit).unwrap();
+        assert!(tail.contains("two") && !tail.contains("one"), "got: {tail}");
     }
 
     /// An absolute path outside the workspace must be refused too — it was
@@ -579,30 +446,5 @@ mod tests {
         assert!(result.contains("Wrote"));
         assert!(result.contains("-old content"));
         assert!(result.contains("+new content"));
-    }
-
-    #[test]
-    fn glob_and_grep_work_with_nested_subdirectories_and_backslashes() {
-        let dir = tempfile::tempdir().unwrap();
-        let sub = dir.path().join("sub").join("nested");
-        std::fs::create_dir_all(&sub).unwrap();
-        let file = sub.join("findme.txt");
-        std::fs::write(&file, "magic_target_token\n").unwrap();
-
-        // Test glob search
-        let glob_input = serde_json::json!({
-            "pattern": "**/*.txt"
-        })
-        .to_string();
-        let glob_res = glob_search(dir.path(), &glob_input).unwrap();
-        assert!(glob_res.contains("findme.txt"));
-
-        // Test grep search
-        let grep_input = serde_json::json!({
-            "pattern": "magic_target_token"
-        })
-        .to_string();
-        let grep_res = grep_search(dir.path(), &grep_input).unwrap();
-        assert!(grep_res.contains("magic_target_token"));
     }
 }

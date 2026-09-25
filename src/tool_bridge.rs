@@ -604,6 +604,77 @@ mod tests {
         let _ = parent.join();
     }
 
+    /// The names in the model's tool list, for a parent toolbox of `tools`.
+    fn listed_names(tools: Toolbox) -> Vec<String> {
+        let (bridge, rx) = open(None);
+        let parent = parent_loop(tools, rx);
+        let mut server = server_for(&bridge);
+        let got = mcp(
+            &mut server,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+        );
+        drop(bridge);
+        drop(server);
+        let _ = parent.join();
+        got["result"]["tools"]
+            .as_array()
+            .expect("a list")
+            .iter()
+            .filter_map(|t| t["name"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    /// **OUTLINE REACHES THE MODEL; CONVERTDOCUMENT ONLY WITH LIBREOFFICE.**
+    /// And a document Read and an Outline run in the parent when called, with
+    /// a malformed call refused by the schema before it runs.
+    #[test]
+    fn the_phase_six_tools_are_listed_over_the_bridge_and_run_in_the_parent() {
+        let ws = tempfile::tempdir().expect("ws");
+        let without = listed_names(Toolbox::new(ws.path(), true).with_soffice(None));
+        assert!(without.iter().any(|n| n == "Outline"), "{without:?}");
+        assert!(
+            !without.iter().any(|n| n == "ConvertDocument"),
+            "{without:?}"
+        );
+        let with = listed_names(
+            Toolbox::new(ws.path(), true).with_soffice(Some(ws.path().join("soffice"))),
+        );
+        assert!(with.iter().any(|n| n == "ConvertDocument"), "{with:?}");
+
+        std::fs::write(ws.path().join("m.rs"), "pub fn marker() {}\n").expect("seed");
+        std::fs::write(
+            ws.path().join("d.docx"),
+            crate::tools::documents::fixtures::docx(crate::tools::documents::fixtures::DOCX_BODY),
+        )
+        .expect("seed");
+        let (bridge, rx) = open(None);
+        let parent = parent_loop(Toolbox::new(ws.path(), true).with_soffice(None), rx);
+        let mut server = server_for(&bridge);
+        let outline = mcp(
+            &mut server,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"Outline","arguments":{"path":"m.rs"}}}"#,
+        );
+        assert_eq!(outline["result"]["isError"], false, "{outline}");
+        assert!(outline.to_string().contains("fn marker [L1]"), "{outline}");
+        let read = mcp(
+            &mut server,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"Read","arguments":{"path":"d.docx"}}}"#,
+        );
+        assert!(read.to_string().contains("# Quarterly Report"), "{read}");
+        let bad = mcp(
+            &mut server,
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"Outline","arguments":{}}}"#,
+        );
+        assert_eq!(bad["result"]["isError"], true, "{bad}");
+        assert!(
+            bad.to_string().contains("does not match its schema"),
+            "{bad}"
+        );
+        drop(bridge);
+        drop(server);
+        let _ = parent.join();
+    }
+
     /// **A CALL IS RUN BY THE PARENT'S TOOLBOX**, and the parent shows it as
     /// its own call and result.
     #[test]

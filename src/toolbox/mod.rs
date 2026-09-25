@@ -47,18 +47,21 @@
 //! tool at all — the call is refused before anything else is asked.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use serde_json::{json, Value};
 
 use crate::agent::AgentBackend;
 
 mod checks;
+mod convert;
 mod edits;
 mod listing;
+mod outline;
 mod shell;
 mod team;
 mod todo;
+mod validate;
 
 pub(crate) use todo::{parse_todos, Priority, TodoStatus};
 
@@ -80,6 +83,10 @@ pub const LS: &str = "LS";
 pub const GLOB: &str = "Glob";
 /// Search file contents.
 pub const GREP: &str = "Grep";
+/// A source file's symbols, from its syntax tree.
+pub const OUTLINE: &str = "Outline";
+/// An office document to PDF, when LibreOffice is installed.
+pub const CONVERT_DOCUMENT: &str = "ConvertDocument";
 /// Run a shell command, in the foreground or as a background job.
 pub const BASH: &str = "Bash";
 /// Read what a background job has said since it was last read.
@@ -157,7 +164,7 @@ pub fn reach_of(name: &str) -> Option<Reach> {
         BLAST_RADIUS_TOOL, FORGET_TOOL, REMEMBER_TOOL, SEARCH_TOOL, SKELETON_TOOL, SYMBOL_TOOL,
     };
     Some(match name {
-        READ | GLOB | GREP | LS | BASH_OUTPUT | SKILL => Reach::Observe,
+        READ | GLOB | GREP | LS | OUTLINE | BASH_OUTPUT | SKILL => Reach::Observe,
         crate::web::FETCH_TOOL | crate::web::SEARCH_TOOL => Reach::Observe,
         crate::recall::INDEX_TOOL | crate::recall::GET_TOOL => Reach::Observe,
         SEARCH_TOOL | SYMBOL_TOOL | SKELETON_TOOL | BLAST_RADIUS_TOOL => Reach::Observe,
@@ -168,6 +175,8 @@ pub fn reach_of(name: &str) -> Option<Reach> {
             Reach::Record
         }
         WRITE | EDIT | MULTI_EDIT | APPLY_PATCH | NOTEBOOK_EDIT => Reach::Change,
+        // It writes a PDF into the workspace.
+        CONVERT_DOCUMENT => Reach::Change,
         BASH | KILL_SHELL | DIAGNOSTICS | AGENT | crate::verify::VERIFY_TOOL => Reach::Run,
         _ => return None,
     })
@@ -315,6 +324,9 @@ pub struct Toolbox {
     state: Arc<SessionTools>,
     /// The team channel, spoken on as the role this agent holds.
     team: team::Team,
+    /// LibreOffice's `soffice`, looked for once, the first time it matters.
+    /// `ConvertDocument` is offered only when it was found.
+    soffice: OnceLock<Option<PathBuf>>,
 }
 
 impl Toolbox {
@@ -341,6 +353,31 @@ impl Toolbox {
             mode: None,
             state: SessionTools::new(filter_env),
             team: team::Team::new(workspace),
+            soffice: OnceLock::new(),
+        }
+    }
+
+    /// LibreOffice, when it is installed where [`convert::find_soffice`]
+    /// looks.
+    fn soffice(&self) -> Option<&Path> {
+        self.soffice
+            .get_or_init(|| convert::find_soffice(&|name| std::env::var_os(name)))
+            .as_deref()
+    }
+
+    /// Whether this session offers `name`. Every tool is offered except
+    /// `ConvertDocument` where LibreOffice was not found.
+    fn offered(&self, name: &str) -> bool {
+        name != CONVERT_DOCUMENT || self.soffice().is_some()
+    }
+
+    /// This toolbox with LibreOffice found at `soffice`, or not at all,
+    /// whatever this machine has installed.
+    #[cfg(test)]
+    pub(crate) fn with_soffice(self, soffice: Option<PathBuf>) -> Self {
+        Self {
+            soffice: OnceLock::from(soffice),
+            ..self
         }
     }
 
@@ -645,6 +682,8 @@ impl Toolbox {
                 .unwrap_or("")
                 .to_string()]),
             APPLY_PATCH => edits::patch_paths(input),
+            // The PDF it writes, not the document it reads.
+            CONVERT_DOCUMENT => Ok(vec![convert::output_path(input)]),
             _ => Ok(Vec::new()),
         }
     }
@@ -697,64 +736,101 @@ impl Toolbox {
         crate::spec::refuse_source_write(&self.workspace, path)
     }
 
-    /// Every tool, as the model is told about them.
-    ///
-    /// The file and shell schemas are written here because their
-    /// implementations never had any; the rest come from the modules that own
-    /// them, so a tool's description lives beside the code that honours it.
+    /// Every tool this session offers, as the model is told about them: the
+    /// whole [`catalogue`], less `ConvertDocument` where LibreOffice is not
+    /// installed.
     #[must_use]
     pub fn definitions(&self) -> Vec<Value> {
-        let mut all = vec![
-            json!({
-                "name": READ,
-                "description": "Read a file from the workspace. Returns the text with line \
-                    numbers. Use `offset` and `limit` to take part of a large file rather \
-                    than all of it.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string", "description": "File to read, relative to the workspace or absolute."},
-                        "offset": {"type": "integer", "description": "First line to return, counting from 0."},
-                        "limit": {"type": "integer", "description": "How many lines to return."}
-                    },
-                    "required": ["path"]
-                }
-            }),
-            json!({
-                "name": WRITE,
-                "description": "Create a file, or replace one entirely. When the file already \
-                    exists the reply includes a diff of what changed. Prefer Edit for a small \
-                    change to a large file.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string"},
-                        "content": {"type": "string", "description": "The complete new contents."}
-                    },
-                    "required": ["path", "content"]
-                }
-            }),
-            json!({
-                "name": EDIT,
-                "description": "Replace an exact string in a file. The old string must appear \
-                    exactly once, so include enough surrounding text to be unambiguous.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string"},
-                        "old_string": {"type": "string", "description": "Text to replace, matched exactly."},
-                        "new_string": {"type": "string", "description": "What to put in its place."}
-                    },
-                    "required": ["path", "old_string", "new_string"]
-                }
-            }),
-        ];
-        all.extend(edits::definitions());
-        all.push(listing::definition());
-        all.extend([
+        catalogue()
+            .into_iter()
+            .filter(|def| {
+                def.get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| self.offered(name))
+            })
+            .collect()
+    }
+
+    /// The name of every tool offered.
+    #[must_use]
+    pub fn names(&self) -> Vec<String> {
+        self.definitions()
+            .iter()
+            .filter_map(|d| d.get("name").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect()
+    }
+}
+
+/// Every tool there is, as the model is told about them, whether or not this
+/// session offers it. Also the source of the schemas every call's input is
+/// checked against ([`validate`]).
+///
+/// The file and shell schemas are written here because their
+/// implementations never had any; the rest come from the modules that own
+/// them, so a tool's description lives beside the code that honours it.
+fn catalogue() -> Vec<Value> {
+    let mut all = vec![
+        json!({
+            "name": READ,
+            "description": "Read a file from the workspace. Returns the text with line \
+                numbers. Use `offset` and `limit` to take part of a large file rather \
+                than all of it. A document — PDF, Word (.docx), PowerPoint (.pptx, with \
+                speaker notes), a spreadsheet (.xlsx, .xls, .ods), OpenDocument text (.odt) \
+                — comes back as markdown, and `offset`/`limit` page through that. HTML, CSV \
+                and TSV come back as their source unless `render` is set, which returns the \
+                page as markdown or the table as a markdown table.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File to read, relative to the workspace or absolute."},
+                    "offset": {"type": "integer", "minimum": 0, "description": "First line to return, counting from 0."},
+                    "limit": {"type": "integer", "minimum": 1, "description": "How many lines to return."},
+                    "render": {"type": "boolean", "description": "For HTML, CSV or TSV: return markdown instead of the source."}
+                },
+                "required": ["path"]
+            }
+        }),
+        json!({
+            "name": WRITE,
+            "description": "Create a file, or replace one entirely. When the file already \
+                exists the reply includes a diff of what changed. Prefer Edit for a small \
+                change to a large file.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string", "description": "The complete new contents."}
+                },
+                "required": ["path", "content"]
+            }
+        }),
+        json!({
+            "name": EDIT,
+            "description": "Replace an exact string in a file. The old string must appear \
+                exactly once, so include enough surrounding text to be unambiguous.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "old_string": {"type": "string", "description": "Text to replace, matched exactly."},
+                    "new_string": {"type": "string", "description": "What to put in its place."}
+                },
+                "required": ["path", "old_string", "new_string"]
+            }
+        }),
+    ];
+    all.extend(edits::definitions());
+    all.push(listing::definition());
+    all.extend([
             json!({
                 "name": GLOB,
-                "description": "Find files whose paths match a pattern, such as `**/*.rs`.",
+                "description": "Find files whose paths match a glob. A pattern with no `/` \
+                    matches file names at any depth (`*.rs`); one with a `/` matches the path \
+                    from `path`, where `*` stays in one directory and `**` crosses them \
+                    (`src/**/*.ts`). Skips what .gitignore, .ignore and .git/info/exclude \
+                    exclude, hidden files, node_modules and build caches — the same files Grep \
+                    and LS skip. Lists files only, sorted; long results are cut and counted.",
                 "input_schema": {
                     "type": "object",
                     "properties": {
@@ -766,17 +842,25 @@ impl Toolbox {
             }),
             json!({
                 "name": GREP,
-                "description": "Search file contents for a regular expression.",
+                "description": "Search file contents for a regular expression (Rust regex \
+                    syntax), line by line. Skips the same files Glob and LS skip. Reports a \
+                    binary file that matches without printing it, reads UTF-16 files, and stops \
+                    at 100 matching lines — saying so — so narrow with `path` or `glob` when it \
+                    does.",
                 "input_schema": {
                     "type": "object",
                     "properties": {
                         "pattern": {"type": "string", "description": "Regular expression to search for."},
-                        "path": {"type": "string", "description": "Directory to search under. Defaults to the workspace."},
-                        "glob": {"type": "string", "description": "Only search files matching this, e.g. `*.rs`."}
+                        "path": {"type": "string", "description": "Directory or file to search. Defaults to the workspace."},
+                        "glob": {"type": "string", "description": "Only search files matching this, e.g. `*.rs` or `src/**/*.ts`."},
+                        "context": {"type": "integer", "minimum": 0, "maximum": crate::tools::search::MAX_CONTEXT_LINES, "description": "Lines of context to show before and after each match."},
+                        "case_insensitive": {"type": "boolean", "description": "Match regardless of case."}
                     },
                     "required": ["pattern"]
                 }
             }),
+            outline::definition(),
+            convert::definition(),
             json!({
                 "name": BASH,
                 "description": "Run a shell command in the workspace and return its output. \
@@ -795,10 +879,10 @@ impl Toolbox {
                 }
             }),
         ]);
-        all.extend(shell::definitions());
-        all.push(todo::definition());
-        all.push(checks::definition());
-        all.extend([
+    all.extend(shell::definitions());
+    all.push(todo::definition());
+    all.push(checks::definition());
+    all.extend([
             json!({
                 "name": SKILL,
                 "description": "Read one skill's own text. The session lists what skills exist                     and what each is for, but not their contents — ask for one BY NAME when the                     work matches its description, and follow it only after reading it.",
@@ -885,22 +969,13 @@ impl Toolbox {
             // the loop stalls on a brief that can never be saved.
             crate::brief::save_tool_definition(),
         ]);
-        all.extend(crate::knowledge::tool_definitions());
-        all.extend(crate::web::tool_definitions());
-        all.extend(team::definitions());
-        all
-    }
+    all.extend(crate::knowledge::tool_definitions());
+    all.extend(crate::web::tool_definitions());
+    all.extend(team::definitions());
+    all
+}
 
-    /// The name of every tool offered.
-    #[must_use]
-    pub fn names(&self) -> Vec<String> {
-        self.definitions()
-            .iter()
-            .filter_map(|d| d.get("name").and_then(Value::as_str))
-            .map(str::to_string)
-            .collect()
-    }
-
+impl Toolbox {
     /// Carry out one call.
     ///
     /// A failure comes back as `Err` and belongs in the model's `tool_result`
@@ -926,6 +1001,22 @@ impl Toolbox {
             reach.as_str(),
             crate::text::truncate(&input.to_string(), 160)
         );
+        // A tool this session does not offer is not run, even by a model
+        // that knows its name from elsewhere.
+        if !self.offered(name) {
+            crate::trace!("tool", "{name} REFUSED: not offered in this session");
+            return Err(format!(
+                "{name} is not available: LibreOffice was not found (install it, or set {} to \
+                 its soffice executable)",
+                convert::SOFFICE_ENV
+            ));
+        }
+        // The input the tool's own schema promised, before anything is asked
+        // or decided about it: a malformed call runs nothing.
+        if let Err(problems) = validate::check(name, input) {
+            crate::trace!("tool", "{name} REFUSED: input does not match its schema");
+            return Err(problems);
+        }
         // BEFORE the call, not after. The sentinel that watches the tree can
         // only report a write that already happened; a protected path has to be
         // refused while refusing it still means something.
@@ -986,7 +1077,7 @@ impl Toolbox {
             cwd: &self.workspace,
             transcript: None,
         };
-        if name != APPLY_PATCH {
+        if name != APPLY_PATCH && name != CONVERT_DOCUMENT {
             engine.code_edit(at, name, &self.event_input(name, input), said);
             return;
         }
@@ -1128,12 +1219,15 @@ impl Toolbox {
     /// changes, as `paths`. Everything else is passed unchanged.
     fn event_input(&self, name: &str, input: &Value) -> Value {
         let mut shown = input.clone();
-        if matches!(name, READ | WRITE | EDIT | MULTI_EDIT | NOTEBOOK_EDIT | LS) {
+        if matches!(
+            name,
+            READ | WRITE | EDIT | MULTI_EDIT | NOTEBOOK_EDIT | LS | OUTLINE | CONVERT_DOCUMENT
+        ) {
             if let Some(path) = input.get("path").and_then(Value::as_str) {
                 shown["path"] = json!(self.absolute(path));
             }
         }
-        if name == APPLY_PATCH {
+        if name == APPLY_PATCH || name == CONVERT_DOCUMENT {
             if let Ok(paths) = self.changed_paths(name, input) {
                 let named: Vec<String> = paths.iter().map(|p| self.absolute(p)).collect();
                 shown["paths"] = json!(named);
@@ -1185,7 +1279,7 @@ impl Toolbox {
         // The workspace, or the added directory the call names a path in.
         let ws = if matches!(
             name,
-            READ | WRITE | EDIT | GLOB | GREP | MULTI_EDIT | NOTEBOOK_EDIT | LS
+            READ | WRITE | EDIT | GLOB | GREP | MULTI_EDIT | NOTEBOOK_EDIT | LS | OUTLINE
         ) {
             self.root_for(input)
         } else {
@@ -1207,8 +1301,15 @@ impl Toolbox {
             NOTEBOOK_EDIT => edits::notebook_edit(ws, input),
             APPLY_PATCH => edits::apply_patch(input, &|path| self.resolve(path)),
             LS => listing::list(ws, input),
-            GLOB => crate::tools::file_ops::glob_search(ws, &raw).map_err(|e| e.to_string()),
-            GREP => crate::tools::file_ops::grep_search(ws, &raw).map_err(|e| e.to_string()),
+            GLOB => crate::tools::search::glob_search(ws, input),
+            GREP => crate::tools::search::grep_search(ws, input),
+            OUTLINE => outline::run(ws, input),
+            CONVERT_DOCUMENT => match self.soffice() {
+                Some(soffice) => {
+                    convert::run(soffice, input, self.filter_env, &|path| self.resolve(path))
+                }
+                None => Err("LibreOffice was not found".to_string()),
+            },
             BASH if background => shell::start(&self.state, ws, input),
             BASH => crate::tools::bash::execute_bash(ws, &raw, self.filter_env)
                 .map_err(|e| e.to_string()),
@@ -1249,3 +1350,6 @@ mod tests;
 
 #[cfg(test)]
 mod tool_tests;
+
+#[cfg(test)]
+mod reading_tests;

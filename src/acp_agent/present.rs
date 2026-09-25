@@ -372,9 +372,9 @@ fn side(text: &str) -> String {
 /// [`acp::ToolKind::Other`], never a guess.
 pub(crate) fn tool_kind(name: &str) -> acp::ToolKind {
     match name.to_ascii_lowercase().as_str() {
-        "read" | "notebookread" | "read_file" | "bashoutput" => acp::ToolKind::Read,
+        "read" | "notebookread" | "read_file" | "bashoutput" | "outline" => acp::ToolKind::Read,
         "edit" | "multiedit" | "write" | "notebookedit" | "apply_patch" | "applypatch"
-        | "write_file" => acp::ToolKind::Edit,
+        | "write_file" | "convertdocument" => acp::ToolKind::Edit,
         "bash" | "powershell" | "shell" | "exec_command" | "run_shell_command" | "killshell"
         | "diagnostics" => acp::ToolKind::Execute,
         "grep" | "glob" | "ls" | "search" | "toolsearch" | "watchman_lookup" => {

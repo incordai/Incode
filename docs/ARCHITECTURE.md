@@ -563,6 +563,12 @@ table, `toolbox::reach_of`:
   (fail closed); `observe` and `session` tools run, traced (fail open).
 
 A name missing from the table is refused as no tool at all, before anything is asked.
+Then, still before the guards, the mode or the engine, the call's input is checked
+against the schema its own tool advertises (`toolbox::validate`, jsonschema; the
+schemas are compiled once per process from the full catalogue): a malformed call runs
+nothing and comes back as an error listing every violation with its JSON path.
+`ConvertDocument` is offered only where LibreOffice is found, and a call to it anywhere
+else is refused before validation.
 `change` tools are also checked against the operator's guards for EVERY file they touch
 (`Toolbox::changed_paths`), snapshotted file by file for `/undo` when a checkpoint store
 is attached, and reported to the engine's `code-edit` hook once they land (once per file
@@ -570,19 +576,21 @@ for a patch). The ACP kind is `acp_agent::present::tool_kind`.
 
 | Tool | Reach | ACP kind | Bound | Notes |
 |---|---|---|---|---|
-| `Read` | observe | read | — | |
+| `Read` | observe | read | documents: `MAX_DOCUMENT_BYTES` 32 MiB in, `MAX_DOCUMENT_READ_CHARS` 60 000 out; archives `MAX_UNZIPPED_BYTES` 96 MiB inflated, `MAX_ZIP_ENTRIES` 10 000; tables `MAX_TABLE_ROWS` 200, `MAX_TABLE_COLUMNS` 40, `MAX_SHEETS` 30; `MAX_SLIDES` 500; PDF 60 s | a document comes back as markdown, paged by `offset`/`limit` (`tools::documents`): PDF (pdf-extract, on its own thread under `catch_unwind`), xlsx/xlsm/xlsb/xls/ods (calamine, a table per sheet), docx, pptx (slides in presentation order, with speaker notes) and odt (one zip + quick-xml walker). HTML, CSV and TSV stay source unless `render` is set. The zip budget is counted on bytes actually inflated, not the sizes the archive states. |
 | `Write`, `Edit` | change | edit | — | |
 | `MultiEdit` | change | edit | `MAX_EDITS` 100, report `MAX_CHANGE_REPORT_CHARS` 30 000 | all or none, in memory first |
 | `ApplyPatch` | change | edit | `MAX_PATCH_FILES` 50 | unified diff; add/modify/delete; every hunk checked before any write; a failed write puts back the files already written; renames and binary patches refused |
 | `NotebookEdit` | change | edit | `MAX_NOTEBOOK_BYTES` 32 MiB | replace / insert / delete a cell by id or index; written back as 1-space-indented JSON |
-| `LS` | observe | search | `MAX_LS_ENTRIES` 500 | no ignore list of its own (Glob has none); `ignore` patterns from the model |
-| `Glob`, `Grep` | observe | search | Grep: 50 matches | |
+| `LS` | observe | search | `MAX_LS_ENTRIES` 500 | the shared walker at depth 1; what it skipped is NAMED (up to 20, the rest counted); `ignore` patterns from the model |
+| `Glob`, `Grep` | observe | search | Glob `MAX_GLOB_RESULTS` 500 (rest counted); Grep `MAX_GREP_MATCHES` 100 matching lines (says it stopped), 300 chars a line, 30 000 chars, files over 50 MiB counted not searched | ripgrep's engine (`tools::search`). One walker for Glob, Grep and LS: `.gitignore`, `.ignore`, `.git/info/exclude` with `require_git(false)`, hidden files, `node_modules` and any directory holding `CACHEDIR.TAG` skipped. The model's glob is applied with globset AFTER the walk (an override or type filter re-admits hidden files — measured); no `/` matches a name at any depth, a `/` anchors to `path`. Grep: context lines, case-insensitive, a matching binary file reported without its bytes, non-matching binaries counted, BOM-marked UTF-16 transcoded. |
+| `Outline` | observe | read | `MAX_OUTLINE_SYMBOLS` 400, `MAX_OUTLINE_BYTES` 4 MiB, 10 s parse | tree-sitter queries for rs, ts/tsx, js/jsx/mjs/cjs, py, go (`toolbox::outline`); kind, name, signature and line range, nested; a syntax error's line is reported; another language is refused by name. Each grammar is a cargo feature (`lang-rust`, `lang-ts`, `lang-python`, `lang-go`, `lang-js`), all default. |
+| `ConvertDocument` | change | edit | `CONVERT_DEADLINE` 120 s, whole-tree kill | OFFERED ONLY when `soffice` is found: `INCODE_SOFFICE` (alone, when set), then `PATH`, then the platform's install paths. Headless, `--norestore --nologo --nodefault --nolockcheck`, a private `-env:UserInstallation` profile in a temp dir, PDF made there and copied into place; the guards and the checkpoint see the OUTPUT path. The conversion itself has run only against a fake `soffice`: LibreOffice is not installed on the development machine. |
 | `Bash` | run | execute | output 30 000 chars; timeout | `run_in_background` starts a session job (`MAX_RUNNING_JOBS` 8) |
 | `BashOutput` | observe | read | `MAX_JOB_READ_BYTES` 30 000 per read; `MAX_JOB_BUFFER_BYTES` 1 MiB kept per stream | new output since the last read; loss past the buffer is counted |
 | `KillShell` | run | execute | — | kills the job's process tree |
 | `TodoWrite` | session | think | `MAX_TODOS` 100, `MAX_TODO_CHARS` 500 | kept per session; `--acp` sends it as the plan, with its priority, on the call's successful result |
 | `Diagnostics` | run | execute | `PROJECT_CHECK_TIMEOUT` 300 s, `MAX_PROJECT_FINDINGS` 50, `MAX_DIAGNOSTIC_FILES` 50 | `INCORD_CHECK_CMD`, else `cargo check` / `tsc --noEmit` |
-| `WebFetch` | observe | fetch | 20 s, 512 KiB read, 20 000 chars shown | private addresses refused by name and by resolution; carries no credential |
+| `WebFetch` | observe | fetch | 20 s, 512 KiB read, 20 000 chars shown | private addresses refused by name and by resolution; carries no credential; an HTML answer becomes markdown through Read's HTML conversion (readability when the page reads as an article, the whole page less nav/scripts otherwise), anything else is returned as sent |
 | `WebSearch` | observe | fetch | 15 s, 512 KiB, 8 results | provider from `admin.json` `web_search` — contract in `web::search_with` |
 | `Skill` | observe | other | — | |
 | `Agent` | run | other | depth 2 | |
@@ -612,6 +620,34 @@ route's `tool_result`, the ACP tool-call update). Second, the desktop owns proce
 state the harness should not take on: per-monitor DPI awareness set at startup, the input
 thread, and its kill switch — EOF on its own stdin stops it, and a stop file beside its
 journal is checked before every call. Both are the next phase's work.
+
+### Dependencies (phase 6a)
+
+Each vetted in a scratch crate and approved by the owner; each pinned exactly (`=`) in
+`Cargo.toml`, with a one-line comment there. The lock gained 115 packages and changed
+none; every one of the 115 manifests was read, 72 declare a `rust-version`, the highest
+is 1.88 (calamine, globset, ignore, zip), so the crate's floor is unchanged.
+
+| Crate | Pin | Why |
+|---|---|---|
+| `ignore` | 0.4.33 | ripgrep's walker: `.gitignore` / `.ignore` / `.git/info/exclude`, hidden files, inside or outside a repo — the one walker Glob, Grep and LS share |
+| `grep-searcher` | 0.1.17 | line search with context lines, binary detection and BOM transcoding |
+| `grep-regex` | 0.1.14 | the regex matcher grep-searcher drives |
+| `globset` | 0.4.20 | the model's glob, applied after the walk so it only narrows |
+| `tree-sitter` | 0.26.13 | parser runtime and query engine for Outline |
+| `tree-sitter-language` | 0.1.7 | held back: 0.1.8 declares rust-version 1.90 |
+| `tree-sitter-rust` / `-typescript` / `-python` / `-go` / `-javascript` | 0.24.2 / 0.23.2 / 0.25.0 / 0.25.0 / 0.25.0 | one grammar per language, each behind its `lang-*` feature |
+| `pdf-extract` | 0.12.1 | PDF text; can panic, so every call is on its own thread under `catch_unwind`, with a deadline and an input size bound |
+| `calamine` | 0.36.1, no default features | xlsx / xlsm / xlsb / xls / ods |
+| `zip` | 8.6.0, `deflate` only | the archive under docx / pptx / odt, and the bomb check before calamine |
+| `quick-xml` | 0.41.0, no default features | the XML in those archives; 0.41 was already in the lock |
+| `dom_smoothie` | 0.18.2, no default features | readability: an HTML article as markdown |
+| `dom_query` | 0.28.0, `markdown` only | a page that is not an article, as markdown |
+| `jsonschema` | 0.58.0, no default features | each call's input against its tool's schema; the defaults would add a network resolver and a TLS stack, and a `$ref` must never fetch |
+
+Removed: `walkdir` (no `.rs` file used it) and `glob` (its two uses were the Glob/Grep
+walk and LS's `ignore`, both now globset). Both remain in the lock as other packages'
+dependencies.
 
 ---
 

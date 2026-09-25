@@ -187,10 +187,13 @@ fn asking_for_a_skill_without_naming_one_costs_no_request() {
     // An unnamed ask cannot match anything, so going to the store for it
     // spends a request and a four-second timeout to answer a question that
     // was already answered.
+    // Blank, not missing: a missing `name` is now refused by the schema check
+    // before the tool is reached; a blank one passes it and must still be
+    // caught here.
     let dir = tempfile::tempdir().expect("tmp");
     let started = std::time::Instant::now();
     let refused = toolbox(dir.path())
-        .run(SKILL, &json!({}))
+        .run(SKILL, &json!({"name": "  "}))
         .expect_err("nothing to look up");
     assert!(refused.contains("say which skill"), "{refused}");
     assert!(
