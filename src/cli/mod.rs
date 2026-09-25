@@ -21,7 +21,6 @@ use std::path::Path;
 use crate::config::IncordCodeConfig;
 use crate::permissions::PermissionMode;
 use crate::runtime::lifecycle::LifecycleHooks;
-use crate::tools::bash_jobs::BashJobManager;
 use crate::tools::git_context;
 use crate::tools::tool_status::ToolStatusCache;
 
@@ -688,7 +687,11 @@ impl CliApp {
             });
         }
         let mut editor = LineEditor::new(Some(history_path));
-        let mut job_mgr = BashJobManager::new().with_env_filter(self.config.env_filter_enabled);
+        // The session's own jobs: `/bg` and the model's background `Bash`
+        // share one table, so `/jobs` shows both and the stop hook waits on
+        // both.
+        let session_tools = session.session_tools();
+        session_tools.jobs().env_filter_enabled = self.config.env_filter_enabled;
 
         // Print tool status summary
         if tool_cache.installed_count() > 0 {
@@ -1487,10 +1490,10 @@ impl CliApp {
                     SlashCommand::Plan => slash_commands::handle_plan(&mut session),
                     SlashCommand::Act => slash_commands::handle_act(&mut session),
                     SlashCommand::Jobs => {
-                        slash_commands::handle_jobs(&job_mgr);
+                        slash_commands::handle_jobs(&mut session_tools.jobs());
                     }
                     SlashCommand::Kill(id) => {
-                        if job_mgr.kill(id) {
+                        if session_tools.jobs().kill(id) {
                             render::print_info(&format!("Job #{id} killed."));
                         } else {
                             render::print_error(&format!(
@@ -1498,14 +1501,16 @@ impl CliApp {
                             ));
                         }
                     }
-                    SlashCommand::Background(cmd) => match job_mgr.spawn(&cmd, &workspace) {
-                        Ok(id) => {
-                            render::print_info(&format!("Job #{id} started: {cmd}"));
+                    SlashCommand::Background(cmd) => {
+                        match session_tools.jobs().spawn(&cmd, &workspace) {
+                            Ok(id) => {
+                                render::print_info(&format!("Job #{id} started: {cmd}"));
+                            }
+                            Err(e) => {
+                                render::print_error(&format!("Failed to start job: {e}"));
+                            }
                         }
-                        Err(e) => {
-                            render::print_error(&format!("Failed to start job: {e}"));
-                        }
-                    },
+                    }
                     SlashCommand::Worktree(arg) => {
                         slash_commands::handle_worktree(arg.as_deref(), &workspace);
                     }
@@ -1529,7 +1534,8 @@ impl CliApp {
             }
 
             // Poll background jobs for completion notifications
-            for (id, output, code) in job_mgr.poll_completed() {
+            let finished = session_tools.jobs().poll_completed();
+            for (id, output, code) in finished {
                 outln!();
                 if code == 0 {
                     render::print_info(&format!("Job #{id} completed."));
@@ -1588,9 +1594,9 @@ impl CliApp {
             // every time, contributing nothing and costing 1.2s of the
             // operator's wait per message. What memory has to say is fetched
             // once per session instead, into the cached prefix.
-            // A `/bg` job still running makes the turn's stop a wait rather
-            // than an end: the memory engine is not asked about it.
-            session.set_background_jobs(job_mgr.running_count());
+            // A background job still running as the turn ends makes its stop
+            // a wait rather than an end: the session counts them itself, at
+            // that moment, from the table `/bg` and the model share.
             // Context, checkpoint, turn and streaming all live in one place
             // now, shared with the one-shot path above so the two cannot drift.
             if let Err(e) = run_one_turn(&mut session, &workspace, &augmented_input, &line) {
@@ -1749,20 +1755,22 @@ fn permission_mode_from_env() -> crate::permissions::PermissionMode {
     }
 }
 
-/// Every MCP server this harness hands a spawned agent, as one config.
+/// The MCP servers a model incode drives through its tool bridge still gets
+/// beside the bridge, as one config — today only the desktop, when it is
+/// switched on.
 ///
-/// # Why they are merged and not passed separately
+/// # Why the team channel is not here
 ///
-/// Each server's config is a whole `mcpServers` object. Handing an agent two
-/// of them means whichever is applied last wins and the other server is
-/// silently absent — the agent starts, works, and simply has no way to reach
-/// its team, with nothing anywhere saying so.
+/// Its tools are incode's own now (`toolbox::team`), reached through the
+/// bridge like every other tool, so the guards, the permission mode and the
+/// memory engine's hooks cover them. Registering the separate server as well
+/// would hand the model the same four tools twice, one copy unguarded.
 ///
-/// The team channel is always registered; the desktop only when it is
-/// switched on. They differ because they are different kinds of thing: a
-/// desktop is a capability over the operator's machine and is opt-in, while
-/// talking to the other agents on your own project has no blast radius and no
-/// reason to be off.
+/// # Why the desktop still is
+///
+/// Its screenshot answers with an image, and a toolbox result is text; see
+/// `docs/ARCHITECTURE.md`, "Tools", for what moving it needs. It stays opt-in:
+/// a desktop is a capability over the operator's machine.
 pub(crate) fn mcp_config_for(
     desktop: bool,
     exe: Option<std::path::PathBuf>,
@@ -1774,24 +1782,16 @@ pub(crate) fn mcp_config_for(
     // server that will not start — which is a far harder thing to diagnose
     // than simply not offering it.
     let exe = exe?;
-    let mut servers = serde_json::Map::new();
-
-    servers.insert(
-        crate::team_mcp::CLIENT_KEY.to_string(),
-        crate::team_mcp::client_entry(&exe, &crate::team::path_in(workspace)),
-    );
-
-    if desktop {
-        let journal = crate::desktop::journal::path_in(workspace);
-        let desktop_config = crate::desktop::mcp::client_config(&exe, Some(&journal), mode);
-        if let Some(entry) = desktop_config
-            .get("mcpServers")
-            .and_then(|m| m.get(crate::desktop::mcp::CLIENT_KEY))
-        {
-            servers.insert(crate::desktop::mcp::CLIENT_KEY.to_string(), entry.clone());
-        }
+    if !desktop {
+        return None;
     }
-
+    let journal = crate::desktop::journal::path_in(workspace);
+    let desktop_config = crate::desktop::mcp::client_config(&exe, Some(&journal), mode);
+    let entry = desktop_config
+        .get("mcpServers")
+        .and_then(|m| m.get(crate::desktop::mcp::CLIENT_KEY))?;
+    let mut servers = serde_json::Map::new();
+    servers.insert(crate::desktop::mcp::CLIENT_KEY.to_string(), entry.clone());
     Some(serde_json::json!({ "mcpServers": servers }).to_string())
 }
 
@@ -2385,11 +2385,10 @@ mod tests {
     fn the_desktop_is_not_handed_over_unless_it_is_switched_on() {
         let exe = Some(std::path::PathBuf::from("C:/bin/incode.exe"));
 
-        let off = mcp_config_for(false, exe.clone(), Path::new("C:/work"), ORDINARY)
-            .expect("the team channel is registered either way");
-        assert!(
-            !off.contains("--desktop-mcp"),
-            "the desktop must not be offered when the switch is off: {off}"
+        let off = mcp_config_for(false, exe.clone(), Path::new("C:/work"), ORDINARY);
+        assert_eq!(
+            off, None,
+            "the desktop must not be offered when the switch is off"
         );
 
         let config = mcp_config_for(true, exe, Path::new("C:/work"), ORDINARY)
@@ -2402,13 +2401,12 @@ mod tests {
         assert!(config.contains("desktop.jsonl"), "got: {config}");
     }
 
-    /// **NEITHER SERVER MAY HIDE THE OTHER.**
-    ///
-    /// Each one's config is a whole `mcpServers` object. Assembled carelessly
-    /// the second overwrites the first, and the agent starts with one server
-    /// missing and nothing anywhere saying so.
+    /// **THE TEAM CHANNEL IS NOT A SECOND SERVER ANY MORE.** Its tools are
+    /// incode's own, reached through the bridge; registering the separate
+    /// server too would hand the model the same tools twice, one copy
+    /// unguarded.
     #[test]
-    fn both_servers_survive_being_registered_together() {
+    fn the_desktop_is_the_only_server_beside_the_bridge() {
         let exe = Some(std::path::PathBuf::from("C:/bin/incode.exe"));
         let config = mcp_config_for(true, exe, Path::new("C:/work"), ORDINARY).expect("a config");
 
@@ -2423,10 +2421,10 @@ mod tests {
             "{config}"
         );
         assert!(
-            servers.contains_key(crate::team_mcp::CLIENT_KEY),
+            !servers.contains_key(crate::team_mcp::CLIENT_KEY),
             "{config}"
         );
-        assert_eq!(servers.len(), 2, "got: {config}");
+        assert_eq!(servers.len(), 1, "got: {config}");
     }
 
     /// No path to this binary means no usable config — for either server.
@@ -2489,15 +2487,8 @@ mod tests {
             .mcp_config()
             .expect("the desktop is on, so the agent gets it");
         assert!(config.contains("--desktop-mcp"), "got: {config}");
-
-        // **BOTH SERVERS, IN ONE CONFIG.** Each one's config is a whole
-        // `mcpServers` object, so handing over two means the second replaces
-        // the first and one server is silently missing — the agent starts,
-        // works, and simply cannot reach what it was supposed to.
-        assert!(
-            config.contains("--team-mcp"),
-            "the desktop config swallowed the team server: {config}"
-        );
+        // The team channel's tools come through the bridge, not as a server.
+        assert!(!config.contains("--team-mcp"), "got: {config}");
 
         let off = run_backend_with_desktop(
             Path::new("."),
@@ -2508,14 +2499,11 @@ mod tests {
             false,
             ORDINARY,
         );
-        let quiet = off
-            .mcp_config()
-            .expect("the team channel is not optional — see `mcp_config_for`");
-        assert!(
-            !quiet.contains("--desktop-mcp"),
-            "handed a desktop nobody asked for: {quiet}"
+        assert_eq!(
+            off.mcp_config(),
+            None,
+            "handed a server nobody asked for; the bridge is added per turn"
         );
-        assert!(quiet.contains("--team-mcp"), "got: {quiet}");
     }
 
     /// agy has NO per-invocation MCP flag, so it must never be handed one.

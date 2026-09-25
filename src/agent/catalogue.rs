@@ -582,7 +582,10 @@ fn clean(raw: &str) -> Option<String> {
 /// between here and the provider can read it. `https` is accepted anywhere;
 /// plain `http` only to this machine, where a provider is run while it is
 /// being built and the traffic never leaves the host.
-fn key_may_travel_to(url: &str) -> Result<(), String> {
+///
+/// The one statement of the rule: the web search provider's key
+/// ([`crate::web`]) is held to it too.
+pub(crate) fn key_may_travel_to(url: &str) -> Result<(), String> {
     let parsed = reqwest::Url::parse(url).map_err(|e| format!("its url is not valid: {e}"))?;
     match parsed.scheme() {
         "https" => Ok(()),

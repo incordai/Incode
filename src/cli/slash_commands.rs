@@ -868,7 +868,7 @@ pub fn handle_memories(query: Option<&str>) {
 // Background job handlers
 // ---------------------------------------------------------------------------
 
-pub fn handle_jobs(job_mgr: &crate::tools::bash_jobs::BashJobManager) {
+pub fn handle_jobs(job_mgr: &mut crate::tools::bash_jobs::BashJobManager) {
     render::print_header("Background Jobs");
     let jobs = job_mgr.list();
     if jobs.is_empty() {

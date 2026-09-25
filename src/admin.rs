@@ -131,6 +131,12 @@ pub struct AdminConfig {
     /// from the environment when it is needed and never written to this file.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub api_providers: Vec<ApiProvider>,
+    /// The search service the `WebSearch` tool asks — see [`crate::web`] for
+    /// the exact request and reply. Only the NAME of the variable holding
+    /// its key is kept here, never the key. Unset, the tool says it is not
+    /// configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_search: Option<SearchProvider>,
     /// The capability ladder, named by the operator.
     ///
     /// A tier is a list of models that can do the same JOB — `"top"` might hold
@@ -206,6 +212,17 @@ pub struct ApiProvider {
     pub url: String,
     /// The NAME of the environment variable holding the key — never the key.
     pub key_env: String,
+}
+
+/// The web search service `WebSearch` asks.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchProvider {
+    /// The search endpoint. The query is added as `q`.
+    pub url: String,
+    /// The NAME of the environment variable holding its key, when it takes
+    /// one — never the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_env: Option<String>,
 }
 
 /// Which optional parts of the body are in use.
@@ -1059,6 +1076,11 @@ mod tests {
                 url: "http://127.0.0.1:9".to_string(),
                 key_env: "TEAM_KEY_VARIABLE".to_string(),
             }],
+            // The search provider too, holding its key variable's NAME only.
+            web_search: Some(SearchProvider {
+                url: "https://search.invalid/q".to_string(),
+                key_env: Some("SEARCH_KEY_VARIABLE".to_string()),
+            }),
             // The ladder has to survive the file too — a tier an operator
             // writes and cannot read back is a setting that does not exist.
             tiers: BTreeMap::from([(

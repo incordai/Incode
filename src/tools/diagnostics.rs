@@ -166,43 +166,89 @@ impl DiagnosticsRunner {
     /// Run the checker and report only what it said about `changed`.
     #[must_use]
     pub fn check(&self, changed: &Path) -> DiagnosticsReport {
-        let Some((program, args)) = self.command.split_first() else {
-            return DiagnosticsReport::default();
-        };
-
-        // Spawned rather than `output()` so the wait can be bounded, reusing the
-        // same helper the bash tool waits with — one timeout implementation, and
-        // a checker that hangs is killed instead of hanging the turn.
-        let spawned = Command::new(program)
-            .args(args)
-            .current_dir(&self.workspace)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn();
-
-        let output = match spawned {
-            Ok(child) => super::bash::wait_with_timeout(child, CHECK_TIMEOUT),
-            Err(e) => Err(e.into()),
-        };
-
-        match output {
-            Ok(output) => {
-                // Both streams: compilers differ on which one carries
-                // diagnostics, and reading only one would silently miss them.
-                let mut combined = String::from_utf8_lossy(&output.stderr).into_owned();
-                combined.push('\n');
-                combined.push_str(&String::from_utf8_lossy(&output.stdout));
-                report_from_output(&combined, changed, &self.workspace)
-            }
+        match self.run_within(CHECK_TIMEOUT) {
+            Ok((combined, _)) => report_from_output(&combined, changed, &self.workspace),
             Err(e) => DiagnosticsReport {
                 findings: Vec::new(),
                 note: Some(format!(
-                    "could not run `{program}` to check this file: {e}. \
+                    "{e}. \
                      The edit itself was written."
                 )),
             },
         }
     }
+
+    /// Run the checker once, bounded by `timeout`: what it printed on both
+    /// streams, and whether it exited cleanly.
+    ///
+    /// # Errors
+    ///
+    /// No command is configured, it could not start, or it ran past
+    /// `timeout` and was killed.
+    pub fn run_within(&self, timeout: Duration) -> Result<(String, bool), String> {
+        let Some((program, args)) = self.command.split_first() else {
+            return Err("no checker command is configured".to_string());
+        };
+
+        // Spawned rather than `output()` so the wait can be bounded, reusing the
+        // same helper the bash tool waits with — one timeout implementation, and
+        // a checker that hangs is killed instead of hanging the turn.
+        let mut command = Command::new(program);
+        command
+            .args(args)
+            .current_dir(&self.workspace)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        crate::agent::process_tree::prepare(&mut command);
+        let output = match command.spawn() {
+            Ok(child) => super::bash::wait_with_timeout(child, timeout),
+            Err(e) => Err(e.into()),
+        }
+        .map_err(|e| format!("could not run `{program}` to check this file: {e}"))?;
+
+        // Both streams: compilers differ on which one carries diagnostics,
+        // and reading only one would silently miss them.
+        let mut combined = String::from_utf8_lossy(&output.stderr).into_owned();
+        combined.push('\n');
+        combined.push_str(&String::from_utf8_lossy(&output.stdout));
+        Ok((combined, output.status.success()))
+    }
+}
+
+/// How long a check the model ASKED for may take. Longer than
+/// [`CHECK_TIMEOUT`]: nothing else is waiting on it, and the first check of a
+/// large project compiles its dependencies.
+pub const PROJECT_CHECK_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Most diagnostic lines reported for a whole-project check.
+pub const MAX_PROJECT_FINDINGS: usize = 50;
+
+/// The error and warning lines of a whole-project check, bounded, with the
+/// cut said.
+#[must_use]
+pub fn problems_in(output: &str) -> DiagnosticsReport {
+    let mut findings: Vec<String> = Vec::new();
+    let mut more = 0usize;
+    for line in output.lines() {
+        let trimmed = line.trim();
+        let lowered = trimmed.to_ascii_lowercase();
+        if !(lowered.contains("error") || lowered.contains("warning")) {
+            continue;
+        }
+        if findings.iter().any(|seen| seen == trimmed) {
+            continue;
+        }
+        if findings.len() >= MAX_PROJECT_FINDINGS {
+            more += 1;
+            continue;
+        }
+        findings.push(trimmed.to_string());
+    }
+    let note = (more > 0).then(|| {
+        format!("{more} more error or warning lines not shown; fix these and check again")
+    });
+    DiagnosticsReport { findings, note }
 }
 
 /// Pick the lines of checker output that are about `changed`.

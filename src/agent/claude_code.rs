@@ -310,8 +310,6 @@ pub struct ClaudeCodeBackend {
     /// hands it. Memory is reached through incode's own tools, not through a
     /// server the operator happened to configure for the CLI.
     desktop_mcp: Option<String>,
-    /// Who this agent speaks as on the team channel, for the task in hand.
-    team_identity: Option<String>,
 }
 
 /// What THIS agent calls its sub-agent tool.
@@ -370,7 +368,6 @@ impl ClaudeCodeBackend {
             // request would widen what an agent can reach as a side effect of
             // a constructor.
             desktop_mcp: None,
-            team_identity: None,
             model: None,
             fallbacks: Vec::new(),
             partial_messages: false,
@@ -609,13 +606,9 @@ impl ClaudeCodeBackend {
             }
         }
 
-        // WHO THIS AGENT IS ON THE TEAM CHANNEL, for the task about to run.
-        // The team MCP server is a child of this process and reads it from
-        // here — see [`crate::agent::AgentBackend::set_team_identity`] for why
-        // it cannot come from the registration or from the model.
-        if let Some(role) = &self.team_identity {
-            cmd.env(crate::team_mcp::IDENTITY_ENV, role);
-        }
+        // No team server identity here: on this route the team channel's
+        // tools are incode's own (`toolbox::team`), and who they speak as is
+        // set on the toolbox by `set_team_identity`.
         cmd
     }
 
@@ -1097,8 +1090,14 @@ impl AgentBackend for ClaudeCodeBackend {
         self.desktop_mcp.clone()
     }
 
+    /// The team channel's tools are incode's toolbox's on this route, so the
+    /// toolbox is who speaks.
     fn set_team_identity(&mut self, role: &str) {
-        self.team_identity = Some(role.to_string());
+        self.tools.set_team_identity(role);
+    }
+
+    fn share_session_tools(&mut self, state: std::sync::Arc<crate::toolbox::SessionTools>) {
+        self.tools.share_session(state);
     }
 
     fn deny_rules(&self) -> &[String] {

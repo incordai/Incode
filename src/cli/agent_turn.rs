@@ -115,6 +115,10 @@ pub struct AgentSession {
     native_context: Vec<String>,
     /// What the engine's session-start handed this session, when it answered.
     start_block: Option<String>,
+    /// The session's tool state: its background jobs — the model's and the
+    /// REPL's `/bg` alike — and the model's task list, shared by every
+    /// backend. A stop while a job runs is a wait, not an end.
+    session_tools: std::sync::Arc<crate::toolbox::SessionTools>,
 }
 
 /// How wide a tool result panel is drawn in a conversation.
@@ -197,9 +201,12 @@ impl AgentSession {
         let workspace_for_self = workspace.clone();
         // WHICH ROUTE is the agent's id, never whether API variables happen to
         // be set: those used to replace the chosen agent outright.
-        let backend: Box<dyn AgentBackend> =
+        let mut backend: Box<dyn AgentBackend> =
             crate::cli::route_backend(&workspace, agent_id, &binary, guards, &system_context, true);
+        let session_tools = crate::toolbox::SessionTools::new(true);
+        backend.share_session_tools(std::sync::Arc::clone(&session_tools));
         Self {
+            session_tools,
             backend,
             standby: Vec::new(),
             memory: crate::hooks::memory::MemoryHooks::off(&workspace),
@@ -228,9 +235,16 @@ impl AgentSession {
                 s.set_cancel(token.clone());
             }
             s.set_extra_dirs(self.extra_dirs.clone());
+            s.share_session_tools(std::sync::Arc::clone(&self.session_tools));
         }
         self.standby = standby;
         self
+    }
+
+    /// The session's background jobs and task list.
+    #[must_use]
+    pub fn session_tools(&self) -> std::sync::Arc<crate::toolbox::SessionTools> {
+        std::sync::Arc::clone(&self.session_tools)
     }
 
     /// Access configured standby backends.
@@ -247,7 +261,8 @@ impl AgentSession {
 
     #[cfg(test)]
     #[must_use]
-    pub fn with_backend(mut self, backend: Box<dyn AgentBackend>) -> Self {
+    pub fn with_backend(mut self, mut backend: Box<dyn AgentBackend>) -> Self {
+        backend.share_session_tools(std::sync::Arc::clone(&self.session_tools));
         self.backend = backend;
         self
     }
@@ -398,12 +413,6 @@ impl AgentSession {
     /// transcript, and the engine's context for it returned.
     pub fn memory_prompt(&mut self, line: &str) -> Option<String> {
         self.memory.prompt(line)
-    }
-
-    /// How many of incode's background jobs are running as the next turn
-    /// starts. A stop while any are is a wait, not an end.
-    pub fn set_background_jobs(&mut self, running: usize) {
-        self.memory.set_background(running);
     }
 
     /// The session is over; `reason` says why.
@@ -921,6 +930,10 @@ impl AgentSession {
         // the turn was stopped or while a background job runs.
         while outcome.is_ok() {
             let last = said.last().to_string();
+            // Counted NOW, as the turn ends: a job the model started during
+            // it counts, and one that has finished does not.
+            self.memory
+                .set_background(self.session_tools.running_jobs());
             let Some(reason) = self.memory.stop(&last, self.cancel.as_ref()) else {
                 break;
             };
@@ -1783,7 +1796,8 @@ mod tests {
     }
 
     /// **WHILE A BACKGROUND JOB RUNS THE STOP IS NOT SENT**; with none
-    /// running it is.
+    /// running it is. A real job, in the session's own job table — the one
+    /// the model's `Bash` with `run_in_background` and the REPL's `/bg` use.
     #[test]
     fn a_running_background_job_holds_the_stop() {
         let (ws, engine) = (
@@ -1798,10 +1812,19 @@ mod tests {
             &seen,
             Box::new(|_| {}),
         );
-        s.set_background_jobs(1);
+        let long = if cfg!(windows) {
+            "ping -n 31 127.0.0.1 > nul"
+        } else {
+            "sleep 30"
+        };
+        let job = s
+            .session_tools()
+            .jobs()
+            .spawn(long, ws.path())
+            .expect("the job starts");
         let _ = one_turn(&mut s, ws.path(), "start the build");
         assert_eq!(fake::calls(engine.path(), "capture"), 0);
-        s.set_background_jobs(0);
+        assert!(s.session_tools().jobs().kill(job), "the job was running");
         let _ = one_turn(&mut s, ws.path(), "is it done");
         assert_eq!(fake::calls(engine.path(), "capture"), 1);
     }

@@ -764,6 +764,7 @@ fn run_prompt(
     }
 
     let mut edits = present::Edits::new(workspace);
+    let mut plans = present::Plans::new();
     let outcome = session.turn_observed(
         workspace,
         &instruction,
@@ -775,7 +776,7 @@ fn run_prompt(
         &mut |_status| {},
         Some(&mut |event: &AgentEvent, start: &TurnStart<'_>| {
             shared.hold_cancel();
-            for update in updates_for(event, &mut edits, start) {
+            for update in updates_for(event, &mut edits, &mut plans, start) {
                 say(update);
             }
         }),
@@ -804,7 +805,9 @@ fn run_prompt(
 /// through the turn's text callback, after the question block is filtered out.
 ///
 /// An edit's result becomes a diff when [`present::Edits`] can name both
-/// sides; any other result, and an edit it cannot, is the tool's output.
+/// sides; any other result, and an edit it cannot, is the tool's output. A
+/// task list incode's `TodoWrite` accepted is sent as the plan, after its
+/// result ([`present::Plans`]).
 ///
 /// Token counts ([`AgentEvent::Usage`]) and quota ([`AgentEvent::Quota`]) have
 /// no place in the stable protocol: `usage_update` needs the window size too,
@@ -814,18 +817,16 @@ fn run_prompt(
 fn updates_for(
     event: &AgentEvent,
     edits: &mut present::Edits,
+    plans: &mut present::Plans,
     start: &TurnStart<'_>,
 ) -> Vec<acp::SessionUpdate> {
     match event {
         AgentEvent::ToolUse { id, name, input } => {
             edits.called(id, input);
-            let mut updates = vec![acp::SessionUpdate::ToolCall(present::tool_call(
+            plans.called(id, name, input);
+            vec![acp::SessionUpdate::ToolCall(present::tool_call(
                 id, name, input,
-            ))];
-            if let Some(plan) = present::plan_of(name, input) {
-                updates.push(acp::SessionUpdate::Plan(plan));
-            }
-            updates
+            ))]
         }
         AgentEvent::ToolResult {
             id,
@@ -836,7 +837,11 @@ fn updates_for(
                 Some(diff) => present::tool_diff(id, diff),
                 None => present::tool_result(id, output, *is_error),
             };
-            vec![acp::SessionUpdate::ToolCallUpdate(update)]
+            let mut updates = vec![acp::SessionUpdate::ToolCallUpdate(update)];
+            if let Some(plan) = plans.landed(id, *is_error) {
+                updates.push(acp::SessionUpdate::Plan(plan));
+            }
+            updates
         }
         AgentEvent::Context { used, size } => vec![acp::SessionUpdate::UsageUpdate(
             acp::UsageUpdate::new(*used, *size),
@@ -1016,8 +1021,13 @@ mod tests {
         on_event(&AgentEvent::ToolUse {
             id: "t2".to_string(),
             name: "TodoWrite".to_string(),
-            input: r#"{"todos":[{"content":"read a.txt","status":"completed","activeForm":"reading"}]}"#
+            input: r#"{"todos":[{"content":"read a.txt","status":"completed","priority":"high","activeForm":"reading"}]}"#
                 .to_string(),
+        });
+        on_event(&AgentEvent::ToolResult {
+            id: "t2".to_string(),
+            output: "Task list saved: 1 task(s)".to_string(),
+            is_error: false,
         });
         // Both numbers, as the agent reports them at the end of a turn.
         on_event(&AgentEvent::Usage {
@@ -1531,6 +1541,9 @@ mod tests {
             .find(|u| u["sessionUpdate"] == "plan")
             .unwrap_or_else(|| panic!("no plan: {updates:#?}"));
         assert_eq!(plan["entries"][0]["status"], "completed", "{plan}");
+        // The priority the model gave, not a stand-in: the plan is incode's
+        // own task list.
+        assert_eq!(plan["entries"][0]["priority"], "high", "{plan}");
         client.close();
     }
 

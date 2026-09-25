@@ -244,7 +244,6 @@ Useful environment variables:
 | `INCORD_MEMORY_URL` | Where the memory service listens |
 | `INCORD_CODE_DIR` | Where this harness keeps its settings |
 | `INCORD_TRACE` | Say what the harness did, as it happens |
-| `INCORD_SEARCH_URL` / `INCORD_SEARCH_KEY` | The search endpoint for the API path |
 
 ### What lives where
 

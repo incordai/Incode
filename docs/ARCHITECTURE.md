@@ -447,7 +447,7 @@ them at the start.
 The owner's rule: incode IS the harness. An installed agent CLI is used only as the
 model, headless. Its built-in tools, its hooks, its permission prompts and modes, its
 edit events and its settings are not relied on. Every tool call the model makes runs in
-incode's own `Toolbox` (`src/toolbox.rs`), so the guards, the memory engine's pre-tool
+incode's own `Toolbox` (`src/toolbox/`), so the guards, the memory engine's pre-tool
 hook, the permission mode, the Allow/Reject flow, the cancel token and the observer that
 draws the call apply the same way to every model.
 
@@ -532,8 +532,12 @@ Sentinel as detection.
 - `--add-dir` roots: **fixed (phase 4).** The toolbox acts inside an added root when a
   file tool names an absolute path in it, under the workspace's guards (matched on the
   path within the root); the intake gate stays the workspace's own.
-- incode's team and desktop MCP servers still run their own tools in their own
-  processes; they are incode's code, but those calls do not pass through `Toolbox`.
+- The team channel: **fixed (phase 5)** — `team_ask`, `team_tell`, `team_answer` and
+  `team_read` are toolbox tools (`toolbox::team`, over `team_mcp::Server`), and the
+  separate server is no longer handed to a bridged model. It is kept for codex, which
+  still reaches the channel through `mcp_overrides_for`.
+- The desktop MCP server still runs its own tools in its own process, when switched on;
+  see §5b for why it was not moved.
 - The engine's session-capture hooks: **fixed (phase 4)** — incode fires them itself on
   every route; see "The engine's session lifecycle, fired by incode" in §2.
 - Project instruction files: **fixed (phase 4)** — `instructions::project_block` reads
@@ -541,6 +545,73 @@ Sentinel as detection.
   into the session's system context for every model, and for `--task`.
 - A prompt over the command-line budget now loses its MIDDLE, not its end: the
   instruction is last in every prompt incode assembles (`budget_for_spawn`).
+
+---
+
+## 5b. Tools
+
+Every tool a model can call, with the two rules `Toolbox::run_call` applies from ONE
+table, `toolbox::reach_of`:
+
+- **Mode.** `observe` and `session` tools run under every mode, never asked about. Every
+  other reach is refused in a read-only session (`plan`) and asked about, call by call, in
+  a prompting one (`default`); the writing modes leave it to the guards and the engine.
+  `Agent` is also refused under read-only and prompt, because the agent it starts would
+  not carry the mode.
+- **Engine failure.** When the memory engine's pre-tool hook cannot decide (missing where
+  named, crashed, past its bound), `record`, `change` and `run` tools are REFUSED
+  (fail closed); `observe` and `session` tools run, traced (fail open).
+
+A name missing from the table is refused as no tool at all, before anything is asked.
+`change` tools are also checked against the operator's guards for EVERY file they touch
+(`Toolbox::changed_paths`), snapshotted file by file for `/undo` when a checkpoint store
+is attached, and reported to the engine's `code-edit` hook once they land (once per file
+for a patch). The ACP kind is `acp_agent::present::tool_kind`.
+
+| Tool | Reach | ACP kind | Bound | Notes |
+|---|---|---|---|---|
+| `Read` | observe | read | — | |
+| `Write`, `Edit` | change | edit | — | |
+| `MultiEdit` | change | edit | `MAX_EDITS` 100, report `MAX_CHANGE_REPORT_CHARS` 30 000 | all or none, in memory first |
+| `ApplyPatch` | change | edit | `MAX_PATCH_FILES` 50 | unified diff; add/modify/delete; every hunk checked before any write; a failed write puts back the files already written; renames and binary patches refused |
+| `NotebookEdit` | change | edit | `MAX_NOTEBOOK_BYTES` 32 MiB | replace / insert / delete a cell by id or index; written back as 1-space-indented JSON |
+| `LS` | observe | search | `MAX_LS_ENTRIES` 500 | no ignore list of its own (Glob has none); `ignore` patterns from the model |
+| `Glob`, `Grep` | observe | search | Grep: 50 matches | |
+| `Bash` | run | execute | output 30 000 chars; timeout | `run_in_background` starts a session job (`MAX_RUNNING_JOBS` 8) |
+| `BashOutput` | observe | read | `MAX_JOB_READ_BYTES` 30 000 per read; `MAX_JOB_BUFFER_BYTES` 1 MiB kept per stream | new output since the last read; loss past the buffer is counted |
+| `KillShell` | run | execute | — | kills the job's process tree |
+| `TodoWrite` | session | think | `MAX_TODOS` 100, `MAX_TODO_CHARS` 500 | kept per session; `--acp` sends it as the plan, with its priority, on the call's successful result |
+| `Diagnostics` | run | execute | `PROJECT_CHECK_TIMEOUT` 300 s, `MAX_PROJECT_FINDINGS` 50, `MAX_DIAGNOSTIC_FILES` 50 | `INCORD_CHECK_CMD`, else `cargo check` / `tsc --noEmit` |
+| `WebFetch` | observe | fetch | 20 s, 512 KiB read, 20 000 chars shown | private addresses refused by name and by resolution; carries no credential |
+| `WebSearch` | observe | fetch | 15 s, 512 KiB, 8 results | provider from `admin.json` `web_search` — contract in `web::search_with` |
+| `Skill` | observe | other | — | |
+| `Agent` | run | other | depth 2 | |
+| `AskUserQuestion` | session | other | — | |
+| `verify` | run | other | 600 s | |
+| `recall_index`, `recall_get`, `memory_search`, `find_symbol`, `code_skeleton`, `git_blast_radius` | observe | other | 8 s | the memory service |
+| `watchman_lookup` | observe | search | 8 s, 20 000 chars | `POST /v1/memory/watchman/lookup`; project named by `recorder::task_for` |
+| `remember`, `forget_memory`, `save_brief` | record | other | 8 s | |
+| `team_ask`, `team_tell`, `team_answer` | record | other | — | speaks as the harness's identity for the task |
+| `team_read` | observe | other | `team::SHOWN` | |
+
+Changed by this table (phase 5): `remember`, `forget_memory` and the team verbs used to
+run under every mode and fail open; as records they are now refused read-only, asked
+under prompt, and refused when the engine cannot decide.
+
+`WebSearch` configuration: `"web_search": {"url": "https://…", "key_env": "NAME"}` in
+`admin.json`. Only the variable's NAME is stored. The key is sent as a bearer only over
+https or to loopback (`catalogue::key_may_travel_to`), no redirect is followed, and an
+unconfigured search says so. The former `INCORD_SEARCH_URL` / `INCORD_SEARCH_KEY`
+variables are gone — the second was also sent, as a bearer, on every `WebFetch`.
+
+**Not moved: the desktop.** The desktop tools still run in `incode --desktop-mcp`,
+registered beside the bridge only when `INCORD_DESKTOP` is on. Moving them needs, first,
+an image channel: `screenshot` answers with an image content block, while a toolbox
+result is a `String` end to end (`Toolbox::run_call`, the bridge's `output`, the API
+route's `tool_result`, the ACP tool-call update). Second, the desktop owns process-wide
+state the harness should not take on: per-monitor DPI awareness set at startup, the input
+thread, and its kill switch — EOF on its own stdin stops it, and a stop file beside its
+journal is checked before every call. Both are the next phase's work.
 
 ---
 

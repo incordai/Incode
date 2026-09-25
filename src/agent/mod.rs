@@ -887,6 +887,14 @@ pub trait AgentBackend {
     /// itself ([`crate::toolbox::Toolbox`]) has a moment at which to ask.
     fn set_prompter(&mut self, _prompter: std::sync::Arc<dyn crate::hooks::engine::Prompter>) {}
 
+    /// The session's own tool state — its background jobs and task list —
+    /// for a backend whose tools this harness runs, so every backend of one
+    /// session shares them.
+    ///
+    /// Defaulted to nothing: a backend whose tools are not incode's has no
+    /// jobs or list of incode's to share.
+    fn share_session_tools(&mut self, _state: std::sync::Arc<crate::toolbox::SessionTools>) {}
+
     /// The model this backend was asked for, when it was asked for one.
     fn model(&self) -> Option<&str> {
         None
@@ -992,6 +1000,10 @@ impl AgentBackend for Box<dyn AgentBackend> {
 
     fn set_prompter(&mut self, prompter: std::sync::Arc<dyn crate::hooks::engine::Prompter>) {
         (**self).set_prompter(prompter);
+    }
+
+    fn share_session_tools(&mut self, state: std::sync::Arc<crate::toolbox::SessionTools>) {
+        (**self).share_session_tools(state);
     }
 
     fn model(&self) -> Option<&str> {

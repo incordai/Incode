@@ -900,6 +900,16 @@ impl AgentBackend for ApiBackend {
         self.tools.set_prompter(prompter);
     }
 
+    fn share_session_tools(&mut self, state: std::sync::Arc<crate::toolbox::SessionTools>) {
+        self.tools.share_session(state);
+    }
+
+    /// The team channel's tools are the toolbox's, so the toolbox is who
+    /// speaks.
+    fn set_team_identity(&mut self, role: &str) {
+        self.tools.set_team_identity(role);
+    }
+
     /// The harness context this route carries, as the one block it was given.
     ///
     /// Reported rather than left to the empty default: this backend HOLDS the

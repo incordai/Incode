@@ -31,9 +31,6 @@ pub(crate) const MAX_TOOL_OUTPUT_BYTES: usize = 64 * 1024;
 /// the way output is, and the cut says so.
 pub(crate) const MAX_DIFF_TEXT_BYTES: usize = MAX_TOOL_OUTPUT_BYTES / 2;
 
-/// The tool whose input is the agent's task list, reported as a plan.
-const TASK_LIST_TOOL: &str = "TodoWrite";
-
 /// The instruction a prompt's content blocks make, in the client's order.
 ///
 /// # What is accepted
@@ -375,49 +372,77 @@ fn side(text: &str) -> String {
 /// [`acp::ToolKind::Other`], never a guess.
 pub(crate) fn tool_kind(name: &str) -> acp::ToolKind {
     match name.to_ascii_lowercase().as_str() {
-        "read" | "notebookread" | "read_file" => acp::ToolKind::Read,
-        "edit" | "multiedit" | "write" | "notebookedit" | "apply_patch" | "write_file" => {
-            acp::ToolKind::Edit
+        "read" | "notebookread" | "read_file" | "bashoutput" => acp::ToolKind::Read,
+        "edit" | "multiedit" | "write" | "notebookedit" | "apply_patch" | "applypatch"
+        | "write_file" => acp::ToolKind::Edit,
+        "bash" | "powershell" | "shell" | "exec_command" | "run_shell_command" | "killshell"
+        | "diagnostics" => acp::ToolKind::Execute,
+        "grep" | "glob" | "ls" | "search" | "toolsearch" | "watchman_lookup" => {
+            acp::ToolKind::Search
         }
-        "bash" | "powershell" | "shell" | "exec_command" | "run_shell_command" => {
-            acp::ToolKind::Execute
-        }
-        "grep" | "glob" | "ls" | "search" | "toolsearch" => acp::ToolKind::Search,
         "webfetch" | "websearch" | "web_fetch" | "web_search" => acp::ToolKind::Fetch,
         "todowrite" | "think" => acp::ToolKind::Think,
         _ => acp::ToolKind::Other,
     }
 }
 
-/// The agent's task list, when this tool call is one, as an ACP plan.
+/// Follows one prompt's task-list calls — incode's own `TodoWrite` — and
+/// turns each one incode ACCEPTED into the plan.
 ///
-/// The list arrives as the input of the agent's task-list tool, whole each
-/// time — which is exactly ACP's rule for a plan: every update replaces the
-/// last. `None` for every other tool, and for an input that is not the shape
-/// this reads, rather than a plan with invented entries.
-pub(crate) fn plan_of(name: &str, input: &str) -> Option<acp::Plan> {
-    if name != TASK_LIST_TOOL {
-        return None;
+/// The list arrives whole each time, which is exactly ACP's rule for a plan:
+/// every update replaces the last. It is sent on the call's successful
+/// RESULT, not on the call: a list the toolbox refused was never the
+/// session's list, and a plan built from it would show one that does not
+/// exist.
+pub(crate) struct Plans {
+    /// Task-list calls seen, keyed by call id, until their result arrives.
+    pending: HashMap<String, String>,
+}
+
+impl Plans {
+    pub(crate) fn new() -> Self {
+        Self {
+            pending: HashMap::new(),
+        }
     }
-    let value: Value = serde_json::from_str(input).ok()?;
-    let todos = value.get("todos")?.as_array()?;
+
+    /// A tool was called; remembered when it is the task list.
+    pub(crate) fn called(&mut self, id: &str, name: &str, input: &str) {
+        if name == crate::toolbox::TODO_WRITE {
+            self.pending.insert(id.to_string(), input.to_string());
+        }
+    }
+
+    /// The plan a result makes, or `None` when it makes none.
+    pub(crate) fn landed(&mut self, id: &str, is_error: bool) -> Option<acp::Plan> {
+        let input = self.pending.remove(id)?;
+        if is_error {
+            return None;
+        }
+        plan_of(&input)
+    }
+}
+
+/// A task list as an ACP plan, read by the same parser incode's `TodoWrite`
+/// accepted it with — its priority included. `None` for an input that parser
+/// refuses, rather than a plan with invented entries.
+pub(crate) fn plan_of(input: &str) -> Option<acp::Plan> {
+    use crate::toolbox::{Priority, TodoStatus};
+    let todos = crate::toolbox::parse_todos(input).ok()?;
     let entries: Vec<acp::PlanEntry> = todos
-        .iter()
-        .filter_map(|todo| {
-            let content = todo.get("content")?.as_str()?;
-            let status = match todo.get("status")?.as_str()? {
-                "pending" => acp::PlanEntryStatus::Pending,
-                "in_progress" => acp::PlanEntryStatus::InProgress,
-                "completed" => acp::PlanEntryStatus::Completed,
-                _ => return None,
+        .into_iter()
+        .map(|todo| {
+            let status = match todo.status {
+                TodoStatus::Pending => acp::PlanEntryStatus::Pending,
+                TodoStatus::InProgress => acp::PlanEntryStatus::InProgress,
+                TodoStatus::Completed => acp::PlanEntryStatus::Completed,
             };
-            // The task list carries no priority, and ACP requires one. Medium
-            // is the protocol's own middle, not a claim about the task.
-            Some(acp::PlanEntry::new(
-                content,
-                acp::PlanEntryPriority::Medium,
-                status,
-            ))
+            let priority = match todo.priority {
+                Priority::High => acp::PlanEntryPriority::High,
+                Priority::Medium => acp::PlanEntryPriority::Medium,
+                Priority::Low => acp::PlanEntryPriority::Low,
+            };
+            acp::PlanEntry::new(todo.content, priority, status)
         })
         .collect();
     Some(acp::Plan::new(entries))
@@ -536,13 +561,27 @@ mod tests {
         assert!(prompt_text(&[text("look"), image], dir.path()).is_err());
     }
 
+    /// **THE PLAN IS INCODE'S TASK LIST**: sent on the successful result of
+    /// its own `TodoWrite`, with the priority the model gave; nothing for a
+    /// refused call or for another tool.
     #[test]
     fn a_task_list_becomes_a_plan_and_nothing_else_does() {
-        let input = r#"{"todos":[{"content":"read","status":"completed","activeForm":"reading"},{"content":"fix","status":"in_progress","activeForm":"fixing"}]}"#;
-        let plan = plan_of(TASK_LIST_TOOL, input).expect("a plan");
+        let input = r#"{"todos":[{"content":"read","status":"completed","priority":"high","activeForm":"reading"},{"content":"fix","status":"in_progress","priority":"low"}]}"#;
+        let mut plans = Plans::new();
+        plans.called("t1", crate::toolbox::TODO_WRITE, input);
+        let plan = plans.landed("t1", false).expect("a plan");
         assert_eq!(plan.entries.len(), 2);
+        assert_eq!(plan.entries[0].priority, acp::PlanEntryPriority::High);
+        assert_eq!(plan.entries[1].priority, acp::PlanEntryPriority::Low);
         assert_eq!(plan.entries[1].status, acp::PlanEntryStatus::InProgress);
-        assert!(plan_of("Read", input).is_none());
+
+        plans.called("t2", crate::toolbox::TODO_WRITE, input);
+        assert!(
+            plans.landed("t2", true).is_none(),
+            "a refused list is no plan"
+        );
+        plans.called("t3", "Read", input);
+        assert!(plans.landed("t3", false).is_none(), "not the task list");
     }
 
     /// Each side of a diff is bounded like tool output, and the cut is said.

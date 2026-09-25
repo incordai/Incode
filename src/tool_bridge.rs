@@ -559,6 +559,51 @@ mod tests {
         let _ = parent.join();
     }
 
+    /// **THE NEW TOOLS REACH THE MODEL THROUGH THE BRIDGE**, named as models
+    /// know them — and one of them runs in the parent when called.
+    #[test]
+    fn the_phase_five_tools_are_listed_over_the_bridge() {
+        let ws = tempfile::tempdir().expect("ws");
+        let (bridge, rx) = open(None);
+        let parent = parent_loop(Toolbox::new(ws.path(), true), rx);
+        let mut server = server_for(&bridge);
+        let got = mcp(
+            &mut server,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+        );
+        let names: Vec<&str> = got["result"]["tools"]
+            .as_array()
+            .expect("a list")
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        for expected in [
+            "MultiEdit",
+            "ApplyPatch",
+            "LS",
+            "NotebookEdit",
+            "BashOutput",
+            "KillShell",
+            "TodoWrite",
+            "Diagnostics",
+            "WebFetch",
+            "WebSearch",
+            "watchman_lookup",
+            "team_ask",
+            "team_read",
+        ] {
+            assert!(names.contains(&expected), "{expected} missing: {names:?}");
+        }
+        let listed = mcp(
+            &mut server,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"TodoWrite","arguments":{"todos":[{"content":"one","status":"pending"}]}}}"#,
+        );
+        assert_eq!(listed["result"]["isError"], false, "{listed}");
+        drop(bridge);
+        drop(server);
+        let _ = parent.join();
+    }
+
     /// **A CALL IS RUN BY THE PARENT'S TOOLBOX**, and the parent shows it as
     /// its own call and result.
     #[test]

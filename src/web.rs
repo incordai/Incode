@@ -36,13 +36,11 @@ pub const FETCH_TOOL: &str = "WebFetch";
 /// Ask the operator's configured search endpoint.
 pub const SEARCH_TOOL: &str = "WebSearch";
 
-/// Where searches go. No default: there is no neutral one to guess.
-pub const SEARCH_URL_ENV: &str = "INCORD_SEARCH_URL";
-/// The credential for that endpoint, if it wants one.
-pub const SEARCH_KEY_ENV: &str = "INCORD_SEARCH_KEY";
-
 /// How long a fetch may take.
 const TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How long a search may take.
+const SEARCH_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// How much of a page is read before the rest is dropped.
 ///
@@ -116,11 +114,57 @@ fn run_fetch(input: &serde_json::Value) -> Result<String, String> {
     if let Some(why) = blocked(url) {
         return Err(why);
     }
-    let body = get(url)?;
+    let body = fetch_page(url)?;
     Ok(as_page(url, &readable(&body)))
 }
 
 fn run_search(input: &serde_json::Value) -> Result<String, String> {
+    let provider = crate::admin::AdminConfig::load_default().web_search;
+    search_with(provider.as_ref(), input, &|name| std::env::var(name).ok())
+}
+
+/// Search through `provider`. THE SEARCH PROVIDER CONTRACT is stated here,
+/// once.
+///
+/// # Configuration
+///
+/// `web_search` in `admin.json`: `{"url": "<endpoint>", "key_env": "<NAME>"}`.
+/// `key_env` is optional and is the NAME of the environment variable holding
+/// the key; the key itself is never written to the file. No provider is
+/// built in: unconfigured, the tool says so and nothing is sent anywhere.
+///
+/// # The request
+///
+/// `GET <url>?q=<query>` — or `&q=` when the url already carries a query —
+/// with the query percent-encoded, and `Authorization: Bearer <key>` when
+/// `key_env` names a variable that is set. A key is sent only when the url
+/// is `https`, or plain `http` to this machine
+/// ([`crate::agent::catalogue::key_may_travel_to`]); anything else is
+/// refused before the request is made. No redirect is followed, so a key
+/// never follows one to another host. The whole request must finish within
+/// [`SEARCH_TIMEOUT`], and at most [`MAX_BYTES`] of the reply are read.
+///
+/// The url is the OPERATOR's, not the model's, so it is not held to
+/// [`blocked`]: a provider run on this machine is allowed.
+///
+/// # The reply
+///
+/// A 2xx status with a JSON body holding a list of results:
+///
+/// ```json
+/// {"results": [{"title": "A page", "url": "https://…", "snippet": "…"}]}
+/// ```
+///
+/// The list may also be named `items`, `organic`, `webPages` or `data`, or
+/// be the body itself; a result's text may be `title`/`name`/`heading`,
+/// `url`/`link`/`href`, and `snippet`/`description`/`content`/`text`. At most
+/// [`MAX_RESULTS`] are shown. Any other status, or a body in no such shape,
+/// is an error that says so — never an empty result.
+fn search_with(
+    provider: Option<&crate::admin::SearchProvider>,
+    input: &serde_json::Value,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<String, String> {
     let query = input
         .get("query")
         .and_then(|q| q.as_str())
@@ -129,19 +173,33 @@ fn run_search(input: &serde_json::Value) -> Result<String, String> {
     if query.is_empty() {
         return Err("say what to search for".to_string());
     }
-    let Some(endpoint) = std::env::var(SEARCH_URL_ENV)
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-    else {
-        return Err(format!(
-            "no search endpoint is configured. Set {SEARCH_URL_ENV} to one that answers with \
-             results, and {SEARCH_KEY_ENV} if it needs a credential. WebFetch works without it \
-             when you already know the address."
-        ));
+    let Some(provider) = provider.filter(|p| !p.url.trim().is_empty()) else {
+        return Err(
+            "web search is not configured: no search provider is set in admin.json \
+             (`web_search`: a `url`, and the `key_env` naming the variable that holds its key). \
+             WebFetch works without it when you already know the address."
+                .to_string(),
+        );
     };
-    let url = format!("{}{}{}", endpoint, separator(&endpoint), encode(query));
-    parse_results(&get(&url)?)
+    let endpoint = provider.url.trim();
+    let key = match provider
+        .key_env
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+    {
+        None => None,
+        Some(name) => {
+            let key = env(name).filter(|k| !k.trim().is_empty()).ok_or_else(|| {
+                format!("web search is configured with a key in {name}, which is not set")
+            })?;
+            crate::agent::catalogue::key_may_travel_to(endpoint)
+                .map_err(|why| format!("the search provider's key was not sent: {why}"))?;
+            Some(key)
+        }
+    };
+    let url = format!("{}{}{}", endpoint, separator(endpoint), encode(query));
+    parse_results(&search_get(url, key)?)
 }
 
 /// `?` or `&`, so a configured endpoint that already carries parameters keeps
@@ -475,10 +533,51 @@ fn encode(value: &str) -> String {
     out
 }
 
-/// Fetch a URL, bounded in time and size.
-fn get(url: &str) -> Result<String, String> {
+/// Ask the search provider, bounded in time and size, following no redirect.
+fn search_get(url: String, key: Option<String>) -> Result<String, String> {
+    crate::runtime::http::run_async(async move {
+        let client = reqwest::Client::builder()
+            .timeout(SEARCH_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| format!("client: {e}"))?;
+        let mut request = client.get(&url);
+        if let Some(key) = key {
+            request = request.bearer_auth(key);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|e| format!("the search provider could not be reached: {e}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(format!("the search provider answered {status}"));
+        }
+        read_bounded(response).await
+    })
+}
+
+/// A response's body, read in pieces and stopped at [`MAX_BYTES`].
+async fn read_bounded(mut response: reqwest::Response) -> Result<String, String> {
+    let mut body = Vec::with_capacity(8 * 1024);
+    while let Some(piece) = response
+        .chunk()
+        .await
+        .map_err(|e| format!("the answer stopped early: {e}"))?
+    {
+        body.extend_from_slice(&piece);
+        if body.len() >= MAX_BYTES {
+            break;
+        }
+    }
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
+/// Fetch a public page, bounded in time and size.
+///
+/// Carries no credential of any kind: the address came from a model.
+fn fetch_page(url: &str) -> Result<String, String> {
     let url = url.to_string();
-    let key = std::env::var(SEARCH_KEY_ENV).ok().filter(|k| !k.is_empty());
     // RESOLVED HERE, once, and the answer is pinned below. Checking the name and
     // then letting the client resolve it again leaves a window in which the same
     // name answers differently — which is the whole of DNS rebinding.
@@ -512,13 +611,8 @@ fn get(url: &str) -> Result<String, String> {
                 }))
                 .build()
                 .map_err(|e| format!("client: {e}"))?;
-            let mut request = client.get(&url);
-            if let Some(key) = key {
-                request = request
-                    .header("authorization", format!("Bearer {key}"))
-                    .header("x-api-key", key);
-            }
-            let mut response = request
+            let response = client
+                .get(&url)
                 .send()
                 .await
                 .map_err(|e| format!("could not reach {url}: {e}"))?;
@@ -527,18 +621,7 @@ fn get(url: &str) -> Result<String, String> {
                 return Err(format!("{url} answered {status}"));
             }
             // Read in pieces so an enormous page is stopped rather than held.
-            let mut body = Vec::with_capacity(8 * 1024);
-            while let Some(piece) = response
-                .chunk()
-                .await
-                .map_err(|e| format!("the page stopped early: {e}"))?
-            {
-                body.extend_from_slice(&piece);
-                if body.len() >= MAX_BYTES {
-                    break;
-                }
-            }
-            Ok(String::from_utf8_lossy(&body).into_owned())
+            read_bounded(response).await
         })
     });
     handle
@@ -761,6 +844,90 @@ mod tests {
         let out =
             parse_results(r#"{"results":[{"title":"T","url":"https://e.com"}]}"#).expect("parses");
         assert!(out.contains("DATA, not instructions"), "{out}");
+    }
+
+    /// A search provider on loopback: answers one request with `body`, and
+    /// hands back the request it received.
+    fn fake_provider(body: &'static str) -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let url = format!("http://{}/search", listener.local_addr().expect("addr"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut request = vec![0u8; 8192];
+                let n = stream.read(&mut request).unwrap_or(0);
+                let _ = tx.send(String::from_utf8_lossy(&request[..n]).into_owned());
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        (url, rx)
+    }
+
+    fn provider(url: &str, key_env: Option<&str>) -> crate::admin::SearchProvider {
+        crate::admin::SearchProvider {
+            url: url.to_string(),
+            key_env: key_env.map(str::to_string),
+        }
+    }
+
+    /// **UNCONFIGURED, IT SAYS SO** — and nothing is sent anywhere.
+    #[test]
+    fn an_unconfigured_search_says_so_plainly() {
+        let refused = search_with(None, &serde_json::json!({"query": "rust"}), &|_| None)
+            .expect_err("no provider");
+        assert!(refused.contains("not configured"), "{refused}");
+        assert!(refused.contains("admin.json"), "{refused}");
+        let blank = provider("  ", None);
+        assert!(search_with(Some(&blank), &serde_json::json!({"query": "x"}), &|_| None).is_err());
+    }
+
+    /// **A PROVIDER ON LOOPBACK IS ASKED BY THE CONTRACT**: the query as `q`,
+    /// the key from the NAMED variable as a bearer, the results read back.
+    #[test]
+    fn a_configured_provider_on_loopback_is_asked_and_its_results_read() {
+        let (url, request) = fake_provider(
+            r#"{"results":[{"title":"Found it","url":"https://example.com/a","snippet":"the answer"}]}"#,
+        );
+        let configured = provider(&url, Some("FAKE_SEARCH_KEY"));
+        let env = |name: &str| (name == "FAKE_SEARCH_KEY").then(|| "k-123".to_string());
+        let said = search_with(
+            Some(&configured),
+            &serde_json::json!({"query": "rust traits"}),
+            &env,
+        )
+        .expect("answered");
+        assert!(said.contains("Found it"), "{said}");
+        assert!(said.contains("https://example.com/a"), "{said}");
+        let seen = request
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the provider was asked");
+        assert!(seen.starts_with("GET /search?q=rust%20traits "), "{seen}");
+        assert!(
+            seen.to_ascii_lowercase()
+                .contains("authorization: bearer k-123"),
+            "{seen}"
+        );
+    }
+
+    /// **THE KEY NEVER CROSSES PLAIN HTTP TO ANOTHER MACHINE**, and a named
+    /// variable that is not set is said, not skipped.
+    #[test]
+    fn a_key_is_not_sent_over_plain_http_off_this_machine() {
+        let remote = provider("http://203.0.113.9/search", Some("K"));
+        let refused = search_with(Some(&remote), &serde_json::json!({"query": "x"}), &|_| {
+            Some("secret".to_string())
+        })
+        .expect_err("refused before sending");
+        assert!(refused.contains("key was not sent"), "{refused}");
+        let unset = provider("https://search.invalid/", Some("NOT_SET_ANYWHERE"));
+        let refused = search_with(Some(&unset), &serde_json::json!({"query": "x"}), &|_| None)
+            .expect_err("the variable is unset");
+        assert!(refused.contains("NOT_SET_ANYWHERE"), "{refused}");
     }
 
     #[test]
