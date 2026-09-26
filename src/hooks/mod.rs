@@ -1,22 +1,35 @@
 //! Run an operator's own shell commands around a tool call.
 //!
-//! # Where these actually run
+//! # Where these run
 //!
-//! On the DESKTOP MCP server, which is the only tool dispatcher this crate
-//! still owns (`desktop::mcp::call_tool`). The agent runs file and shell tools
-//! in its own process, so there is no before-and-after for this crate to sit
-//! in there — which is why this module went unwired long enough to become one
-//! of the six dead capabilities in [`crate::wiring`].
+//! Around EVERY tool incode runs: [`crate::toolbox::Toolbox::run_call`] runs
+//! the pre-tool commands after the guards and the permission mode and before
+//! the memory engine, and the post-tool commands once the tool has returned.
+//! The desktop's tools are the one exception there: their executor, the
+//! desktop MCP server (`desktop::mcp::call_tool`), runs the same commands
+//! itself, as it always has — also for the agent that reaches the desktop
+//! server directly — so they are not run twice.
 //!
-//! That leaves the capability where it is worth the most. A desktop hook sees
-//! every click and keystroke before it reaches a machine the operator is
-//! signed into, and can stop it.
+//! The commands come from `admin.json` `desktop_hooks` (also accepted as
+//! `hooks`); the name predates their running for every tool.
 //!
 //! # The contract with the operator's command
 //!
-//! - `HOOK_TOOL_NAME` and `HOOK_TOOL_INPUT` are set in its environment.
-//! - **Exit code 2 denies the call.** Any other code allows it.
+//! - **stdin** carries the event as one JSON object, then is closed:
+//!   `hook_event_name` (`PreToolUse` / `PostToolUse`), `tool_name`,
+//!   `tool_input`, `session_id` and `cwd`, and after the tool `tool_response`
+//!   and `is_error` — the shape an agent CLI's own hooks are given. It is a
+//!   pipe, never an inherited stdin: under `incode --acp` that is the
+//!   protocol stream.
+//! - `HOOK_TOOL_NAME` and `HOOK_TOOL_INPUT` are also set in its environment
+//!   (the input cut at [`MAX_ENV_INPUT_BYTES`]; the whole of it is on stdin).
+//! - **Exit code 2 denies the call**, before it runs; stderr is the reason
+//!   the model is given (stdout when stderr is empty). Any other code allows
+//!   it. A post-tool command cannot deny anything.
 //! - Anything on stdout is passed back to the agent as a message.
+//! - It runs in the workspace, and is killed with everything it started at
+//!   [`HOOK_TIMEOUT`]; a command that could not run or ran past it allows
+//!   the call, with a message saying so.
 //!
 //! # `HOOK_TOOL_INPUT` is the REAL input, not the redacted description
 //!
@@ -33,8 +46,56 @@
 pub mod engine;
 pub mod memory;
 
-use std::process::Command;
+use std::io::Write;
+use std::path::Path;
+use std::process::{Command, Stdio};
 use std::time::Duration;
+
+use serde_json::{json, Value};
+
+/// The most of a call's input put in `HOOK_TOOL_INPUT`, in bytes. An
+/// environment block is bounded (32 767 characters on Windows) and a `Write`
+/// carries a whole file; the full input is always on stdin.
+pub const MAX_ENV_INPUT_BYTES: usize = 8 * 1024;
+
+/// Why a hook process gave no answer.
+#[derive(Debug)]
+pub(crate) enum Piped {
+    /// It could not be started.
+    Start(std::io::Error),
+    /// It ran past its bound, was abandoned, or its wait failed.
+    Wait(String),
+}
+
+/// Run `command` the way every hook is run: `input` written to a PIPED stdin
+/// that is then closed, stdout and stderr piped, the process tree contained,
+/// and the wait bounded at `bound` or ended when `abandon` turns true — when
+/// the tree is killed.
+///
+/// One implementation for the memory engine's hooks and the operator's.
+pub(crate) fn run_piped(
+    mut command: Command,
+    input: Vec<u8>,
+    bound: Duration,
+    abandon: &dyn Fn() -> bool,
+) -> Result<std::process::Output, Piped> {
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    crate::agent::process_tree::prepare(&mut command);
+    let mut child = command.spawn().map_err(Piped::Start)?;
+    // Written on a thread of its own and CLOSED when that thread ends, so the
+    // child sees end-of-input. Not written inline: a large event and a child
+    // that prints before it reads would each wait on the other.
+    if let Some(mut stdin) = child.stdin.take() {
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&input);
+        });
+    }
+    crate::tools::bash::wait_with_timeout_or(child, bound, abandon)
+        .map_err(|e| Piped::Wait(e.to_string()))
+}
 
 /// How long a hook may take before it is killed and treated as allowing.
 ///
@@ -51,6 +112,7 @@ pub const HOOK_TIMEOUT: Duration = Duration::from_secs(10);
 // HookConfig
 // ---------------------------------------------------------------------------
 
+/// The operator's pre- and post-tool commands.
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct HookConfig {
     /// Commands run BEFORE the tool. Exit code 2 refuses the call.
@@ -114,52 +176,134 @@ pub struct HookRunner {
     config: HookConfig,
 }
 
+/// One call, as a hook is told it.
+#[derive(Debug, Clone, Copy)]
+pub struct HookCall<'a> {
+    pub tool_name: &'a str,
+    pub tool_input: &'a Value,
+    /// The session the call belongs to; empty when there is none.
+    pub session: &'a str,
+    /// Where the command runs; the process's own directory when `None`.
+    pub cwd: Option<&'a Path>,
+}
+
+/// Which side of the call a hook runs on.
+#[derive(Debug, Clone, Copy)]
+enum Side<'a> {
+    Pre,
+    Post { output: &'a str, is_error: bool },
+}
+
 impl HookRunner {
     #[must_use]
     pub fn new(config: HookConfig) -> Self {
         Self { config }
     }
 
+    /// The operator's commands from `admin.json`, when there are any. Read by
+    /// the code that builds a backend for real work, so a toolbox built for a
+    /// test never runs the operator's commands.
     #[must_use]
-    pub fn run_pre_tool_use(&self, tool_name: &str, tool_input: &str) -> HookRunResult {
-        self.run_commands(&self.config.pre_tool_use, tool_name, tool_input)
+    pub fn from_settings() -> Option<Self> {
+        let config = crate::admin::AdminConfig::load_default().desktop_hooks;
+        (!config.is_empty()).then(|| Self::new(config))
     }
 
+    /// The pre-tool commands, for a caller holding the input as text — the
+    /// desktop server, which has no workspace or session.
+    #[must_use]
+    pub fn run_pre_tool_use(&self, tool_name: &str, tool_input: &str) -> HookRunResult {
+        let input = parsed(tool_input);
+        self.pre_tool(&HookCall {
+            tool_name,
+            tool_input: &input,
+            session: "",
+            cwd: None,
+        })
+    }
+
+    /// The post-tool commands, for a caller holding the input as text.
     #[must_use]
     pub fn run_post_tool_use(
         &self,
         tool_name: &str,
         tool_input: &str,
-        _tool_output: &str,
-        _is_error: bool,
+        tool_output: &str,
+        is_error: bool,
     ) -> HookRunResult {
-        self.run_commands(&self.config.post_tool_use, tool_name, tool_input)
+        let input = parsed(tool_input);
+        let call = HookCall {
+            tool_name,
+            tool_input: &input,
+            session: "",
+            cwd: None,
+        };
+        self.post_tool(&call, tool_output, is_error)
+    }
+
+    /// The pre-tool commands for `call`. Exit 2 from any of them denies it,
+    /// and the rest are not run.
+    #[must_use]
+    pub fn pre_tool(&self, call: &HookCall<'_>) -> HookRunResult {
+        self.run_commands(&self.config.pre_tool_use, call, Side::Pre)
+    }
+
+    /// The post-tool commands for `call`, which returned `output`. They
+    /// cannot deny: the call already happened.
+    #[must_use]
+    pub fn post_tool(&self, call: &HookCall<'_>, output: &str, is_error: bool) -> HookRunResult {
+        let mut ran = self.run_commands(
+            &self.config.post_tool_use,
+            call,
+            Side::Post { output, is_error },
+        );
+        ran.denied = false;
+        ran
     }
 
     fn run_commands(
         &self,
         commands: &[String],
-        tool_name: &str,
-        tool_input: &str,
+        call: &HookCall<'_>,
+        side: Side<'_>,
     ) -> HookRunResult {
         if commands.is_empty() {
             return HookRunResult::allow(Vec::new());
         }
+        let mut event = json!({
+            "hook_event_name": match side { Side::Pre => "PreToolUse", Side::Post { .. } => "PostToolUse" },
+            "tool_name": call.tool_name,
+            "tool_input": call.tool_input,
+            "session_id": call.session,
+            "cwd": call.cwd.map(|p| p.to_string_lossy().into_owned()),
+        });
+        if let Side::Post { output, is_error } = side {
+            event["tool_response"] = json!(output);
+            event["is_error"] = json!(is_error);
+        }
+        let mut payload = event.to_string().into_bytes();
+        payload.push(b'\n');
 
         let mut messages = Vec::new();
-
         for command in commands {
-            match run_shell_command(command, tool_name, tool_input) {
-                Ok((code, stdout)) => {
-                    if !stdout.is_empty() {
-                        messages.push(stdout);
-                    }
-                    if code == 2 {
-                        // Exit code 2 = deny
+            match run_shell_command(command, call, &payload) {
+                Ok((code, stdout, stderr)) => {
+                    if code == 2 && matches!(side, Side::Pre) {
+                        // Exit 2 denies; stderr is the reason, as the
+                        // engine's hooks give theirs.
+                        let reason = if stderr.is_empty() { stdout } else { stderr };
+                        messages.push(if reason.is_empty() {
+                            format!("the operator's hook `{command}` refused this call")
+                        } else {
+                            reason
+                        });
                         return HookRunResult {
                             denied: true,
                             messages,
                         };
+                    }
+                    if !stdout.is_empty() {
+                        messages.push(stdout);
                     }
                 }
                 Err(e) => {
@@ -172,15 +316,26 @@ impl HookRunner {
     }
 }
 
+/// A call's input from its text: the JSON it holds, or the text itself.
+fn parsed(tool_input: &str) -> Value {
+    serde_json::from_str(tool_input).unwrap_or_else(|_| json!(tool_input))
+}
+
+/// One operator command, run through the shell with the event on its stdin:
+/// its exit code, stdout and stderr, each trimmed.
 fn run_shell_command(
     command: &str,
-    tool_name: &str,
-    tool_input: &str,
-) -> std::io::Result<(i32, String)> {
+    call: &HookCall<'_>,
+    payload: &[u8],
+) -> std::io::Result<(i32, String, String)> {
+    // Verbatim on Windows, as the Bash tool passes its command: `Command::arg`
+    // would escape a `"` the operator wrote as `\"`, which `cmd /C` does not
+    // read that way.
     #[cfg(windows)]
     let mut child = {
+        use std::os::windows::process::CommandExt;
         let mut c = Command::new("cmd");
-        c.arg("/C").arg(command);
+        c.arg("/C").raw_arg(command);
         c
     };
 
@@ -191,23 +346,125 @@ fn run_shell_command(
         c
     };
 
-    child
-        .env("HOOK_TOOL_NAME", tool_name)
-        .env("HOOK_TOOL_INPUT", tool_input)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+    let input = match call.tool_input {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    };
+    child.env("HOOK_TOOL_NAME", call.tool_name).env(
+        "HOOK_TOOL_INPUT",
+        crate::text::head_bytes(&input, MAX_ENV_INPUT_BYTES),
+    );
+    if let Some(cwd) = call.cwd {
+        child.current_dir(cwd);
+    }
 
-    // BOUNDED, using the same waiter `verify` uses for a project's check — one
-    // timeout implementation in the crate. This used to be `child.output()`,
+    // BOUNDED, through the same runner the memory engine's hooks use: a
+    // piped stdin that is written and closed, the tree contained, the wait
+    // capped. This used to be `child.output()` with the stdin inherited,
     // which waits forever: a hook that blocks on input would have hung the
-    // desktop between the agent asking and anything happening, with nothing
-    // on either side able to say which of them was stuck.
-    crate::agent::process_tree::prepare(&mut child);
-    let spawned = child.spawn()?;
-    let output = crate::tools::bash::wait_with_timeout(spawned, HOOK_TIMEOUT)
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    // call between the agent asking and anything happening.
+    let output =
+        run_piped(child, payload.to_vec(), HOOK_TIMEOUT, &|| false).map_err(|e| match e {
+            Piped::Start(e) => e,
+            Piped::Wait(why) => std::io::Error::other(why),
+        })?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     let code = output.status.code().unwrap_or(-1);
-    Ok((code, stdout))
+    Ok((code, stdout, stderr))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A hook command that saves its stdin next to it, prints `said`, and
+    /// exits with `code` after writing `why` to stderr.
+    fn hook(dir: &Path, code: i32, why: &str) -> String {
+        #[cfg(windows)]
+        {
+            let script = dir.join(format!("hook{code}.cmd"));
+            std::fs::write(
+                &script,
+                format!(
+                    "@echo off\r\nmore > \"%~dp0event.json\"\r\necho said\r\n\
+                     echo {why} 1>&2\r\nexit /b {code}\r\n"
+                ),
+            )
+            .expect("hook");
+            // Quoted as an operator would: the command reaches `cmd /C`
+            // verbatim.
+            format!("\"{}\"", script.display())
+        }
+        #[cfg(not(windows))]
+        {
+            let script = dir.join(format!("hook{code}.sh"));
+            std::fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\ncat > \"$(dirname \"$0\")/event.json\"\necho said\n\
+                     echo '{why}' >&2\nexit {code}\n"
+                ),
+            )
+            .expect("hook");
+            format!("sh '{}'", script.display())
+        }
+    }
+
+    fn call<'a>(input: &'a Value, cwd: &'a Path) -> HookCall<'a> {
+        HookCall {
+            tool_name: "Write",
+            tool_input: input,
+            session: "sess-9",
+            cwd: Some(cwd),
+        }
+    }
+
+    /// **THE EVENT ARRIVES ON A PIPED STDIN THAT IS CLOSED, AND EXIT 2 DENIES
+    /// WITH STDERR AS THE REASON.** A hook that reads stdin to its end would
+    /// hang on an inherited one.
+    #[test]
+    fn a_pre_hook_reads_the_event_on_stdin_and_exit_two_denies_with_its_stderr() {
+        let dir = tempfile::tempdir().expect("dir");
+        let runner = HookRunner::new(HookConfig {
+            pre_tool_use: vec![hook(dir.path(), 2, "no writes today")],
+            post_tool_use: Vec::new(),
+        });
+        let input = json!({"path": "a.txt", "content": "hi"});
+        let ran = runner.pre_tool(&call(&input, dir.path()));
+        assert!(ran.is_denied(), "{ran:?}");
+        assert_eq!(ran.messages(), ["no writes today"], "{ran:?}");
+        let event: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("event.json")).expect("the hook saved it"),
+        )
+        .expect("one JSON object");
+        assert_eq!(event["hook_event_name"], "PreToolUse");
+        assert_eq!(event["tool_name"], "Write");
+        assert_eq!(event["tool_input"]["path"], "a.txt");
+        assert_eq!(event["session_id"], "sess-9");
+    }
+
+    /// Any other exit allows, with what the hook printed; a post hook cannot
+    /// deny, and is told the result.
+    #[test]
+    fn other_exits_allow_and_a_post_hook_cannot_deny() {
+        let dir = tempfile::tempdir().expect("dir");
+        let runner = HookRunner::new(HookConfig {
+            pre_tool_use: vec![hook(dir.path(), 0, "fine")],
+            post_tool_use: vec![hook(dir.path(), 2, "too late")],
+        });
+        let input = json!({"path": "a.txt"});
+        let pre = runner.pre_tool(&call(&input, dir.path()));
+        assert!(!pre.is_denied());
+        assert_eq!(pre.messages(), ["said"]);
+        let post = runner.post_tool(&call(&input, dir.path()), "wrote it", false);
+        assert!(!post.is_denied(), "a post hook cannot deny: {post:?}");
+        let event: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("event.json")).expect("saved"),
+        )
+        .expect("json");
+        assert_eq!(event["hook_event_name"], "PostToolUse");
+        assert_eq!(event["tool_response"], "wrote it");
+    }
 }

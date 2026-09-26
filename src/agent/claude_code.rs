@@ -311,6 +311,27 @@ pub struct ClaudeCodeBackend {
     /// bounds. A turn that carries any is given its prompt on stdin, as a
     /// stream-json user message (see [`user_message`]).
     images: Vec<crate::toolbox::Image>,
+    /// Whether a turn with partial messages still asks for
+    /// `--thinking-display summarized`. The flag is not in the CLI's
+    /// `--help`, so a release may drop it; the first turn that fails with
+    /// "unknown option" naming it turns this off for the rest of the
+    /// session, and that turn is run again without it.
+    thinking_display: bool,
+}
+
+/// The flag that asks the CLI for a readable summary of the model's
+/// thinking. Undocumented; see [`rejects_thinking_display`].
+const THINKING_DISPLAY_FLAG: &str = "--thinking-display";
+
+/// Whether a failed start is the CLI refusing [`THINKING_DISPLAY_FLAG`]:
+/// its option parser names the flag with "unknown option" (or a close
+/// spelling) and exits before any output.
+fn rejects_thinking_display(failure: &str) -> bool {
+    let said = failure.to_ascii_lowercase();
+    said.contains("thinking-display")
+        && ["unknown option", "unknown argument", "unrecognized option"]
+            .iter()
+            .any(|phrase| said.contains(phrase))
 }
 
 /// What THIS agent calls its sub-agent tool.
@@ -378,6 +399,7 @@ impl ClaudeCodeBackend {
             cancel: None,
             deny: Vec::new(),
             images: Vec::new(),
+            thinking_display: true,
         }
     }
 
@@ -490,6 +512,31 @@ impl ClaudeCodeBackend {
     #[must_use]
     pub fn with_desktop(mut self, setup: crate::toolbox::DesktopSetup) -> Self {
         self.tools.enable_desktop(setup);
+        self
+    }
+
+    /// Run the operator's own pre- and post-tool commands around every call
+    /// this model makes — see [`crate::hooks`].
+    #[must_use]
+    pub fn with_operator_hooks(mut self, hooks: Option<crate::hooks::HookRunner>) -> Self {
+        self.tools = self.tools.with_operator_hooks(hooks);
+        self
+    }
+
+    /// Confine this model's shell commands to `mode` — see [`crate::sandbox`].
+    #[must_use]
+    pub fn with_sandbox(mut self, mode: crate::sandbox::SandboxMode) -> Self {
+        self.tools = self.tools.with_sandbox(mode);
+        self
+    }
+
+    /// Offer the model only `tools`, when given — a user-defined sub-agent's
+    /// allow-list. A call to any other tool is refused by the toolbox.
+    #[must_use]
+    pub fn with_tool_allowlist(mut self, tools: Option<Vec<String>>) -> Self {
+        if let Some(tools) = tools {
+            self.tools.restrict_tools(tools);
+        }
         self
     }
 
@@ -614,7 +661,10 @@ impl ClaudeCodeBackend {
             // CLI's option table, choices summarized / omitted / highlights);
             // measured: without it every thinking delta arrived EMPTY, with it
             // the summary arrived word by word, beside an unchanged reply.
-            cmd.arg("--thinking-display").arg("summarized");
+            // Left off once this CLI has refused it (`thinking_display`).
+            if self.thinking_display {
+                cmd.arg(THINKING_DISPLAY_FLAG).arg("summarized");
+            }
         }
         if !context.is_empty() {
             cmd.arg("--append-system-prompt").arg(context);
@@ -1249,11 +1299,39 @@ impl AgentBackend for ClaudeCodeBackend {
         prompt: &str,
         on_event: &mut dyn FnMut(&AgentEvent),
     ) -> Result<TurnOutcome, AgentError> {
-        let (budgeted_prompt, budgeted_context) =
-            crate::agent::budget_for_spawn(prompt, &self.system_context);
         // This turn's pictures, and only this turn's: taken now, so a turn
         // that fails to start does not carry them into the next one.
         let images = std::mem::take(&mut self.images);
+        let asked_for_thinking = self.partial_messages && self.thinking_display;
+        match self.run_once(prompt, images.clone(), on_event) {
+            // The CLI refused the undocumented thinking flag before it did
+            // anything: remembered for the session, and the turn run again,
+            // once, without it.
+            Err(e) if asked_for_thinking && rejects_thinking_display(&e.to_string()) => {
+                crate::trace!(
+                    "agent",
+                    "{} refused {THINKING_DISPLAY_FLAG}; running without it from now on",
+                    self.binary
+                );
+                self.thinking_display = false;
+                self.run_once(prompt, images, on_event)
+            }
+            other => other,
+        }
+    }
+}
+
+impl ClaudeCodeBackend {
+    /// One run of the CLI for a turn: spawned, its tool calls answered, its
+    /// stream read to the end.
+    fn run_once(
+        &mut self,
+        prompt: &str,
+        images: Vec<crate::toolbox::Image>,
+        on_event: &mut dyn FnMut(&AgentEvent),
+    ) -> Result<TurnOutcome, AgentError> {
+        let (budgeted_prompt, budgeted_context) =
+            crate::agent::budget_for_spawn(prompt, &self.system_context);
 
         // THE TOOLS ARE incode's. The CLI's own are switched off below and the
         // model is handed incode's toolbox through the bridge, which this
@@ -2551,6 +2629,100 @@ pub(crate) mod tests {
         );
         let empty = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"","estimated_tokens":50}},"session_id":"d4","parent_tool_use_id":null,"thinking_display":"updates"}"#;
         assert!(map(empty).0.is_empty());
+    }
+
+    /// A stand-in CLI whose option parser does not know the thinking flag:
+    /// named on its argv, it says so on stderr and exits 1 before any
+    /// output; otherwise it prints a short turn. Every start is counted in
+    /// `starts.txt` beside it.
+    fn a_cli_without_the_thinking_flag(dir: &std::path::Path) -> PathBuf {
+        const LINES: [&str; 3] = [
+            r#"{"type":"system","subtype":"init","session_id":"no-think-1","model":"m"}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"still here"}]},"parent_tool_use_id":null}"#,
+            r#"{"type":"result","is_error":false,"stop_reason":"end_turn","session_id":"no-think-1","usage":{"input_tokens":1,"output_tokens":1}}"#,
+        ];
+        #[cfg(windows)]
+        {
+            let mut body = String::from(
+                "@echo off\r\necho x>>\"%~dp0starts.txt\"\r\n\
+                 echo %* | findstr /C:\"--thinking-display\" >nul\r\n\
+                 if not errorlevel 1 (\r\n\
+                 echo error: unknown option '--thinking-display' 1>&2\r\n\
+                 exit /b 1\r\n)\r\n",
+            );
+            for line in LINES {
+                body.push_str(&format!("echo {line}\r\n"));
+            }
+            let path = dir.join("old-agent.cmd");
+            std::fs::write(&path, body).expect("write the stand-in agent");
+            path
+        }
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut body = String::from(
+                "#!/bin/sh\necho x >> \"$(dirname \"$0\")/starts.txt\"\n\
+                 case \"$*\" in *--thinking-display*) \
+                 echo \"error: unknown option '--thinking-display'\" >&2; exit 1;; esac\n",
+            );
+            for line in LINES {
+                body.push_str(&format!("echo '{line}'\n"));
+            }
+            let path = dir.join("old-agent.sh");
+            std::fs::write(&path, body).expect("write the stand-in agent");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("make it runnable");
+            path
+        }
+    }
+
+    /// **A CLI THAT DROPS THE UNDOCUMENTED THINKING FLAG DOES NOT BREAK EVERY
+    /// TURN.** The first refusal is recognised, the turn runs again without
+    /// the flag, and the backend remembers: the next turn starts once.
+    #[test]
+    fn a_refused_thinking_flag_is_dropped_once_and_remembered() {
+        let dir = tempfile::tempdir().expect("scratch");
+        let fake = a_cli_without_the_thinking_flag(dir.path());
+        let starts = dir.path().join("starts.txt");
+        let count = || {
+            std::fs::read_to_string(&starts)
+                .map(|s| s.lines().count())
+                .unwrap_or(0)
+        };
+        let mut backend = ClaudeCodeBackend::new(dir.path().to_path_buf())
+            .with_binary(fake.to_string_lossy())
+            .streaming(true);
+
+        let mut said = Vec::new();
+        let first = backend
+            .run_turn("hi", &mut |e| {
+                if let AgentEvent::Text(t) = e {
+                    said.push(t.clone());
+                }
+            })
+            .expect("the turn is run again without the flag");
+        assert!(!first.is_error, "{first:?}");
+        assert_eq!(said, ["still here"], "{said:?}");
+        assert_eq!(count(), 2, "one refused start, one without the flag");
+
+        backend.run_turn("again", &mut |_| {}).expect("second turn");
+        assert_eq!(count(), 3, "the refusal is remembered: one start this turn");
+    }
+
+    /// Only a refusal that names the flag counts; any other failure is left
+    /// as it was.
+    #[test]
+    fn only_a_refusal_naming_the_thinking_flag_is_recognised() {
+        assert!(rejects_thinking_display(
+            "agent exited with 1 before producing a result: error: unknown option \
+             '--thinking-display'"
+        ));
+        assert!(!rejects_thinking_display(
+            "error: unknown option '--fallback-model'"
+        ));
+        assert!(!rejects_thinking_display(
+            "the --thinking-display summary was empty"
+        ));
     }
 
     /// A stand-in for the agent CLI, for tests elsewhere in the crate: it prints

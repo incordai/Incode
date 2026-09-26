@@ -40,6 +40,9 @@ OPTIONS:
         --team-mcp            Speak MCP on stdin/stdout so a running agent can
                               reach its teammates. Needs --team-channel
         --team-channel <P>    The conversation --team-mcp joins
+        --sandbox-exec        Apply this platform's OS sandbox to this process,
+                              then exec the shell command after `--`. Launched BY
+                              incode's Bash tool on Unix, not by hand
         --tool-server         Speak MCP on stdin/stdout, offering incode's tools to
                               an agent CLI that incode started. Runs nothing
                               itself: every call goes back to that incode.
@@ -53,6 +56,11 @@ OPTIONS:
                               for that session. Works while the harness is busy
     -t, --task <TEXT>         Run one instruction with an installed agent CLI
                               (uses its subscription; needs no API credential)
+        --output-format <F>   With -t: text (default) | stream-json (one JSON
+                              event per line: init, text, thinking, tool_use,
+                              tool_result, usage, result) | json (the result
+                              object alone). In the JSON forms stdout is JSON
+                              only; everything else goes to stderr
     -r, --resume <ID>         Continue an agent session by its id
         --add-dir <PATH>      Also work in this directory (repeatable)
     -h, --help                Print this help
@@ -60,6 +68,27 @@ OPTIONS:
 ";
 
 fn main() -> anyhow::Result<()> {
+    // BEFORE ANYTHING ELSE, and before any thread starts: this mode applies the
+    // OS sandbox to THIS process and then execs the command, and an early
+    // Landlock ruleset binds only the thread that set it. On success it never
+    // returns; it runs only on Unix (Windows launches a confined child
+    // instead), so the argument is simply passed through to the ordinary
+    // parser elsewhere.
+    {
+        let raw: Vec<String> = std::env::args().skip(1).collect();
+        if raw.first().map(String::as_str) == Some("--sandbox-exec") {
+            #[cfg(unix)]
+            {
+                incord_code::sandbox::exec(&raw[1..])?;
+                unreachable!("sandbox::exec replaces this process on success");
+            }
+            #[cfg(windows)]
+            {
+                let code = incord_code::sandbox::run_windows_helper(&raw[1..])?;
+                std::process::exit(code);
+            }
+        }
+    }
     // NOTE: the crate emits `tracing` events (MCP connection failures, tool
     // errors) but no subscriber is installed, so they currently go nowhere.
     // Installing one needs a new dependency, which is a decision to take
@@ -74,12 +103,14 @@ fn main() -> anyhow::Result<()> {
             workspace,
             instruction,
             model,
+            format,
         } => {
             return on_a_runtime(|| {
-                incord_code::task_run::run_task_with_model(
+                incord_code::task_run::run_task_as(
                     &workspace,
                     &instruction,
                     model.as_deref(),
+                    format,
                 )
             })?
             .map(|_| ())
@@ -240,6 +271,8 @@ enum Parsed {
         workspace: PathBuf,
         instruction: String,
         model: Option<String>,
+        /// How what happens is reported: text, or JSON for a script.
+        format: incord_code::task_run::OutputFormat,
     },
     Exit(String),
     /// Serve what the run is doing to a local interface, and nothing else.
@@ -353,6 +386,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> anyhow::Result<Parsed> {
     // collides with whatever else this machine is already running.
     let mut port: Option<u16> = None;
     let mut task: Option<String> = None;
+    let mut output_format: Option<incord_code::task_run::OutputFormat> = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -405,6 +439,18 @@ fn parse_args(args: impl Iterator<Item = String>) -> anyhow::Result<Parsed> {
             // One instruction, run by an installed agent on its own
             // subscription. No provider credential is read or needed.
             "-t" | "--task" => task = Some(next_value(&mut args, &arg)?),
+            // Refused rather than defaulted: a script that asked for JSON and
+            // got text would parse a person's prose.
+            "--output-format" => {
+                let value = next_value(&mut args, &arg)?;
+                output_format = Some(
+                    incord_code::task_run::OutputFormat::parse(&value).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "unknown output format `{value}`. Valid: text, stream-json, json"
+                        )
+                    })?,
+                );
+            }
             // The id the agent assigned, which every session prints on the way
             // out. Promised by that message, so it has to exist.
             "-r" | "--resume" => config.resume_session = Some(next_value(&mut args, &arg)?),
@@ -579,7 +625,13 @@ fn parse_args(args: impl Iterator<Item = String>) -> anyhow::Result<Parsed> {
             workspace: config.workspace,
             instruction,
             model: config.model_from_flag,
+            format: output_format.unwrap_or_default(),
         });
+    }
+    // Only a one-shot task has an output to format; ignored anywhere else it
+    // would be believed.
+    if output_format.is_some() {
+        anyhow::bail!("`--output-format` only applies with `-t`/`--task`\n\n{USAGE}");
     }
 
     if serve {
@@ -1120,10 +1172,12 @@ mod tests {
                 instruction,
                 workspace,
                 model,
+                format,
             } => {
                 assert_eq!(instruction, "write the brief");
                 assert_eq!(workspace, PathBuf::from("."));
                 assert_eq!(model, None);
+                assert_eq!(format, incord_code::task_run::OutputFormat::Text);
             }
             other => panic!("--task must not start a session, got {other:?}"),
         }
@@ -1145,6 +1199,7 @@ mod tests {
                 instruction,
                 workspace,
                 model,
+                ..
             } => {
                 assert_eq!(instruction, "write the brief");
                 assert_eq!(workspace, PathBuf::from("."));
@@ -1152,6 +1207,31 @@ mod tests {
             }
             other => panic!("--task must not start a session, got {other:?}"),
         }
+    }
+
+    /// **A SCRIPT ASKS FOR JSON AND GETS IT, OR IS REFUSED.** The format
+    /// rides the task; a name nobody knows, or the flag without `-t`, is an
+    /// error rather than text a script would then try to parse.
+    #[test]
+    fn the_output_format_rides_a_task_and_is_refused_elsewhere() {
+        for (name, want) in [
+            (
+                "stream-json",
+                incord_code::task_run::OutputFormat::StreamJson,
+            ),
+            ("json", incord_code::task_run::OutputFormat::Json),
+            ("text", incord_code::task_run::OutputFormat::Text),
+        ] {
+            match parse(&["-t", "do it", "-w", ".", "--output-format", name]).expect("valid") {
+                Parsed::Task { format, .. } => assert_eq!(format, want),
+                other => panic!("got {other:?}"),
+            }
+        }
+        let err = parse(&["-t", "x", "--output-format", "yaml"]).expect_err("unknown");
+        assert!(err.to_string().contains("stream-json"), "{err}");
+        let err = parse(&["--output-format", "json"]).expect_err("no task");
+        assert!(err.to_string().contains("--task"), "{err}");
+        assert!(USAGE.contains("--output-format"));
     }
 
     /// A task with no text is a mistake worth catching at the boundary.

@@ -41,9 +41,8 @@
 //! run without it. When nothing was named and nothing is installed, the hooks
 //! are skipped: the engine is a plugin, and the harness works without it.
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -457,34 +456,14 @@ impl Engine {
         abandon: &dyn Fn() -> bool,
     ) -> Ran {
         let mut command = Command::new(&self.bin);
-        command
-            .arg("hook")
-            .arg(event.subcommand())
-            .current_dir(cwd)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        crate::agent::process_tree::prepare(&mut command);
+        command.arg("hook").arg(event.subcommand()).current_dir(cwd);
         #[cfg(test)]
         fake::note_spawn(&self.bin, event.subcommand());
-        let mut child = match command.spawn() {
-            Ok(child) => child,
-            Err(e) => {
-                return Ran::Failed(format!("could not start `{}`: {e}", self.bin.display()));
-            }
-        };
-        // Written on a thread of its own and CLOSED when that thread ends, so
-        // the engine sees end-of-input. Not written inline: a large event (a
-        // Write carries the whole file) and a child that prints before it
-        // reads would each wait on the other.
+        // The event on a piped stdin that is then closed — a Write carries
+        // the whole file — through the runner the operator's hooks share.
         let mut bytes = payload.to_string().into_bytes();
         bytes.push(b'\n');
-        if let Some(mut stdin) = child.stdin.take() {
-            std::thread::spawn(move || {
-                let _ = stdin.write_all(&bytes);
-            });
-        }
-        match crate::tools::bash::wait_with_timeout_or(child, bound, abandon) {
+        match super::run_piped(command, bytes, bound, abandon) {
             Ok(output) => match output.status.code() {
                 Some(code) => Ran::Exited {
                     code,
@@ -493,7 +472,10 @@ impl Engine {
                 },
                 None => Ran::Failed("the engine ended without an exit code".to_string()),
             },
-            Err(e) => Ran::Failed(e.to_string()),
+            Err(super::Piped::Start(e)) => {
+                Ran::Failed(format!("could not start `{}`: {e}", self.bin.display()))
+            }
+            Err(super::Piped::Wait(why)) => Ran::Failed(why),
         }
     }
 }

@@ -44,9 +44,9 @@ pub(crate) struct Settings {
 
 /// The commands offered, by name, in the order a menu shows them. Each is in
 /// [`COMMANDS`], which gives its description and its argument hint.
-const OFFERED: [&str; 13] = [
-    "undo", "plan", "act", "diff", "links", "roadmap", "run", "doctor", "memories", "remember",
-    "worktree", "agent", "roles",
+const OFFERED: [&str; 15] = [
+    "undo", "rewind", "plan", "act", "diff", "links", "roadmap", "run", "doctor", "memories",
+    "remember", "worktree", "agent", "agents", "roles",
 ];
 
 /// The list `available_commands_update` carries.
@@ -96,6 +96,8 @@ pub(crate) fn run(
     let mut mode = None;
     let ((), said) = crate::cli::console::capture(|| match command {
         SlashCommand::Undo => slash_commands::handle_undo(session, workspace),
+        SlashCommand::Rewind(turns) => slash_commands::handle_rewind(session, workspace, turns),
+        SlashCommand::Agents => slash_commands::handle_agents(workspace),
         SlashCommand::Plan => {
             slash_commands::handle_plan(session);
             mode = Some(PermissionMode::ReadOnly);

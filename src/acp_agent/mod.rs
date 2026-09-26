@@ -68,7 +68,9 @@ mod history;
 mod permission;
 mod present;
 mod run;
-mod stdio;
+// Shared with `incode -t --output-format stream-json|json`, whose stdout is
+// its JSON and nothing else, for the same reason.
+pub(crate) mod stdio;
 mod transport;
 mod workers;
 
@@ -2473,8 +2475,8 @@ mod tests {
         assert_eq!(
             names,
             [
-                "undo", "plan", "act", "diff", "links", "roadmap", "run", "doctor", "memories",
-                "remember", "worktree", "agent", "roles"
+                "undo", "rewind", "plan", "act", "diff", "links", "roadmap", "run", "doctor",
+                "memories", "remember", "worktree", "agent", "agents", "roles"
             ],
             "{announced}"
         );

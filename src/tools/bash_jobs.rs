@@ -16,7 +16,7 @@
 
 use std::io::Read;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
@@ -216,7 +216,12 @@ impl BashJobManager {
     /// # Errors
     ///
     /// [`MAX_RUNNING_JOBS`] are already running, or the shell could not start.
-    pub fn spawn(&mut self, command: &str, workspace: &Path) -> Result<u32> {
+    pub fn spawn(
+        &mut self,
+        command: &str,
+        workspace: &Path,
+        sandbox: &crate::sandbox::Sandbox,
+    ) -> Result<u32> {
         let running = self.running_count();
         if running >= MAX_RUNNING_JOBS {
             anyhow::bail!(
@@ -225,23 +230,10 @@ impl BashJobManager {
             );
         }
 
-        // `raw_arg` on Windows, for the reason `tools::bash` gives: `cmd /C`
-        // does not parse MSVC-style quoting, so `arg` would backslash every
-        // quote the command holds.
-        #[cfg(windows)]
-        let mut cmd_builder = {
-            use std::os::windows::process::CommandExt;
-            let mut c = Command::new("cmd");
-            c.arg("/C").raw_arg(command);
-            c
-        };
-
-        #[cfg(not(windows))]
-        let mut cmd_builder = {
-            let mut c = Command::new("sh");
-            c.arg("-c").arg(command);
-            c
-        };
+        // Under the session's OS sandbox where the platform can confine it,
+        // through the plain shell where it cannot — `wrap` decides, and passes
+        // the command to `cmd /C` verbatim (which does not parse MSVC quoting).
+        let mut cmd_builder = sandbox.wrap(super::bash::SHELL, command);
 
         cmd_builder
             .current_dir(workspace)
@@ -415,6 +407,11 @@ mod tests {
         }
     }
 
+    /// No sandbox: these tests are about the job manager, not confinement.
+    fn off() -> crate::sandbox::Sandbox {
+        crate::sandbox::Sandbox::off()
+    }
+
     fn wait_until(mut done: impl FnMut() -> bool) -> bool {
         let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline {
@@ -429,8 +426,8 @@ mod tests {
     #[test]
     fn job_ids_increment() {
         let mut mgr = BashJobManager::new();
-        let id1 = mgr.spawn("echo hello", Path::new(".")).unwrap();
-        let id2 = mgr.spawn("echo world", Path::new(".")).unwrap();
+        let id1 = mgr.spawn("echo hello", Path::new("."), &off()).unwrap();
+        let id2 = mgr.spawn("echo world", Path::new("."), &off()).unwrap();
         assert_eq!(id1, 1);
         assert_eq!(id2, 2);
     }
@@ -438,7 +435,9 @@ mod tests {
     #[test]
     fn spawn_and_poll_completes() {
         let mut mgr = BashJobManager::new();
-        let _id = mgr.spawn("echo test_output", Path::new(".")).unwrap();
+        let _id = mgr
+            .spawn("echo test_output", Path::new("."), &off())
+            .unwrap();
         let mut completed = Vec::new();
         assert!(wait_until(|| {
             completed.extend(mgr.poll_completed());
@@ -454,7 +453,7 @@ mod tests {
     #[test]
     fn list_shows_jobs() {
         let mut mgr = BashJobManager::new();
-        mgr.spawn("echo a", Path::new(".")).unwrap();
+        mgr.spawn("echo a", Path::new("."), &off()).unwrap();
         let jobs = mgr.list();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].0, 1);
@@ -472,7 +471,9 @@ mod tests {
     #[test]
     fn a_read_returns_new_output_once() {
         let mut mgr = BashJobManager::new();
-        let id = mgr.spawn("echo first_line", Path::new(".")).unwrap();
+        let id = mgr
+            .spawn("echo first_line", Path::new("."), &off())
+            .unwrap();
         assert!(wait_until(|| mgr.running_count() == 0));
         let first = mgr.read_new(id).expect("the job exists");
         assert!(first.stdout.contains("first_line"), "{first:?}");
@@ -487,7 +488,9 @@ mod tests {
     #[test]
     fn a_running_job_is_counted_and_can_be_killed() {
         let mut mgr = BashJobManager::new();
-        let id = mgr.spawn(&long_running(30), Path::new(".")).unwrap();
+        let id = mgr
+            .spawn(&long_running(30), Path::new("."), &off())
+            .unwrap();
         assert_eq!(mgr.running_count(), 1);
         assert!(mgr.kill(id));
         assert_eq!(mgr.running_count(), 0);
@@ -512,10 +515,11 @@ mod tests {
     fn no_more_than_the_limit_run_at_once() {
         let mut mgr = BashJobManager::new();
         for _ in 0..MAX_RUNNING_JOBS {
-            mgr.spawn(&long_running(30), Path::new(".")).unwrap();
+            mgr.spawn(&long_running(30), Path::new("."), &off())
+                .unwrap();
         }
         let refused = mgr
-            .spawn("echo one_too_many", Path::new("."))
+            .spawn("echo one_too_many", Path::new("."), &off())
             .expect_err("over the limit");
         assert!(refused.to_string().contains("limit"), "{refused}");
     }

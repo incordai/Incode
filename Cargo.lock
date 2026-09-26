@@ -1983,6 +1983,7 @@ dependencies = [
  "ignore",
  "image",
  "jsonschema",
+ "landlock",
  "libc",
  "pdf-extract",
  "pulldown-cmark",
@@ -2198,6 +2199,17 @@ name = "khronos_api"
 version = "3.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
+
+[[package]]
+name = "landlock"
+version = "0.4.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4cca98e95f35b29d469dade6724c6f96cec9236640f745a0e99b0334ec320ab1"
+dependencies = [
+ "enumflags2",
+ "libc",
+ "thiserror",
+]
 
 [[package]]
 name = "libc"

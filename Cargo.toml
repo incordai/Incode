@@ -197,6 +197,15 @@ windows-sys = { version = "0.61", features = [
     # so nothing else (a stray print, an inherited child) can reach the
     # protocol channel. GetStdHandle / SetStdHandle live here.
     "Win32_System_Console",
+    # sandbox::windows — a write-restricted token for the read-only shell
+    # sandbox. CreateRestrictedToken, TokenLogonSid, TokenDefaultDacl and
+    # WRITE_RESTRICTED are in Win32_Security; ConvertStringSidToSidW and
+    # ConvertStringSecurityDescriptorToSecurityDescriptorW (for the restricting
+    # SIDs and the token's default DACL) are in Win32_Security_Authorization;
+    # CreateProcessAsUserW / OpenProcessToken / ResumeThread are in
+    # Win32_System_Threading (already on). Each was confirmed present in the
+    # cached 0.61.2 manifest before being written here.
+    "Win32_Security_Authorization",
 ] }
 
 # agent::process_tree on Linux and macOS: `killpg` for the process group the
@@ -204,6 +213,20 @@ windows-sys = { version = "0.61", features = [
 # (0.2.189) as a dependency of tokio and others.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# The Linux OS sandbox for a model's shell commands (`src/sandbox`): Landlock,
+# the kernel's own unprivileged filesystem confinement, applied by the
+# `--sandbox-exec` helper before it execs the command. A NEW PACKAGE, vetted in
+# a scratch copy of this manifest on 2026-09-25:
+#   - 0.4.7 is the latest (published 2026-07-27, not yanked); covers ABI V1–V9.
+#   - MIT OR Apache-2.0; rust-version 1.71, below this crate's 1.88 floor.
+#   - Adds EXACTLY ONE package to the lock — landlock itself. Its dependencies
+#     (enumflags2 0.7, libc 0.2, thiserror 2.0) are all already resolved.
+#   - `cargo check --target x86_64-unknown-linux-musl` passes with no cross C
+#     compiler, and a static musl probe enforced the rules live in WSL2.
+# Pinned exactly, like every other toolbox dependency.
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "=0.4.7"
 
 # ---------------------------------------------------------------------------
 # Features

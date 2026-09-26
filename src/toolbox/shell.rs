@@ -51,7 +51,12 @@ fn job_id(input: &Value, key: &str) -> Result<u32, String> {
 }
 
 /// Start `input`'s command as a background job of the session.
-pub(super) fn start(state: &SessionTools, root: &Path, input: &Value) -> Result<String, String> {
+pub(super) fn start(
+    state: &SessionTools,
+    root: &Path,
+    input: &Value,
+    sandbox: &crate::sandbox::Sandbox,
+) -> Result<String, String> {
     let command = input
         .get("command")
         .and_then(Value::as_str)
@@ -60,7 +65,7 @@ pub(super) fn start(state: &SessionTools, root: &Path, input: &Value) -> Result<
         .ok_or("`command` is required")?;
     let id = state
         .jobs()
-        .spawn(command, root)
+        .spawn(command, root, sandbox)
         .map_err(|e| format!("{e:#}"))?;
     Ok(format!(
         "Started background job {id}. Read its output with BashOutput {{\"bash_id\": \"{id}\"}}; \

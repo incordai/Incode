@@ -1,13 +1,18 @@
 //! Bash tool — execute shell commands with timeout.
 
 use std::path::Path;
-use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000; // 2 minutes
 const MAX_OUTPUT_CHARS: usize = 30_000;
+
+/// How this platform runs a command string: the shell and the "run this" flag.
+#[cfg(windows)]
+pub(crate) const SHELL: (&str, &str) = ("cmd", "/C");
+#[cfg(not(windows))]
+pub(crate) const SHELL: (&str, &str) = ("sh", "-c");
 
 /// Execute a bash command in the workspace directory.
 ///
@@ -32,6 +37,7 @@ pub fn execute_bash_watched(
     workspace: &Path,
     input: &str,
     filter_env: bool,
+    sandbox: &crate::sandbox::Sandbox,
     stopped: &dyn Fn() -> bool,
     on_output: &mut dyn FnMut(&[u8]),
 ) -> Result<String> {
@@ -43,26 +49,14 @@ pub fn execute_bash_watched(
         .context("missing 'command' field")?;
     let timeout_ms = parsed["timeout"].as_u64().unwrap_or(DEFAULT_TIMEOUT_MS);
 
-    // `Command::arg` applies MSVC-style quoting on Windows: a `"` in the
-    // argument is escaped to `\"`. `cmd.exe /C` does not parse its argument
-    // that way, so every quote the model wrote arrived literally backslashed
-    // and `echo "hello world"` printed `\"hello world\"`. Redirects, paths with
-    // spaces and any quoted grep pattern were all corrupted. `raw_arg` passes
-    // the command through verbatim, which is what a shell string needs.
-    #[cfg(windows)]
-    let mut child = {
-        use std::os::windows::process::CommandExt;
-        let mut c = Command::new("cmd");
-        c.arg("/C").raw_arg(command);
-        c
-    };
-
-    #[cfg(not(windows))]
-    let mut child = {
-        let mut c = Command::new("sh");
-        c.arg("-c").arg(command);
-        c
-    };
+    // The command runs under the session's OS sandbox where the platform can
+    // confine it, and through the plain shell where it cannot — `wrap` decides,
+    // and traces which. `cmd /C` gets the command verbatim (it does not parse
+    // MSVC quoting, so `arg` would backslash every quote), which `wrap` handles.
+    if !sandbox.is_off() {
+        crate::trace!("sandbox", "{}", sandbox.note());
+    }
+    let mut child = sandbox.wrap(SHELL, command);
 
     child
         .current_dir(workspace)
@@ -304,6 +298,11 @@ fn wait_streaming(
 mod tests {
     use super::*;
 
+    /// No sandbox: these tests are about the shell tool, not confinement.
+    fn no_sandbox() -> crate::sandbox::Sandbox {
+        crate::sandbox::Sandbox::off()
+    }
+
     /// A line, two seconds of nothing, another line.
     #[cfg(windows)]
     const SLOW_TWO_LINES: &str = "echo first&& ping -n 3 127.0.0.1 >nul&& echo second";
@@ -320,12 +319,19 @@ mod tests {
         let mut first_at = None;
         let mut seen = Vec::new();
         let input = serde_json::json!({ "command": SLOW_TWO_LINES }).to_string();
-        let said = execute_bash_watched(dir.path(), &input, false, &|| false, &mut |piece| {
-            seen.extend_from_slice(piece);
-            if first_at.is_none() && String::from_utf8_lossy(&seen).contains("first") {
-                first_at = Some(started.elapsed());
-            }
-        })
+        let said = execute_bash_watched(
+            dir.path(),
+            &input,
+            false,
+            &no_sandbox(),
+            &|| false,
+            &mut |piece| {
+                seen.extend_from_slice(piece);
+                if first_at.is_none() && String::from_utf8_lossy(&seen).contains("first") {
+                    first_at = Some(started.elapsed());
+                }
+            },
+        )
         .expect("runs");
         let whole = started.elapsed();
         let first_at = first_at.expect("the first line was handed on");
@@ -352,6 +358,7 @@ mod tests {
             dir.path(),
             &input,
             false,
+            &no_sandbox(),
             &|| std::time::Instant::now() > stop_at,
             &mut |_| {},
         )
@@ -365,7 +372,8 @@ mod tests {
     }
 
     /// A shell command that prints `lines` lines of about 70 bytes each.
-    fn loud(lines: u32) -> Command {
+    fn loud(lines: u32) -> std::process::Command {
+        use std::process::Command;
         #[cfg(windows)]
         {
             let mut c = Command::new("cmd");
@@ -460,6 +468,7 @@ mod tests {
             std::path::Path::new("."),
             &input,
             filter_env,
+            &no_sandbox(),
             &|| false,
             &mut |_| {},
         )

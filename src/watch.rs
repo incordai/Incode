@@ -41,6 +41,8 @@ pub enum Decider {
     Guards,
     /// The memory engine's `pre-tool` hook.
     Engine,
+    /// The operator's own pre-tool command (`crate::hooks`), when it refused.
+    Hook,
 }
 
 impl Decider {
@@ -50,6 +52,7 @@ impl Decider {
         match self {
             Self::Guards => "guards",
             Self::Engine => "engine",
+            Self::Hook => "hook",
         }
     }
 }

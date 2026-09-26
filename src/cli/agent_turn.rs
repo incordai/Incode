@@ -30,16 +30,9 @@
 use std::path::{Path, PathBuf};
 
 use crate::agent::{AgentBackend, AgentEvent, TurnOutcome};
-use crate::tools::checkpoint::CheckpointStore;
+use crate::tools::checkpoint::{CheckpointStore, SKIP_DIRS};
 
-/// How many files a pre-turn snapshot will hold.
-///
-/// Bounds the ACTION — the snapshot — and never the report: a tree over this is
-/// told that undo is off for the turn, not quietly given half of one.
-pub const MAX_SNAPSHOT_FILES: usize = 5_000;
-
-/// Directories that never hold hand-written source and are enormous.
-const SKIP_DIRS: [&str; 5] = ["target", "node_modules", "dist", ".git", ".incord"];
+pub use crate::tools::checkpoint::MAX_SNAPSHOT_FILES;
 
 /// An interactive session driven by an installed agent.
 pub struct AgentSession {
@@ -1123,6 +1116,11 @@ impl AgentSession {
         self.usage.cache_creation_input_tokens += turn_usage.cache_creation_input_tokens;
         self.usage.cache_read_input_tokens += turn_usage.cache_read_input_tokens;
 
+        // THE TURN'S CHECKPOINT IS SEALED: only what changed is kept, what
+        // the turn created is added, and — when the session keeps its
+        // checkpoints — it is written to disk for `/undo` after a restart.
+        self.checkpoints.finish_turn();
+
         outcome
     }
 
@@ -1134,51 +1132,43 @@ impl AgentSession {
         &mut self,
         workspace: &Path,
     ) -> Result<crate::tools::checkpoint::UndoOutcome, String> {
-        match self.snapshot_complete {
-            None => return Err("there is nothing to undo yet — no turn has run.".to_string()),
-            Some(false) => {
-                return Err(format!(
-                    "undo is not available for that turn: the workspace has more than {MAX_SNAPSHOT_FILES} files, so no complete snapshot was taken. A partial undo would restore some files and not others."
-                ))
+        // A turn whose snapshot hit its cap is refused by the store itself:
+        // its checkpoint is kept, marked incomplete, for exactly that.
+        self.checkpoints.undo_last(workspace).map_err(|e| {
+            let said = e.to_string();
+            if said.contains("nothing to undo") && self.snapshot_complete.is_none() {
+                "there is nothing to undo yet — no turn has changed anything.".to_string()
+            } else {
+                said
             }
-            Some(true) => {}
-        }
-        self.checkpoints
-            .undo_last(workspace)
-            .map_err(|e| e.to_string())
+        })
+    }
+
+    /// Put the files back as they were `turns` changed turns ago, newest
+    /// first: what was undone, and why it stopped early when it did.
+    pub fn rewind(
+        &mut self,
+        workspace: &Path,
+        turns: usize,
+    ) -> (Vec<crate::tools::checkpoint::UndoOutcome>, Option<String>) {
+        self.checkpoints.rewind(workspace, turns)
+    }
+
+    /// Keep this session's checkpoints on disk under `session`, so `/undo`
+    /// and `/rewind` outlive the process — and start from the turns earlier
+    /// sessions in this workspace kept.
+    pub fn keep_checkpoints(&mut self, session: &str) {
+        self.checkpoints = CheckpointStore::persisted(&self.workspace, &self.roots(), session);
     }
 
     /// Snapshot the tree. Returns whether it covered everything.
     fn snapshot(&mut self, workspace: &Path, label: &str) -> bool {
-        self.checkpoints.begin(crate::text::head_bytes(label, 60));
-
         // Every root, not just the workspace: a change made in an added
         // directory has to be undoable too.
-        let mut stack = vec![workspace.to_path_buf()];
-        stack.extend(self.extra_dirs.iter().cloned());
-        let mut seen = 0usize;
-        while let Some(dir) = stack.pop() {
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if SKIP_DIRS.contains(&name.as_str()) {
-                    continue;
-                }
-                let path = entry.path();
-                if path.is_dir() {
-                    stack.push(path);
-                    continue;
-                }
-                seen += 1;
-                if seen > MAX_SNAPSHOT_FILES {
-                    return false;
-                }
-                self.checkpoints.snapshot(&path);
-            }
-        }
-        true
+        let mut roots = vec![workspace.to_path_buf()];
+        roots.extend(self.extra_dirs.iter().cloned());
+        self.checkpoints
+            .begin_tree(crate::text::head_bytes(label, 60), &roots)
     }
 }
 
@@ -1921,7 +1911,7 @@ mod tests {
         let job = s
             .session_tools()
             .jobs()
-            .spawn(long, ws.path())
+            .spawn(long, ws.path(), &crate::sandbox::Sandbox::off())
             .expect("the job starts");
         let _ = one_turn(&mut s, ws.path(), "start the build");
         assert_eq!(fake::calls(engine.path(), "capture"), 0);

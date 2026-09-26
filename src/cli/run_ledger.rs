@@ -164,7 +164,7 @@ pub(crate) fn run(ctx: &RunContext<'_>, cancel: &CancelToken, watch: Watch<'_>) 
         });
     // Every OTHER installed agent is somewhere the work can move when this
     // one runs out of room: two subscriptions are two separate allowances.
-    let standby: Vec<Box<dyn crate::agent::AgentBackend>> = ctx
+    let mut standby: Vec<Box<dyn crate::agent::AgentBackend>> = ctx
         .fleet
         .agents()
         .iter()
@@ -227,6 +227,16 @@ pub(crate) fn run(ctx: &RunContext<'_>, cancel: &CancelToken, watch: Watch<'_>) 
         ledger.tasks = planned;
     }
 
+    // THE WORKER IS A MEMORY SESSION OF ITS OWN, as a person's session is:
+    // its agents' calls are filed under its id, and the engine hears it
+    // start, stop after each task, and end (`run_memory`). Named after the
+    // planning pass, which is the lead's work, not the worker's.
+    let engine = crate::hooks::engine::Engine::locate();
+    let worker_session = uuid::Uuid::new_v4().to_string();
+    backend.set_memory_session(&worker_session);
+    for other in &mut standby {
+        other.set_memory_session(&worker_session);
+    }
     // The role table applies here too: the CLI takes `--model` per
     // invocation, so cheap work runs cheap.
     let worker =
@@ -251,9 +261,13 @@ pub(crate) fn run(ctx: &RunContext<'_>, cancel: &CancelToken, watch: Watch<'_>) 
     };
     let run_status = render::LiveStatus::start(draw);
     let edit_writer = run_status.writer();
-    let mut worker = worker.showing_edits(Box::new(move |line: &str| {
+    let worker = worker.showing_edits(Box::new(move |line: &str| {
         edit_writer.write_text(line);
     }));
+    let mut worker = super::run_memory::Remembered::new(
+        worker,
+        crate::hooks::memory::MemoryHooks::new(engine.clone(), workspace, &worker_session),
+    );
     let mut watcher = RunWatcher {
         status: &run_status,
         width: crate::cli::activity::terminal_width(),
@@ -311,6 +325,7 @@ pub(crate) fn run(ctx: &RunContext<'_>, cancel: &CancelToken, watch: Watch<'_>) 
         watch: followed,
         cancel: cancel.clone(),
         opened: std::sync::atomic::AtomicUsize::new(0),
+        engine,
     };
     let outcome = work(
         &mut ledger,
@@ -543,6 +558,9 @@ pub(crate) struct CliLaneWorkers {
     pub cancel: CancelToken,
     /// How many lanes this run has opened, so each is named apart.
     pub opened: std::sync::atomic::AtomicUsize,
+    /// The memory engine each lane's session is filed with, when there is
+    /// one: every lane is a session of its own.
+    pub engine: Option<crate::hooks::engine::Engine>,
 }
 
 impl crate::runner::LaneWorkers for CliLaneWorkers {
@@ -564,6 +582,7 @@ impl crate::runner::LaneWorkers for CliLaneWorkers {
             watch: self.watch.clone(),
             cancel: self.cancel.clone(),
             lane,
+            engine: self.engine.clone(),
         }))
     }
 }
@@ -583,6 +602,8 @@ struct LaneAgent {
     cancel: CancelToken,
     /// This lane's number in the run, from 1.
     lane: usize,
+    /// The memory engine its session is filed with, when there is one.
+    engine: Option<crate::hooks::engine::Engine>,
 }
 
 impl crate::runner::TaskWorker for LaneAgent {
@@ -630,20 +651,27 @@ impl LaneAgent {
         if let Some(tap) = &tap {
             backend.set_watch(tap.watch());
         }
-        let mut worker =
+        // A session of its own with the memory engine, like every worker.
+        let session = uuid::Uuid::new_v4().to_string();
+        backend.set_memory_session(&session);
+        let mut agent =
             crate::agent::worker::AgentBackendWorker::in_workspace(backend, self.workspace.clone())
                 .with_roles(self.roles.clone())
                 .with_extra_dirs(self.extra_dirs.clone());
         if let Some(tap) = tap {
-            worker = worker.with_tap(tap);
+            agent = agent.with_tap(tap);
         }
+        let mut worker = super::run_memory::Remembered::new(
+            agent,
+            crate::hooks::memory::MemoryHooks::new(self.engine.clone(), &self.workspace, &session),
+        );
 
         let report = crate::runner::TaskWorker::work(&mut worker, task);
         // The conversation this lane opened is on the vendor's side and is
         // billed on every later turn. Nothing else will clear it: the worker
         // is dropped here.
         crate::runner::TaskWorker::release(&mut worker);
-        if let Some(mut tap) = worker.take_tap() {
+        if let Some(mut tap) = worker.inner_mut().take_tap() {
             tap.ended(if self.cancel.is_cancelled() {
                 crate::watch::WorkerEnd::Cancelled
             } else if report.is_ok() {
@@ -824,6 +852,7 @@ mod tests {
             watch: Some(Arc::clone(&kept) as Arc<dyn Watch>),
             cancel: CancelToken::new(),
             opened: std::sync::atomic::AtomicUsize::new(0),
+            engine: None,
         };
         let task = crate::ledger::Task::new("t-1", "r-1", "count the files").with_tier("implement");
         // The lane's own agent, as `spawn_for` makes it, on a stand-in
@@ -843,6 +872,7 @@ mod tests {
             watch: lanes.watch.clone(),
             cancel: lanes.cancel.clone(),
             lane: lanes.opened.load(std::sync::atomic::Ordering::Relaxed),
+            engine: None,
         };
         let report = lane.work_on(Box::new(Says("three files")), &task);
         assert!(report.is_ok(), "{report:?}");

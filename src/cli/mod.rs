@@ -13,6 +13,7 @@ pub mod panel;
 pub mod prompt;
 pub mod render;
 pub(crate) mod run_ledger;
+pub(crate) mod run_memory;
 pub mod slash_commands;
 pub mod viewport;
 
@@ -569,6 +570,9 @@ pub(crate) fn prepare_session(
     timed("memory session-start", || {
         session.start_memory(memory, native, source);
     });
+    // Checkpoints on disk under this session's id, so `/undo` and `/rewind`
+    // work after a restart.
+    session.keep_checkpoints(session_id);
 
     // `-m` first, then the role table. A model named on the command line is
     // the most specific thing the operator said, and it was previously
@@ -779,6 +783,10 @@ impl CliApp {
                     SlashCommand::Undo => {
                         slash_commands::handle_undo(&mut session, &workspace);
                     }
+                    SlashCommand::Rewind(turns) => {
+                        slash_commands::handle_rewind(&mut session, &workspace, turns);
+                    }
+                    SlashCommand::Agents => slash_commands::handle_agents(&workspace),
                     SlashCommand::Image(path) => {
                         slash_commands::handle_image(&mut session, &workspace, &path);
                     }
@@ -1005,7 +1013,13 @@ impl CliApp {
                         }
                     }
                     SlashCommand::Background(cmd) => {
-                        match session_tools.jobs().spawn(&cmd, &workspace) {
+                        // The operator's own command, not the model's: run as
+                        // they typed it, unconfined.
+                        match session_tools.jobs().spawn(
+                            &cmd,
+                            &workspace,
+                            &crate::sandbox::Sandbox::off(),
+                        ) {
                             Ok(id) => {
                                 render::print_info(&format!("Job #{id} started: {cmd}"));
                             }
@@ -1294,6 +1308,14 @@ fn desktop_enabled_from_env() -> bool {
     std::env::var(DESKTOP_ENV).is_ok_and(|v| !v.trim().is_empty())
 }
 
+/// How the OS confines a model's shell commands, from the settings and the
+/// session's permission mode — the same resolution `/admin` reports.
+fn sandbox_for(mode: crate::permissions::PermissionMode) -> crate::sandbox::SandboxMode {
+    crate::admin::AdminConfig::load_default()
+        .resolve_sandbox(mode)
+        .value
+}
+
 /// The backend for one catalogue route: the configured API when the route is
 /// [`crate::agent::registry::API_ROUTE`], otherwise the installed CLI.
 ///
@@ -1328,8 +1350,10 @@ pub(crate) fn route_backend(
                 filter_env,
             )
             // The memory engine's guard, asked before each of the harness's own
-            // tools runs.
+            // tools runs, and the operator's own commands around each.
             .with_engine(crate::hooks::engine::Engine::locate())
+            .with_operator_hooks(crate::hooks::HookRunner::from_settings())
+            .with_sandbox(sandbox_for(permission_mode_from_env()))
             .with_desktop(desktop_setup_for(
                 desktop_enabled_from_env(),
                 std::env::current_exe().ok(),
@@ -1414,8 +1438,11 @@ fn run_backend_with_desktop(
                     .with_system_context(system_prompt.to_vec())
                     // The model's tools are incode's own on this route, so the
                     // memory engine's guard is asked before each, as it is on
-                    // the API route.
-                    .with_engine(crate::hooks::engine::Engine::locate());
+                    // the API route, and the operator's own commands run
+                    // around each.
+                    .with_engine(crate::hooks::engine::Engine::locate())
+                    .with_operator_hooks(crate::hooks::HookRunner::from_settings())
+                    .with_sandbox(sandbox_for(mode));
 
             // The desktop, as toolbox tools reached through the bridge — not
             // a server of its own beside it. The desktop child is told the

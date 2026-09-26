@@ -1,8 +1,9 @@
-//! IncordCodeConfig — model, provider, workspace path, hooks, MCP.
+//! IncordCodeConfig — model, provider, workspace path, lifecycle hooks, MCP.
+//!
+//! The operator's pre- and post-tool commands are not here: they are read
+//! from `admin.json` (`desktop_hooks`), where they apply to every session.
 
 use std::path::PathBuf;
-
-use crate::hooks::HookConfig;
 
 /// Environment variable naming the session's model.
 ///
@@ -69,8 +70,6 @@ pub struct IncordCodeConfig {
     pub additional_dirs: Vec<std::path::PathBuf>,
     /// Permission mode string ("workspace-write", "read-only", "danger-full-access").
     pub permission_mode: String,
-    /// Hook commands.
-    pub hooks: HookConfig,
     /// Lifecycle hooks (on_session_start, on_session_end, on_compact).
     pub lifecycle_hooks: crate::runtime::lifecycle::LifecycleHooks,
     /// Whether to filter env vars for subprocess spawning (default: true).
@@ -86,7 +85,6 @@ impl Default for IncordCodeConfig {
             resume_session: None,
             additional_dirs: Vec::new(),
             permission_mode: "workspace-write".to_string(),
-            hooks: HookConfig::default(),
             lifecycle_hooks: crate::runtime::lifecycle::LifecycleHooks::default(),
             env_filter_enabled: true,
         }

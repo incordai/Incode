@@ -605,6 +605,31 @@ impl ApiBackend {
         self
     }
 
+    /// Run the operator's own pre- and post-tool commands around every call
+    /// this model makes — see [`crate::hooks`].
+    #[must_use]
+    pub fn with_operator_hooks(mut self, hooks: Option<crate::hooks::HookRunner>) -> Self {
+        self.tools = self.tools.with_operator_hooks(hooks);
+        self
+    }
+
+    /// Confine this model's shell commands to `mode` — see [`crate::sandbox`].
+    #[must_use]
+    pub fn with_sandbox(mut self, mode: crate::sandbox::SandboxMode) -> Self {
+        self.tools = self.tools.with_sandbox(mode);
+        self
+    }
+
+    /// Offer the model only `tools`, when given — a user-defined sub-agent's
+    /// allow-list. A call to any other tool is refused by the toolbox.
+    #[must_use]
+    pub fn with_tool_allowlist(mut self, tools: Option<Vec<String>>) -> Self {
+        if let Some(tools) = tools {
+            self.tools.restrict_tools(tools);
+        }
+        self
+    }
+
     /// The same backend, one level further down the tree of agents.
     ///
     /// Carried into the toolbox rather than held here: it is the TOOL that has

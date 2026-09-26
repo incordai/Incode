@@ -413,6 +413,19 @@ pub struct Toolbox {
     /// `Agent` tool starts its sub-agent there when no model endpoint is
     /// configured. See [`subagent`].
     cli_agent: Option<String>,
+    /// The only tools this toolbox offers and runs, when a sub-agent's
+    /// definition named them ([`crate::subagents`]). `None` is every tool.
+    allowed: Option<Vec<String>>,
+    /// The operator's own pre- and post-tool commands ([`crate::hooks`]),
+    /// run around every call. `None` when none are configured, and in every
+    /// toolbox a test builds.
+    hooks: Option<crate::hooks::HookRunner>,
+    /// How tightly the OS confines the shell commands the model runs
+    /// ([`crate::sandbox`]). `Off` by default, and in every toolbox a test
+    /// builds; set for real work from the session's mode and the settings. The
+    /// writable roots are the workspace and the extra directories, taken when a
+    /// command runs so a directory added mid-session is covered.
+    sandbox: crate::sandbox::SandboxMode,
 }
 
 impl Toolbox {
@@ -445,7 +458,56 @@ impl Toolbox {
             desktop: None,
             watch: None,
             cli_agent: None,
+            allowed: None,
+            hooks: None,
+            sandbox: crate::sandbox::SandboxMode::Off,
         }
+    }
+
+    /// Confine the model's shell commands to `mode` from now on — see
+    /// [`crate::sandbox`]. Opt-in, and given by the code that builds a backend
+    /// for real work, so a toolbox built for a test runs commands unconfined.
+    #[must_use]
+    pub fn with_sandbox(mut self, mode: crate::sandbox::SandboxMode) -> Self {
+        self.sandbox = mode;
+        self
+    }
+
+    /// The sandbox for a shell command now: the mode, over the workspace and
+    /// every added directory (plus the temp dir, added by the sandbox itself).
+    fn sandbox(&self) -> crate::sandbox::Sandbox {
+        if self.sandbox == crate::sandbox::SandboxMode::Off {
+            return crate::sandbox::Sandbox::off();
+        }
+        let mut roots = vec![self.workspace.clone()];
+        roots.extend(self.extra_dirs.iter().cloned());
+        crate::sandbox::Sandbox::new(self.sandbox, roots)
+    }
+
+    /// Run the operator's own commands around every call from now on — see
+    /// [`crate::hooks`]. Opt-in, like the engine, and given by the code that
+    /// builds a backend for real work.
+    #[must_use]
+    pub fn with_operator_hooks(mut self, hooks: Option<crate::hooks::HookRunner>) -> Self {
+        self.hooks = hooks;
+        self
+    }
+
+    /// Offer and run only `names` from now on — narrowed further when a list
+    /// is already in force, never widened. A call to any other tool is refused
+    /// by [`Self::run_call`]'s gate before anything else is asked.
+    pub fn restrict_tools(&mut self, names: Vec<String>) {
+        self.allowed = Some(match self.allowed.take() {
+            Some(already) => names.into_iter().filter(|n| already.contains(n)).collect(),
+            None => names,
+        });
+    }
+
+    /// Whether this toolbox may run `name` at all.
+    fn allows(&self, name: &str) -> bool {
+        self.allowed
+            .as_ref()
+            .is_none_or(|names| names.iter().any(|n| n == name))
     }
 
     /// Tell `watch` what calls do while they run, from now on.
@@ -878,9 +940,19 @@ impl Toolbox {
             .filter(|def| {
                 def.get("name")
                     .and_then(Value::as_str)
-                    .is_some_and(|name| self.offered(name))
+                    .is_some_and(|name| self.offered(name) && self.allows(name))
             })
             .map(|mut def| {
+                // The sub-agents defined for this workspace, named where the
+                // model decides whether to delegate — read now, so a file
+                // added mid-session is offered from the next turn.
+                if def.get("name").and_then(Value::as_str) == Some(AGENT) {
+                    if let Some(note) = crate::subagents::load(&self.workspace).schema_note() {
+                        if let Some(text) = def.get("description").and_then(Value::as_str) {
+                            def["description"] = json!(format!("{text}\n\n{note}"));
+                        }
+                    }
+                }
                 if !browser
                     && def.get("name").and_then(Value::as_str) == Some(crate::web::FETCH_TOOL)
                 {
@@ -897,7 +969,11 @@ impl Toolbox {
         // The tools of the MCP servers the session's client handed it, run
         // through the same gate as the rest.
         if let Some(client) = self.state.client() {
-            all.extend(client.definitions());
+            all.extend(client.definitions().into_iter().filter(|def| {
+                def.get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| self.allows(name))
+            }));
         }
         all
     }
@@ -1065,6 +1141,12 @@ fn catalogue() -> Vec<Value> {
                             "description": "What KIND of work this is, which decides how capable a \
                                 model serves it. Omit if unsure and it uses this one's model.",
                             "enum": crate::roles::KNOWN_ROLES
+                        },
+                        "agent": {
+                            "type": "string",
+                            "description": "The name of an agent defined for this workspace, when \
+                                the list below names one that fits: it works with that \
+                                definition's instructions, role, model and tools."
                         }
                     },
                     "required": ["task"]
@@ -1165,6 +1247,15 @@ impl Toolbox {
             reach.as_str(),
             crate::text::truncate(&input.to_string(), 160)
         );
+        // A sub-agent's definition named the tools it may use: any other is
+        // refused here, before its input is looked at or anyone is asked.
+        if !self.allows(name) {
+            crate::trace!("tool", "{name} REFUSED: not in this agent's tools");
+            return Err(format!(
+                "{name} is not one of the tools this agent may use: {}",
+                self.allowed.as_deref().unwrap_or_default().join(", ")
+            ));
+        }
         // A tool this session does not offer is not run, even by a model
         // that knows its name from elsewhere.
         if !self.offered(name) {
@@ -1204,6 +1295,15 @@ impl Toolbox {
             crate::trace!("tool", "{name} REFUSED by the permission mode: {refusal}");
             return Err(refusal);
         }
+        // The operator's own pre-tool commands: after the free checks, before
+        // the engine, so a call they deny never costs an engine process.
+        let said_before = match self.operator_hook_before(call_id, name, input) {
+            Ok(said) => said,
+            Err(refusal) => {
+                crate::trace!("tool", "{name} REFUSED by the operator's hook: {refusal}");
+                return Err(refusal);
+            }
+        };
         // AFTER the operator's own guards, which are free: a call they refuse
         // never costs an engine process. BEFORE the snapshot and the dispatch,
         // because this is the last point where refusing still prevents.
@@ -1241,6 +1341,24 @@ impl Toolbox {
                 self.tell_engine_what_changed(engine, name, input, &said.shown());
             }
         }
+        // The operator's post-tool commands, told what came back; what they
+        // and the pre-tool commands printed travels with the result.
+        let mut said_hooks = said_before;
+        said_hooks.extend(self.operator_hook_after(name, input, &outcome));
+        let context = match (context, said_hooks.is_empty()) {
+            (context, true) => context,
+            (context, false) => {
+                let hooks = said_hooks
+                    .iter()
+                    .map(|line| format!("[operator hook] {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                Some(match context {
+                    Some(context) => format!("{context}\n\n{hooks}"),
+                    None => hooks,
+                })
+            }
+        };
         // The engine's guidance for THIS action travels with its result, which
         // is the one place the model reads it at the moment it applies.
         match context {
@@ -1252,6 +1370,77 @@ impl Toolbox {
                 .map_err(|why| format!("{why}\n\n{context}")),
             None => outcome,
         }
+    }
+
+    /// The call as the operator's hooks are told it.
+    fn hook_call<'a>(&'a self, name: &'a str, shown: &'a Value) -> crate::hooks::HookCall<'a> {
+        crate::hooks::HookCall {
+            tool_name: name,
+            tool_input: shown,
+            session: &self.session,
+            cwd: Some(&self.workspace),
+        }
+    }
+
+    /// The operator's pre-tool commands for this call: what they printed, or
+    /// the refusal when one exited 2. The desktop's tools are left to their
+    /// executor, which runs the same commands itself.
+    fn operator_hook_before(
+        &self,
+        call_id: &str,
+        name: &str,
+        input: &Value,
+    ) -> Result<Vec<String>, String> {
+        let Some(hooks) = &self.hooks else {
+            return Ok(Vec::new());
+        };
+        if desktop::is_desktop(name) {
+            return Ok(Vec::new());
+        }
+        let shown = self.event_input(name, input);
+        let ran = hooks.pre_tool(&self.hook_call(name, &shown));
+        if !ran.is_denied() {
+            return Ok(ran.messages().to_vec());
+        }
+        let reason = ran.messages().join("; ");
+        self.tell_decided(
+            call_id,
+            crate::watch::Decision {
+                by: crate::watch::Decider::Hook,
+                allowed: false,
+                rule: None,
+                path: None,
+                reason: Some(crate::text::truncate(&reason, MAX_DECISION_REASON_CHARS)),
+            },
+        );
+        Err(format!(
+            "NOT RUN — refused by the operator's hook: {reason}"
+        ))
+    }
+
+    /// The operator's post-tool commands for a call that returned `outcome`:
+    /// what they printed. They cannot refuse — the call already happened.
+    fn operator_hook_after(
+        &self,
+        name: &str,
+        input: &Value,
+        outcome: &Result<ToolOutput, String>,
+    ) -> Vec<String> {
+        let Some(hooks) = &self.hooks else {
+            return Vec::new();
+        };
+        if desktop::is_desktop(name) {
+            return Vec::new();
+        }
+        let shown = self.event_input(name, input);
+        let (said, is_error) = match outcome {
+            Ok(out) => (out.shown(), false),
+            Err(why) => (why.clone(), true),
+        };
+        hooks
+            .post_tool(&self.hook_call(name, &shown), &said, is_error)
+            .messages()
+            .to_vec()
     }
 
     /// The engine's code-edit event for a change that landed: once for a
@@ -1582,6 +1771,7 @@ impl Toolbox {
     /// soon as the turn is.
     fn run_shell(&self, call_id: &str, root: &Path, raw: &str) -> Result<String, String> {
         let stopped = || self.stopped();
+        let sandbox = self.sandbox();
         let ran = match &self.watch {
             Some(watch) => {
                 let mut live = crate::watch::LiveOutput::new(watch.as_ref(), call_id);
@@ -1589,6 +1779,7 @@ impl Toolbox {
                     root,
                     raw,
                     self.filter_env,
+                    &sandbox,
                     &stopped,
                     &mut |piece| live.push(piece),
                 )
@@ -1597,6 +1788,7 @@ impl Toolbox {
                 root,
                 raw,
                 self.filter_env,
+                &sandbox,
                 &stopped,
                 &mut |_| {},
             ),
@@ -1645,7 +1837,7 @@ impl Toolbox {
                 }
                 None => Err("LibreOffice was not found".to_string()),
             },
-            BASH if background => shell::start(&self.state, ws, input),
+            BASH if background => shell::start(&self.state, ws, input, &self.sandbox()),
             BASH => self.run_shell(call_id, ws, &raw),
             BASH_OUTPUT => shell::output(&self.state, input),
             KILL_SHELL => shell::kill(&self.state, input),
@@ -1688,6 +1880,9 @@ mod picture_tests;
 
 #[cfg(test)]
 mod client_tool_tests;
+
+#[cfg(test)]
+mod hook_tests;
 
 #[cfg(test)]
 pub(crate) use client_servers::tests::{calls_in as client_server_calls, fake_server};

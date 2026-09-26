@@ -81,18 +81,61 @@ impl Toolbox {
                     .to_string(),
             );
         }
+        // An agent the operator defined, by name: its instructions, role,
+        // model and tools. A name that is not defined is refused with the
+        // names that are, rather than run as a plain sub-agent.
+        let definition = match input
+            .get("agent")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            Some(name) => {
+                let loaded = crate::subagents::load(&self.workspace);
+                match loaded.find(name) {
+                    Some(found) => Some(found.clone()),
+                    None => {
+                        let known: Vec<&str> =
+                            loaded.agents.iter().map(|a| a.name.as_str()).collect();
+                        return Err(format!(
+                            "there is no agent called `{name}`. Defined here: {}",
+                            if known.is_empty() {
+                                "none".to_string()
+                            } else {
+                                known.join(", ")
+                            }
+                        ));
+                    }
+                }
+            }
+            None => None,
+        };
         // The operator's routing, not ours. An unknown role leaves the model
         // alone rather than guessing at one — the parent's model is a working
-        // answer, and a wrong model is a wasted call.
-        let role = input
+        // answer, and a wrong model is a wasted call. A role in the call wins
+        // over the definition's.
+        let asked = input
             .get("role")
             .and_then(Value::as_str)
             .unwrap_or("")
             .trim();
+        let role = if asked.is_empty() {
+            definition
+                .as_ref()
+                .and_then(|d| d.role.as_deref())
+                .unwrap_or("")
+        } else {
+            asked
+        };
+        let spec = Child {
+            role,
+            definition: definition.as_ref(),
+            tools: self.child_tools(definition.as_ref()),
+        };
         let (mut child, agent) = match crate::agent::api::Settings::from_env() {
-            Some(settings) => (self.api_child(settings, role), "api"),
+            Some(settings) => (self.api_child(settings, &spec), "api"),
             None => match &self.cli_agent {
-                Some(binary) => (self.cli_child(binary, role), "claude-code"),
+                Some(binary) => (self.cli_child(binary, &spec), "claude-code"),
                 None => {
                     return Err(
                         "no endpoint is configured and this model runs in no agent CLI, so \
@@ -122,10 +165,10 @@ impl Toolbox {
         let mut tap = self.watch.as_ref().and_then(|watch| {
             watch.worker(&WorkerSpec {
                 kind: "sub-agent",
-                name: if role.is_empty() {
-                    "sub-agent".to_string()
-                } else {
-                    format!("{role} · sub-agent")
+                name: match (definition.as_ref(), role.is_empty()) {
+                    (Some(def), _) => format!("{} · sub-agent", def.name),
+                    (None, true) => "sub-agent".to_string(),
+                    (None, false) => format!("{role} · sub-agent"),
                 },
                 task: crate::text::truncate(task, MAX_ANNOUNCED_TASK_CHARS),
                 role: (!role.is_empty()).then(|| role.to_string()),
@@ -186,17 +229,46 @@ impl Toolbox {
         }
     }
 
+    /// The tools a sub-agent may use: a definition's list, narrowed to what
+    /// this agent itself may use, or this agent's own list — so a sub-agent
+    /// never gets a tool its parent was not given. `None` is every tool.
+    fn child_tools(&self, definition: Option<&crate::subagents::AgentDef>) -> Option<Vec<String>> {
+        let named = definition.and_then(|d| d.tools.clone());
+        match (named, &self.allowed) {
+            (Some(named), Some(mine)) => {
+                Some(named.into_iter().filter(|t| mine.contains(t)).collect())
+            }
+            (Some(named), None) => Some(named),
+            (None, mine) => mine.clone(),
+        }
+    }
+
+    /// The instructions a sub-agent works under: the note on its position,
+    /// then its definition's own, when it has one.
+    fn child_system(definition: Option<&crate::subagents::AgentDef>) -> Vec<String> {
+        let mut blocks = vec![SUBAGENT_SYSTEM.to_string()];
+        if let Some(def) = definition {
+            blocks.push(def.prompt.clone());
+        }
+        blocks
+    }
+
     /// A sub-agent on the model endpoint.
     fn api_child(
         &self,
         mut settings: crate::agent::api::Settings,
-        role: &str,
+        spec: &Child<'_>,
     ) -> Box<dyn AgentBackend> {
+        let role = spec.role;
         let inherited = settings.model.clone();
         if !role.is_empty() {
             if let Some(chosen) = crate::roles::RoleTable::from_env().model_for(role) {
                 settings.model = crate::roles::model_name(chosen).to_string();
             }
+        }
+        // A model the definition names outright wins over the role's.
+        if let Some(model) = spec.definition.and_then(|d| d.model.as_deref()) {
+            settings.model = model.to_string();
         }
         // WHICH WORK WENT WHERE. Routing is invisible from outside: a subagent on
         // the wrong model looks exactly like one on the right model that answered
@@ -219,11 +291,14 @@ impl Toolbox {
         let mut child = crate::agent::api::ApiBackend::new(
             settings,
             &self.workspace,
-            SUBAGENT_SYSTEM,
+            &Self::child_system(spec.definition).join("\n\n"),
             self.filter_env,
         )
         .at_depth(self.depth + 1)
-        .with_engine(self.engine.clone());
+        .with_engine(self.engine.clone())
+        .with_operator_hooks(self.hooks.clone())
+        .with_sandbox(self.sandbox)
+        .with_tool_allowlist(spec.tools.clone());
         if let Some(cp) = &self.checkpoints {
             child = child.with_checkpoints(cp.clone());
         }
@@ -233,13 +308,18 @@ impl Toolbox {
     /// A sub-agent on the agent CLI `binary`, headless, as a model only: its
     /// tools are a toolbox of its own one level down, under this session's
     /// mode, guards and engine. The role routes its model the way a session's
-    /// is routed — the operator's candidates, then the agent's own ladder.
-    fn cli_child(&self, binary: &str, role: &str) -> Box<dyn AgentBackend> {
+    /// is routed — the operator's candidates, then the agent's own ladder —
+    /// unless the definition names a model outright.
+    fn cli_child(&self, binary: &str, spec: &Child<'_>) -> Box<dyn AgentBackend> {
+        let role = spec.role;
         let mut child = crate::agent::claude_code::ClaudeCodeBackend::new(self.workspace.clone())
             .with_binary(binary)
             .streaming(true)
-            .with_system_context(vec![SUBAGENT_SYSTEM.to_string()])
+            .with_system_context(Self::child_system(spec.definition))
             .with_engine(self.engine.clone())
+            .with_operator_hooks(self.hooks.clone())
+            .with_sandbox(self.sandbox)
+            .with_tool_allowlist(spec.tools.clone())
             .at_depth(self.depth + 1);
         if let Ok(guards) = &self.guards {
             child = child.with_guards(guards);
@@ -247,15 +327,129 @@ impl Toolbox {
         if let Some(mode) = self.mode {
             child.set_permission_mode(mode.agent_mode());
         }
+        let mut ladder: Vec<String> = spec
+            .definition
+            .and_then(|d| d.model.clone())
+            .into_iter()
+            .collect();
         if !role.is_empty() {
-            let mut ladder = crate::roles::RoleTable::from_env()
-                .candidates_for(role)
-                .to_vec();
+            ladder.extend(
+                crate::roles::RoleTable::from_env()
+                    .candidates_for(role)
+                    .iter()
+                    .cloned(),
+            );
             ladder.extend(AgentBackend::ladder_for(&child, role));
-            if !ladder.is_empty() {
-                AgentBackend::set_models(&mut child, &ladder);
-            }
+        }
+        if !ladder.is_empty() {
+            AgentBackend::set_models(&mut child, &ladder);
         }
         Box::new(child)
+    }
+}
+
+/// What a sub-agent is started with, beyond the task.
+struct Child<'a> {
+    /// The role routing its model; empty for none.
+    role: &'a str,
+    /// The operator's definition it runs, when the call named one.
+    definition: Option<&'a crate::subagents::AgentDef>,
+    /// The only tools it may use; `None` is every tool.
+    tools: Option<Vec<String>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reviewer(tools: Option<&[&str]>) -> crate::subagents::AgentDef {
+        crate::subagents::AgentDef {
+            name: "reviewer".to_string(),
+            description: "reads a change".to_string(),
+            role: Some("review".to_string()),
+            model: Some("opus".to_string()),
+            tools: tools.map(|t| t.iter().map(|s| (*s).to_string()).collect()),
+            prompt: "REVIEWER-INSTRUCTIONS: report each problem with its line.".to_string(),
+            source: std::path::PathBuf::from("reviewer.md"),
+            scope: crate::subagents::Scope::Project,
+        }
+    }
+
+    /// **A DEFINED AGENT RUNS WITH ITS OWN INSTRUCTIONS, MODEL AND TOOLS.**
+    /// Its prompt rides the sub-agent's system context, its model is the one
+    /// asked for, and its toolbox offers only the tools it names.
+    #[test]
+    fn a_defined_agent_gets_its_instructions_model_and_only_its_tools() {
+        let ws = tempfile::tempdir().expect("ws");
+        let parent = Toolbox::new(ws.path(), true);
+        let def = reviewer(Some(&["Read", "Grep"]));
+        let spec = Child {
+            role: "review",
+            definition: Some(&def),
+            tools: parent.child_tools(Some(&def)),
+        };
+        let child = parent.cli_child("claude", &spec);
+        assert!(
+            child
+                .system_context()
+                .iter()
+                .any(|b| b.contains("REVIEWER-INSTRUCTIONS")),
+            "{:?}",
+            child.system_context()
+        );
+        assert_eq!(child.model(), Some("opus"));
+        let mut offered = child.offered_tools();
+        offered.sort();
+        assert_eq!(offered, ["Grep", "Read"]);
+    }
+
+    /// A sub-agent never gets a tool its parent was not given: a definition's
+    /// list is narrowed to the parent's, and with no list it inherits it.
+    #[test]
+    fn a_sub_agents_tools_are_never_wider_than_its_parents() {
+        let ws = tempfile::tempdir().expect("ws");
+        let mut parent = Toolbox::new(ws.path(), true);
+        parent.restrict_tools(vec!["Read".to_string(), "Agent".to_string()]);
+        let def = reviewer(Some(&["Read", "Write"]));
+        assert_eq!(
+            parent.child_tools(Some(&def)),
+            Some(vec!["Read".to_string()])
+        );
+        assert_eq!(
+            parent.child_tools(None),
+            Some(vec!["Read".to_string(), "Agent".to_string()])
+        );
+        let open = Toolbox::new(ws.path(), true);
+        assert_eq!(open.child_tools(None), None);
+    }
+
+    /// A name that is not defined is refused with the names that are.
+    #[test]
+    fn an_undefined_agent_is_refused_with_the_defined_names() {
+        let ws = tempfile::tempdir().expect("ws");
+        let dir = ws.path().join(crate::subagents::PROJECT_DIR);
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(
+            dir.join("scout.md"),
+            "---\nname: scout\ndescription: finds things\n---\nFind it.",
+        )
+        .expect("def");
+        let tools = Toolbox::new(ws.path(), true);
+        let refused = tools
+            .run_subagent(&serde_json::json!({"task": "look", "agent": "nobody"}))
+            .expect_err("refused");
+        assert!(refused.contains("no agent called `nobody`"), "{refused}");
+        assert!(refused.contains("scout"), "{refused}");
+        let agent_def = tools
+            .definitions()
+            .into_iter()
+            .find(|d| d["name"] == super::super::AGENT)
+            .expect("the Agent tool");
+        assert!(
+            agent_def["description"]
+                .as_str()
+                .is_some_and(|d| d.contains("- scout: finds things")),
+            "{agent_def}"
+        );
     }
 }

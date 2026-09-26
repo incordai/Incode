@@ -253,6 +253,13 @@ impl CodexBackend {
     }
 
     fn command(&self, prompt: &str) -> Command {
+        /// Codex's own hooks file off, on both spawn paths: incode fires the
+        /// memory engine's lifecycle itself, and codex firing it too would
+        /// record each session twice. Proved on 0.145.0 and 0.153.4, `exec`
+        /// and `exec resume`: with a probe hooks file (trust bypassed), hooks
+        /// on recorded `session-start` and `user-prompt`; `--disable hooks`
+        /// recorded nothing, and codex no longer read `~/.codex/hooks.json`.
+        const HOOKS_OFF: [&str; 2] = ["--disable", "hooks"];
         let mut cmd = Command::new(&self.binary);
         cmd.current_dir(&self.workspace);
 
@@ -280,6 +287,7 @@ impl CodexBackend {
             images(&mut cmd);
             cmd.arg("--skip-git-repo-check");
             cmd.arg("--json");
+            cmd.args(HOOKS_OFF);
             cmd.arg("--dangerously-bypass-approvals-and-sandbox");
             cmd.arg("-c")
                 .arg("mcp_servers.memory.default_tools_approval_mode=\"auto\"");
@@ -296,6 +304,7 @@ impl CodexBackend {
             images(&mut cmd);
             cmd.arg("--skip-git-repo-check");
             cmd.arg("--json");
+            cmd.args(HOOKS_OFF);
             cmd.arg("-c")
                 .arg("mcp_servers.memory.default_tools_approval_mode=\"auto\"");
             for override_ in &self.mcp_overrides {
@@ -960,5 +969,26 @@ mod tests {
         // And without it, nothing: the flag is not unconditional.
         let plain = CodexBackend::new(PathBuf::from("."));
         assert_eq!(carries(&argv(&plain)), 0);
+    }
+
+    /// **CODEX'S OWN HOOKS ARE OFF ON BOTH SPAWN PATHS.** incode fires the
+    /// memory engine's lifecycle itself; codex loading its hooks file too
+    /// would record every session twice, under two ids.
+    #[test]
+    fn codex_is_started_with_its_own_hooks_off_on_both_paths() {
+        let off = |backend: &CodexBackend| {
+            let args: Vec<String> = backend
+                .command("hi")
+                .get_args()
+                .map(|a| a.to_string_lossy().to_string())
+                .collect();
+            args.windows(2)
+                .any(|w| w[0] == "--disable" && w[1] == "hooks")
+        };
+        let fresh = CodexBackend::new(PathBuf::from("."));
+        assert!(off(&fresh));
+        let mut resumed = CodexBackend::new(PathBuf::from("."));
+        resumed.thread_id = Some("thread-abc".to_string());
+        assert!(off(&resumed));
     }
 }

@@ -33,6 +33,10 @@ pub enum SlashCommand {
     Act,
     /// Put the files from the last change back as they were.
     Undo,
+    /// Put the files back as they were this many changed turns ago.
+    Rewind(usize),
+    /// The sub-agents defined for this workspace and for the operator.
+    Agents,
     /// Can this session actually work?
     Doctor,
     /// What the agent is not allowed to write.
@@ -90,6 +94,11 @@ impl SlashCommand {
             "/status" | "/s" => Self::Status,
             "/compact" => Self::Compact,
             "/undo" | "/u" => Self::Undo,
+            "/rewind" => match arg.as_deref().map(str::parse::<usize>) {
+                Some(Ok(turns)) if turns > 0 => Self::Rewind(turns),
+                _ => Self::Usage("/rewind <n>  (how many changed turns back, from 1)".to_string()),
+            },
+            "/agents" => Self::Agents,
             "/doctor" | "/dr" => Self::Doctor,
             "/guards" | "/g" => Self::Guards,
             "/add-dir" => Self::AddDir(arg),
@@ -182,6 +191,14 @@ pub const COMMANDS: &[(&str, &str)] = &[
     (
         "/undo",
         "Put the files from the last change back as they were",
+    ),
+    (
+        "/rewind <n>",
+        "Put the files back as they were n changed turns ago",
+    ),
+    (
+        "/agents",
+        "List the sub-agents defined in .incord/agents and ~/.incord-code/agents",
     ),
     (
         "/doctor",
@@ -298,19 +315,49 @@ pub fn handle_undo(
     workspace: &std::path::Path,
 ) {
     match session.undo(workspace) {
-        Ok(outcome) => {
-            outln!("Undid: {}", outcome.label);
-            for path in &outcome.restored {
-                outln!("  restored {path}");
-            }
-            // Never swallowed: a partial undo the user believes was complete
-            // is worse than none.
-            for failure in &outcome.failed {
-                render::print_error(&format!("  could NOT restore {failure}"));
-            }
-        }
+        Ok(outcome) => say_undone(&outcome),
         Err(e) => render::print_error(&e),
     }
+}
+
+/// What one undone turn put back, and what it could not.
+fn say_undone(outcome: &crate::tools::checkpoint::UndoOutcome) {
+    outln!("Undid: {}", outcome.label);
+    for path in &outcome.restored {
+        outln!("  restored {path}");
+    }
+    // Never swallowed: a partial undo the user believes was complete is
+    // worse than none.
+    for failure in &outcome.failed {
+        render::print_error(&format!("  could NOT restore {failure}"));
+    }
+}
+
+/// `/rewind <n>`: put the files back as they were `turns` changed turns ago,
+/// undoing the newest first. Stops at the first turn that cannot be undone,
+/// and says how far it got.
+pub fn handle_rewind(
+    session: &mut crate::cli::agent_turn::AgentSession,
+    workspace: &std::path::Path,
+    turns: usize,
+) {
+    let (undone, stopped) = session.rewind(workspace, turns);
+    for outcome in &undone {
+        say_undone(outcome);
+    }
+    match stopped {
+        Some(why) => render::print_error(&format!(
+            "Rewound {} of {turns} turn(s), then stopped: {why}",
+            undone.len()
+        )),
+        None => outln!("Rewound {turns} turn(s)."),
+    }
+}
+
+/// `/agents`: the sub-agents defined for this workspace and for the
+/// operator, and every definition file left out with why.
+pub fn handle_agents(workspace: &std::path::Path) {
+    out!("{}", crate::subagents::load(workspace).report());
 }
 
 /// The most bytes a picture file `/image` reads may have. Past the image

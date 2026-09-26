@@ -54,7 +54,7 @@ use std::path::{Path, PathBuf};
 /// actually happened, six times.
 ///
 /// Lower it whenever the number falls. The test fails and tells you to.
-pub const MAX_UNWIRED: usize = 43;
+pub const MAX_UNWIRED: usize = 42;
 
 /// A `pub` item nothing outside its own file calls.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -114,6 +114,15 @@ pub const DELIBERATELY_UNWIRED: &[(&str, &str)] = &[
         "Same shape as `rules_for`: the unbounded spelling of what \
          `context_for_session_within` asks with a deadline. The auditor is \
          wired; this is the entry point without a clock on it.",
+    ),
+    (
+        "run_on_compact",
+        "The operator's `on_compact` command, kept as configuration with nothing \
+         to fire it truthfully: incode never compacts a conversation — the model \
+         CLI compacts its own, inside its own process. The claude CLI's stream \
+         does carry a `compact_boundary` system frame (found in the 2.1.283 \
+         binary, NOT measured live: a compaction needs a full context window), \
+         which is where this would be wired once it has been seen.",
     ),
     (
         "Supervisor",

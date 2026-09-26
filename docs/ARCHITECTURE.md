@@ -605,6 +605,8 @@ yet") rather than routed to an endpoint nothing is known to answer.
 | `.incord/run.stop` | **human**, via `--serve` | a stop request; a running `/run` consumes it and stops, one found at `/run` start is cleared unobeyed |
 | `.incord/findings/<task>.md` | **agent** | one research task's answer, and the thing its check reads |
 | `.incord/brief.cache.json` | machine | the last complete brief, so an unreachable memory service does not stop a run |
+| `.incord/checkpoints/<session>/` | machine | each turn's "before", so `/undo` and `/rewind <n>` survive a restart (bounded: newest 20 turns, ≤ 256 MiB; a manifest naming a path outside the session's roots is not trusted) |
+| `.incord/agents/*.md` | **human** | the project's user-defined sub-agents (`~/.incord-code/agents/*.md` for every project); see §5c |
 | `<repo-parent>/worktrees/` | machine | one checkout per lane, removed after; the **branch is kept** |
 | `~/.incord-code/admin.json` | human sets once | model, roles, ceiling, check |
 | `~/.incord-code/sessions/` | machine | session transcripts |
@@ -886,6 +888,114 @@ is restarted when the mode changes between the two; the operator's `desktop_hook
 run in it. Codex, which is not bridged, is still handed the desktop server as TOML
 overrides.
 
+### User-defined sub-agents (phase 8)
+
+`src/subagents.rs` loads a Markdown definition per file from `.incord/agents/` in the
+workspace and `~/.incord-code/agents/` for the operator; a project's definition wins over
+the operator's of the same name. The front matter is `name`, `description`, optional
+`role` (one of `roles::KNOWN_ROLES`) and `model`, and an optional `tools` allow-list of
+Toolbox tool names; the body is the sub-agent's instructions. The `Agent` tool
+(`toolbox::subagent`) takes `agent: <name>`: the definition's body rides the sub-agent's
+system context, its `model`/`role` route the model (a call's `role` wins; a definition's
+`model` wins over the role's), and its `tools` restrict the sub-agent's toolbox —
+narrowed to what the PARENT may use, never wider, and checked at `Toolbox::run_call`'s
+gate (`restrict_tools`/`allows`). The defined agents are named in the `Agent` tool's
+schema and listed by `/agents` (REPL and ACP). Each file is bounded, and a bad one is
+reported (by `/agents` and the trace), never a crash.
+
+### Headless JSON output (phase 8)
+
+`incode -t "<task>" --output-format stream-json` prints one JSON object per line as the
+turn happens — `init`, `text`, `thinking`, `tool_use`, `tool_result`, `usage`, and last
+`result` — for CI and scripts; `--output-format json` prints the `result` object alone.
+The default stays text. In both JSON forms stdout carries the JSON and nothing else:
+`task_run` takes the real stdout as a private handle and repoints the process's standard
+output at stderr through the same `acp_agent::stdio::claim` that keeps `--acp` pure, so
+every stray print, the console, and any inherited child land on stderr. The events are
+the existing `AgentEvent` stream mapped to JSON (`task_run::Report`); the whole text
+blocks are emitted, not the deltas beside them.
+
+### The OS sandbox for shell commands (phase 8)
+
+The `Bash` tool runs a command the MODEL chose. The guards catch a direct textual
+route to a protected file and the permission mode decides whether the tool may run
+at all, but neither stops a command that writes outside the workspace through a
+variable, a glob or a script it wrote first (§8, "Shell is not sandboxed"). `src/sandbox`
+hands the command to the operating system's own confinement so the write is
+PREVENTED. It is a setting — `admin.json` `sandbox: off | workspace-write | read-only`,
+or `INCORD_SANDBOX` — tied to the session's permission mode by default:
+
+| permission mode | default sandbox |
+|---|---|
+| read-only, plan | `read-only` |
+| prompt, workspace-write, acceptEdits | `workspace-write` |
+| danger-full-access, allow | `off` |
+
+- **`read-only`** — read anywhere, write nowhere (bar the null sink and the terminal).
+- **`workspace-write`** — read anywhere, write only inside the session's roots (the
+  workspace and each `--add-dir`) and the temp directory.
+- **`off`** — unconfined.
+
+**Network is not restricted by any mode, on any OS** — reported by `sandbox::per_os`,
+never pretended. Both the foreground `Bash` and background `/bg`-style jobs run through
+`Sandbox::wrap` (`tools::bash`, `tools::bash_jobs`); the operator's own `/bg` at the
+REPL runs unconfined (it is their command, not the model's).
+
+Per OS, all measured live except where noted:
+
+- **Linux — Landlock, sound.** The command runs through `incode --sandbox-exec`, which
+  applies the kernel's own unprivileged filesystem confinement to itself (read
+  everywhere; write beneath the roots and temp for workspace-write; write nothing for
+  read-only, bar the device sinks) and then execs the shell. Applied before any thread
+  starts, because an early-ABI ruleset binds one thread. Measured in WSL2 (kernel 5.15,
+  ABI V1 so `PartiallyEnforced`): a write in a granted root works, a write to `$HOME` is
+  denied and the file is not created, a child's write is denied, `git`/`cc`/`ls` and
+  `/dev/null` work, `curl` is untouched. Crate: `landlock` 0.4.7 (below).
+- **macOS — `sandbox-exec` (Seatbelt), sound.** A generated profile: allow all, then
+  deny every write, then re-allow the temp directory, the roots (`WS0..WSn`, passed as
+  `-D` parameters so a path with a quote or backslash needs no escaping) and the device
+  sinks. Validated on macOS 26.6.2: a write in the workspace works, a write to `$HOME`
+  is refused and not created, a child is refused, `git`/`cc`/`mktemp` and `curl` work.
+  `sandbox-exec` is marked deprecated by Apple but present and silent. The profile
+  string (`sandbox::seatbelt_profile`) is compiled and unit-tested on every platform.
+- **Windows — a write-restricted token for read-only; workspace-write left OFF.** The
+  command runs through `incode --sandbox-exec`, whose helper (`sandbox::windows`) builds
+  a token with `WRITE_RESTRICTED` and three restricting SIDs — incode's own private SID,
+  `Everyone` (so `> NUL` works) and this logon's SID (so the shell and its tools run) —
+  plus a default DACL, and launches `cmd /S /C` under it with `CreateProcessAsUserW`,
+  inheriting incode's pipes and joining incode's job. Measured without elevation: a write
+  inside the workspace and a write to `Documents` are both refused and no file lands,
+  `reg add HKCU` / `schtasks` / injection into `explorer` are refused, reads and `> NUL`
+  work. **workspace-write is deliberately not applied on Windows:** the only sound route
+  is to add an ACE for incode's SID to the workspace's real DACL before each command and
+  remove it after — about 2.5 s each way on a 28,000-file tree, mutating the operator's
+  own files and leaving the ACE behind on a crash. Doing that silently on every command
+  is a cost the operator did not agree to, so a workspace-write session runs unconfined
+  and the trace says so. A read-only session, or `sandbox: "read-only"` in any session,
+  is confined. Low integrity and AppContainer were measured too (AppContainer is the
+  only thing that blocks the network, at the cost of granting read access to every tool
+  and directory); neither is used.
+
+The `--sandbox-exec` helper is its own CLI mode, handled in `main` before any thread
+starts. On Unix it applies the confinement and execs; on Windows it launches the
+restricted child and waits. On a platform or mode it cannot confine soundly, the command
+runs unconfined and `Sandbox::note` says which — a session that ran unconfined is never
+mistaken for one that was confined.
+
+### Operator hooks on every tool (phase 8)
+
+`hooks::HookRunner` runs the operator's own pre- and post-tool commands
+(`admin.json` `desktop_hooks`, alias `hooks`) around EVERY Toolbox tool, in
+`Toolbox::run_call` — after the guards and the permission mode, before the memory
+engine. The event is one JSON object on a piped, then closed, stdin
+(`hook_event_name`, `tool_name`, `tool_input`, `session_id`, `cwd`, plus
+`tool_response`/`is_error` after), the shape a CLI's own hooks are given; exit 2 on a
+pre-tool command denies, stderr the reason. The desktop tools are the one exception:
+their executor (`desktop::mcp`) runs the same commands itself, as it always has, so they
+are not doubled. The name predates their running for every tool. Shared with the memory
+engine's runner through `hooks::run_piped` (piped-and-closed stdin, contained tree,
+bounded wait).
+
 ### Dependencies (phase 6a)
 
 Each vetted in a scratch crate and approved by the owner; each pinned exactly (`=`) in
@@ -919,6 +1029,18 @@ Phase 6b added one, vetted the same way in a scratch copy of the manifest:
 | Crate | Pin | Why |
 |---|---|---|
 | `tungstenite` | 0.30.0, `handshake` only (no TLS) | the DevTools websocket to the headless browser, client half, over a loopback `TcpStream`. The latest release; MIT OR Apache-2.0; rust-version 1.85. It adds 7 packages to the lock — itself, `sha1` 0.11, `digest` 0.11, `block-buffer` 0.12, `crypto-common` 0.2, `hybrid-array` 0.4.15, `const-oid` 0.10.2, each MIT OR Apache-2.0 at rust-version 1.85 — and reuses `bytes`, `http`, `httparse`, `rand`, `data-encoding`, `log` and `thiserror`, already there |
+
+Phase 8 added one, Linux-only, vetted the same way in a scratch copy of the manifest
+(and its API compile-checked for `x86_64-unknown-linux-musl`, which needs no cross C
+compiler):
+
+| Crate | Pin | Why |
+|---|---|---|
+| `landlock` | 0.4.7, `[target.'cfg(target_os = "linux")']` | the Linux OS sandbox for shell commands: the kernel's own unprivileged filesystem confinement. The latest release (2026-07-27, not yanked), covering ABI V1–V9; MIT OR Apache-2.0; rust-version 1.71, below the crate's 1.88 floor. Adds EXACTLY ONE package to the lock — itself; its dependencies (`enumflags2` 0.7, `libc` 0.2, `thiserror` 2.0) are all already resolved |
+
+The Windows sandbox needs no new crate: it turns on the `Win32_Security_Authorization`
+feature of `windows-sys` 0.61, already in the lock, for the write-restricted token's
+SID and DACL calls.
 
 ---
 
@@ -964,9 +1086,13 @@ shape passes happily while the request goes nowhere.
 - **It has never run against a live model.** No credential on the development machine.
   Everything here compiles, passes its tests, and appears in the built binary; none of
   it has completed a real task end to end.
-- **Shell is not sandboxed.** `guards.rs` catches direct textual routes to a protected
-  file. A variable, a glob, or a script that writes on the agent's behalf gets past it.
-  The real boundary for shell is the permission tier.
+- **Shell is not sandboxed** (mostly closed, phase 8). `guards.rs` catches direct textual
+  routes to a protected file; a variable, a glob, or a script that writes on the agent's
+  behalf gets past it. The OS sandbox (`src/sandbox`, §5b) now confines the shell where
+  the platform can — Landlock on Linux, Seatbelt on macOS, a write-restricted token for
+  read-only on Windows — and says plainly where it cannot (Windows workspace-write, and
+  the network everywhere). The permission tier remains the boundary in the `off` mode and
+  wherever the sandbox is not applied.
 - **Contracts are checked by name, not by type.** Types belong to the project's own
   compiler, which already runs.
 - **One runner, no concurrency.** Multiple runners over one ledger needs a claim

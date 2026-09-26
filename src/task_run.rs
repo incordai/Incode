@@ -25,9 +25,217 @@
 //! whether it ended cleanly. Nothing here marks anything done.
 
 use crate::outln;
+use std::io::Write as _;
 use std::path::Path;
 
+use serde_json::{json, Value};
+
 use crate::agent::{AgentBackend, AgentEvent};
+
+/// How `incode -t` reports what happens.
+///
+/// - `text` (the default): what the agent says and does, printed as it
+///   happens, for a person.
+/// - `stream-json`: one JSON object per line on stdout as it happens —
+///   `init`, `text`, `thinking`, `tool_use`, `tool_result`, `usage`, and
+///   last `result` — for CI and scripts.
+/// - `json`: only the `result` object, once, at the end.
+///
+/// In both JSON forms stdout carries the JSON and nothing else: it is taken
+/// as a private handle and the process's standard output is pointed at
+/// stderr ([`crate::acp_agent::stdio::claim`], as under `--acp`), so every
+/// other print — the text a person would read, a child process — lands on
+/// stderr.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutputFormat {
+    #[default]
+    Text,
+    StreamJson,
+    Json,
+}
+
+impl OutputFormat {
+    /// The format named on the command line.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "text" => Some(Self::Text),
+            "stream-json" => Some(Self::StreamJson),
+            "json" => Some(Self::Json),
+            _ => None,
+        }
+    }
+}
+
+/// Where a JSON run's events go, and what its `result` will say.
+struct Report {
+    /// The real stdout and whether every event is written (`stream-json`) or
+    /// only the result (`json`). `None` for text.
+    out: Option<(std::fs::File, bool)>,
+    session: String,
+    agent: Option<String>,
+    model: Option<String>,
+    agent_session: Option<String>,
+    stop_reason: Option<String>,
+    served_by: Vec<String>,
+    usage: [u32; 4],
+}
+
+impl Report {
+    fn text() -> Self {
+        Self {
+            out: None,
+            session: String::new(),
+            agent: None,
+            model: None,
+            agent_session: None,
+            stop_reason: None,
+            served_by: Vec::new(),
+            usage: [0; 4],
+        }
+    }
+
+    /// One line of JSON on the real stdout, when every event is written.
+    fn line(&mut self, value: &Value) {
+        if let Some((file, true)) = self.out.as_mut() {
+            let _ = writeln!(file, "{value}");
+            let _ = file.flush();
+        }
+    }
+
+    /// An agent is about to take the instruction.
+    fn init(&mut self, workspace: &Path, agent: &str, model: Option<&str>) {
+        let fallback_from = self.agent.replace(agent.to_string());
+        self.model = model.map(str::to_string);
+        let mut init = json!({
+            "type": "init",
+            "session_id": self.session,
+            "workspace": workspace.to_string_lossy(),
+            "agent": agent,
+            "model": model,
+            "incode_version": env!("CARGO_PKG_VERSION"),
+        });
+        if let Some(previous) = fallback_from {
+            init["fallback_from"] = json!(previous);
+        }
+        self.line(&init);
+    }
+
+    /// One event of the agent's turn.
+    fn event(&mut self, event: &AgentEvent) {
+        let line = match event {
+            AgentEvent::Text(text) => json!({"type": "text", "text": text}),
+            AgentEvent::Thinking(text) => json!({"type": "thinking", "text": text}),
+            AgentEvent::ToolUse { id, name, input } => json!({
+                "type": "tool_use",
+                "id": id,
+                "name": name,
+                "input": serde_json::from_str::<Value>(input).unwrap_or_else(|_| json!(input)),
+            }),
+            AgentEvent::ToolResult {
+                id,
+                output,
+                is_error,
+            } => json!({"type": "tool_result", "id": id, "output": output, "is_error": is_error}),
+            AgentEvent::Usage {
+                input_tokens,
+                output_tokens,
+                cache_creation_tokens,
+                cache_read_tokens,
+            } => {
+                self.usage = [
+                    *input_tokens,
+                    *output_tokens,
+                    *cache_creation_tokens,
+                    *cache_read_tokens,
+                ];
+                json!({
+                    "type": "usage",
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "cache_creation_tokens": cache_creation_tokens,
+                    "cache_read_tokens": cache_read_tokens,
+                })
+            }
+            AgentEvent::SessionStarted { session_id, .. } => {
+                if !session_id.is_empty() {
+                    self.agent_session = Some(session_id.clone());
+                }
+                return;
+            }
+            // A whole block follows each delta, and the window and quota are
+            // the agent's own bookkeeping: not part of the stream.
+            AgentEvent::TextDelta(_) | AgentEvent::Quota { .. } | AgentEvent::Context { .. } => {
+                return
+            }
+        };
+        self.line(&line);
+    }
+
+    /// How the agent's turn ended.
+    fn outcome(&mut self, outcome: &crate::agent::TurnOutcome) {
+        self.stop_reason = Some(outcome.stop_reason.clone());
+        self.served_by.clone_from(&outcome.served_by);
+        if !outcome.session_id.is_empty() {
+            self.agent_session = Some(outcome.session_id.clone());
+        }
+    }
+
+    /// The last line: what the run came to, as one object.
+    fn finish(&mut self, ran: &Result<String, String>, took: std::time::Duration) {
+        let [input, output, cache_creation, cache_read] = self.usage;
+        let mut result = json!({
+            "type": "result",
+            "is_error": ran.is_err(),
+            "session_id": self.session,
+            "agent": self.agent,
+            "model": self.model,
+            "agent_session_id": self.agent_session,
+            "stop_reason": self.stop_reason,
+            "served_by": self.served_by,
+            "usage": {
+                "input_tokens": input,
+                "output_tokens": output,
+                "cache_creation_tokens": cache_creation,
+                "cache_read_tokens": cache_read,
+            },
+            "duration_ms": u64::try_from(took.as_millis()).unwrap_or(u64::MAX),
+        });
+        match ran {
+            Ok(answer) => result["result"] = json!(answer),
+            Err(why) => result["error"] = json!(why),
+        }
+        if let Some((file, _)) = self.out.as_mut() {
+            let _ = writeln!(file, "{result}");
+            let _ = file.flush();
+        }
+    }
+}
+
+/// [`run_task_with_model`], reported in `format`.
+///
+/// # Errors
+///
+/// As [`run_task_with_model`]; and, for a JSON format, when stdout cannot be
+/// taken for it. A JSON run's `result` line says the same error.
+pub fn run_task_as(
+    workspace: &Path,
+    instruction: &str,
+    model: Option<&str>,
+    format: OutputFormat,
+) -> Result<String, String> {
+    if format == OutputFormat::Text {
+        return run_task_with_model(workspace, instruction, model);
+    }
+    let claimed = crate::acp_agent::stdio::claim()
+        .map_err(|e| format!("stdout could not be taken for the JSON output: {e}"))?;
+    let mut report = Report::text();
+    report.out = Some((claimed.output, format == OutputFormat::StreamJson));
+    let began = std::time::Instant::now();
+    let ran = run_task_reporting(workspace, instruction, model, &mut report);
+    report.finish(&ran, began.elapsed());
+    ran
+}
 
 /// Run one instruction through an installed agent and report what happened.
 ///
@@ -46,6 +254,16 @@ pub fn run_task_with_model(
     workspace: &Path,
     instruction: &str,
     model: Option<&str>,
+) -> Result<String, String> {
+    run_task_reporting(workspace, instruction, model, &mut Report::text())
+}
+
+/// The run itself, telling `report` what happens.
+fn run_task_reporting(
+    workspace: &Path,
+    instruction: &str,
+    model: Option<&str>,
+    report: &mut Report,
 ) -> Result<String, String> {
     if instruction.trim().is_empty() {
         return Err("nothing to do: the instruction is empty".to_string());
@@ -66,6 +284,7 @@ pub fn run_task_with_model(
     // with no hooks of its own. One instruction is one session — it starts,
     // takes the person's line, stops, and ends.
     let session_id = uuid::Uuid::new_v4().to_string();
+    report.session.clone_from(&session_id);
     let mut memory = crate::hooks::memory::MemoryHooks::new(
         crate::hooks::engine::Engine::locate(),
         workspace,
@@ -89,7 +308,7 @@ pub fn run_task_with_model(
         prompt: &prompt,
         system: &system,
     };
-    let ran = drive(&task, &mut memory);
+    let ran = drive(&task, &mut memory, report);
     memory.end("other");
     ran
 }
@@ -111,6 +330,7 @@ struct Task<'a> {
 fn drive(
     task: &Task<'_>,
     memory: &mut crate::hooks::memory::MemoryHooks,
+    report: &mut Report,
 ) -> Result<String, String> {
     let Task {
         workspace,
@@ -163,6 +383,10 @@ fn drive(
     let mut failures = Vec::new();
 
     for (idx, candidate) in candidates.into_iter().enumerate() {
+        let agent_id = match &candidate {
+            Candidate::Api(_) => crate::agent::registry::API_ROUTE.to_string(),
+            Candidate::Cli(agent) => agent.id.clone(),
+        };
         let (mut backend, route): (Box<dyn AgentBackend>, String) = match candidate {
             Candidate::Api(settings) => (
                 Box::new(
@@ -175,7 +399,13 @@ fn drive(
                     // Nobody is at an unattended run: a call the engine
                     // wants confirmed is the owner's app's to answer, or
                     // refused.
-                    .with_engine(crate::hooks::engine::Engine::locate()),
+                    .with_engine(crate::hooks::engine::Engine::locate())
+                    .with_operator_hooks(crate::hooks::HookRunner::from_settings())
+                    .with_sandbox(
+                        crate::admin::AdminConfig::load_default()
+                            .resolve_sandbox(crate::permissions::PermissionMode::WorkspaceWrite)
+                            .value,
+                    ),
                 ),
                 "a model over the configured API".to_string(),
             ),
@@ -208,6 +438,7 @@ fn drive(
         }
 
         outln!("Driving {route} in {}", workspace.display());
+        report.init(workspace, &agent_id, backend.model());
         crate::trace!(
             "agent",
             "turn start: route={route} prompt={} chars, guards={} protected",
@@ -224,6 +455,7 @@ fn drive(
         let mut heard = crate::hooks::memory::Said::default();
         let turn_res = backend.run_turn(prompt, &mut |event: &AgentEvent| {
             heard.hear(event);
+            report.event(event);
             show(event, &mut said, &mut tool_calls);
         });
 
@@ -248,6 +480,7 @@ fn drive(
             }
         };
 
+        report.outcome(&outcome);
         crate::trace!(
             "agent",
             "turn end: stop={} error={} said={} chars served_by={:?} session={}",
@@ -299,9 +532,11 @@ fn drive(
             let mut heard = crate::hooks::memory::Said::default();
             match backend.run_turn(&reason, &mut |event: &AgentEvent| {
                 heard.hear(event);
+                report.event(event);
                 show(event, &mut more, &mut tool_calls);
             }) {
                 Ok(next) if !next.is_error => {
+                    report.outcome(&next);
                     memory.said(crate::hooks::memory::Speaker::Agent, &heard.whole());
                     last = heard.last().to_string();
                     said.extend(more);
@@ -577,5 +812,178 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let refused = run_task(dir.path(), "   ").expect_err("refused");
         assert!(refused.contains("nothing to do"), "got: {refused}");
+    }
+
+    /// A turn, as the stream sees it.
+    fn a_turn(report: &mut Report) {
+        report.session = "sess-json".to_string();
+        report.init(Path::new("/ws"), "claude-code", Some("sonnet"));
+        for event in [
+            AgentEvent::SessionStarted {
+                session_id: "agent-conv".to_string(),
+                model: "sonnet".to_string(),
+            },
+            AgentEvent::Thinking("look first".to_string()),
+            AgentEvent::TextDelta("Rea".to_string()),
+            AgentEvent::ToolUse {
+                id: "incode-1".to_string(),
+                name: "Read".to_string(),
+                input: r#"{"path":"a.txt"}"#.to_string(),
+            },
+            AgentEvent::ToolResult {
+                id: "incode-1".to_string(),
+                output: "hello".to_string(),
+                is_error: false,
+            },
+            AgentEvent::Text("It says hello.".to_string()),
+            AgentEvent::Usage {
+                input_tokens: 10,
+                output_tokens: 3,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 7,
+            },
+        ] {
+            report.event(&event);
+        }
+        report.outcome(&crate::agent::TurnOutcome {
+            session_id: "agent-conv".to_string(),
+            stop_reason: "end_turn".to_string(),
+            is_error: false,
+            detail: None,
+            served_by: vec!["claude-sonnet".to_string()],
+        });
+        report.finish(
+            &Ok("It says hello.".to_string()),
+            std::time::Duration::from_millis(5),
+        );
+    }
+
+    fn lines_of(path: &Path) -> Vec<Value> {
+        std::fs::read_to_string(path)
+            .expect("written")
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("not JSON ({e}): {l}")))
+            .collect()
+    }
+
+    /// **`stream-json` IS ONE OBJECT PER EVENT, IN ORDER, ENDING WITH THE
+    /// RESULT** — the whole blocks, never the deltas beside them.
+    #[test]
+    fn stream_json_writes_each_event_as_one_json_line() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("out.jsonl");
+        let mut report = Report::text();
+        report.out = Some((std::fs::File::create(&path).expect("file"), true));
+        a_turn(&mut report);
+        let lines = lines_of(&path);
+        let kinds: Vec<&str> = lines.iter().filter_map(|l| l["type"].as_str()).collect();
+        assert_eq!(
+            kinds,
+            [
+                "init",
+                "thinking",
+                "tool_use",
+                "tool_result",
+                "text",
+                "usage",
+                "result"
+            ]
+        );
+        assert_eq!(lines[0]["agent"], "claude-code");
+        assert_eq!(lines[0]["session_id"], "sess-json");
+        assert_eq!(
+            lines[2]["input"]["path"], "a.txt",
+            "the input is JSON, not a string"
+        );
+        let result = &lines[6];
+        assert_eq!(result["is_error"], false);
+        assert_eq!(result["result"], "It says hello.");
+        assert_eq!(result["agent_session_id"], "agent-conv");
+        assert_eq!(result["stop_reason"], "end_turn");
+        assert_eq!(result["usage"]["cache_read_tokens"], 7);
+    }
+
+    /// `json` is the result alone, once; a failed run's says why.
+    #[test]
+    fn json_writes_only_the_result() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("out.json");
+        let mut report = Report::text();
+        report.out = Some((std::fs::File::create(&path).expect("file"), false));
+        a_turn(&mut report);
+        let lines = lines_of(&path);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0]["type"], "result");
+
+        let failed = dir.path().join("failed.json");
+        let mut report = Report::text();
+        report.out = Some((std::fs::File::create(&failed).expect("file"), false));
+        report.finish(&Err("no agent".to_string()), std::time::Duration::ZERO);
+        let lines = lines_of(&failed);
+        assert_eq!(lines[0]["is_error"], true);
+        assert_eq!(lines[0]["error"], "no agent");
+    }
+
+    /// Set only in the child process the purity test starts.
+    const JSON_CHILD: &str = "INCODE_TASK_JSON_CHILD";
+
+    /// The child half: stdout claimed as `run_task_as` claims it, then every
+    /// kind of stray print, then a turn reported as `stream-json`.
+    #[test]
+    fn json_output_child() {
+        if std::env::var_os(JSON_CHILD).is_none() {
+            return;
+        }
+        let claimed = crate::acp_agent::stdio::claim().expect("claim stdout");
+        println!("stray println");
+        crate::outln!("stray outln");
+        let _ = std::process::Command::new(if cfg!(windows) { "cmd" } else { "sh" })
+            .args(if cfg!(windows) {
+                ["/C", "echo stray child"]
+            } else {
+                ["-c", "echo stray child"]
+            })
+            .status();
+        let mut report = Report::text();
+        report.out = Some((claimed.output, true));
+        a_turn(&mut report);
+        std::process::exit(0);
+    }
+
+    /// **STDOUT CARRIES THE JSON AND NOTHING ELSE.** Every stray print — a
+    /// `println!`, the console, a child that inherits stdout — lands on
+    /// stderr; stdout is JSON lines only, apart from the test harness's own
+    /// banner, printed before the child's code runs.
+    #[test]
+    fn the_json_output_carries_nothing_else() {
+        let out = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "task_run::tests::json_output_child",
+                "--nocapture",
+                "--test-threads=1",
+                "-q",
+            ])
+            .env(JSON_CHILD, "1")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run the child");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let mut json_lines = 0;
+        for line in stdout.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            if line == "running 1 test" {
+                continue;
+            }
+            assert!(
+                serde_json::from_str::<Value>(line).is_ok(),
+                "a stray line reached stdout: {line:?}\nstdout:\n{stdout}"
+            );
+            json_lines += 1;
+        }
+        assert_eq!(json_lines, 7, "stdout:\n{stdout}\nstderr:\n{stderr}");
+        for stray in ["stray println", "stray outln", "stray child"] {
+            assert!(stderr.contains(stray), "{stray} went nowhere: {stderr}");
+        }
     }
 }

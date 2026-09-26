@@ -146,6 +146,13 @@ pub struct AdminConfig {
     /// Which program `RenderPdf` prints with. Unset is `auto`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pdf_renderer: Option<PdfRenderer>,
+    /// How tightly the OS confines a model's shell commands: `off`,
+    /// `workspace-write` or `read-only` — see [`crate::sandbox`]. Unset ties it
+    /// to the session's permission mode (read-only writes nothing, a writing
+    /// mode writes the workspace, full access opts out), which is the safe
+    /// default; naming one here pins it across every session and mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<String>,
     /// The capability ladder, named by the operator.
     ///
     /// A tier is a list of models that can do the same JOB — `"top"` might hold
@@ -191,14 +198,15 @@ pub struct AdminConfig {
     /// less" is indistinguishable from "it silently did nothing".
     #[serde(default)]
     pub plugins: Plugins,
-    /// The operator's own commands, run around every desktop tool call.
+    /// The operator's own commands, run around every tool call incode makes.
     ///
-    /// # Why the desktop specifically, and why here
+    /// # The name, and why here
     ///
-    /// The desktop is the widest capability this harness hands over and the
-    /// only one whose mistakes a checkpoint cannot undo. It is also the only
-    /// tool dispatcher left in this crate's own process, so it is the one
-    /// place a hook can sit between the decision and the action.
+    /// Named for the desktop, where they first ran: the desktop is the widest
+    /// capability this harness hands over and the only one whose mistakes a
+    /// checkpoint cannot undo. They now run around every toolbox tool (the
+    /// desktop's still by its own executor), and `hooks` is accepted as the
+    /// same key.
     ///
     /// In this file rather than per-workspace because it is a guard on the
     /// MACHINE — an operator who wants a confirmation before anything types
@@ -207,7 +215,11 @@ pub struct AdminConfig {
     /// includes the fact that a hook is shown the real input.
     ///
     /// Empty is the default and costs nothing.
-    #[serde(default, skip_serializing_if = "crate::hooks::HookConfig::is_empty")]
+    #[serde(
+        default,
+        alias = "hooks",
+        skip_serializing_if = "crate::hooks::HookConfig::is_empty"
+    )]
     pub desktop_hooks: crate::hooks::HookConfig,
 }
 
@@ -640,6 +652,39 @@ impl AdminConfig {
                 Source::AdminFile,
             ),
             None => Resolved::new(crate::budget::Budget::default(), Source::BuiltIn),
+        }
+    }
+
+    /// How tightly the OS confines a model's shell commands, and where the
+    /// choice came from. The operator's setting wins; unset, it is tied to
+    /// `permission_mode` — see [`crate::sandbox::SandboxMode::for_permission_mode`].
+    /// An unrecognised setting falls back to the permission mode's default
+    /// rather than running unconfined, and says which layer decided.
+    #[must_use]
+    pub fn resolve_sandbox(
+        &self,
+        permission_mode: crate::permissions::PermissionMode,
+    ) -> Resolved<crate::sandbox::SandboxMode> {
+        if let Ok(raw) = std::env::var(crate::sandbox::SANDBOX_ENV) {
+            let name = raw.trim();
+            if !name.is_empty() {
+                if let Some(mode) = crate::sandbox::SandboxMode::parse(name) {
+                    return Resolved::new(mode, Source::Environment);
+                }
+            }
+        }
+        match self.sandbox.as_deref().map(str::trim) {
+            Some(name) if !name.is_empty() => match crate::sandbox::SandboxMode::parse(name) {
+                Some(mode) => Resolved::new(mode, Source::AdminFile),
+                None => Resolved::new(
+                    crate::sandbox::SandboxMode::for_permission_mode(permission_mode),
+                    Source::BuiltIn,
+                ),
+            },
+            _ => Resolved::new(
+                crate::sandbox::SandboxMode::for_permission_mode(permission_mode),
+                Source::BuiltIn,
+            ),
         }
     }
 
@@ -1107,6 +1152,7 @@ mod tests {
             // The browser and the PDF switch, which the owner flips by hand.
             browser_bin: Some("C:/tools/incord-browser.exe".to_string()),
             pdf_renderer: Some(PdfRenderer::IncordBrowser),
+            sandbox: Some("read-only".to_string()),
             // The ladder has to survive the file too — a tier an operator
             // writes and cannot read back is a setting that does not exist.
             tiers: BTreeMap::from([(

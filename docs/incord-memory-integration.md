@@ -12,6 +12,22 @@ for this audit, or by the engine contract stated in the task, is marked
 
 ## Build status (phases 2–4, 2026-09-25)
 
+### Phase 8 (2026-09-26) — CLI parity and the OS sandbox
+
+| Item | Status |
+|---|---|
+| User-defined sub-agents | **DONE** — `src/subagents.rs` loads `.incord/agents/*.md` (project) and `~/.incord-code/agents/*.md` (user); front matter `name`/`description`/`role`/`model`/`tools`, then the prompt body. The `Agent` tool takes `agent: <name>` (`toolbox::subagent`), runs it with that definition's instructions/model/role and only its tools (narrowed to the parent's, never wider). Listed in the `Agent` schema and by `/agents` (REPL and ACP). A bad file is reported, never a crash. Live: an operator-defined `reviewer` run through the `Agent` tool. |
+| Headless JSON output | **DONE** — `incode -t --output-format stream-json` prints one JSON event per line (init, text, thinking, tool_use, tool_result, usage, result); `--output-format json` prints the final object only. stdout is JSON only (`acp_agent::stdio::claim`, as under `--acp`); everything else goes to stderr. Live with the real claude (bridged): thinking, `tool_use` Write, `tool_result`, text, usage, result, all JSON, `agent=claude-code model=opus`. |
+| Persistent checkpoints + `/rewind` | **DONE** — `tools::checkpoint` writes each sealed turn under `.incord/checkpoints/<session>/` (bounded: newest 20 turns, ≤ 256 MiB), so `/undo` works after a restart; `/rewind <n>` restores n changed turns back. A turn is sealed at its end: unchanged files dropped, files and directories it CREATED added (so an undo deletes them), and a file changed since is left alone and said. A manifest naming a path outside the session's roots is not trusted. `/rewind` announced over ACP. |
+| OS sandbox for shell commands | **DONE (Windows + Linux live; macOS validated on a Mac)** — `src/sandbox`. `admin.json` `sandbox: off\|workspace-write\|read-only` (env `INCORD_SANDBOX`), tied to the permission mode by default. Linux: Landlock (`--sandbox-exec` helper). macOS: `sandbox-exec` Seatbelt profile. Windows: a write-restricted token for **read-only** (measured: writes denied inside and outside the workspace, reads and `NUL` work); **workspace-write left OFF** on Windows with the reason stated — see `docs/ARCHITECTURE.md`. Network not restricted on any OS; reported, not pretended. |
+| Operator hooks on every tool | **DONE** — `hooks::HookRunner` now runs the operator's `admin.json` `desktop_hooks` (alias `hooks`) pre- and post-tool for EVERY Toolbox tool, in `Toolbox::run_call` (exit 2 denies; stdin piped with the event JSON, bounded 10 s). The desktop's own executor still runs them for the desktop tools, so they are not doubled. |
+| `/run` workers as memory sessions | **DONE** — `cli::run_memory::Remembered` makes each ledger worker (sequential and each lane) a memory session of its own: `session-start`, a `capture` per task, `session-end`, under its own id, with its agents' calls filed under it. A carry-on answer is recorded, not followed (the task's check decides). |
+| codex hooks off | **DONE** — `codex exec`/`exec resume` now carry `--disable hooks` (`src/agent/codex.rs`), so codex does not fire its own `~/.codex/hooks.json` and record a session incode already records. Proven live on codex 0.145.0 and 0.153.4 (probe hooks file, trust bypassed): hooks on recorded `session-start`/`user-prompt`, `--disable hooks` recorded nothing. |
+| `--thinking-display` fallback | **DONE** — the claude backend drops `--thinking-display summarized` and retries the turn once if the CLI rejects it with "unknown option" naming the flag, and remembers that for the session (`agent::claude_code`). Tested with a fake CLI that rejects the flag. |
+| `run_on_compact` | Allowlisted honestly in `wiring.rs` `DELIBERATELY_UNWIRED` with the reason: incode never compacts (the model CLI compacts inside its own process); the claude stream's `compact_boundary` frame is where it would wire once measured. |
+
+### Phases 2–4
+
 | § | Feature | Status |
 |---|---|---|
 | 2 | Shared engine-hook runner | **DONE** — `src/hooks/engine.rs`. Piped-and-closed stdin, piped stdout/stderr, `process_tree` + `tools::bash::wait_with_timeout_or`, bounds 610 s for pre-tool / permission-request / capture. Binary: `INCORD_ENGINE_BIN` → `AdminConfig.engine_bin` → install location (see the correction under §2). Phase 4 added `session-start`, `user-prompt`, `code-edit` (bound 70 s), `capture` (610 s) and `session-end` (130 s). |
