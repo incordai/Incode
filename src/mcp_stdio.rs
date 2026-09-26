@@ -9,9 +9,9 @@
 //! drifts, and the copy that is called is not always the one being read.
 //!
 //! What differs per server is what its tools ARE, which is the [`Handler`].
-//! The desktop server keeps its own loop for now: it answers with images and
-//! trips a kill switch when its client goes away, neither of which the others
-//! do.
+//! A handler whose tools answer with pictures overrides
+//! [`Handler::call_content`]. The desktop server keeps its own loop: it trips
+//! a kill switch when its client goes away, which the others do not.
 
 use std::io::{BufRead, Write};
 
@@ -49,6 +49,13 @@ pub trait Handler {
     /// as a result marked `isError` — never as a transport error, which a
     /// client answers by retrying the connection instead of reading why.
     fn call(&mut self, name: &str, args: &Value) -> Result<String, String>;
+
+    /// Run one tool, answering in MCP content blocks — for a server whose
+    /// tools can answer with pictures. By default, [`Self::call`]'s text as
+    /// one text block.
+    fn call_content(&mut self, name: &str, args: &Value) -> Result<Vec<Value>, String> {
+        self.call(name, args).map(|body| vec![text(body)])
+    }
 }
 
 /// Answer one line of JSON-RPC. `None` for a notification, or a blank line.
@@ -114,8 +121,8 @@ fn dispatch(
                 "tools/call needs a tool name".to_string(),
             ))?;
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
-            Ok(match handler.call(name, &args) {
-                Ok(body) => json!({"content": [text(body)], "isError": false}),
+            Ok(match handler.call_content(name, &args) {
+                Ok(content) => json!({"content": content, "isError": false}),
                 Err(why) => json!({"content": [text(why)], "isError": true}),
             })
         }

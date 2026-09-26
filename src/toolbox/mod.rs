@@ -53,16 +53,23 @@ use serde_json::{json, Value};
 
 use crate::agent::AgentBackend;
 
+mod browser;
+mod cdp;
 mod checks;
 mod convert;
+mod desktop;
 mod edits;
+mod image;
 mod listing;
 mod outline;
+mod pdf;
 mod shell;
 mod team;
 mod todo;
 mod validate;
 
+pub use desktop::DesktopSetup;
+pub use image::{Image, ImageFormat, ToolOutput};
 pub(crate) use todo::{parse_todos, Priority, TodoStatus};
 
 /// Read a file's contents.
@@ -87,6 +94,12 @@ pub const GREP: &str = "Grep";
 pub const OUTLINE: &str = "Outline";
 /// An office document to PDF, when LibreOffice is installed.
 pub const CONVERT_DOCUMENT: &str = "ConvertDocument";
+/// A picture of a web page or a workspace HTML file, when the headless
+/// browser is installed.
+pub const SCREENSHOT: &str = "Screenshot";
+/// A web page or a workspace HTML file printed to PDF, when a browser that
+/// can print is installed.
+pub const RENDER_PDF: &str = "RenderPdf";
 /// Run a shell command, in the foreground or as a background job.
 pub const BASH: &str = "Bash";
 /// Read what a background job has said since it was last read.
@@ -174,10 +187,16 @@ pub fn reach_of(name: &str) -> Option<Reach> {
         crate::team_mcp::ASK_TOOL | crate::team_mcp::TELL_TOOL | crate::team_mcp::ANSWER_TOOL => {
             Reach::Record
         }
+        // It reads the page it is pointed at, held to WebFetch's address rules.
+        SCREENSHOT => Reach::Observe,
         WRITE | EDIT | MULTI_EDIT | APPLY_PATCH | NOTEBOOK_EDIT => Reach::Change,
-        // It writes a PDF into the workspace.
-        CONVERT_DOCUMENT => Reach::Change,
+        // Each writes a PDF into the workspace.
+        CONVERT_DOCUMENT | RENDER_PDF => Reach::Change,
         BASH | KILL_SHELL | DIAGNOSTICS | AGENT | crate::verify::VERIFY_TOOL => Reach::Run,
+        // The desktop: looking at the screen observes; everything that moves
+        // the mouse or types acts on a machine signed into real accounts.
+        other if desktop::OBSERVING.contains(&other) => Reach::Observe,
+        other if desktop::ACTING.contains(&other) => Reach::Run,
         _ => return None,
     })
 }
@@ -192,6 +211,12 @@ pub fn reach_of(name: &str) -> Option<Reach> {
 pub struct SessionTools {
     jobs: Mutex<crate::tools::bash_jobs::BashJobManager>,
     todos: Mutex<Vec<todo::Todo>>,
+    /// The headless browser's `serve` processes, started on first use and
+    /// killed, with their trees, when the session's tools are dropped.
+    browsers: Mutex<browser::Browsers>,
+    /// The desktop child, started on the first desktop call and stopped —
+    /// EOF, then its tree — when the session's tools are dropped.
+    desktop: Mutex<Option<desktop::DesktopClient>>,
 }
 
 impl SessionTools {
@@ -204,6 +229,8 @@ impl SessionTools {
                 crate::tools::bash_jobs::BashJobManager::new().with_env_filter(filter_env),
             ),
             todos: Mutex::new(Vec::new()),
+            browsers: Mutex::new(browser::Browsers::default()),
+            desktop: Mutex::new(None),
         })
     }
 
@@ -327,6 +354,14 @@ pub struct Toolbox {
     /// LibreOffice's `soffice`, looked for once, the first time it matters.
     /// `ConvertDocument` is offered only when it was found.
     soffice: OnceLock<Option<PathBuf>>,
+    /// The headless browser, looked for once. Screenshot is offered, and
+    /// `WebFetch` runs script, only when it was found.
+    browser: OnceLock<Option<PathBuf>>,
+    /// What `RenderPdf` prints with, chosen once; not offered when `None`.
+    printer: OnceLock<Option<pdf::Printer>>,
+    /// Where the desktop is started from, when the operator switched it on.
+    /// The desktop tools are offered only then.
+    desktop: Option<DesktopSetup>,
 }
 
 impl Toolbox {
@@ -354,6 +389,9 @@ impl Toolbox {
             state: SessionTools::new(filter_env),
             team: team::Team::new(workspace),
             soffice: OnceLock::new(),
+            browser: OnceLock::new(),
+            printer: OnceLock::new(),
+            desktop: None,
         }
     }
 
@@ -365,10 +403,76 @@ impl Toolbox {
             .as_deref()
     }
 
-    /// Whether this session offers `name`. Every tool is offered except
-    /// `ConvertDocument` where LibreOffice was not found.
+    /// The headless browser, when it is installed where [`browser::find`]
+    /// looks.
+    fn browser(&self) -> Option<&Path> {
+        self.browser
+            .get_or_init(|| {
+                let configured = crate::admin::AdminConfig::load_default().browser_bin;
+                browser::find(&|name| std::env::var_os(name), configured.as_deref())
+            })
+            .as_deref()
+    }
+
+    /// What `RenderPdf` prints with, per `admin.json` `pdf_renderer`.
+    fn printer(&self) -> Option<&pdf::Printer> {
+        self.printer
+            .get_or_init(|| {
+                let setting = crate::admin::AdminConfig::load_default()
+                    .pdf_renderer
+                    .unwrap_or_default();
+                pdf::choose(
+                    setting,
+                    pdf::find_chromium(&|name| std::env::var_os(name)),
+                    self.browser().map(Path::to_path_buf),
+                )
+            })
+            .as_ref()
+    }
+
+    /// Whether this session offers `name`. Every tool is offered except the
+    /// ones whose program is not installed — `ConvertDocument` without
+    /// LibreOffice, Screenshot without the headless browser, `RenderPdf`
+    /// without a browser that can print — and the desktop's, unless the
+    /// operator switched the desktop on.
     fn offered(&self, name: &str) -> bool {
-        name != CONVERT_DOCUMENT || self.soffice().is_some()
+        match name {
+            CONVERT_DOCUMENT => self.soffice().is_some(),
+            SCREENSHOT => self.browser().is_some(),
+            RENDER_PDF => self.printer().is_some(),
+            other if desktop::is_desktop(other) => self.desktop.is_some(),
+            _ => true,
+        }
+    }
+
+    /// Why `name` is not offered here, for a model that called it anyway.
+    fn unavailable(name: &str) -> String {
+        match name {
+            CONVERT_DOCUMENT => format!(
+                "{name} is not available: LibreOffice was not found (install it, or set {} to \
+                 its soffice executable)",
+                convert::SOFFICE_ENV
+            ),
+            SCREENSHOT => format!(
+                "{name} is not available: the headless browser was not found (set {} or \
+                 `browser_bin` in admin.json)",
+                browser::BROWSER_ENV
+            ),
+            RENDER_PDF => format!(
+                "{name} is not available: no browser that can print was found (set {}, or \
+                 install the headless browser)",
+                pdf::PDF_BROWSER_ENV
+            ),
+            other => {
+                format!("{other} is not available: the desktop is not switched on for this session")
+            }
+        }
+    }
+
+    /// Offer the desktop tools, run by the desktop child started from
+    /// `setup` — see [`desktop`] for why it is a child.
+    pub fn enable_desktop(&mut self, setup: DesktopSetup) {
+        self.desktop = Some(setup);
     }
 
     /// This toolbox with LibreOffice found at `soffice`, or not at all,
@@ -379,6 +483,54 @@ impl Toolbox {
             soffice: OnceLock::from(soffice),
             ..self
         }
+    }
+
+    /// This toolbox with the headless browser at `browser`, or none —
+    /// whatever this machine has installed — and no system browser to print
+    /// with, so `RenderPdf` prints with `browser` when there is one.
+    #[cfg(test)]
+    pub(crate) fn with_browser(self, browser: Option<PathBuf>) -> Self {
+        let printer = pdf::choose(crate::admin::PdfRenderer::Auto, None, browser.clone());
+        self.with_printer(browser, printer)
+    }
+
+    /// This toolbox with the headless browser at `browser`, or none, and
+    /// `RenderPdf` printing with `printer`, or not offered.
+    #[cfg(test)]
+    fn with_printer(self, browser: Option<PathBuf>, printer: Option<pdf::Printer>) -> Self {
+        Self {
+            browser: OnceLock::from(browser),
+            printer: OnceLock::from(printer),
+            ..self
+        }
+    }
+
+    /// This toolbox with a desktop that answers `screenshot` with `picture`
+    /// (a PNG or JPEG) and counts in `calls` the calls that reach it — for a
+    /// test elsewhere in the crate to send a picture through.
+    #[cfg(test)]
+    pub(crate) fn with_desktop_picture(
+        self,
+        picture: Vec<u8>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        self.with_desktop_client(picture_tests::fake_desktop(picture, calls))
+    }
+
+    /// The desktop, served by `client` rather than a child this toolbox
+    /// starts.
+    #[cfg(test)]
+    fn with_desktop_client(mut self, client: desktop::DesktopClient) -> Self {
+        self.desktop = Some(DesktopSetup {
+            exe: PathBuf::from("not-started-in-a-test"),
+            journal: self.workspace.join(".incord").join("desktop.jsonl"),
+        });
+        *self
+            .state
+            .desktop
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(client);
+        self
     }
 
     /// The session's permission mode, decided HERE for every call.
@@ -684,6 +836,8 @@ impl Toolbox {
             APPLY_PATCH => edits::patch_paths(input),
             // The PDF it writes, not the document it reads.
             CONVERT_DOCUMENT => Ok(vec![convert::output_path(input)]),
+            // The PDF it writes, not the page it prints.
+            RENDER_PDF => Ok(vec![pdf::output_path(input)]),
             _ => Ok(Vec::new()),
         }
     }
@@ -737,16 +891,31 @@ impl Toolbox {
     }
 
     /// Every tool this session offers, as the model is told about them: the
-    /// whole [`catalogue`], less `ConvertDocument` where LibreOffice is not
-    /// installed.
+    /// whole [`catalogue`], less what [`Self::offered`] leaves out — and
+    /// `WebFetch` without its `render_js` option where no headless browser
+    /// is installed, so it reads exactly as it did before there was one.
     #[must_use]
     pub fn definitions(&self) -> Vec<Value> {
+        let browser = self.browser().is_some();
         catalogue()
             .into_iter()
             .filter(|def| {
                 def.get("name")
                     .and_then(Value::as_str)
                     .is_some_and(|name| self.offered(name))
+            })
+            .map(|mut def| {
+                if !browser
+                    && def.get("name").and_then(Value::as_str) == Some(crate::web::FETCH_TOOL)
+                {
+                    if let Some(properties) = def
+                        .pointer_mut("/input_schema/properties")
+                        .and_then(Value::as_object_mut)
+                    {
+                        properties.remove("render_js");
+                    }
+                }
+                def
             })
             .collect()
     }
@@ -971,7 +1140,10 @@ fn catalogue() -> Vec<Value> {
         ]);
     all.extend(crate::knowledge::tool_definitions());
     all.extend(crate::web::tool_definitions());
+    all.push(browser::definition());
+    all.push(pdf::definition());
     all.extend(team::definitions());
+    all.extend(desktop::definitions());
     all
 }
 
@@ -983,12 +1155,13 @@ impl Toolbox {
     /// success — a model told a write succeeded when it did not will build on
     /// the file it thinks it wrote.
     pub fn run(&self, name: &str, input: &Value) -> Result<String, String> {
-        self.run_call("", name, input)
+        self.run_call("", name, input).map(|out| out.shown())
     }
 
     /// [`Self::run`], for the call the model numbered `call_id` — the id a
-    /// person is shown if the call has to be confirmed.
-    pub fn run_call(&self, call_id: &str, name: &str, input: &Value) -> Result<String, String> {
+    /// person is shown if the call has to be confirmed — with the answer's
+    /// pictures kept, for a caller that can send them on.
+    pub fn run_call(&self, call_id: &str, name: &str, input: &Value) -> Result<ToolOutput, String> {
         // A name nobody classified is not a tool: refused before a guard, a
         // person or the engine is asked about it.
         let Some(reach) = reach_of(name) else {
@@ -1005,11 +1178,7 @@ impl Toolbox {
         // that knows its name from elsewhere.
         if !self.offered(name) {
             crate::trace!("tool", "{name} REFUSED: not offered in this session");
-            return Err(format!(
-                "{name} is not available: LibreOffice was not found (install it, or set {} to \
-                 its soffice executable)",
-                convert::SOFFICE_ENV
-            ));
+            return Err(Self::unavailable(name));
         }
         // The input the tool's own schema promised, before anything is asked
         // or decided about it: a malformed call runs nothing.
@@ -1041,7 +1210,7 @@ impl Toolbox {
             }
             Gate::Answered(said) => {
                 crate::trace!("tool", "{name} answered in the owner's app");
-                return Ok(said);
+                return Ok(ToolOutput::from(said));
             }
         };
         let outcome = self.dispatch(name, input, reach);
@@ -1050,14 +1219,17 @@ impl Toolbox {
         // happened: a refused or failed one changed nothing. Not waited on.
         if reach == Reach::Change {
             if let (Some(engine), Ok(said)) = (&self.engine, &outcome) {
-                self.tell_engine_what_changed(engine, name, input, said);
+                self.tell_engine_what_changed(engine, name, input, &said.shown());
             }
         }
         // The engine's guidance for THIS action travels with its result, which
         // is the one place the model reads it at the moment it applies.
         match context {
             Some(context) => outcome
-                .map(|said| format!("{said}\n\n{context}"))
+                .map(|mut said| {
+                    said.text = format!("{}\n\n{context}", said.text);
+                    said
+                })
                 .map_err(|why| format!("{why}\n\n{context}")),
             None => outcome,
         }
@@ -1077,7 +1249,7 @@ impl Toolbox {
             cwd: &self.workspace,
             transcript: None,
         };
-        if name != APPLY_PATCH && name != CONVERT_DOCUMENT {
+        if !matches!(name, APPLY_PATCH | CONVERT_DOCUMENT | RENDER_PDF) {
             engine.code_edit(at, name, &self.event_input(name, input), said);
             return;
         }
@@ -1227,7 +1399,7 @@ impl Toolbox {
                 shown["path"] = json!(self.absolute(path));
             }
         }
-        if name == APPLY_PATCH || name == CONVERT_DOCUMENT {
+        if matches!(name, APPLY_PATCH | CONVERT_DOCUMENT | RENDER_PDF) {
             if let Ok(paths) = self.changed_paths(name, input) {
                 let named: Vec<String> = paths.iter().map(|p| self.absolute(p)).collect();
                 shown["paths"] = json!(named);
@@ -1271,7 +1443,74 @@ impl Toolbox {
     }
 
     /// Run the tool itself: guards and the engine have already passed it.
-    fn dispatch(&self, name: &str, input: &Value, reach: Reach) -> Result<String, String> {
+    fn dispatch(&self, name: &str, input: &Value, reach: Reach) -> Result<ToolOutput, String> {
+        if reach == Reach::Change {
+            self.checkpoint(name, input);
+        }
+        let began = std::time::Instant::now();
+        let resolve = |path: &str| self.resolve(path);
+        let outcome = match name {
+            SCREENSHOT => match self.browser() {
+                Some(bin) => {
+                    browser::screenshot(&self.state.browsers, bin, input, &resolve, self.filter_env)
+                }
+                None => Err(Self::unavailable(name)),
+            },
+            RENDER_PDF => match self.printer() {
+                Some(printer) => pdf::run(
+                    printer,
+                    &self.state.browsers,
+                    input,
+                    &resolve,
+                    self.filter_env,
+                )
+                .map(ToolOutput::from),
+                None => Err(Self::unavailable(name)),
+            },
+            other if desktop::is_desktop(other) => self.run_desktop(other, input),
+            other => self.dispatch_text(other, input).map(ToolOutput::from),
+        };
+        // The OUTCOME, not just the attempt. A tool that ran and failed and a
+        // tool that was never reached look identical from the call above.
+        match &outcome {
+            Ok(said) => crate::trace!(
+                "tool",
+                "{name} ok in {:?}, {} bytes, {} picture(s)",
+                began.elapsed(),
+                said.text.len(),
+                said.images.len()
+            ),
+            Err(why) => crate::trace!("tool", "{name} FAILED in {:?}: {why}", began.elapsed()),
+        }
+        outcome
+    }
+
+    /// One desktop tool, run by the session's desktop child — started now
+    /// when there is none, or when the one running was started for a
+    /// different mode or has failed.
+    fn run_desktop(&self, name: &str, input: &Value) -> Result<ToolOutput, String> {
+        let Some(setup) = &self.desktop else {
+            return Err(Self::unavailable(name));
+        };
+        let read_only = self.mode == Some(crate::permissions::PermissionMode::ReadOnly);
+        let mut slot = self
+            .state
+            .desktop
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !slot.as_ref().is_some_and(|c| c.serves(read_only)) {
+            // Dropped FIRST: its kill switch ends it before another starts.
+            *slot = None;
+            *slot = Some(desktop::DesktopClient::start(setup, read_only)?);
+        }
+        match slot.as_mut() {
+            Some(client) => client.call(name, input),
+            None => Err("the desktop could not be started".to_string()),
+        }
+    }
+
+    /// The tools whose answer is text alone.
+    fn dispatch_text(&self, name: &str, input: &Value) -> Result<String, String> {
         // The file and shell tools parse their own JSON from a string, which is
         // the interface they were written to; re-serialising here keeps that
         // contract rather than rewriting six working implementations.
@@ -1286,14 +1525,15 @@ impl Toolbox {
             self.workspace.as_path()
         };
 
-        // Snapshot before file-modifying operations if checkpoints are enabled.
-        if reach == Reach::Change {
-            self.checkpoint(name, input);
-        }
-
         let background = input.get("run_in_background").and_then(Value::as_bool) == Some(true);
-        let began = std::time::Instant::now();
-        let outcome = match name {
+        // The page's script, run by the headless browser, for a WebFetch
+        // that needs it — when the browser is installed.
+        let render = |url: &str| match self.browser() {
+            Some(bin) => browser::render_html(bin, url, self.filter_env),
+            None => Err("no headless browser is installed".to_string()),
+        };
+        let render: Option<crate::web::Render<'_>> = self.browser().is_some().then_some(&render);
+        match name {
             READ => crate::tools::file_ops::read_file(ws, &raw).map_err(|e| e.to_string()),
             WRITE => crate::tools::file_ops::write_file(ws, &raw).map_err(|e| e.to_string()),
             EDIT => crate::tools::file_ops::edit_file(ws, &raw).map_err(|e| e.to_string()),
@@ -1326,22 +1566,10 @@ impl Toolbox {
             ASK_USER_QUESTION => self.ask_here(input),
             crate::brief::SAVE_TOOL => self.save_brief(&raw),
             other => crate::knowledge::handle_tool(other, input)
-                .or_else(|| crate::web::handle_tool(other, input))
+                .or_else(|| crate::web::handle_tool(other, input, render))
                 .or_else(|| self.team.handle(other, input))
                 .unwrap_or_else(|| Err(format!("there is no tool called `{other}`"))),
-        };
-        // The OUTCOME, not just the attempt. A tool that ran and failed and a
-        // tool that was never reached look identical from the call above.
-        match &outcome {
-            Ok(said) => crate::trace!(
-                "tool",
-                "{name} ok in {:?}, {} bytes",
-                began.elapsed(),
-                said.len()
-            ),
-            Err(why) => crate::trace!("tool", "{name} FAILED in {:?}: {why}", began.elapsed()),
         }
-        outcome
     }
 }
 
@@ -1353,3 +1581,6 @@ mod tool_tests;
 
 #[cfg(test)]
 mod reading_tests;
+
+#[cfg(test)]
+mod picture_tests;

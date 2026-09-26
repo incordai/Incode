@@ -131,6 +131,16 @@ dom_query = { version = "=0.28.0", default-features = false, features = ["markdo
 # `$ref` must never make this process fetch anything.
 jsonschema = { version = "=0.58.0", default-features = false }
 
+# The headless browser's DevTools socket, for the Screenshot tool and the
+# image-only PDF fallback (phase 6b). A NEW PACKAGE, vetted in a scratch copy of
+# this manifest: 0.30.0 is the latest, MIT OR Apache-2.0, rust-version 1.85.
+# The client half only, over a plain loopback TcpStream: `handshake` without
+# any TLS feature. It adds 7 packages to the lock (itself, sha1 0.11 and its
+# digest 0.11 / block-buffer 0.12 / crypto-common 0.2 / hybrid-array / const-oid,
+# each MIT OR Apache-2.0, rust-version 1.85); bytes, http, httparse, rand,
+# data-encoding, log and thiserror were already there.
+tungstenite = { version = "=0.30.0", default-features = false, features = ["handshake"] }
+
 # Computer use — see docs/COMPUTER_USE.md. THESE ARE NEW PACKAGES, unlike every
 # other entry in this file, and the vetting is recorded in .incord/RULE_ACK:
 # latest stable as resolved from the live index on 2026-09-16, pinned, MSRV

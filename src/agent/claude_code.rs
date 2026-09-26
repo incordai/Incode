@@ -302,14 +302,6 @@ pub struct ClaudeCodeBackend {
     /// the write (see [`crate::toolbox::Toolbox`]); these stay as the readable
     /// statement of what the session protects.
     deny: Vec<String>,
-    /// incode's other MCP servers (the team channel, and the desktop when it
-    /// is on), as `--mcp-config` JSON. The tool bridge is added beside them on
-    /// every turn.
-    ///
-    /// `--strict-mcp-config` goes with it: the CLI loads ONLY what incode
-    /// hands it. Memory is reached through incode's own tools, not through a
-    /// server the operator happened to configure for the CLI.
-    desktop_mcp: Option<String>,
 }
 
 /// What THIS agent calls its sub-agent tool.
@@ -364,10 +356,6 @@ impl ClaudeCodeBackend {
             calls: 0,
             workspace,
             session_id: None,
-            // Off unless a caller asks. Handing every run a desktop it did not
-            // request would widen what an agent can reach as a side effect of
-            // a constructor.
-            desktop_mcp: None,
             model: None,
             fallbacks: Vec::new(),
             partial_messages: false,
@@ -472,14 +460,14 @@ impl ClaudeCodeBackend {
         &self.deny
     }
 
-    /// Hand this agent an MCP server, as `--mcp-config` JSON.
-    ///
-    /// Build the JSON with [`crate::desktop::mcp::client_config_json`] so the
-    /// flag that selects the server mode cannot drift from the one `main.rs`
-    /// parses.
+    /// Offer the model the desktop tools, run through incode's toolbox and
+    /// executed by the desktop child it starts — see `toolbox::desktop`.
+    /// Off unless a caller asks: handing every run a desktop it did not
+    /// request would widen what an agent can reach as a side effect of a
+    /// constructor.
     #[must_use]
-    pub fn with_mcp_config(mut self, config: impl Into<String>) -> Self {
-        self.desktop_mcp = Some(config.into());
+    pub fn with_desktop(mut self, setup: crate::toolbox::DesktopSetup) -> Self {
+        self.tools.enable_desktop(setup);
         self
     }
 
@@ -1038,18 +1026,16 @@ const MODEL_ONLY_ENV: [(&str, &str); 2] = [
     ("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1"),
 ];
 
-/// Every MCP server the CLI gets: incode's other servers, if any, and the
-/// tool bridge — as one `--mcp-config` document, and the tool names each
-/// server's calls may use without the CLI asking anyone.
-fn servers_for(others: Option<&str>, exe: &std::path::Path) -> (String, Vec<String>) {
-    let mut servers = others
-        .and_then(|config| serde_json::from_str::<serde_json::Value>(config).ok())
-        .and_then(|config| {
-            config
-                .get("mcpServers")
-                .and_then(|m| m.as_object().cloned())
-        })
-        .unwrap_or_default();
+/// The one MCP server the CLI gets: the tool bridge — as an `--mcp-config`
+/// document, and the tool names its calls may use without the CLI asking
+/// anyone. The team channel and the desktop are toolbox tools reached
+/// through it, so no server of their own is handed over.
+///
+/// `--strict-mcp-config` goes with it: the CLI loads ONLY what incode hands
+/// it. Memory is reached through incode's own tools, not through a server
+/// the operator happened to configure for the CLI.
+fn servers_for(exe: &std::path::Path) -> (String, Vec<String>) {
+    let mut servers = serde_json::Map::new();
     servers.insert(
         crate::tool_bridge::CLIENT_KEY.to_string(),
         crate::tool_bridge::client_entry(exe),
@@ -1086,10 +1072,6 @@ impl AgentBackend for ClaudeCodeBackend {
         ClaudeCodeBackend::set_extra_dirs(self, dirs);
     }
 
-    fn mcp_config(&self) -> Option<String> {
-        self.desktop_mcp.clone()
-    }
-
     /// The team channel's tools are incode's toolbox's on this route, so the
     /// toolbox is who speaks.
     fn set_team_identity(&mut self, role: &str) {
@@ -1119,6 +1101,10 @@ impl AgentBackend for ClaudeCodeBackend {
             .into_iter()
             .map(|c| (c.session, c.title))
             .collect()
+    }
+
+    fn offered_tools(&self) -> Vec<String> {
+        self.tools.names()
     }
 
     fn model(&self) -> Option<&str> {
@@ -1210,7 +1196,7 @@ impl AgentBackend for ClaudeCodeBackend {
                          was not started: {e}"
                     ))
                 })?;
-        let (servers, allowed) = servers_for(self.desktop_mcp.as_deref(), &exe);
+        let (servers, allowed) = servers_for(&exe);
 
         let mut cmd = self.command(&budgeted_prompt, &budgeted_context, &servers, &allowed);
         // How the tool server finds this process: through the CLI's
@@ -2197,7 +2183,7 @@ mod tests {
             !backend.deny_rules().is_empty(),
             "control: there are deny rules that could leak onto the argv"
         );
-        let (servers, allowed) = servers_for(None, std::path::Path::new("incode"));
+        let (servers, allowed) = servers_for(std::path::Path::new("incode"));
         let cmd = backend.command("hi", "", &servers, &allowed);
         let args = args_of(&cmd);
 
@@ -2249,20 +2235,38 @@ mod tests {
         }
     }
 
-    /// The bridge joins incode's other servers rather than replacing them,
-    /// and every server's tools are allowed by name.
+    /// **THE DESKTOP IS THE TOOLBOX'S, NOT A SERVER BESIDE THE BRIDGE.** With
+    /// the desktop switched on, the model's tool list (the toolbox's) holds
+    /// the desktop tools, and the CLI is handed the bridge and nothing else.
     #[test]
-    fn the_bridge_is_added_beside_incodes_other_servers() {
-        let team = r#"{"mcpServers":{"team":{"command":"incode","args":["--team-mcp"]}}}"#;
-        let (servers, allowed) = servers_for(Some(team), std::path::Path::new("incode"));
+    fn the_bridge_is_the_only_server_and_the_desktop_is_the_toolboxs() {
+        let off = ClaudeCodeBackend::new(PathBuf::from("."));
+        assert!(
+            !off.tools.names().iter().any(|n| n == "screenshot"),
+            "a desktop nobody switched on"
+        );
+        let on =
+            ClaudeCodeBackend::new(PathBuf::from(".")).with_desktop(crate::toolbox::DesktopSetup {
+                exe: PathBuf::from("incode"),
+                journal: PathBuf::from(".incord/desktop.jsonl"),
+            });
+        let names = on.tools.names();
+        for tool in ["screenshot", "screen_info", "ui_tree", "click", "type_text"] {
+            assert!(names.iter().any(|n| n == tool), "{tool} missing: {names:?}");
+        }
+        let (servers, allowed) = servers_for(std::path::Path::new("incode"));
         let parsed: serde_json::Value = serde_json::from_str(&servers).expect("json");
-        assert!(parsed["mcpServers"]["team"].is_object(), "{servers}");
+        let keys: Vec<&String> = parsed["mcpServers"]
+            .as_object()
+            .expect("servers")
+            .keys()
+            .collect();
+        assert_eq!(keys, [crate::tool_bridge::CLIENT_KEY], "{servers}");
         assert_eq!(
             parsed["mcpServers"][crate::tool_bridge::CLIENT_KEY]["args"][0],
             crate::tool_bridge::SERVER_FLAG
         );
-        assert!(allowed.contains(&"mcp__team".to_string()), "{allowed:?}");
-        assert!(allowed.contains(&"mcp__incode".to_string()), "{allowed:?}");
+        assert_eq!(allowed, ["mcp__incode".to_string()]);
     }
 
     /// One request to the bridge, as the tool server sends it.

@@ -1195,7 +1195,7 @@ mod tests {
                     });
                     let (output, is_error) =
                         match tools.run_call("g1", crate::toolbox::WRITE, &input) {
-                            Ok(said) => (said, false),
+                            Ok(said) => (said.shown(), false),
                             Err(why) => (why, true),
                         };
                     on_event(&AgentEvent::ToolResult {

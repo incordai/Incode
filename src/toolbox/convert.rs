@@ -137,8 +137,9 @@ pub(super) fn output_path(input: &Value) -> String {
     }
 }
 
-/// A local path as the `file://` URL LibreOffice's `-env:` option takes.
-fn file_url(path: &Path) -> String {
+/// A local path as a `file://` URL: what LibreOffice's `-env:` option takes,
+/// and what a headless browser is pointed at for a workspace file.
+pub(super) fn file_url(path: &Path) -> String {
     let spelled = path.to_string_lossy().replace('\\', "/");
     let mut url = String::from("file://");
     if !spelled.starts_with('/') {

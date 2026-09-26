@@ -137,6 +137,15 @@ pub struct AdminConfig {
     /// configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web_search: Option<SearchProvider>,
+    /// The owner's headless browser (`incord-browser`), when it is not on
+    /// `PATH`. The `INCODE_BROWSER` variable wins over it. Unset and not
+    /// found, the Screenshot tool is not offered and `WebFetch` runs no
+    /// script — see `toolbox::browser`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_bin: Option<String>,
+    /// Which program `RenderPdf` prints with. Unset is `auto`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdf_renderer: Option<PdfRenderer>,
     /// The capability ladder, named by the operator.
     ///
     /// A tier is a list of models that can do the same JOB — `"top"` might hold
@@ -212,6 +221,20 @@ pub struct ApiProvider {
     pub url: String,
     /// The NAME of the environment variable holding the key — never the key.
     pub key_env: String,
+}
+
+/// Which program `RenderPdf` prints with — see `toolbox::pdf`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PdfRenderer {
+    /// The system headless browser when one is installed (text PDFs), else
+    /// incord-browser (image-only PDFs).
+    #[default]
+    Auto,
+    /// Only the system headless browser.
+    Chromium,
+    /// Only incord-browser.
+    IncordBrowser,
 }
 
 /// The web search service `WebSearch` asks.
@@ -1081,6 +1104,9 @@ mod tests {
                 url: "https://search.invalid/q".to_string(),
                 key_env: Some("SEARCH_KEY_VARIABLE".to_string()),
             }),
+            // The browser and the PDF switch, which the owner flips by hand.
+            browser_bin: Some("C:/tools/incord-browser.exe".to_string()),
+            pdf_renderer: Some(PdfRenderer::IncordBrowser),
             // The ladder has to survive the file too — a tier an operator
             // writes and cannot read back is a setting that does not exist.
             tiers: BTreeMap::from([(

@@ -1755,44 +1755,27 @@ fn permission_mode_from_env() -> crate::permissions::PermissionMode {
     }
 }
 
-/// The MCP servers a model incode drives through its tool bridge still gets
-/// beside the bridge, as one config — today only the desktop, when it is
-/// switched on.
+/// Where the desktop tools are started from, for a model whose tools are
+/// incode's own (the bridged CLI and the API route), or `None` when the
+/// desktop is off.
 ///
-/// # Why the team channel is not here
-///
-/// Its tools are incode's own now (`toolbox::team`), reached through the
-/// bridge like every other tool, so the guards, the permission mode and the
-/// memory engine's hooks cover them. Registering the separate server as well
-/// would hand the model the same four tools twice, one copy unguarded.
-///
-/// # Why the desktop still is
-///
-/// Its screenshot answers with an image, and a toolbox result is text; see
-/// `docs/ARCHITECTURE.md`, "Tools", for what moving it needs. It stays opt-in:
-/// a desktop is a capability over the operator's machine.
-pub(crate) fn mcp_config_for(
+/// The desktop tools are toolbox tools there: offered by the toolbox, held to
+/// the permission mode and the memory engine, and executed by the desktop
+/// child the toolbox starts (`toolbox::desktop`). No desktop server is handed
+/// to the model beside the bridge. It stays opt-in: a desktop is a capability
+/// over the operator's machine.
+pub(crate) fn desktop_setup_for(
     desktop: bool,
     exe: Option<std::path::PathBuf>,
     workspace: &Path,
-    mode: crate::permissions::PermissionMode,
-) -> Option<String> {
-    // No path to this binary means nothing can be launched at all. A config
-    // naming a binary nobody can find fails later, inside the agent, as a
-    // server that will not start — which is a far harder thing to diagnose
-    // than simply not offering it.
+) -> Option<crate::toolbox::DesktopSetup> {
+    // No path to this binary means the desktop child cannot be started at
+    // all, and a tool that can only fail is not offered.
     let exe = exe?;
-    if !desktop {
-        return None;
-    }
-    let journal = crate::desktop::journal::path_in(workspace);
-    let desktop_config = crate::desktop::mcp::client_config(&exe, Some(&journal), mode);
-    let entry = desktop_config
-        .get("mcpServers")
-        .and_then(|m| m.get(crate::desktop::mcp::CLIENT_KEY))?;
-    let mut servers = serde_json::Map::new();
-    servers.insert(crate::desktop::mcp::CLIENT_KEY.to_string(), entry.clone());
-    Some(serde_json::json!({ "mcpServers": servers }).to_string())
+    desktop.then(|| crate::toolbox::DesktopSetup {
+        exe,
+        journal: crate::desktop::journal::path_in(workspace),
+    })
 }
 
 /// The same set, in Codex's `-c key=value` spelling.
@@ -1940,7 +1923,12 @@ pub(crate) fn route_backend(
             )
             // The memory engine's guard, asked before each of the harness's own
             // tools runs.
-            .with_engine(crate::hooks::engine::Engine::locate()),
+            .with_engine(crate::hooks::engine::Engine::locate())
+            .with_desktop(desktop_setup_for(
+                desktop_enabled_from_env(),
+                std::env::current_exe().ok(),
+                workspace,
+            )),
         ),
         None => run_backend(workspace, agent_id, binary, guards, system_prompt),
     }
@@ -2023,14 +2011,12 @@ fn run_backend_with_desktop(
                     // the API route.
                     .with_engine(crate::hooks::engine::Engine::locate());
 
-            // incode's other MCP servers, handed over beside the tool bridge
-            // the backend adds itself. agy is the one backend left alone: it
-            // offers only a persistent `mcp add`, which edits the operator's
-            // machine rather than this spawn, and that is their decision.
-            if let Some(config) =
-                mcp_config_for(desktop, std::env::current_exe().ok(), workspace, mode)
+            // The desktop, as toolbox tools reached through the bridge — not
+            // a server of its own beside it. The desktop child is told the
+            // session's mode by the toolbox, which holds it.
+            if let Some(setup) = desktop_setup_for(desktop, std::env::current_exe().ok(), workspace)
             {
-                backend = backend.with_mcp_config(config);
+                backend = backend.with_desktop(setup);
             }
 
             Box::new(backend)
@@ -2385,59 +2371,31 @@ mod tests {
     fn the_desktop_is_not_handed_over_unless_it_is_switched_on() {
         let exe = Some(std::path::PathBuf::from("C:/bin/incode.exe"));
 
-        let off = mcp_config_for(false, exe.clone(), Path::new("C:/work"), ORDINARY);
+        let off = desktop_setup_for(false, exe.clone(), Path::new("C:/work"));
         assert_eq!(
             off, None,
             "the desktop must not be offered when the switch is off"
         );
 
-        let config = mcp_config_for(true, exe, Path::new("C:/work"), ORDINARY)
-            .expect("switched on, so a config");
-        assert!(config.contains("--desktop-mcp"), "got: {config}");
-        assert!(config.contains("incode.exe"), "got: {config}");
+        let setup =
+            desktop_setup_for(true, exe, Path::new("C:/work")).expect("switched on, so a setup");
+        assert_eq!(setup.exe, std::path::PathBuf::from("C:/bin/incode.exe"));
         // The journal is what makes the work watchable; without it the agent
-        // drives a desktop nobody can see.
-        assert!(config.contains("--desktop-journal"), "got: {config}");
-        assert!(config.contains("desktop.jsonl"), "got: {config}");
+        // drives a desktop nobody can see. Its stop file sits beside it.
+        assert!(
+            setup.journal.ends_with("desktop.jsonl"),
+            "{}",
+            setup.journal.display()
+        );
     }
 
-    /// **THE TEAM CHANNEL IS NOT A SECOND SERVER ANY MORE.** Its tools are
-    /// incode's own, reached through the bridge; registering the separate
-    /// server too would hand the model the same tools twice, one copy
-    /// unguarded.
-    #[test]
-    fn the_desktop_is_the_only_server_beside_the_bridge() {
-        let exe = Some(std::path::PathBuf::from("C:/bin/incode.exe"));
-        let config = mcp_config_for(true, exe, Path::new("C:/work"), ORDINARY).expect("a config");
-
-        let parsed: serde_json::Value =
-            serde_json::from_str(&config).expect("the config must be valid JSON");
-        let servers = parsed["mcpServers"]
-            .as_object()
-            .expect("an mcpServers object");
-
-        assert!(
-            servers.contains_key(crate::desktop::mcp::CLIENT_KEY),
-            "{config}"
-        );
-        assert!(
-            !servers.contains_key(crate::team_mcp::CLIENT_KEY),
-            "{config}"
-        );
-        assert_eq!(servers.len(), 1, "got: {config}");
-    }
-
-    /// No path to this binary means no usable config — for either server.
+    /// No path to this binary means no desktop — on either route.
     ///
-    /// A config naming a binary nobody can find fails later, inside the agent,
-    /// as an MCP server that will not start — which is a much harder thing to
-    /// diagnose than simply not offering it.
+    /// A desktop child that cannot be started is a tool that can only fail,
+    /// which is a much harder thing to diagnose than simply not offering it.
     #[test]
     fn an_unknown_executable_path_offers_nothing() {
-        assert_eq!(
-            mcp_config_for(true, None, Path::new("C:/work"), ORDINARY),
-            None
-        );
+        assert_eq!(desktop_setup_for(true, None, Path::new("C:/work")), None);
         assert!(mcp_overrides_for(true, None, Path::new("C:/work"), ORDINARY).is_empty());
     }
 
@@ -2465,13 +2423,17 @@ mod tests {
     /// a spawn is invisible from outside, so it goes missing quietly. The
     /// system context went missing twice this way.
     ///
-    /// Drop the `.with_mcp_config(..)` from [`run_backend`] and this fails.
+    /// Drop the `.with_desktop(..)` from [`run_backend_with_desktop`] and
+    /// this fails.
     ///
     /// Both states are driven in one process, so the assertion does not depend
     /// on what `INCORD_DESKTOP` happens to say on the machine running it. The
     /// earlier shape of this test read the environment and asserted the pairing,
     /// which on an unset machine reduced to "off, and nothing was handed over" —
     /// true with every registration line deleted.
+    ///
+    /// The desktop reaches the model as incode's own tools now, through the
+    /// bridge: no MCP server is handed over beside it, on or off.
     #[test]
     fn the_run_backend_hands_the_desktop_to_the_agent_when_it_is_on() {
         let on = run_backend_with_desktop(
@@ -2483,12 +2445,14 @@ mod tests {
             true,
             ORDINARY,
         );
-        let config = on
-            .mcp_config()
-            .expect("the desktop is on, so the agent gets it");
-        assert!(config.contains("--desktop-mcp"), "got: {config}");
-        // The team channel's tools come through the bridge, not as a server.
-        assert!(!config.contains("--team-mcp"), "got: {config}");
+        let tools = on.offered_tools();
+        for tool in ["screenshot", "click", "ui_tree"] {
+            assert!(
+                tools.iter().any(|t| t == tool),
+                "the desktop is on, so the model gets {tool}: {tools:?}"
+            );
+        }
+        assert_eq!(on.mcp_config(), None, "no desktop server beside the bridge");
 
         let off = run_backend_with_desktop(
             Path::new("."),
@@ -2499,11 +2463,13 @@ mod tests {
             false,
             ORDINARY,
         );
-        assert_eq!(
-            off.mcp_config(),
-            None,
-            "handed a server nobody asked for; the bridge is added per turn"
+        let tools = off.offered_tools();
+        assert!(
+            !tools.iter().any(|t| t == "screenshot"),
+            "handed a desktop nobody asked for: {tools:?}"
         );
+        assert!(tools.iter().any(|t| t == "Read"), "{tools:?}");
+        assert_eq!(off.mcp_config(), None);
     }
 
     /// agy has NO per-invocation MCP flag, so it must never be handed one.

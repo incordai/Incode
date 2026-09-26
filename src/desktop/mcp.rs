@@ -671,7 +671,9 @@ fn error_response(id: Value, code: i64, message: &str) -> String {
     .to_string()
 }
 
-fn tool_definitions() -> Vec<Value> {
+/// Every desktop tool, in MCP's shape. The toolbox offers these same
+/// definitions to a model (`toolbox::desktop`), so they are written once.
+pub(crate) fn tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "screen_info",

@@ -32,7 +32,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use super::{AgentBackend, AgentError, AgentEvent, TurnOutcome};
-use crate::toolbox::Toolbox;
+use crate::toolbox::{ToolOutput, Toolbox};
 
 /// Where requests go. The full URL of the messages endpoint.
 pub const API_URL_ENV: &str = "INCORD_API_URL";
@@ -485,15 +485,35 @@ pub fn assistant_message(reply: &Reply) -> Value {
 /// A failure is marked with `is_error` rather than sent as ordinary text: a
 /// model that reads a failure as a result carries on as though the file was
 /// written.
+///
+/// A text answer is sent as the string it always was. An answer with
+/// pictures is sent as blocks: its text, then one base64 `image` block per
+/// picture, each already inside the toolbox's image bounds.
 #[must_use]
-pub fn tool_result_message(results: &[(String, String, bool)]) -> Value {
+pub fn tool_result_message(results: &[(String, ToolOutput, bool)]) -> Value {
     let blocks: Vec<Value> = results
         .iter()
         .map(|(id, output, failed)| {
+            let content = if output.images.is_empty() {
+                json!(output.text)
+            } else {
+                let mut parts = vec![json!({"type": "text", "text": output.text})];
+                parts.extend(output.images.iter().map(|image| {
+                    json!({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": image.format().mime(),
+                            "data": image.base64(),
+                        }
+                    })
+                }));
+                Value::Array(parts)
+            };
             json!({
                 "type": "tool_result",
                 "tool_use_id": id,
-                "content": output,
+                "content": content,
                 "is_error": failed,
             })
         })
@@ -553,6 +573,15 @@ impl ApiBackend {
     #[must_use]
     pub fn with_engine(mut self, engine: Option<crate::hooks::engine::Engine>) -> Self {
         self.tools = self.tools.with_engine(engine);
+        self
+    }
+
+    /// Offer the model the desktop tools — see `toolbox::desktop`.
+    #[must_use]
+    pub fn with_desktop(mut self, setup: Option<crate::toolbox::DesktopSetup>) -> Self {
+        if let Some(setup) = setup {
+            self.tools.enable_desktop(setup);
+        }
         self
     }
 
@@ -666,11 +695,13 @@ impl ApiBackend {
                     // Handed BACK to the model rather than ending the turn: a
                     // failed tool is something to recover from, and the model
                     // cannot recover from what it is not told.
-                    Err(why) => (why, true),
+                    Err(why) => (ToolOutput::from(why), true),
                 };
+                // Shown and recorded with a placeholder per picture; the
+                // pictures themselves go only to the model.
                 on_event(&AgentEvent::ToolResult {
                     id: call.id.clone(),
-                    output: output.clone(),
+                    output: output.shown(),
                     is_error: failed,
                 });
                 results.push((call.id.clone(), output, failed));
@@ -878,6 +909,10 @@ impl AgentBackend for ApiBackend {
             .into_iter()
             .map(|c| (c.session, c.title))
             .collect()
+    }
+
+    fn offered_tools(&self) -> Vec<String> {
+        self.tools.names()
     }
 
     fn clear_session(&mut self) {

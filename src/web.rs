@@ -27,9 +27,16 @@
 //! same conversion Read gives an HTML file
 //! ([`crate::tools::documents::html_to_markdown`]): readability extracts the
 //! article when there is one, and a page that is not an article comes back
-//! whole, less its navigation and scripts. A heavily scripted app that renders
-//! nothing server-side still comes out poorly — nothing here runs its script.
-//! An answer that is not HTML is text already and is returned as sent.
+//! whole, less its navigation and scripts. An answer that is not HTML is text
+//! already and is returned as sent.
+//!
+//! A page that builds itself with script arrives as an empty shell. Where the
+//! owner's headless browser is installed (`toolbox::browser`), such a page —
+//! or any page asked for with `render_js` — is rendered there, script run,
+//! and the resulting HTML read the same way. The address is checked by name
+//! and by resolution first ([`check_public`]), and the browser keeps its own
+//! private-network block on for everything the page loads. Where no browser
+//! is installed nothing here runs script.
 
 use std::time::Duration;
 
@@ -75,7 +82,8 @@ pub fn tool_definitions() -> Vec<serde_json::Value> {
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "url": {"type": "string", "description": "An http:// or https:// address."}
+                    "url": {"type": "string", "description": "An http:// or https:// address."},
+                    "render_js": {"type": "boolean", "description": RENDER_JS_DESCRIPTION}
                 },
                 "required": ["url"]
             }
@@ -96,16 +104,35 @@ pub fn tool_definitions() -> Vec<serde_json::Value> {
     ]
 }
 
+/// What `WebFetch`'s `render_js` says. Advertised only where a headless
+/// browser is installed; see `toolbox::browser`.
+pub const RENDER_JS_DESCRIPTION: &str = "Run the page's JavaScript in a headless browser \
+    before reading it, for an app that builds its content in the browser. A page that comes \
+    back as an empty shell is rendered this way on its own.";
+
+/// Renders a page with its script run, returning the HTML: the headless
+/// browser, when one is installed.
+pub type Render<'a> = &'a dyn Fn(&str) -> Result<String, String>;
+
+/// A page whose readable text is shorter than this, and whose HTML carries
+/// script, is taken to be an app shell that builds itself in the browser.
+const SHELL_TEXT_CHARS: usize = 200;
+
 /// Run one of this module's tools. `None` when the name is not one of them.
-pub fn handle_tool(name: &str, input: &serde_json::Value) -> Option<Result<String, String>> {
+/// `render` runs a page's script, when a headless browser is installed.
+pub fn handle_tool(
+    name: &str,
+    input: &serde_json::Value,
+    render: Option<Render<'_>>,
+) -> Option<Result<String, String>> {
     match name {
-        FETCH_TOOL => Some(run_fetch(input)),
+        FETCH_TOOL => Some(run_fetch(input, render)),
         SEARCH_TOOL => Some(run_search(input)),
         _ => None,
     }
 }
 
-fn run_fetch(input: &serde_json::Value) -> Result<String, String> {
+fn run_fetch(input: &serde_json::Value, render: Option<Render<'_>>) -> Result<String, String> {
     let url = input
         .get("url")
         .and_then(|u| u.as_str())
@@ -117,8 +144,74 @@ fn run_fetch(input: &serde_json::Value) -> Result<String, String> {
     if let Some(why) = blocked(url) {
         return Err(why);
     }
+    let asked_js = input.get("render_js").and_then(serde_json::Value::as_bool) == Some(true);
+    if asked_js {
+        if let Some(render) = render {
+            return rendered(url, render, "rendered with its script run, as asked");
+        }
+    }
     let (content_type, body) = fetch_page(url)?;
-    Ok(as_page(url, &readable(&content_type, &body, url)))
+    let text = readable(&content_type, &body, url);
+    if asked_js {
+        return Ok(format!(
+            "{}\n\n[The page's script was not run: no headless browser is installed.]",
+            as_page(url, &text)
+        ));
+    }
+    // An app that builds its page in the browser arrives as an empty shell:
+    // rendered, when there is a browser to render it, and the plain answer
+    // kept (with the reason) when rendering fails.
+    if let Some(render) = render {
+        if looks_like_app_shell(&body, &text) {
+            return match rendered(
+                url,
+                render,
+                "the plain page was an empty shell built by script, so it was rendered",
+            ) {
+                Ok(page) => Ok(page),
+                Err(why) => Ok(format!(
+                    "{}\n\n[The page looks built by script, and rendering it failed: {why}]",
+                    as_page(url, &text)
+                )),
+            };
+        }
+    }
+    Ok(as_page(url, &text))
+}
+
+/// `url` rendered by the headless browser, read as markdown and labelled.
+/// The address is checked again by resolution first — the browser resolves
+/// it itself, so a name pointing inward must be refused before it is handed
+/// over.
+fn rendered(url: &str, render: Render<'_>, how: &str) -> Result<String, String> {
+    check_public(url)?;
+    crate::trace!("tool", "WebFetch {url}: {how}");
+    let html = render(url)?;
+    let text = crate::tools::documents::html_to_markdown(&html, Some(url));
+    Ok(format!("{}\n\n[{how}]", as_page(url, &text)))
+}
+
+/// Whether a fetched page is an app shell: script in the HTML, and almost no
+/// text once read.
+fn looks_like_app_shell(body: &str, text: &str) -> bool {
+    let has_script = body.to_ascii_lowercase().contains("<script");
+    let chars = text.chars().filter(|c| !c.is_whitespace()).count();
+    has_script && chars < SHELL_TEXT_CHARS
+}
+
+/// Refuse `url` unless it names the public web, by name AND by what the name
+/// resolves to — the two halves of this module's guard, for a caller (the
+/// headless browser) that will connect to it itself.
+///
+/// # Errors
+///
+/// Why the address is refused.
+pub fn check_public(url: &str) -> Result<(), String> {
+    if let Some(why) = blocked(url) {
+        return Err(why);
+    }
+    let (host, port) = host_and_port(url).ok_or_else(|| format!("`{url}` names no host"))?;
+    resolve_public(&host, port).map(|_| ())
 }
 
 fn run_search(input: &serde_json::Value) -> Result<String, String> {
@@ -910,9 +1003,9 @@ mod tests {
         let names: Vec<&str> = defs.iter().filter_map(|d| d["name"].as_str()).collect();
         assert!(names.contains(&FETCH_TOOL), "{names:?}");
         assert!(names.contains(&SEARCH_TOOL), "{names:?}");
-        assert!(handle_tool(FETCH_TOOL, &serde_json::json!({})).is_some());
-        assert!(handle_tool(SEARCH_TOOL, &serde_json::json!({})).is_some());
-        assert!(handle_tool("NotAWebTool", &serde_json::json!({})).is_none());
+        assert!(handle_tool(FETCH_TOOL, &serde_json::json!({}), None).is_some());
+        assert!(handle_tool(SEARCH_TOOL, &serde_json::json!({}), None).is_some());
+        assert!(handle_tool("NotAWebTool", &serde_json::json!({}), None).is_none());
     }
 
     #[test]
@@ -922,9 +1015,60 @@ mod tests {
         let refused = handle_tool(
             FETCH_TOOL,
             &serde_json::json!({"url": "http://127.0.0.1:9180/"}),
+            None,
         )
         .expect("the tool exists")
         .expect_err("must be refused");
         assert!(refused.contains("private network"), "{refused}");
+    }
+
+    /// **A PAGE ASKED FOR WITH ITS SCRIPT RUN IS STILL HELD TO THE ADDRESS
+    /// RULES**, and the browser is never started for a refused one.
+    #[test]
+    fn rendering_a_private_address_is_refused_before_the_browser_starts() {
+        let started = std::cell::Cell::new(0);
+        let render = |_: &str| -> Result<String, String> {
+            started.set(started.get() + 1);
+            Ok("<p>rendered</p>".to_string())
+        };
+        for url in [
+            "http://127.0.0.1:9180/app",
+            "http://192.168.1.10/",
+            "http://localhost/",
+        ] {
+            let refused = handle_tool(
+                FETCH_TOOL,
+                &serde_json::json!({"url": url, "render_js": true}),
+                Some(&render),
+            )
+            .expect("the tool exists")
+            .expect_err("must be refused");
+            assert!(refused.contains("private network"), "{refused}");
+        }
+        assert_eq!(
+            started.get(),
+            0,
+            "the browser was started for a refused address"
+        );
+    }
+
+    #[test]
+    fn an_app_shell_is_recognised_and_an_article_is_not() {
+        let shell = "<html><head><script src=\"/app.js\"></script></head>\
+                     <body><div id=\"root\"></div></body></html>";
+        assert!(looks_like_app_shell(
+            shell,
+            &readable("text/html", shell, "https://x.test/")
+        ));
+        let article = format!(
+            "<html><body><script>track()</script><article><h1>T</h1><p>{}</p></article></body></html>",
+            "Real words in a real paragraph. ".repeat(20)
+        );
+        assert!(!looks_like_app_shell(
+            &article,
+            &readable("text/html", &article, "https://x.test/")
+        ));
+        let no_script = "<html><body><p>short</p></body></html>";
+        assert!(!looks_like_app_shell(no_script, "short"));
     }
 }

@@ -205,6 +205,16 @@ impl AgentSession {
             crate::cli::route_backend(&workspace, agent_id, &binary, guards, &system_context, true);
         let session_tools = crate::toolbox::SessionTools::new(true);
         backend.share_session_tools(std::sync::Arc::clone(&session_tools));
+        let offered = backend.offered_tools();
+        if !offered.is_empty() {
+            crate::trace!(
+                "session",
+                "incode runs {} tools for {}: {}",
+                offered.len(),
+                backend.id(),
+                offered.join(", ")
+            );
+        }
         Self {
             session_tools,
             backend,

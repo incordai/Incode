@@ -40,7 +40,7 @@ use serde_json::{json, Value};
 
 use crate::agent::AgentEvent;
 use crate::runtime::cancel::CancelToken;
-use crate::toolbox::Toolbox;
+use crate::toolbox::{ToolOutput, Toolbox};
 
 /// Where the tool server finds the parent: `127.0.0.1:<port>`.
 pub const ADDR_ENV: &str = "INCODE_TOOL_BRIDGE";
@@ -75,11 +75,11 @@ pub enum Request {
     List {
         reply: Sender<Result<Vec<Value>, String>>,
     },
-    /// "Run this one."
+    /// "Run this one." Answered with the text and any pictures.
     Call {
         name: String,
         input: Value,
-        reply: Sender<Result<String, String>>,
+        reply: Sender<Result<ToolOutput, String>>,
     },
 }
 
@@ -266,7 +266,11 @@ fn answer_connection<M>(
             let (reply, back) = std::sync::mpsc::channel();
             forward(to, wrap(Request::Call { name, input, reply }));
             match back.recv() {
-                Ok(Ok(output)) => json!({"ok": true, "output": output}),
+                // The text, and the whole answer as MCP content: the server
+                // half hands the content on as it is, pictures included.
+                Ok(Ok(output)) => {
+                    json!({"ok": true, "output": output.text, "content": output.mcp_content()})
+                }
                 Ok(Err(why)) => json!({"ok": false, "error": why}),
                 Err(_) => json!({"ok": false, "error": ENDED}),
             }
@@ -349,8 +353,10 @@ pub fn answer(
                 input: input.to_string(),
             });
             let outcome = tools.run_call(call_id, &name, &input);
+            // What incode shows and records: the text, with a placeholder
+            // for each picture — never the pixels.
             let (output, is_error) = match &outcome {
-                Ok(said) => (said.clone(), false),
+                Ok(said) => (said.shown(), false),
                 Err(why) => (why.clone(), true),
             };
             on_event(&AgentEvent::ToolResult {
@@ -453,12 +459,25 @@ impl crate::mcp_stdio::Handler for ToolServer {
     }
 
     fn call(&mut self, name: &str, args: &Value) -> Result<String, String> {
+        self.call_content(name, args)
+            .map(|blocks| ToolOutput::from_mcp_content(&blocks).text)
+    }
+
+    /// The parent's answer as MCP content, pictures included. Each picture
+    /// is checked against the image bounds again here, on the way out.
+    fn call_content(&mut self, name: &str, args: &Value) -> Result<Vec<Value>, String> {
         let answer = self.ask(json!({"op": "call", "name": name, "input": args}))?;
-        Ok(answer
-            .get("output")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string())
+        match answer.get("content").and_then(Value::as_array) {
+            Some(blocks) => Ok(ToolOutput::from_mcp_content(blocks).mcp_content()),
+            None => Ok(ToolOutput::from(
+                answer
+                    .get("output")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            )
+            .mcp_content()),
+        }
     }
 }
 
@@ -675,6 +694,43 @@ mod tests {
         let _ = parent.join();
     }
 
+    /// **THE BROWSER TOOLS AND THE DESKTOP REACH THE MODEL ONLY WHERE THEY
+    /// CAN RUN.** Screenshot and RenderPdf with a headless browser, the
+    /// desktop's tools with the desktop switched on — and none of them
+    /// otherwise.
+    #[test]
+    fn the_phase_six_b_tools_are_listed_only_where_they_can_run() {
+        let ws = tempfile::tempdir().expect("ws");
+        let bare = listed_names(Toolbox::new(ws.path(), true).with_browser(None));
+        for absent in ["Screenshot", "RenderPdf", "screenshot", "click", "ui_tree"] {
+            assert!(!bare.iter().any(|n| n == absent), "{absent}: {bare:?}");
+        }
+        let mut full = Toolbox::new(ws.path(), true).with_browser(Some(ws.path().join("obscura")));
+        full.enable_desktop(crate::toolbox::DesktopSetup {
+            exe: ws.path().join("incode"),
+            journal: ws.path().join("desktop.jsonl"),
+        });
+        let listed = listed_names(full);
+        for present in [
+            "Screenshot",
+            "RenderPdf",
+            "screen_info",
+            "screenshot",
+            "ui_tree",
+            "cursor_position",
+            "click_element",
+            "type_text",
+            "paste_text",
+            "key",
+            "scroll",
+            "drag",
+            "move_mouse",
+            "click",
+        ] {
+            assert!(listed.iter().any(|n| n == present), "{present}: {listed:?}");
+        }
+    }
+
     /// **A CALL IS RUN BY THE PARENT'S TOOLBOX**, and the parent shows it as
     /// its own call and result.
     #[test]
@@ -709,6 +765,66 @@ mod tests {
                 }
             ),
             "{seen:?}"
+        );
+    }
+
+    /// **THE MODEL GETS THE PICTURE; INCODE SHOWS A PLACEHOLDER.** A tool
+    /// that answers with an image, through the bridge: the MCP result the CLI
+    /// receives carries an `image` block with the PNG, and the result event
+    /// incode draws and records carries `[image WxH png]` and no pixels.
+    #[test]
+    fn the_bridge_hands_the_model_a_picture_and_incode_a_placeholder() {
+        use std::sync::atomic::AtomicUsize;
+        let ws = tempfile::tempdir().expect("ws");
+        let png = crate::desktop::capture::encode(
+            &image::RgbaImage::from_pixel(32, 24, image::Rgba([10, 20, 30, 255])),
+            crate::desktop::capture::ShotFormat::Png,
+            0,
+        )
+        .expect("png");
+        let tools = Toolbox::new(ws.path(), true)
+            .with_desktop_picture(png.clone(), Arc::new(AtomicUsize::new(0)));
+        let (bridge, rx) = open(None);
+        let parent = parent_loop(tools, rx);
+        let mut server = server_for(&bridge);
+
+        let listed = mcp(
+            &mut server,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+        );
+        assert!(
+            listed.to_string().contains("\"screenshot\""),
+            "the desktop's screenshot is listed: {listed}"
+        );
+        let got = mcp(
+            &mut server,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"screenshot","arguments":{}}}"#,
+        );
+        assert_eq!(got["result"]["isError"], false, "{got}");
+        let blocks = got["result"]["content"].as_array().expect("content");
+        assert_eq!(blocks[0]["type"], "text", "{got}");
+        assert_eq!(blocks[1]["type"], "image", "{got}");
+        assert_eq!(blocks[1]["mimeType"], "image/png");
+        use base64::Engine as _;
+        let sent = base64::engine::general_purpose::STANDARD
+            .decode(blocks[1]["data"].as_str().expect("data"))
+            .expect("base64");
+        assert_eq!(sent, png, "the model got the picture the tool made");
+
+        drop(bridge);
+        drop(server);
+        let seen = parent.join().expect("the parent loop");
+        let recorded = seen
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::ToolResult { output, .. } => Some(output.clone()),
+                _ => None,
+            })
+            .expect("a result event");
+        assert!(recorded.contains("[image 32x24 png]"), "{recorded}");
+        assert!(
+            !recorded.contains(blocks[1]["data"].as_str().unwrap_or("")),
+            "the event carries the pixels"
         );
     }
 

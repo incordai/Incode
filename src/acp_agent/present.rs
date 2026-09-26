@@ -374,7 +374,7 @@ pub(crate) fn tool_kind(name: &str) -> acp::ToolKind {
     match name.to_ascii_lowercase().as_str() {
         "read" | "notebookread" | "read_file" | "bashoutput" | "outline" => acp::ToolKind::Read,
         "edit" | "multiedit" | "write" | "notebookedit" | "apply_patch" | "applypatch"
-        | "write_file" | "convertdocument" => acp::ToolKind::Edit,
+        | "write_file" | "convertdocument" | "renderpdf" => acp::ToolKind::Edit,
         "bash" | "powershell" | "shell" | "exec_command" | "run_shell_command" | "killshell"
         | "diagnostics" => acp::ToolKind::Execute,
         "grep" | "glob" | "ls" | "search" | "toolsearch" | "watchman_lookup" => {

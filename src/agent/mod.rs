@@ -930,6 +930,15 @@ pub trait AgentBackend {
     fn children(&self) -> Vec<(String, String)> {
         Vec::new()
     }
+
+    /// The tools incode itself runs for this agent's model, by name: the
+    /// toolbox's, for a backend whose model has no tools of its own. Empty
+    /// for an agent whose CLI still brings its own. A session traces them
+    /// when it starts, so which tools a model was handed is on the record —
+    /// including whether the desktop was among them.
+    fn offered_tools(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// A boxed backend is a backend.
@@ -1032,6 +1041,10 @@ impl AgentBackend for Box<dyn AgentBackend> {
 
     fn children(&self) -> Vec<(String, String)> {
         (**self).children()
+    }
+
+    fn offered_tools(&self) -> Vec<String> {
+        (**self).offered_tools()
     }
 }
 

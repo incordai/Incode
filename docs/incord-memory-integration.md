@@ -50,6 +50,15 @@ claude route created `a.txt`, and the service then answered
 Codex and antigravity still load their own hooks files, so on those routes the engine
 may hear a session twice — once from incode, once from the CLI under the CLI's id.
 
+**Phase 6b (2026-09-25).** Three more kinds of call now pass the engine's pre-tool hook,
+because they are Toolbox tools: the desktop's twelve tools (previously run in
+`incode --desktop-mcp` with only the desktop's own hooks, which still run there as a
+second line), `Screenshot` (observe, fail open) and `RenderPdf` (change, fail closed;
+its OUTPUT path is in `tool_input.paths` and is reported to `code-edit` once written). A
+tool result may now carry pictures; the engine, the event stream and the transcript
+incode writes see only the text and a `[image WxH png]` placeholder per picture, never
+the base64 (`ToolOutput::shown`, `docs/ARCHITECTURE.md` §5b).
+
 ---
 
 ## 0. The shape of the problem: two routes, and only one of them is ours

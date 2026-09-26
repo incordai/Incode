@@ -536,8 +536,9 @@ Sentinel as detection.
   `team_read` are toolbox tools (`toolbox::team`, over `team_mcp::Server`), and the
   separate server is no longer handed to a bridged model. It is kept for codex, which
   still reaches the channel through `mcp_overrides_for`.
-- The desktop MCP server still runs its own tools in its own process, when switched on;
-  see §5b for why it was not moved.
+- The desktop: **fixed (phase 6b)** — its twelve tools are toolbox tools, reached
+  through the bridge; `incode --desktop-mcp` is now only their executor, started by the
+  toolbox. No desktop server is handed to the CLI. See §5b, "The desktop".
 - The engine's session-capture hooks: **fixed (phase 4)** — incode fires them itself on
   every route; see "The engine's session lifecycle, fired by incode" in §2.
 - Project instruction files: **fixed (phase 4)** — `instructions::project_block` reads
@@ -590,7 +591,11 @@ for a patch). The ACP kind is `acp_agent::present::tool_kind`.
 | `KillShell` | run | execute | — | kills the job's process tree |
 | `TodoWrite` | session | think | `MAX_TODOS` 100, `MAX_TODO_CHARS` 500 | kept per session; `--acp` sends it as the plan, with its priority, on the call's successful result |
 | `Diagnostics` | run | execute | `PROJECT_CHECK_TIMEOUT` 300 s, `MAX_PROJECT_FINDINGS` 50, `MAX_DIAGNOSTIC_FILES` 50 | `INCORD_CHECK_CMD`, else `cargo check` / `tsc --noEmit` |
-| `WebFetch` | observe | fetch | 20 s, 512 KiB read, 20 000 chars shown | private addresses refused by name and by resolution; carries no credential; an HTML answer becomes markdown through Read's HTML conversion (readability when the page reads as an article, the whole page less nav/scripts otherwise), anything else is returned as sent |
+| `WebFetch` | observe | fetch | 20 s, 512 KiB read, 20 000 chars shown; rendered: 20 s + 10 s kill grace, 2 MiB read | private addresses refused by name and by resolution; carries no credential; an HTML answer becomes markdown through Read's HTML conversion (readability when the page reads as an article, the whole page less nav/scripts otherwise), anything else is returned as sent. Where the headless browser is found: `render_js` runs the page's script first, and a page that comes back as an app shell (script, under 200 characters of text) is rendered on its own; `render_js` is not advertised where there is no browser |
+| `Screenshot` | observe | other | `PAGE_DEADLINE` 60 s, load 30 s, settle 3 s; viewport 200–3840 x 200–2160 CSS px; the image bounds below | OFFERED ONLY when the headless browser is found. A public `url` (WebFetch's address rules) or an HTML/SVG `path` in the workspace; `width`/`height`, `scale` 1 or 2, `full_page` (clipped at `MAX_IMAGE_EDGE` px tall, said so). The answer is an image block. See "The headless browser" below |
+| `RenderPdf` | change | edit | `PDF_DEADLINE` 120 s, whole-tree kill | OFFERED ONLY when a printer is found (`pdf_renderer`, below). A public `url` or a workspace HTML/SVG `path`, to `output` (must end `.pdf`); the guards and the checkpoint see `output`; the engine's `code-edit` is told it. Printed in a private temp profile and copied into place only when it exists |
+| `screen_info`, `screenshot`, `ui_tree`, `cursor_position` | observe | other | a call 120 s; the image bounds | OFFERED ONLY when the desktop is switched on (`INCORD_DESKTOP`). Executed by the desktop child — see "The desktop" below. `screenshot` answers with an image block |
+| `click_element`, `type_text`, `paste_text`, `key`, `scroll`, `drag`, `move_mouse`, `click` | run | other | a call 120 s | the same; refused read-only, asked under prompt, refused when the engine cannot decide |
 | `WebSearch` | observe | fetch | 15 s, 512 KiB, 8 results | provider from `admin.json` `web_search` — contract in `web::search_with` |
 | `Skill` | observe | other | — | |
 | `Agent` | run | other | depth 2 | |
@@ -612,14 +617,88 @@ https or to loopback (`catalogue::key_may_travel_to`), no redirect is followed, 
 unconfigured search says so. The former `INCORD_SEARCH_URL` / `INCORD_SEARCH_KEY`
 variables are gone — the second was also sent, as a bearer, on every `WebFetch`.
 
-**Not moved: the desktop.** The desktop tools still run in `incode --desktop-mcp`,
-registered beside the bridge only when `INCORD_DESKTOP` is on. Moving them needs, first,
-an image channel: `screenshot` answers with an image content block, while a toolbox
-result is a `String` end to end (`Toolbox::run_call`, the bridge's `output`, the API
-route's `tool_result`, the ACP tool-call update). Second, the desktop owns process-wide
-state the harness should not take on: per-monitor DPI awareness set at startup, the input
-thread, and its kill switch — EOF on its own stdin stops it, and a stop file beside its
-journal is checked before every call. Both are the next phase's work.
+### Pictures in a result (phase 6b)
+
+`Toolbox::run_call` answers with a `ToolOutput` (`toolbox::image`): the text, plus
+`Image`s — PNG or JPEG, each checked from its own header when it is made. Every text
+tool's answer is unchanged: its text, no images.
+
+| Layer | What it carries |
+|---|---|
+| The bridge (MCP) | the parent sends the result as MCP content; the server half re-checks each picture and hands the CLI `{"type":"text"}` then `{"type":"image","data","mimeType"}` (`Handler::call_content` in `mcp_stdio`) |
+| The API route | a text answer is the plain `content` string it always was; an answer with pictures is `[{"type":"text"}, {"type":"image","source":{"type":"base64","media_type","data"}}]` (`agent::api::tool_result_message`) |
+| incode's events, transcript, engine | `ToolOutput::shown()`: the text, then `[image 1280x720 png]` per picture — never the pixels |
+| ACP | the same text and placeholder. The owner's app (`incord-dashboard` `ChatView.tsx` `ToolBody`) draws only `text` and `diff` tool content, so no image block is sent to it |
+
+Bounds (`toolbox::image`): `MAX_IMAGE_BYTES` 3 750 000 encoded (5 000 000 as base64),
+`MAX_IMAGE_EDGE` 8 000 px, `MAX_IMAGE_PIXELS` 16 777 216, `MAX_IMAGES_PER_RESULT` 4. A
+picture incode drew itself (Screenshot) is made to fit — scaled, then JPEG at 85/70/50 —
+and the answer says what was done; a picture from another process (the desktop child,
+the bridge's other half) that does not fit is left out, with a line saying why.
+
+### The headless browser (phase 6b)
+
+The owner's `incord-browser` (`toolbox::browser`), found by `INCODE_BROWSER` (alone when
+set), then `admin.json` `browser_bin` (alone when set), then `PATH` (`obscura`,
+`incord-browser`). Not found: Screenshot is not offered, `WebFetch` runs no script and is
+advertised without `render_js`, and RenderPdf is offered only with a system browser.
+
+- **WebFetch with script:** `obscura fetch <url> --dump html --quiet --timeout 20 -o
+  <temp>`, one child per call, whole tree killed 10 s past its own timeout, 2 MiB read
+  back, then `html_to_markdown`. The url passes `web::check_public` (by name and by
+  resolution) before the browser starts.
+- **Screenshot:** `obscura serve --host 127.0.0.1 --port <picked> --quiet --font-dir
+  <system fonts>`, started lazily, once per session, held in `SessionTools` and killed with
+  its tree when the session's tools are dropped. Driven over DevTools (`toolbox::cdp`, a
+  synchronous `tungstenite` client over loopback; every read has a deadline):
+  `/json/version` → `Target.createTarget` → `attachToTarget` (`flatten`) → `Page.enable` →
+  `Emulation.setDeviceMetricsOverride` → `Page.navigate` + its load event (then up to 3 s
+  for `networkIdle`) → `Page.captureScreenshot` (full page: `getLayoutMetrics` +
+  `captureBeyondViewport` + clip) → `Target.closeTarget`. A workspace file is opened in a
+  SECOND instance started with `--allow-file-access`; the one that reads the web never is.
+- **Never passed:** `--allow-private-network` (incode's address checks refuse loopback and
+  private addresses first, and the browser's own block — measured: `Access to
+  private/internal IP address 127.0.0.1 is not allowed` — stays on for everything a page
+  loads), `--stealth`, `--user-agent`. The browser's own User-Agent is a generic one
+  (measured: `Mozilla/5.0 (X11; Linux x86_64) … Chrome/145.0.0.0 Safari/537.36`).
+- **Known limits.** The browser resolves the name itself after incode checked it, so the
+  DNS-pinning WebFetch does is not available there; its own private-network block is the
+  second line. A workspace HTML file opened with file access can reference other local
+  files (an `iframe`, an `img`); incode confines the path it opens, not what that page
+  loads.
+
+**RenderPdf** (`toolbox::pdf`) prints with a system headless browser of the Chromium
+family when one is found — `INCODE_PDF_BROWSER` (alone when set), then `PATH`, then the
+standard install paths, the x86 program directory first on Windows — as `--headless
+--disable-gpu --no-pdf-header-footer --user-data-dir=<temp> --print-to-pdf=<temp>`. Its
+PDF has real text (measured: Read on the output returns the page's words). Otherwise it
+falls back to incord-browser's `Page.printToPDF`, whose PDF is image-only today
+(incordai/incord-browser#11), and every such result says so. `admin.json` `pdf_renderer`:
+`"auto"` (default), `"chromium"` or `"incord-browser"` — the owner's switch for when #11
+is fixed. Measured: this browser refuses `preferCSSPageSize` (`-32601`), so the fallback
+prints at the protocol's default page.
+
+### The desktop (phase 6b)
+
+The twelve desktop tools are toolbox tools when the desktop is switched on
+(`INCORD_DESKTOP`; `cli::desktop_setup_for` → `Toolbox::enable_desktop`, on the bridged
+claude route and the API route). They are offered, schema-checked, held to the mode and
+the engine, and drawn as incode's own calls like every other tool, and no desktop server
+is handed to the CLI any more.
+
+They are still EXECUTED by `incode --desktop-mcp`, now started by the toolbox itself
+(`toolbox::desktop`) on the first desktop call, over its stdin/stdout, and held in
+`SessionTools`. Moving the execution into the session's own process was rejected, for
+three reasons: DPI awareness is process-wide and can be set once only
+(`desktop::dpi`), so the REPL's process would be changed for every run; the input thread
+owns the synthetic mouse and keyboard; and the kill switch — EOF on the child's stdin, and
+the stop file beside its journal checked before every call — needs a process boundary to
+be absolute. Dropping the session's tools closes the pipe, waits 2 s, then kills the
+child's tree. The child runs `-p read-only` for a read-only session and `-p
+workspace-write` otherwise (the toolbox has already asked the person under `prompt`), and
+is restarted when the mode changes between the two; the operator's `desktop_hooks` still
+run in it. Codex, which is not bridged, is still handed the desktop server as TOML
+overrides.
 
 ### Dependencies (phase 6a)
 
@@ -648,6 +727,12 @@ is 1.88 (calamine, globset, ignore, zip), so the crate's floor is unchanged.
 Removed: `walkdir` (no `.rs` file used it) and `glob` (its two uses were the Glob/Grep
 walk and LS's `ignore`, both now globset). Both remain in the lock as other packages'
 dependencies.
+
+Phase 6b added one, vetted the same way in a scratch copy of the manifest:
+
+| Crate | Pin | Why |
+|---|---|---|
+| `tungstenite` | 0.30.0, `handshake` only (no TLS) | the DevTools websocket to the headless browser, client half, over a loopback `TcpStream`. The latest release; MIT OR Apache-2.0; rust-version 1.85. It adds 7 packages to the lock — itself, `sha1` 0.11, `digest` 0.11, `block-buffer` 0.12, `crypto-common` 0.2, `hybrid-array` 0.4.15, `const-oid` 0.10.2, each MIT OR Apache-2.0 at rust-version 1.85 — and reuses `bytes`, `http`, `httparse`, `rand`, `data-encoding`, `log` and `thiserror`, already there |
 
 ---
 
