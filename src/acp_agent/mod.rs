@@ -13,22 +13,32 @@
 //! # Methods answered
 //!
 //! - `initialize` — protocol version 1, and the capabilities incode really
-//!   has: text and embedded-context prompts. No session loading, no client
-//!   MCP servers, no authentication methods.
+//!   has: text and embedded-context prompts, loading and listing sessions,
+//!   and stdio MCP servers from the client (no HTTP or SSE ones). No
+//!   authentication methods.
 //! - `authenticate` — refused as invalid params: the method id must be one
 //!   `initialize` advertised, and none is. The subscription CLIs hold their
 //!   own logins.
 //! - `session/new` — `cwd` must be an absolute path to an existing directory;
-//!   it becomes the workspace. The session is built on its own thread, and
-//!   its slash commands follow the answer as `available_commands_update`.
+//!   it becomes the workspace. The session is built on its own thread, the
+//!   client's stdio MCP servers are started as incode's own tools, the answer
+//!   carries the modes and the pickers ([`config`]), and the slash commands
+//!   follow as `available_commands_update`.
+//! - `session/load` — the same, for a session kept in `cwd`: its history is
+//!   replayed first ([`history`]).
+//! - `session/list` — the sessions kept in `cwd`, or in every workspace an ACP
+//!   session was recorded in.
 //! - `session/prompt` — one turn; its text, tool calls, tool results, task
 //!   list, the diff of each edit that landed and the context window's fill
 //!   stream as `session/update`, and the reply carries the stop reason. A
-//!   prompt that is a slash command runs that command instead ([`commands`]).
+//!   prompt that is a slash command runs that command instead ([`commands`]);
+//!   `/run` works the ledger and sends it as the plan ([`run`]).
 //! - `session/cancel` — trips the session's cancel token; the pending prompt
 //!   answers `cancelled`.
 //! - `session/set_mode` — `read-only`, `workspace-write` or
 //!   `danger-full-access`, applied from the next turn.
+//! - `session/set_config_option` — the agent or the role, applied from the
+//!   next turn.
 //! - `session/close` — cancels the session's turn and frees its slot.
 //!
 //! Any other request is answered "method not found"; a notification nothing
@@ -53,8 +63,11 @@
 //! anything else happens — see [`stdio`].
 
 mod commands;
+mod config;
+mod history;
 mod permission;
 mod present;
+mod run;
 mod stdio;
 mod transport;
 
@@ -71,12 +84,25 @@ use agent_client_protocol_schema::ProtocolVersion;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use crate::agent::AgentEvent;
+use crate::agent::{AgentBackend, AgentEvent, DetectedAgent};
 use crate::cli::agent_turn::{AgentSession, TurnStart};
 use crate::config::IncordCodeConfig;
 use crate::permissions::PermissionMode;
 use crate::runtime::cancel::CancelToken;
+use run::LedgerRuns;
 use transport::{Incoming, Line, Outbox};
+
+/// Builds the backend for an agent a client picks, the way a session's own
+/// was built.
+type BuildAgent = Box<dyn Fn(&DetectedAgent) -> Box<dyn AgentBackend>>;
+
+/// Work handed to a session's thread.
+///
+/// Room for a few: a prompt is admitted only when none is running (the
+/// reader refuses a second before it is queued), and an [`Work::Apply`] is a
+/// wake-up that is dropped rather than waited for when the queue is full —
+/// the next prompt applies the client's choices anyway.
+const WORK_QUEUE: usize = 4;
 
 /// How many sessions one connection may hold at once.
 ///
@@ -85,13 +111,6 @@ use transport::{Incoming, Line, Outbox};
 /// drives by hand, and still bounds what a runaway client can make this
 /// process start. A `session/new` beyond it is refused, not queued.
 const MAX_SESSIONS: usize = 16;
-
-/// Prompts waiting for a session's thread.
-///
-/// One. A session runs one prompt at a time and a second is refused on the
-/// reader BEFORE it is queued, so this never holds more than the prompt about
-/// to start — and the reader never blocks on it.
-const PROMPT_QUEUE: usize = 1;
 
 /// At the end of input, how long running turns get to stop before this
 /// process returns anyway.
@@ -141,28 +160,43 @@ pub fn run_stdio(config: IncordCodeConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A session, as built for one `session/new`.
+/// A session, as built for one `session/new` or `session/load`.
 pub(crate) struct Opened {
     pub(crate) session: AgentSession,
     /// The permission mode already applied to it.
     pub(crate) mode: PermissionMode,
     /// What the slash commands need beyond the session.
     pub(crate) settings: commands::Settings,
+    /// The workspace the session was built on: absolute and canonical, the
+    /// spelling its snapshot and tools name files by.
+    pub(crate) workspace: PathBuf,
+    /// Which models serve which role, as the session was opened with them.
+    pub(crate) roles: crate::roles::RoleTable,
+    /// Builds the backend for an agent the client picks, the way this
+    /// session's own was built.
+    pub(crate) build: BuildAgent,
+    /// How `/run` works the ledger.
+    pub(crate) runs: Box<dyn LedgerRuns>,
 }
 
-/// Builds the session a `session/new` asks for.
+/// Builds the session a `session/new` or `session/load` asks for.
 ///
 /// Called on the thread that will drive the session, because a session cannot
 /// cross threads. `cancel` is the token `session/cancel` trips.
 pub(crate) trait SessionFactory: Send + Sync + 'static {
     /// `session_id` is the protocol's id for the session, which is also the id
-    /// the memory engine files it under.
+    /// the memory engine files it under. `loading` is set for a session
+    /// opened again (`session/load`).
     fn open(
         &self,
         workspace: &Path,
         cancel: CancelToken,
         session_id: &str,
+        loading: bool,
     ) -> Result<Opened, String>;
+
+    /// Where the operator's settings and session records live.
+    fn data_dir(&self) -> PathBuf;
 }
 
 /// The production factory: the interactive CLI's own session builder.
@@ -176,20 +210,62 @@ impl SessionFactory for CliSessions {
         workspace: &Path,
         cancel: CancelToken,
         session_id: &str,
+        loading: bool,
     ) -> Result<Opened, String> {
         let mut config = self.config.clone();
         config.workspace = workspace.to_path_buf();
+        // Read by `prepare_session` only to open the memory engine's session
+        // as `resume`; the model's own conversation is resumed from the
+        // session record, in `drive`.
+        config.resume_session = loading.then(|| session_id.to_string());
         let prepared = crate::cli::prepare_session(&config, cancel, Instant::now(), session_id)
             .map_err(|e| e.to_string())?;
+        let mut session = prepared.session;
+        // Kept whether or not an engine reads it: it is what `session/load`
+        // replays.
+        session.keep_transcript();
+        let roles = prepared.admin.resolve_roles().value;
+        let build = {
+            let workspace = prepared.workspace.clone();
+            let system_prompt = prepared.system_prompt.clone();
+            let guards = crate::guards::Guards::load(&workspace).map_err(|e| e.to_string())?;
+            // As `AgentSession::new` builds the session's first backend.
+            Box::new(move |agent: &DetectedAgent| {
+                crate::cli::route_backend(
+                    &workspace,
+                    &agent.id,
+                    &agent.command,
+                    &guards,
+                    &system_prompt,
+                    true,
+                )
+            })
+        };
         Ok(Opened {
-            session: prepared.session,
+            session,
             mode: prepared.permission_mode,
             settings: commands::Settings {
-                data_dir: prepared.incord_code_dir,
-                catalogue: prepared.catalogue,
+                data_dir: prepared.incord_code_dir.clone(),
+                catalogue: prepared.catalogue.clone(),
                 lead: prepared.agent,
             },
+            workspace: prepared.workspace,
+            roles,
+            build,
+            runs: Box::new(run::CliRuns {
+                data_dir: prepared.incord_code_dir,
+                admin: prepared.admin,
+                catalogue: prepared.catalogue,
+                fleet: prepared.fleet,
+                system_prompt: prepared.system_prompt,
+                extra_dirs: self.config.additional_dirs.clone(),
+                env_filter: self.config.env_filter_enabled,
+            }),
         })
+    }
+
+    fn data_dir(&self) -> PathBuf {
+        crate::admin::AdminConfig::default_dir()
     }
 }
 
@@ -237,7 +313,7 @@ struct Server<F: SessionFactory> {
 
 /// The reader's hold on one session.
 struct SessionHandle {
-    prompts: SyncSender<Prompt>,
+    work: SyncSender<Work>,
     shared: Arc<Shared>,
     thread: JoinHandle<()>,
 }
@@ -248,11 +324,21 @@ struct Prompt {
     blocks: Vec<acp::ContentBlock>,
 }
 
+/// What a session's thread is handed.
+enum Work {
+    Prompt(Prompt),
+    /// The client changed a picker: apply it now, if nothing is running.
+    Apply,
+}
+
 /// What the reader and a session's thread both touch.
 struct Shared {
     /// The token the session was built with — tripped by `session/cancel`.
     cancel: CancelToken,
     state: Mutex<TurnState>,
+    /// The pickers, once the session is built: chosen on the reader, applied
+    /// on the session's thread. See [`config`].
+    choices: Mutex<Option<config::Choices>>,
 }
 
 #[derive(Default)]
@@ -270,11 +356,18 @@ impl Shared {
         Self {
             cancel: CancelToken::new(),
             state: Mutex::new(TurnState::default()),
+            choices: Mutex::new(None),
         }
     }
 
     fn state(&self) -> MutexGuard<'_, TurnState> {
         self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn choices(&self) -> MutexGuard<'_, Option<config::Choices>> {
+        self.choices
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -358,10 +451,18 @@ impl<F: SessionFactory> Server<F> {
             self.outbox.respond(id, answer);
         } else if method == names.session_new {
             self.new_session(id, params);
+        } else if method == names.session_load {
+            self.load_session(id, params);
+        } else if method == names.session_list {
+            let answer = self.list_sessions(params);
+            self.outbox.respond(id, answer);
         } else if method == names.session_prompt {
             self.prompt(id, params);
         } else if method == names.session_set_mode {
             let answer = self.set_mode(params);
+            self.outbox.respond(id, answer);
+        } else if method == names.session_set_config_option {
+            let answer = self.set_config_option(params);
             self.outbox.respond(id, answer);
         } else if method == names.session_close {
             let answer = self.close(params);
@@ -409,21 +510,109 @@ impl<F: SessionFactory> Server<F> {
                 )),
             );
         }
-        if !request.mcp_servers.is_empty() {
-            // Accepted and not passed on. See `docs/ARCHITECTURE.md`: the
-            // backends' MCP configuration is assembled inside the spawn, with
-            // no seam for servers a client names — and a stdio server is a
-            // program the client would have this machine run.
-            eprintln!(
-                "incode acp: {} MCP server(s) from the client were not passed to the agent",
-                request.mcp_servers.len()
+        let session_id = acp::SessionId::new(uuid::Uuid::new_v4().to_string());
+        self.start_session(
+            id,
+            Start {
+                session_id,
+                workspace,
+                history: None,
+                servers: request.mcp_servers,
+            },
+        );
+    }
+
+    /// Open a session kept in `cwd` again: its history replayed, its
+    /// model's conversation resumed where the agent can. See [`history`].
+    fn load_session(&mut self, id: acp::RequestId, params: Option<Value>) {
+        let request = match decode::<acp::LoadSessionRequest>(params) {
+            Ok(request) => request,
+            Err(e) => return self.outbox.respond::<Value>(id, Err(e)),
+        };
+        let workspace = match workspace_from(&request.cwd) {
+            Ok(workspace) => workspace,
+            Err(why) => return self.outbox.respond::<Value>(id, Err(invalid_params(why))),
+        };
+        if !request.additional_directories.is_empty() {
+            return self.outbox.respond::<Value>(
+                id,
+                Err(invalid_params(
+                    "additional directories are not offered: this agent works in `cwd` only",
+                )),
             );
         }
+        self.prune();
+        if self.sessions.contains_key(&*request.session_id.0) {
+            return self.outbox.respond::<Value>(
+                id,
+                Err(acp::Error::invalid_request().data(Value::String(format!(
+                    "session `{}` is already open on this connection",
+                    request.session_id
+                )))),
+            );
+        }
+        let kept = history::transcript_of(&workspace, &request.session_id.0);
+        let conversation = match history::read(&kept) {
+            Ok(conversation) => conversation,
+            Err(_) => {
+                return self.outbox.respond::<Value>(
+                    id,
+                    Err(invalid_params(format!(
+                        "no session `{}` is kept in `{}`",
+                        request.session_id,
+                        workspace.display()
+                    ))),
+                )
+            }
+        };
+        self.start_session(
+            id,
+            Start {
+                session_id: request.session_id,
+                workspace,
+                history: Some(conversation),
+                servers: request.mcp_servers,
+            },
+        );
+    }
 
-        // Sessions whose thread has ended — a build that failed — no longer
-        // count against the limit.
+    /// The sessions kept in `cwd`, or — with none named — in every workspace
+    /// an ACP session was recorded in.
+    fn list_sessions(
+        &mut self,
+        params: Option<Value>,
+    ) -> Result<acp::ListSessionsResponse, acp::Error> {
+        let request = decode::<acp::ListSessionsRequest>(params)?;
+        let workspaces: Vec<PathBuf> = match request.cwd {
+            Some(cwd) => vec![workspace_from(&cwd).map_err(invalid_params)?],
+            None => {
+                let mut known: Vec<PathBuf> = Vec::new();
+                for record in crate::session::load_all(&self.factory.data_dir()) {
+                    let place = PathBuf::from(&record.workspace);
+                    if !record.incode_session.is_empty() && !known.contains(&place) {
+                        known.push(place);
+                    }
+                }
+                known
+            }
+        };
+        let sessions = workspaces
+            .iter()
+            .flat_map(|workspace| history::list_in(workspace))
+            .collect();
+        Ok(acp::ListSessionsResponse::new(sessions))
+    }
+
+    /// Sessions whose thread has ended — a build that failed — no longer
+    /// count against the limit.
+    fn prune(&mut self) {
         self.sessions
             .retain(|_, handle| !handle.thread.is_finished());
+    }
+
+    /// Start a session's thread: it builds the session and answers `id`.
+    fn start_session(&mut self, id: acp::RequestId, start: Start) {
+        self.prune();
         if self.sessions.len() >= MAX_SESSIONS {
             return self.outbox.respond::<Value>(
                 id,
@@ -432,35 +621,58 @@ impl<F: SessionFactory> Server<F> {
                 )))),
             );
         }
-
-        let session_id = acp::SessionId::new(uuid::Uuid::new_v4().to_string());
+        let session_id = start.session_id.clone();
         let shared = Arc::new(Shared::new());
-        let (prompts, queue) = mpsc::sync_channel::<Prompt>(PROMPT_QUEUE);
+        let (work, queue) = mpsc::sync_channel::<Work>(WORK_QUEUE);
         let thread = {
             let factory = Arc::clone(&self.factory);
             let outbox = Arc::clone(&self.outbox);
             let shared = Arc::clone(&shared);
-            let session_id = session_id.clone();
             std::thread::spawn(move || {
-                drive(
-                    factory.as_ref(),
-                    &outbox,
-                    id,
-                    &session_id,
-                    &workspace,
-                    &shared,
-                    &queue,
-                );
+                drive(factory.as_ref(), &outbox, id, start, &shared, &queue);
             })
         };
         self.sessions.insert(
             session_id.0.to_string(),
             SessionHandle {
-                prompts,
+                work,
                 shared,
                 thread,
             },
         );
+    }
+
+    /// Record the client's choice of agent or role, answered at once with
+    /// every option as it now stands; the session's thread applies it before
+    /// the next turn, or now when it is idle.
+    fn set_config_option(
+        &mut self,
+        params: Option<Value>,
+    ) -> Result<acp::SetSessionConfigOptionResponse, acp::Error> {
+        let request = decode::<acp::SetSessionConfigOptionRequest>(params)?;
+        let handle = self.sessions.get(&*request.session_id.0).ok_or_else(|| {
+            invalid_params(format!(
+                "no session `{}` on this connection",
+                request.session_id
+            ))
+        })?;
+        let value = request
+            .value
+            .as_value_id()
+            .ok_or_else(|| invalid_params("every option this agent offers is a select"))?;
+        let options = {
+            let mut choices = handle.shared.choices();
+            let choices = choices
+                .as_mut()
+                .ok_or_else(|| invalid_params("the session is still being built"))?;
+            choices
+                .choose(&request.config_id.0, &value.0)
+                .map_err(invalid_params)?;
+            choices.options()
+        };
+        // A wake-up only: when the queue is full, the next prompt applies it.
+        let _ = handle.work.try_send(Work::Apply);
+        Ok(acp::SetSessionConfigOptionResponse::new(options))
     }
 
     fn prompt(&mut self, id: acp::RequestId, params: Option<Value>) {
@@ -489,9 +701,18 @@ impl<F: SessionFactory> Server<F> {
             id: id.clone(),
             blocks: request.prompt,
         };
-        match handle.prompts.try_send(prompt) {
+        match handle.work.try_send(Work::Prompt(prompt)) {
             Ok(()) => {}
-            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
+            Err(TrySendError::Full(_)) => {
+                handle.shared.finish();
+                self.outbox.respond::<Value>(
+                    id,
+                    Err(acp::Error::invalid_request().data(Value::String(
+                        "the session is still applying earlier changes; send it again".to_string(),
+                    ))),
+                );
+            }
+            Err(TrySendError::Disconnected(_)) => {
                 handle.shared.finish();
                 self.outbox
                     .respond::<Value>(id, Err(internal("the session has ended".to_string())));
@@ -543,7 +764,7 @@ impl<F: SessionFactory> Server<F> {
         // Dropping the sender ends the thread once its turn, if any, has
         // answered `cancelled`. It is not joined: the reader never waits on a
         // turn.
-        drop(handle.prompts);
+        drop(handle.work);
         Ok(acp::CloseSessionResponse::new())
     }
 
@@ -556,7 +777,7 @@ impl<F: SessionFactory> Server<F> {
         for (_, handle) in self.sessions {
             handle.shared.cancel_running();
             // Dropping the sender ends the thread's wait for the next prompt.
-            drop(handle.prompts);
+            drop(handle.work);
             threads.push(handle.thread);
         }
         let deadline = Instant::now() + SHUTDOWN_GRACE + crate::hooks::engine::SESSION_END_BOUND;
@@ -571,28 +792,90 @@ impl<F: SessionFactory> Server<F> {
     }
 }
 
-/// One session's thread: build it, answer `session/new`, then run prompts
-/// until the reader lets go.
+/// What a session's thread starts from.
+struct Start {
+    session_id: acp::SessionId,
+    /// The `cwd` the client named.
+    workspace: PathBuf,
+    /// The conversation to replay, for `session/load`.
+    history: Option<Vec<history::Said>>,
+    /// The MCP servers the client named.
+    servers: Vec<acp::McpServer>,
+}
+
+/// The client's MCP servers as incode starts them: stdio only, since the
+/// crate has no HTTP MCP client (and `initialize` says so). What is left out
+/// is said.
+fn server_specs(servers: &[acp::McpServer]) -> (Vec<crate::toolbox::ServerSpec>, Vec<String>) {
+    let mut specs = Vec::new();
+    let mut said = Vec::new();
+    for server in servers {
+        match server {
+            acp::McpServer::Stdio(stdio) => specs.push(crate::toolbox::ServerSpec {
+                name: stdio.name.clone(),
+                command: stdio.command.clone(),
+                args: stdio.args.clone(),
+                env: stdio
+                    .env
+                    .iter()
+                    .map(|var| (var.name.clone(), var.value.clone()))
+                    .collect(),
+            }),
+            acp::McpServer::Http(http) => said.push(format!(
+                "MCP server `{}` was not started: HTTP servers are not supported \
+                 (`mcpCapabilities.http` is false)",
+                http.name
+            )),
+            acp::McpServer::Sse(sse) => said.push(format!(
+                "MCP server `{}` was not started: SSE servers are not supported \
+                 (`mcpCapabilities.sse` is false)",
+                sse.name
+            )),
+            _ => said.push(
+                "an MCP server of a kind this agent does not support was not started".to_string(),
+            ),
+        }
+    }
+    (specs, said)
+}
+
+/// One session's thread: build it, answer `session/new` or `session/load`,
+/// then run prompts until the reader lets go.
 fn drive<F: SessionFactory>(
     factory: &F,
     outbox: &Arc<Outbox>,
     opened_by: acp::RequestId,
-    session_id: &acp::SessionId,
-    workspace: &Path,
+    start: Start,
     shared: &Shared,
-    prompts: &Receiver<Prompt>,
+    work: &Receiver<Work>,
 ) {
+    let Start {
+        session_id,
+        workspace,
+        history,
+        servers,
+    } = start;
+    let session_id = &session_id;
     // A panic is caught here and at each prompt below, never let through: the
     // request that was running is owed an answer, and an unwound thread would
     // leave the client waiting for it forever.
     let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        factory.open(workspace, shared.cancel.clone(), &session_id.0)
+        factory.open(
+            &workspace,
+            shared.cancel.clone(),
+            &session_id.0,
+            history.is_some(),
+        )
     }))
     .unwrap_or_else(|_| Err("building it panicked".to_string()));
     let Opened {
         mut session,
         mode,
         settings,
+        workspace,
+        roles,
+        build,
+        runs,
     } = match opened {
         Ok(opened) => opened,
         Err(why) => {
@@ -616,36 +899,91 @@ fn drive<F: SessionFactory>(
         Arc::clone(outbox),
         session_id.clone(),
     )));
-    outbox.respond(
-        opened_by,
-        Ok(acp::NewSessionResponse::new(session_id.clone()).modes(mode_state(applied))),
+    // The client's MCP servers, started here as incode's own tools — every
+    // call to them goes through the toolbox's gate. Bounded; one that does
+    // not start costs its own tools and nothing else.
+    let (specs, mut connected) = server_specs(&servers);
+    connected.extend(
+        session
+            .session_tools()
+            .connect_client_servers(specs, &workspace),
     );
-    // After the answer, so the client knows the session the list belongs to.
-    outbox.notify(
-        acp::CLIENT_METHOD_NAMES.session_update,
-        acp::SessionNotification::new(
-            session_id.clone(),
-            acp::SessionUpdate::AvailableCommandsUpdate(acp::AvailableCommandsUpdate::new(
-                commands::available(),
-            )),
-        ),
-    );
+    for line in &connected {
+        eprintln!("incode acp: {line}");
+    }
+    let choices = config::opening(&settings, &roles, session.model());
+    *shared.choices() = Some(choices.clone());
     let mut held = Held {
         session,
         applied,
         settings,
+        workspace,
+        roles,
+        build,
+        runs,
+        lead: choices.agent.clone(),
+        role: choices.role.clone(),
+        shown: choices.options(),
+        replay: None,
     };
+    let say = |update: acp::SessionUpdate| {
+        outbox.notify(
+            acp::CLIENT_METHOD_NAMES.session_update,
+            acp::SessionNotification::new(session_id.clone(), update),
+        );
+    };
+    match &history {
+        // The history first, then the answer, as `session/load` requires.
+        Some(conversation) => {
+            history::resume_or_carry(&mut held, session_id, conversation);
+            for update in history::replay(conversation) {
+                say(update);
+            }
+            outbox.respond(
+                opened_by,
+                Ok(acp::LoadSessionResponse::new()
+                    .modes(mode_state(applied))
+                    .config_options(held.shown.clone())),
+            );
+        }
+        None => outbox.respond(
+            opened_by,
+            Ok(acp::NewSessionResponse::new(session_id.clone())
+                .modes(mode_state(applied))
+                .config_options(held.shown.clone())),
+        ),
+    }
+    // After the answer, so the client knows the session the list belongs to.
+    say(acp::SessionUpdate::AvailableCommandsUpdate(
+        acp::AvailableCommandsUpdate::new(commands::available()),
+    ));
+    if !connected.is_empty() {
+        say(acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new(acp::ContentBlock::from(format!(
+                "{}\n",
+                connected.join("\n")
+            ))),
+        ));
+    }
 
-    while let Ok(prompt) = prompts.recv() {
+    while let Ok(next) = work.recv() {
+        let prompt = match next {
+            Work::Prompt(prompt) => prompt,
+            Work::Apply => {
+                let applied = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    config::apply(&mut held, shared, outbox, session_id);
+                }));
+                if applied.is_err() {
+                    // As after a panicked turn: the session's state is unknown,
+                    // so it ends, and later prompts are refused as ended.
+                    eprintln!("incode acp: applying the client's choices panicked");
+                    return;
+                }
+                continue;
+            }
+        };
         let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_prompt(
-                &mut held,
-                workspace,
-                outbox,
-                session_id,
-                shared,
-                &prompt.blocks,
-            )
+            run_prompt(&mut held, outbox, session_id, shared, &prompt.blocks)
         }));
         let Ok(answer) = answer else {
             shared.finish();
@@ -677,23 +1015,40 @@ struct Held {
     /// The permission mode the session is running under now.
     applied: PermissionMode,
     settings: commands::Settings,
+    /// The session's own workspace: absolute and canonical.
+    workspace: PathBuf,
+    /// The role table the role picker routes by.
+    roles: crate::roles::RoleTable,
+    /// Builds the backend for an agent the client picks.
+    build: BuildAgent,
+    /// How `/run` works the ledger.
+    runs: Box<dyn LedgerRuns>,
+    /// The agent the session's backend is now, by catalogue id.
+    lead: String,
+    /// The role the session's model was last routed by.
+    role: String,
+    /// The pickers as the client was last told them.
+    shown: Vec<acp::SessionConfigOption>,
+    /// A loaded session's conversation, for the next turn, when the model's
+    /// own could not be resumed.
+    replay: Option<String>,
 }
 
 /// One prompt: the same turn an interactive line runs, streamed as updates —
 /// or, when the prompt is a slash command, that command.
 fn run_prompt(
     held: &mut Held,
-    workspace: &Path,
-    outbox: &Outbox,
+    outbox: &Arc<Outbox>,
     session_id: &acp::SessionId,
     shared: &Shared,
     blocks: &[acp::ContentBlock],
 ) -> Result<acp::StopReason, acp::Error> {
+    let workspace = held.workspace.clone();
+    let workspace = workspace.as_path();
     let text = present::prompt_text(blocks, workspace).map_err(invalid_params)?;
     if text.trim().is_empty() {
         return Err(invalid_params("the prompt has no text"));
     }
-    let session = &mut held.session;
 
     // The mode the client chose, sent to the thing that does the writing —
     // as `-p` is at startup. Before the turn, because a running agent's mode
@@ -701,14 +1056,33 @@ fn run_prompt(
     let wanted = shared.state().mode;
     if let Some(wanted) = wanted {
         if wanted != held.applied {
-            session.set_permission_mode(wanted.agent_mode());
+            held.session.set_permission_mode(wanted.agent_mode());
             held.applied = wanted;
         }
     }
+    // And the agent and role the client picked, for the same reason.
+    config::apply(held, shared, outbox, session_id);
 
     if shared.cancelled() {
         return Ok(acp::StopReason::Cancelled);
     }
+
+    // `/run` works the ledger for as long as it takes, streaming, with the
+    // ledger as the plan.
+    if matches!(
+        crate::cli::slash_commands::SlashCommand::parse(text.trim()),
+        Some(crate::cli::slash_commands::SlashCommand::Run)
+    ) {
+        return Ok(run::run(
+            held.runs.as_mut(),
+            workspace,
+            held.applied,
+            outbox,
+            session_id,
+            shared,
+        ));
+    }
+    let session = &mut held.session;
 
     let say = |update: acp::SessionUpdate| {
         outbox.notify(
@@ -745,7 +1119,7 @@ fn run_prompt(
         });
     }
 
-    let (instruction, context) = match crate::cli::plan_turn(session, workspace, &text, &text) {
+    let (instruction, mut context) = match crate::cli::plan_turn(session, workspace, &text, &text) {
         crate::cli::TurnPlan::NextQuestion(reply) | crate::cli::TurnPlan::Greeting(reply) => {
             say_text(&reply);
             return Ok(acp::StopReason::EndTurn);
@@ -755,6 +1129,11 @@ fn run_prompt(
             context,
         } => (instruction, context),
     };
+    // A loaded session whose model could not resume its own conversation is
+    // given it here, once, ahead of everything else the turn carries.
+    if let Some(earlier) = held.replay.take() {
+        context.insert(0, earlier);
+    }
 
     // Looked at again AFTER the plan, which can wait on the memory service:
     // a cancel that landed during that wait is honoured here, before an agent
@@ -788,6 +1167,11 @@ fn run_prompt(
     for notice in session.take_notices() {
         say_text(&format!("\n{notice}\n"));
     }
+    // Which conversation the model holds now, so the session can be loaded
+    // and resumed; and the pickers, when the turn changed what serves the
+    // session (a standby took over) or what model it asks for.
+    history::remember(held, session_id, &text);
+    config::report(held, shared, outbox, session_id);
 
     // A cancel decides the answer whatever the turn did with it: ACP requires
     // `cancelled` once the client has asked, even if stopping surfaced as an
@@ -857,11 +1241,16 @@ fn initialize() -> acp::InitializeResponse {
     acp::InitializeResponse::new(ProtocolVersion::LATEST)
         .agent_capabilities(
             acp::AgentCapabilities::new()
-                .load_session(false)
+                .load_session(true)
                 .prompt_capabilities(acp::PromptCapabilities::new().embedded_context(true))
-                .mcp_capabilities(acp::McpCapabilities::new())
+                // Stdio servers only — every client may send those — run as
+                // incode's own tools. No HTTP or SSE: the crate has no client
+                // for either.
+                .mcp_capabilities(acp::McpCapabilities::new().http(false).sse(false))
                 .session_capabilities(
-                    acp::SessionCapabilities::new().close(acp::SessionCloseCapabilities::new()),
+                    acp::SessionCapabilities::new()
+                        .close(acp::SessionCloseCapabilities::new())
+                        .list(acp::SessionListCapabilities::new()),
                 ),
         )
         .auth_methods(Vec::new())
@@ -926,6 +1315,9 @@ fn internal(why: String) -> acp::Error {
 }
 
 #[cfg(test)]
+mod flow_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::agent::{AgentBackend, AgentError, TurnOutcome};
@@ -942,7 +1334,7 @@ mod tests {
     const CANCEL_FAKE_PATIENCE: Duration = Duration::from_secs(5);
 
     #[derive(Clone, Copy)]
-    enum Behaviour {
+    pub(super) enum Behaviour {
         /// Text, a tool call and its result, and a task list.
         Stream,
         /// Text, then nothing until cancelled.
@@ -956,26 +1348,37 @@ mod tests {
         /// One `Write` through incode's own Toolbox, with the fake engine in
         /// [`Script::engine`] asked first — see [`GUARDED_FILE`].
         Guarded,
+        /// One call to the client's MCP server's `echo`, through incode's
+        /// own Toolbox — see `crate::toolbox::fake_server`.
+        CallMcp,
+        /// Text naming the backend and its model — which agent served.
+        Named,
     }
 
     /// The file [`Behaviour::Guarded`] writes, when it is allowed to.
     const GUARDED_FILE: &str = "guarded.txt";
 
     #[derive(Clone)]
-    struct Script {
+    pub(super) struct Script {
         behaviour: Behaviour,
         /// Every agent mode the session set on the backend, in order.
-        modes: Arc<Mutex<Vec<String>>>,
+        pub(super) modes: Arc<Mutex<Vec<String>>>,
         /// The fake engine a [`Behaviour::Guarded`] toolbox asks.
         engine: Option<PathBuf>,
+        /// Every turn run: `<backend name> <model or ->`, in order.
+        pub(super) ran: Arc<Mutex<Vec<String>>>,
+        /// Every conversation id a backend was told to continue.
+        pub(super) resumed: Arc<Mutex<Vec<String>>>,
     }
 
     impl Script {
-        fn new(behaviour: Behaviour) -> Self {
+        pub(super) fn new(behaviour: Behaviour) -> Self {
             Self {
                 behaviour,
                 modes: Arc::default(),
                 engine: None,
+                ran: Arc::default(),
+                resumed: Arc::default(),
             }
         }
 
@@ -991,8 +1394,29 @@ mod tests {
         script: Script,
         cancel: Option<CancelToken>,
         workspace: PathBuf,
-        /// incode's own tools, for [`Behaviour::Guarded`].
+        /// incode's own tools, for [`Behaviour::Guarded`] and
+        /// [`Behaviour::CallMcp`].
         tools: Option<crate::toolbox::Toolbox>,
+        /// What this backend calls itself — the agent it stands for.
+        name: String,
+        /// The model the session asked for.
+        model: Option<String>,
+        /// The conversation it holds, once it has run a turn.
+        conversation: Option<String>,
+    }
+
+    impl FakeBackend {
+        fn new(script: &Script, workspace: &Path, name: &str) -> Self {
+            Self {
+                script: script.clone(),
+                cancel: None,
+                workspace: workspace.to_path_buf(),
+                tools: None,
+                name: name.to_string(),
+                model: None,
+                conversation: None,
+            }
+        }
     }
 
     fn ended(stop_reason: &str) -> TurnOutcome {
@@ -1140,15 +1564,56 @@ mod tests {
 
     impl AgentBackend for FakeBackend {
         fn id(&self) -> &str {
-            "fake"
+            &self.name
         }
 
         fn run_turn(
             &mut self,
-            _prompt: &str,
+            prompt: &str,
             on_event: &mut dyn FnMut(&AgentEvent),
         ) -> Result<TurnOutcome, AgentError> {
+            self.script
+                .ran
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(format!(
+                    "{} {} {}",
+                    self.name,
+                    self.model.as_deref().unwrap_or("-"),
+                    prompt.len()
+                ));
+            self.conversation = Some(format!("conv-{}", self.name));
             match self.script.behaviour {
+                Behaviour::Named => {
+                    on_event(&AgentEvent::TextDelta(format!(
+                        "served by {} on {}; asked: {prompt}",
+                        self.name,
+                        self.model.as_deref().unwrap_or("its default")
+                    )));
+                    Ok(ended("end_turn"))
+                }
+                Behaviour::CallMcp => {
+                    let tools = self
+                        .tools
+                        .as_ref()
+                        .ok_or_else(|| AgentError::new("an MCP script needs its toolbox"))?;
+                    let input = json!({"text": "from the model"});
+                    on_event(&AgentEvent::ToolUse {
+                        id: "m1".to_string(),
+                        name: "mcp__fake__echo".to_string(),
+                        input: input.to_string(),
+                    });
+                    let (output, is_error) = match tools.run_call("m1", "mcp__fake__echo", &input) {
+                        Ok(said) => (said.shown(), false),
+                        Err(why) => (why, true),
+                    };
+                    on_event(&AgentEvent::ToolResult {
+                        id: "m1".to_string(),
+                        output,
+                        is_error,
+                    });
+                    Ok(ended("end_turn"))
+                }
                 Behaviour::Stream => stream(on_event),
                 Behaviour::WaitForCancel => {
                     on_event(&AgentEvent::TextDelta("working".to_string()));
@@ -1209,7 +1674,32 @@ mod tests {
         }
 
         fn session_id(&self) -> Option<&str> {
-            None
+            self.conversation.as_deref()
+        }
+
+        fn set_session_id(&mut self, session_id: &str) {
+            self.script
+                .resumed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(session_id.to_string());
+            self.conversation = Some(session_id.to_string());
+        }
+
+        fn set_models(&mut self, candidates: &[String]) {
+            if let Some(first) = candidates.first() {
+                self.model = Some(first.clone());
+            }
+        }
+
+        fn model(&self) -> Option<&str> {
+            self.model.as_deref()
+        }
+
+        fn share_session_tools(&mut self, state: Arc<crate::toolbox::SessionTools>) {
+            if let Some(tools) = &mut self.tools {
+                tools.share_session(state);
+            }
         }
 
         fn set_cancel(&mut self, token: CancelToken) {
@@ -1231,18 +1721,52 @@ mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(mode.to_string());
+            // Read back into incode's own mode, as the bridged backend does.
+            if let Some(tools) = &mut self.tools {
+                tools.set_permission_mode(match mode {
+                    "plan" => PermissionMode::ReadOnly,
+                    "default" => PermissionMode::Prompt,
+                    _ => PermissionMode::WorkspaceWrite,
+                });
+            }
         }
     }
 
     /// Builds sessions the way [`CliSessions`] does — an [`AgentSession`] with
     /// the cancel token and the mode applied — around a fake backend, so no
     /// real agent CLI ever runs.
-    struct FakeSessions {
-        script: Script,
-        mode: PermissionMode,
+    pub(super) struct FakeSessions {
+        pub(super) script: Script,
+        pub(super) mode: PermissionMode,
         /// Where `/agent` and `/roles` keep settings: a scratch directory,
         /// never the operator's own.
-        data_dir: PathBuf,
+        pub(super) data_dir: PathBuf,
+    }
+
+    /// An agent in the fake catalogue, drivable.
+    fn catalogued(id: &str, name: &str) -> DetectedAgent {
+        DetectedAgent {
+            id: id.to_string(),
+            display_name: name.to_string(),
+            command: id.to_string(),
+            path: Some(format!("/bin/{id}")),
+            version: None,
+            protocol: crate::agent::Protocol::ClaudeStreamJson,
+        }
+    }
+
+    /// The fake agent's toolbox: incode's own, over `workspace`, with the
+    /// fake engine when the script names one.
+    fn fake_tools(script: &Script, workspace: &Path) -> Option<crate::toolbox::Toolbox> {
+        let needs = script.engine.is_some() || matches!(script.behaviour, Behaviour::CallMcp);
+        needs.then(|| {
+            let engine = script.engine.as_ref().map(|bin| {
+                crate::hooks::engine::fake::engine(bin.clone()).capped(Duration::from_secs(30))
+            });
+            let mut tools = crate::toolbox::Toolbox::new(workspace, true).with_engine(engine);
+            tools.set_session("acp-test-session");
+            tools
+        })
     }
 
     impl SessionFactory for FakeSessions {
@@ -1250,8 +1774,11 @@ mod tests {
             &self,
             workspace: &Path,
             cancel: CancelToken,
-            _session_id: &str,
+            session_id: &str,
+            loading: bool,
         ) -> Result<Opened, String> {
+            let mut lead = FakeBackend::new(&self.script, workspace, "claude-code");
+            lead.tools = fake_tools(&self.script, workspace);
             let mut session = AgentSession::new(
                 workspace.to_path_buf(),
                 "claude-code",
@@ -1259,37 +1786,44 @@ mod tests {
                 &crate::guards::Guards::default(),
                 Vec::new(),
             )
-            .with_backend(Box::new(FakeBackend {
-                script: self.script.clone(),
-                cancel: None,
-                workspace: workspace.to_path_buf(),
-                tools: self.script.engine.as_ref().map(|bin| {
-                    let engine = crate::hooks::engine::fake::engine(bin.clone())
-                        .capped(Duration::from_secs(30));
-                    let mut tools =
-                        crate::toolbox::Toolbox::new(workspace, true).with_engine(Some(engine));
-                    tools.set_session("acp-test-session");
-                    tools
-                }),
-            }))
+            .with_backend(Box::new(lead))
             .with_cancel(cancel);
             session.set_permission_mode(self.mode.agent_mode());
+            session.start_memory(
+                crate::hooks::memory::MemoryHooks::new(None, workspace, session_id),
+                Vec::new(),
+                if loading { "resume" } else { "startup" },
+            );
+            session.keep_transcript();
+            let build = {
+                let script = self.script.clone();
+                let workspace = workspace.to_path_buf();
+                Box::new(move |agent: &DetectedAgent| {
+                    let mut backend = FakeBackend::new(&script, &workspace, &agent.id);
+                    backend.tools = fake_tools(&script, &workspace);
+                    Box::new(backend) as Box<dyn AgentBackend>
+                })
+            };
             Ok(Opened {
                 session,
                 mode: self.mode,
                 settings: commands::Settings {
                     data_dir: self.data_dir.clone(),
-                    catalogue: crate::agent::catalogue::Catalogue::of_local(Vec::new()),
-                    lead: crate::agent::DetectedAgent {
-                        id: "claude-code".to_string(),
-                        display_name: "Claude Code".to_string(),
-                        command: "claude".to_string(),
-                        path: None,
-                        version: None,
-                        protocol: crate::agent::Protocol::ClaudeStreamJson,
-                    },
+                    catalogue: crate::agent::catalogue::Catalogue::of_local(vec![
+                        catalogued("claude-code", "Claude Code"),
+                        catalogued("codex", "Codex CLI"),
+                    ]),
+                    lead: catalogued("claude-code", "Claude Code"),
                 },
+                workspace: workspace.to_path_buf(),
+                roles: crate::roles::RoleTable::default().with_role("explore", "small-model"),
+                build,
+                runs: Box::new(super::flow_tests::FakeRuns),
             })
+        }
+
+        fn data_dir(&self) -> PathBuf {
+            self.data_dir.clone()
         }
     }
 
@@ -1310,7 +1844,7 @@ mod tests {
     }
 
     /// A client on the other end of a pipe pair, with the agent on a thread.
-    struct Client {
+    pub(super) struct Client {
         to_agent: Option<std::io::PipeWriter>,
         from_agent: Receiver<String>,
         server: JoinHandle<()>,
@@ -1320,7 +1854,7 @@ mod tests {
     }
 
     impl Client {
-        fn start(script: Script, mode: PermissionMode, max_line: usize) -> Self {
+        pub(super) fn start(script: Script, mode: PermissionMode, max_line: usize) -> Self {
             let (agent_in, to_agent) = std::io::pipe().expect("pipe");
             let (from_agent_raw, agent_out) = std::io::pipe().expect("pipe");
             let data_dir = tempfile::tempdir().expect("data dir");
@@ -1350,14 +1884,14 @@ mod tests {
             }
         }
 
-        fn send_raw(&mut self, text: &str) {
+        pub(super) fn send_raw(&mut self, text: &str) {
             let pipe = self.to_agent.as_mut().expect("still open");
             pipe.write_all(text.as_bytes()).expect("write");
             pipe.write_all(b"\n").expect("write");
             pipe.flush().expect("flush");
         }
 
-        fn request(&mut self, method: &str, params: Value) -> i64 {
+        pub(super) fn request(&mut self, method: &str, params: Value) -> i64 {
             self.next_id += 1;
             let id = self.next_id;
             self.send_raw(
@@ -1367,14 +1901,14 @@ mod tests {
             id
         }
 
-        fn notify(&mut self, method: &str, params: Value) {
+        pub(super) fn notify(&mut self, method: &str, params: Value) {
             self.send_raw(
                 &json!({"jsonrpc": "2.0", "method": method, "params": params}).to_string(),
             );
         }
 
         /// The next message, checked to be JSON-RPC.
-        fn next(&self) -> Value {
+        pub(super) fn next(&self) -> Value {
             let line = self
                 .from_agent
                 .recv_timeout(WAIT)
@@ -1384,7 +1918,7 @@ mod tests {
 
         /// Messages up to and including the response to `id`: the
         /// notifications that came first, then the response.
-        fn until_response(&self, id: i64) -> (Vec<Value>, Value) {
+        pub(super) fn until_response(&self, id: i64) -> (Vec<Value>, Value) {
             let mut before = Vec::new();
             loop {
                 let message = self.next();
@@ -1395,12 +1929,12 @@ mod tests {
             }
         }
 
-        fn call(&mut self, method: &str, params: Value) -> Value {
+        pub(super) fn call(&mut self, method: &str, params: Value) -> Value {
             let id = self.request(method, params);
             self.until_response(id).1
         }
 
-        fn open_session(&mut self, cwd: &Path) -> String {
+        pub(super) fn open_session(&mut self, cwd: &Path) -> String {
             let reply = self.call("session/new", json!({"cwd": cwd, "mcpServers": []}));
             reply["result"]["sessionId"]
                 .as_str()
@@ -1409,7 +1943,7 @@ mod tests {
         }
 
         /// Close the client's end and wait — bounded — for the agent to stop.
-        fn close(mut self) {
+        pub(super) fn close(mut self) {
             drop(self.to_agent.take());
             let deadline = Instant::now() + WAIT;
             while !self.server.is_finished() {
@@ -1422,7 +1956,7 @@ mod tests {
         }
     }
 
-    fn updates_of(messages: &[Value]) -> Vec<&Value> {
+    pub(super) fn updates_of(messages: &[Value]) -> Vec<&Value> {
         messages
             .iter()
             .filter(|m| m["method"] == "session/update")
@@ -1430,7 +1964,7 @@ mod tests {
             .collect()
     }
 
-    fn text_of(messages: &[Value]) -> String {
+    pub(super) fn text_of(messages: &[Value]) -> String {
         updates_of(messages)
             .into_iter()
             .filter(|u| u["sessionUpdate"] == "agent_message_chunk")
@@ -1438,7 +1972,7 @@ mod tests {
             .collect()
     }
 
-    fn client(behaviour: Behaviour) -> Client {
+    pub(super) fn client(behaviour: Behaviour) -> Client {
         Client::start(
             Script::new(behaviour),
             PermissionMode::WorkspaceWrite,
@@ -1447,7 +1981,8 @@ mod tests {
     }
 
     /// **THE HANDSHAKE.** Version 1, and only the capabilities incode really
-    /// has: text and embedded context, no session loading, no auth methods.
+    /// has: text and embedded context, loading and listing sessions, stdio
+    /// MCP servers only (no HTTP, no SSE), no auth methods.
     #[test]
     fn initialize_negotiates_version_one_and_states_real_capabilities() {
         let mut client = client(Behaviour::Stream);
@@ -1457,7 +1992,19 @@ mod tests {
         );
         let result = &reply["result"];
         assert_eq!(result["protocolVersion"], 1, "{reply}");
-        assert_eq!(result["agentCapabilities"]["loadSession"], false, "{reply}");
+        assert_eq!(result["agentCapabilities"]["loadSession"], true, "{reply}");
+        assert_eq!(
+            result["agentCapabilities"]["mcpCapabilities"]["http"], false,
+            "{reply}"
+        );
+        assert_eq!(
+            result["agentCapabilities"]["mcpCapabilities"]["sse"], false,
+            "{reply}"
+        );
+        assert!(
+            result["agentCapabilities"]["sessionCapabilities"]["list"].is_object(),
+            "{reply}"
+        );
         assert_eq!(
             result["agentCapabilities"]["promptCapabilities"]["embeddedContext"], true,
             "{reply}"
@@ -1569,7 +2116,7 @@ mod tests {
                 break;
             }
         }
-        let busy = client.call("session/list", json!({}));
+        let busy = client.call("session/fork", json!({}));
         assert_eq!(
             busy["error"]["code"], -32601,
             "answered during the turn: {busy}"
@@ -1713,7 +2260,7 @@ mod tests {
         client.close();
     }
 
-    fn prompt_in(client: &mut Client, session: &str, text: &str) -> (Vec<Value>, Value) {
+    pub(super) fn prompt_in(client: &mut Client, session: &str, text: &str) -> (Vec<Value>, Value) {
         let id = client.request(
             "session/prompt",
             json!({"sessionId": session, "prompt": [{"type": "text", "text": text}]}),
@@ -1825,7 +2372,7 @@ mod tests {
         client.close();
     }
 
-    fn commands_announced(messages: &[Value]) -> Option<Vec<String>> {
+    pub(super) fn commands_announced(messages: &[Value]) -> Option<Vec<String>> {
         updates_of(messages)
             .into_iter()
             .find(|u| u["sessionUpdate"] == "available_commands_update")
@@ -1840,7 +2387,7 @@ mod tests {
     }
 
     /// **`session/new` IS FOLLOWED BY THE COMMANDS OFFERED**, in the shape the
-    /// desktop app reads — and `/run` is not among them.
+    /// desktop app reads — `/run` among them.
     #[test]
     fn a_new_session_announces_its_commands() {
         let mut client = client(Behaviour::Stream);
@@ -1852,12 +2399,11 @@ mod tests {
         assert_eq!(
             names,
             [
-                "undo", "plan", "act", "diff", "links", "roadmap", "doctor", "memories",
+                "undo", "plan", "act", "diff", "links", "roadmap", "run", "doctor", "memories",
                 "remember", "worktree", "agent", "roles"
             ],
             "{announced}"
         );
-        assert!(!names.iter().any(|n| n == "run"));
         client.close();
     }
 
@@ -1874,7 +2420,7 @@ mod tests {
         for (typed, expected) in [
             ("/remember", "Usage: /remember <what to remember>"),
             ("/roles", "Roles (candidates"),
-            ("/run", "/run is not a command offered here"),
+            ("/bg echo hi", "/bg is not a command offered here"),
         ] {
             let (streamed, reply) = prompt_in(&mut client, &session, typed);
             assert_eq!(

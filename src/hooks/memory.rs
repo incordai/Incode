@@ -23,8 +23,10 @@
 //! `type` (`user`/`assistant`), `uuid`, `timestamp` and `message.content`, plus
 //! the `cwd` it files the project under. incode writes exactly that, per
 //! session, at `.incord/transcripts/<session>.jsonl` in the workspace, beside
-//! the rest of the workspace's run state. Only when an engine is present: with
-//! no reader, the file would be a copy nobody asked for.
+//! the rest of the workspace's run state. Only when an engine is present, or
+//! when the session is one a client may load again (`incode --acp`'s
+//! `session/load` replays it — [`MemoryHooks::keep_transcript`]): with no
+//! reader, the file would be a copy nobody asked for.
 //!
 //! # Context that does not fit
 //!
@@ -58,7 +60,7 @@ pub const START_INLINE: usize = 12_000;
 pub const TURN_INLINE: usize = 6_000;
 
 /// Where transcripts are written, under the workspace.
-const TRANSCRIPTS: &str = ".incord/transcripts";
+pub(crate) const TRANSCRIPTS: &str = ".incord/transcripts";
 
 /// Where an oversized block is written whole, under the workspace.
 const CONTEXT: &str = ".incord/context";
@@ -155,6 +157,10 @@ pub struct MemoryHooks {
     /// incode's background jobs still running. While there are any, a stop is
     /// not a finished turn and the engine is not asked about it.
     background: usize,
+    /// The transcript is written whether or not an engine reads it: the
+    /// session can be loaded again (`incode --acp`'s `session/load`), and it
+    /// is replayed from this.
+    keep: bool,
 }
 
 impl MemoryHooks {
@@ -170,6 +176,20 @@ impl MemoryHooks {
             stop_active: false,
             continued: 0,
             background: 0,
+            keep: false,
+        }
+    }
+
+    /// Write the transcript with or without an engine to read it — for a
+    /// session a client may load again, which is replayed from it. Nothing
+    /// for a lifecycle with no session id.
+    pub fn keep_transcript(&mut self) {
+        if self.session.is_empty() {
+            return;
+        }
+        self.keep = true;
+        if self.transcript.is_none() {
+            self.transcript = Some(transcript_for(&self.cwd, &self.session));
         }
     }
 
@@ -345,10 +365,8 @@ impl MemoryHooks {
     pub fn restart(&mut self, next: &str, source: &str) -> Option<String> {
         self.end(source);
         self.session = next.to_string();
-        self.transcript = self
-            .engine
-            .as_ref()
-            .map(|_| transcript_for(&self.cwd, next));
+        self.transcript =
+            (self.engine.is_some() || self.keep).then(|| transcript_for(&self.cwd, next));
         self.stop_active = false;
         self.continued = 0;
         self.start(source)
@@ -382,7 +400,7 @@ impl MemoryHooks {
 }
 
 /// The transcript file for one session.
-fn transcript_for(cwd: &Path, session: &str) -> PathBuf {
+pub(crate) fn transcript_for(cwd: &Path, session: &str) -> PathBuf {
     cwd.join(TRANSCRIPTS)
         .join(format!("{}.jsonl", safe_name(session)))
 }

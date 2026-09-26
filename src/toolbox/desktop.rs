@@ -24,15 +24,14 @@
 //! own check is the second line, not the first. The operator's desktop hooks
 //! still run in the child, as before.
 
-use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{channel, Receiver};
+use std::process::Command;
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use super::image::ToolOutput;
+use super::mcp_client::{ChildLink, Link, McpClient};
 
 /// The desktop tools that only look.
 pub(super) const OBSERVING: &[&str] = &["screen_info", "screenshot", "ui_tree", "cursor_position"];
@@ -52,12 +51,8 @@ pub(super) const ACTING: &[&str] = &[
 const CALL_BOUND: Duration = Duration::from_secs(120);
 /// How long the child has to answer `initialize`.
 const START_BOUND: Duration = Duration::from_secs(20);
-/// The longest line read from the child: a screenshot, base64, inside the
-/// image bounds, with room to be refused by those bounds.
-const MAX_LINE_BYTES: u64 = 16 * 1024 * 1024;
-/// How long the child has to exit on its own once its stdin closes, before
-/// its tree is killed.
-const EXIT_GRACE: Duration = Duration::from_secs(2);
+/// What the desktop child is called in what it causes to be said.
+const WHAT: &str = "the desktop";
 
 /// Whether `name` is a desktop tool.
 pub(super) fn is_desktop(name: &str) -> bool {
@@ -89,216 +84,61 @@ pub struct DesktopSetup {
     pub journal: PathBuf,
 }
 
-/// One line each way to a desktop server.
-pub(super) trait Link: Send {
-    fn send(&mut self, line: &str) -> Result<(), String>;
-    fn recv(&mut self, bound: Duration) -> Result<String, String>;
-}
-
-/// The child process, spoken to over its stdin and stdout.
-struct ChildLink {
-    child: Child,
-    tree: crate::agent::process_tree::Tree,
-    stdin: Option<ChildStdin>,
-    lines: Receiver<Result<String, String>>,
-}
-
-impl ChildLink {
-    fn start(setup: &DesktopSetup, read_only: bool) -> Result<Self, String> {
-        let mode = if read_only {
-            crate::permissions::PermissionMode::ReadOnly
-        } else {
-            crate::permissions::PermissionMode::WorkspaceWrite
-        };
-        let mut command = Command::new(&setup.exe);
-        command
-            .arg("--desktop-mcp")
-            .arg("--desktop-journal")
-            .arg(&setup.journal)
-            .args(["-p", mode.as_str()])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        crate::agent::process_tree::prepare(&mut command);
-        let mut child = command
-            .spawn()
-            .map_err(|e| format!("could not start the desktop: {e}"))?;
-        let tree = crate::agent::process_tree::Tree::adopt(&child);
-        let stdin = child.stdin.take();
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or("the desktop was started without a stdout")?;
-        let (tx, lines) = channel();
-        std::thread::spawn(move || {
-            let mut reader = BufReader::new(stdout);
-            loop {
-                let mut line = Vec::new();
-                match (&mut reader)
-                    .take(MAX_LINE_BYTES)
-                    .read_until(b'\n', &mut line)
-                {
-                    Ok(0) => break,
-                    Ok(_) if !line.ends_with(b"\n") => {
-                        let _ = tx.send(Err("the desktop sent a line past the bound".to_string()));
-                        break;
-                    }
-                    Ok(_) => {
-                        if tx
-                            .send(Ok(String::from_utf8_lossy(&line).into_owned()))
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        let _ = tx.send(Err(format!("the desktop's output failed: {e}")));
-                        break;
-                    }
-                }
-            }
-        });
-        crate::trace!("desktop", "started pid {} ({})", child.id(), mode.as_str());
-        Ok(Self {
-            child,
-            tree,
-            stdin,
-            lines,
-        })
-    }
-}
-
-impl Link for ChildLink {
-    fn send(&mut self, line: &str) -> Result<(), String> {
-        let stdin = self.stdin.as_mut().ok_or("the desktop's input is closed")?;
-        writeln!(stdin, "{line}")
-            .and_then(|()| stdin.flush())
-            .map_err(|e| format!("the desktop could not be reached: {e}"))
-    }
-
-    fn recv(&mut self, bound: Duration) -> Result<String, String> {
-        match self.lines.recv_timeout(bound) {
-            Ok(line) => line,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(format!(
-                "the desktop did not answer within {}s",
-                bound.as_secs()
-            )),
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                Err("the desktop exited".to_string())
-            }
-        }
-    }
-}
-
-impl Drop for ChildLink {
-    /// The kill switch: EOF first, which halts the desktop before the child
-    /// returns, then the whole tree.
-    fn drop(&mut self) {
-        drop(self.stdin.take());
-        let began = std::time::Instant::now();
-        while began.elapsed() < EXIT_GRACE {
-            if matches!(self.child.try_wait(), Ok(Some(_))) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
-        self.tree.kill(&mut self.child);
-        let _ = self.child.wait();
-        crate::trace!("desktop", "stopped");
-    }
+/// The desktop child, started for a session that is (or is not) read-only.
+fn start_child(setup: &DesktopSetup, read_only: bool) -> Result<ChildLink, String> {
+    let mode = if read_only {
+        crate::permissions::PermissionMode::ReadOnly
+    } else {
+        crate::permissions::PermissionMode::WorkspaceWrite
+    };
+    let mut command = Command::new(&setup.exe);
+    command
+        .arg("--desktop-mcp")
+        .arg("--desktop-journal")
+        .arg(&setup.journal)
+        .args(["-p", mode.as_str()]);
+    let link = ChildLink::spawn(command, WHAT)?;
+    crate::trace!("desktop", "started ({})", mode.as_str());
+    Ok(link)
 }
 
 /// A desktop server this session has started, and has said hello to.
 pub(super) struct DesktopClient {
-    link: Box<dyn Link>,
-    next: u64,
+    client: McpClient,
     read_only: bool,
-    /// Set when the link failed; the next call starts a fresh one.
-    broken: bool,
 }
 
 impl DesktopClient {
     /// Start the desktop child and open the session with it.
     pub(super) fn start(setup: &DesktopSetup, read_only: bool) -> Result<Self, String> {
-        Self::over(Box::new(ChildLink::start(setup, read_only)?), read_only)
+        Self::over(Box::new(start_child(setup, read_only)?), read_only)
     }
 
     /// A client over an already-open link.
     pub(super) fn over(link: Box<dyn Link>, read_only: bool) -> Result<Self, String> {
-        let mut client = Self {
-            link,
-            next: 0,
+        Ok(Self {
+            client: McpClient::open(link, WHAT, START_BOUND)?,
             read_only,
-            broken: false,
-        };
-        client.request(
-            "initialize",
-            json!({
-                "protocolVersion": crate::mcp_stdio::PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": {"name": "incode", "version": env!("CARGO_PKG_VERSION")}
-            }),
-            START_BOUND,
-        )?;
-        client
-            .link
-            .send(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}).to_string())?;
-        Ok(client)
+        })
     }
 
     /// Whether this client can serve a session that is (or is not)
-    /// read-only.
+    /// read-only. A failed link is replaced by a fresh child on the next call.
     pub(super) fn serves(&self, read_only: bool) -> bool {
-        !self.broken && self.read_only == read_only
-    }
-
-    fn request(&mut self, method: &str, params: Value, bound: Duration) -> Result<Value, String> {
-        self.next += 1;
-        let id = self.next;
-        let sent = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-        let outcome = self.link.send(&sent.to_string()).and_then(|()| loop {
-            let line = self.link.recv(bound)?;
-            let Ok(reply) = serde_json::from_str::<Value>(line.trim()) else {
-                continue;
-            };
-            if reply.get("id").and_then(Value::as_u64) != Some(id) {
-                continue;
-            }
-            if let Some(error) = reply.get("error") {
-                break Err(format!("the desktop refused {method}: {error}"));
-            }
-            break Ok(reply.get("result").cloned().unwrap_or(Value::Null));
-        });
-        if outcome.is_err() {
-            self.broken = true;
-        }
-        outcome
+        !self.client.is_broken() && self.read_only == read_only
     }
 
     /// Run one desktop tool. A tool's own refusal is an `Err` with its words.
     pub(super) fn call(&mut self, name: &str, args: &Value) -> Result<ToolOutput, String> {
-        let result = self.request(
-            "tools/call",
-            json!({"name": name, "arguments": args}),
-            CALL_BOUND,
-        )?;
-        let blocks = result
-            .get("content")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let output = ToolOutput::from_mcp_content(&blocks);
-        if result.get("isError").and_then(Value::as_bool) == Some(true) {
-            return Err(output.text);
-        }
-        Ok(output)
+        self.client.call(name, args, CALL_BOUND, &|| false)
     }
 }
 
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use std::sync::mpsc::Sender;
+    use serde_json::json;
+    use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 
     /// A desktop server in this process, on its own thread, behind a link —
     /// the child's protocol without the child. Counts the tool calls that
@@ -337,8 +177,12 @@ pub(super) mod tests {
         fn send(&mut self, line: &str) -> Result<(), String> {
             self.to.send(line.to_string()).map_err(|e| e.to_string())
         }
-        fn recv(&mut self, bound: Duration) -> Result<String, String> {
-            self.from.recv_timeout(bound).map_err(|e| e.to_string())
+        fn recv(&mut self, bound: Duration) -> Result<Option<String>, String> {
+            match self.from.recv_timeout(bound) {
+                Ok(line) => Ok(Some(line)),
+                Err(RecvTimeoutError::Timeout) => Ok(None),
+                Err(e) => Err(e.to_string()),
+            }
         }
     }
 

@@ -119,6 +119,10 @@ pub struct AgentSession {
     /// REPL's `/bg` alike — and the model's task list, shared by every
     /// backend. A stop while a job runs is a wait, not an end.
     session_tools: std::sync::Arc<crate::toolbox::SessionTools>,
+    /// The agent mode last set, so a backend switched in runs under it too.
+    mode: Option<String>,
+    /// Who is asked mid-turn, so a backend switched in asks them too.
+    prompter: Option<std::sync::Arc<dyn crate::hooks::engine::Prompter>>,
 }
 
 /// How wide a tool result panel is drawn in a conversation.
@@ -234,7 +238,61 @@ impl AgentSession {
             answers: Vec::new(),
             extra_dirs: Vec::new(),
             usage: crate::runtime::usage::TokenUsage::default(),
+            mode: None,
+            prompter: None,
         }
+    }
+
+    /// Put `backend` in as the agent that serves the next turn, carrying
+    /// everything this session has already given the one it replaces: its
+    /// tools, roots, stop, mode, prompter, memory id and standing context.
+    ///
+    /// A different agent cannot continue the conversation the last one had,
+    /// so the next turn starts a fresh one there. The agent replaced becomes
+    /// a standby — two installed agents are two allowances — unless it is
+    /// the configured API route, which is never a standby; a standby of the
+    /// agent now leading is dropped.
+    pub fn switch_backend(&mut self, mut backend: Box<dyn AgentBackend>) {
+        backend.share_session_tools(std::sync::Arc::clone(&self.session_tools));
+        backend.set_extra_dirs(self.extra_dirs.clone());
+        if let Some(token) = &self.cancel {
+            backend.set_cancel(token.clone());
+        }
+        if let Some(mode) = &self.mode {
+            backend.set_permission_mode(mode);
+        }
+        if let Some(prompter) = &self.prompter {
+            backend.set_prompter(std::sync::Arc::clone(prompter));
+        }
+        let mut previous = std::mem::replace(&mut self.backend, backend);
+        let now = self.backend.id().to_string();
+        self.standby.retain(|standby| standby.id() != now);
+        if previous.id() != now && previous.id() != crate::agent::registry::API_ROUTE {
+            previous.clear_session();
+            self.standby.push(previous);
+        }
+        self.name_memory_session();
+        self.carry_context();
+    }
+
+    /// Ask the agent for the model the role table gives `role` — the
+    /// operator's choice first wherever this agent can serve it, then the
+    /// agent's own ladder for the role, as the ledger's worker routes a task.
+    /// Nothing to offer leaves the model as it was. Returns the model the
+    /// next turn asks for, if one was chosen.
+    pub fn use_role(&mut self, table: &crate::roles::RoleTable, role: &str) -> Option<&str> {
+        let mut ladder: Vec<String> = table.candidates_for(role).to_vec();
+        ladder.extend(self.backend.ladder_for(role));
+        if !ladder.is_empty() {
+            self.backend.set_models(&ladder);
+        }
+        self.backend.model()
+    }
+
+    /// Write this session's transcript even when no memory engine will read
+    /// it: a session a client can load again is replayed from it.
+    pub fn keep_transcript(&mut self) {
+        self.memory.keep_transcript();
     }
 
     /// Configure standby agents to take over if the primary backend fails.
@@ -459,6 +517,7 @@ impl AgentSession {
 
     /// How much the agent may do on its own for the following turns.
     pub fn set_permission_mode(&mut self, mode: &str) {
+        self.mode = Some(mode.to_string());
         self.backend.set_permission_mode(mode);
         for s in &mut self.standby {
             s.set_permission_mode(mode);
@@ -469,6 +528,7 @@ impl AgentSession {
     /// needs the owner: the terminal for the REPL, the client under ACP.
     /// Standbys get the same one, since a failover keeps the same person.
     pub fn set_prompter(&mut self, prompter: std::sync::Arc<dyn crate::hooks::engine::Prompter>) {
+        self.prompter = Some(std::sync::Arc::clone(&prompter));
         self.backend.set_prompter(std::sync::Arc::clone(&prompter));
         for s in &mut self.standby {
             s.set_prompter(std::sync::Arc::clone(&prompter));

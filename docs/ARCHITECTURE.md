@@ -49,7 +49,9 @@ The harness used to carry its own MCP client, and attaching it to the service lo
 obvious — it did not work, because that client was **stdio-only** while the service
 registers over **HTTP**. The client is gone along with the rest of the tool layer:
 MCP servers are the agent's business now, configured in the agent's own settings and
-connected by it. The harness proxies nothing.
+connected by it. The harness proxies nothing. The one exception is an ACP client's
+stdio servers under `incode --acp`, which incode connects to itself and runs as its
+own tools (below).
 
 ### `incode --acp`: incode as the agent an editor drives
 
@@ -62,12 +64,15 @@ runs. The code is `src/acp_agent/`; payloads are `agent-client-protocol-schema` 
 
 | Method | What incode does |
 |---|---|
-| `initialize` | protocol version 1; prompts take text and embedded context; no session loading, no client MCP servers, no auth methods |
+| `initialize` | protocol version 1; prompts take text and embedded context; `loadSession: true`; `sessionCapabilities` `close` and `list`; `mcpCapabilities` `http: false`, `sse: false` (stdio servers only); no auth methods |
 | `authenticate` | invalid params — no method was offered; the CLIs hold their own logins |
-| `session/new` | `cwd` must be absolute and an existing directory; it becomes the workspace. The session is built on its own thread; after the answer, `available_commands_update` lists its slash commands |
-| `session/prompt` | one turn: text as `agent_message_chunk`, tool calls and results as `tool_call` / `tool_call_update`, an edit that landed as a `diff`, the task list as `plan`, the context window's fill as `usage_update`; replies with the stop reason, or a JSON-RPC error if the turn failed. A prompt that is a slash command runs that command instead |
+| `session/new` | `cwd` must be absolute and an existing directory; it becomes the workspace (made canonical by `prepare_session`). The session is built on its own thread, the client's stdio MCP servers are started, and the answer carries `modes` and `configOptions`; then `available_commands_update` lists its slash commands, and a message chunk says what each MCP server offered or why it did not start |
+| `session/load` | a session kept in `cwd` (its transcript exists): built like `session/new` under the same id, its history replayed as `user_message_chunk` / `agent_message_chunk` BEFORE the answer (`modes`, `configOptions`); the model's own conversation is resumed where it can be (below) |
+| `session/list` | the transcripts in `cwd` (id, title = the first person's line, `updatedAt` = the file's time), newest first, at most 200; with no `cwd`, every workspace an ACP session record names |
+| `session/prompt` | one turn: text as `agent_message_chunk`, tool calls and results as `tool_call` / `tool_call_update`, an edit that landed as a `diff`, the task list as `plan`, the context window's fill as `usage_update`; replies with the stop reason, or a JSON-RPC error if the turn failed. A prompt that is a slash command runs that command instead; `/run` works the ledger and sends it as the plan |
 | `session/cancel` | trips the session's cancel token; the prompt answers `cancelled` |
 | `session/set_mode` | `read-only`, `workspace-write`, `danger-full-access`; applied from the next turn |
+| `session/set_config_option` | `agent` or `role` (both selects); answered at once with every option, applied before the next turn (or at once when the session is idle) |
 | `session/close` | cancels the session's turn and frees its slot (at most 16 sessions open at once) |
 | anything else | `-32601`; malformed JSON `-32700`; a line over 8 MiB is dropped unread and answered `-32600` under the id found in its first 4 KiB |
 
@@ -101,17 +106,78 @@ reports a window, so none sends one. No `cost` is sent: on a subscription the CL
 the prompt result's `usage`, which the schema only has behind
 `unstable_end_turn_token_usage`; it is not enabled.
 
-**Slash commands.** `/undo`, `/plan`, `/act`, `/diff`, `/links`, `/roadmap`, `/doctor`,
-`/memories`, `/remember`, `/worktree`, `/agent` and `/roles` are announced, with the
-description and argument hint from `slash_commands::COMMANDS`. A prompt that parses as
-a slash command runs the REPL's own handler inside `console::capture`, which returns
-what the handler printed on that thread; that text is the reply, and the agent is not
-run. `/plan` and `/act` also move the session to `read-only` / `workspace-write` and
-send `current_mode_update`. Not offered: `/run` (long, must stream and honour cancel —
-next step), `/bg` / `/jobs` / `/kill` (shell jobs outside the permission mode, with
-completion reported by the REPL loop), and the terminal-session commands (`/quit`,
-`/clear`, `/resume`, `/model`, `/add-dir`, `/forget`, `/help`, `/status` and the other
-information screens). Anything else starting with `/` is answered with the list.
+**Slash commands.** `/undo`, `/plan`, `/act`, `/diff`, `/links`, `/roadmap`, `/run`,
+`/doctor`, `/memories`, `/remember`, `/worktree`, `/agent` and `/roles` are announced,
+with the description and argument hint from `slash_commands::COMMANDS`. A prompt that
+parses as a slash command runs the REPL's own handler inside `console::capture`, which
+returns what the handler printed on that thread; that text is the reply, and the agent
+is not run. `/plan` and `/act` also move the session to `read-only` / `workspace-write`
+and send `current_mode_update`. Not offered: `/bg` / `/jobs` / `/kill` (shell jobs
+outside the permission mode, with completion reported by the REPL loop), and the
+terminal-session commands (`/quit`, `/clear`, `/resume`, `/model`, `/add-dir`,
+`/forget`, `/help`, `/status` and the other information screens). Anything else
+starting with `/` is answered with the list.
+
+**`/run`: the ledger as a live plan (`acp_agent::run`).** The REPL's handler is now one
+function, `cli::run_ledger::run`, which both front ends call: the REPL with a status
+bar (`Watch::Terminal`), `--acp` with its own `runner::Progress` (`Watch::By`) inside
+`console::stream`, which hands every write the run makes on the session's thread to the
+client as it is made (whole lines as `agent_message_chunk`). The runner now also tells
+its `Progress` the whole ledger (`Progress::ledger`) at the top of every round and when
+a task is claimed; `--acp` sends it as a `plan` — one entry per task, in ledger order,
+the task's title as the text, `completed` for `Done`, `in_progress` for `Running`,
+`pending` for every other state (`Blocked`, `Abandoned` and `Cancelled` say so in the
+text); every entry is `medium`, because a ledger task has no priority. A plan is sent
+only when it changed. The app shows it as "Plan · n of m". `session/cancel` trips the
+session's token, which the run looks at between tasks — where Ctrl-C and the
+interface's stop file (still watched) land — so the task already running finishes and
+is verified first, and the prompt then answers `cancelled`. A run is refused in a
+`read-only` session: every task changes files.
+
+**The pickers (`acp_agent::config`).** `configOptions` holds two selects, in the flat
+shape the owner's app reads: `agent` — the catalogue's usable agents
+(`Catalogue::usable_chain`), current = the session's lead; and `role` — the seven
+`roles::KNOWN_ROLES`, each described with the operator's models for it, current `plan`
+(the role `prepare_session` routes the session's model by), with the model the next turn
+asks for in the option's description. A choice is kept on the reader and answered at
+once; the session's thread applies it before the next turn: a new agent is built the
+way the session's own was (`route_backend`) and put in with
+`AgentSession::switch_backend`, which carries over the session's tools, roots, cancel
+token, mode, prompter, memory id and context (the replaced agent becomes a standby
+unless it is the API route; the new one starts a fresh conversation); the role then
+routes the model with `AgentSession::use_role` (the operator's candidates first, then
+the agent's own ladder, as the ledger's worker does). `config_option_update` is sent
+whenever the options change for another reason — a choice applied (with the model it
+settled on), or a standby that took over the session.
+
+**The client's MCP servers (`toolbox::client_servers`).** The `mcpServers` of
+`session/new` / `session/load` are NOT handed to the agent CLI: incode starts each
+stdio server itself (`toolbox::mcp_client`, the client half extracted from the desktop's,
+which now uses it too), lists its tools, and offers each through the Toolbox as
+`mcp__<server>__<tool>` (names made `[A-Za-z0-9_-]`, at most 64 characters; the
+server's `inputSchema` compiled once and checked on every call). Every such call goes
+through `Toolbox::run_call`'s gate like any other: schema, guards, the permission mode,
+the engine's `pre-tool`, the person to ask — with reach `run`, so it is refused
+read-only, asked under `prompt`, and refused when the engine cannot decide (fail
+closed). Bounds: `initialize` and `tools/list` 20 s each, servers started in parallel;
+a call 120 s, abandoned at once when the turn is stopped; at most 16 servers and 128
+tools each; stdout lines 16 MiB. A server gets the filtered environment plus the
+client's variables, and runs in the workspace. The servers are children of incode,
+held in `SessionTools`: when the session ends they get EOF, 2 s, then their process
+trees are killed. HTTP and SSE servers are not started (no HTTP MCP client exists in
+the crate), and `initialize` says so — so the owner's app, which sends its Incord
+Memory server only when `http` is true, sends none.
+
+**Loading a session (`acp_agent::history`).** An ACP session always keeps its
+transcript (`MemoryHooks::keep_transcript`, with or without an engine), and after each
+turn a `session::Record` names the model's conversation, the backend holding it
+(`agent`) and the ACP id (`incode_session`). `session/load` replays the transcript
+(bounded at 2 MiB, newest kept, the cut said) and then: when the record's agent is the
+agent now leading (and not the API route, whose conversation lived in the process that
+ended), the model's conversation is resumed by id (`AgentSession::resume`, which the
+claude bridge passes as `--resume`); otherwise the newest 24 KiB of the transcript
+rides the next turn as context, marked as a replay. The memory engine's session-start
+fires with `resume`.
 
 **Permission requests (agent → client).** When the memory engine's `pre-tool` says a
 call on incode's own Toolbox needs a person (see "The engine's hooks" below), the
@@ -129,10 +195,16 @@ answered and the late answer is dropped. `AskUserQuestion` is NOT sent to the cl
 the owner's app answers every agent request other than `session/request_permission`
 with `-32601`, so the model is told the question went unanswered, with its options.
 
-Not offered: `session/load` and `session/resume` (the agent CLI owns the transcript and
-an ACP session id has no stored mapping to it), the client's MCP servers
-(no seam in the backends, and a stdio server is a program the client would have this
-machine run), elicitation, and fs / terminal.
+Not offered: `session/resume` (stable in the schema; not needed by the owner's app,
+which calls neither it nor `session/load`), HTTP / SSE MCP servers, elicitation, and
+fs / terminal.
+
+**The workspace is made absolute once.** `prepare_session` canonicalises the workspace
+(`file_ops::workspace_root`, the plain `C:\x` spelling, not `\\?\C:\x`), and
+`file_ops::resolve_path` anchors a relative path to the process directory before it
+normalises it — `incode -w .` refused `LS "."` and every write into a new top-level
+directory as "path escapes the workspace", because `./.` normalised to an empty path
+and the walk to the nearest existing ancestor ended at nothing.
 
 ### The engine's hooks, run by incode for its own tools
 

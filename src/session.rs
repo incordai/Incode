@@ -73,6 +73,15 @@ pub struct Record {
     /// The opening instruction, trimmed — so a list of records is readable.
     #[serde(default)]
     pub title: String,
+    /// incode's own id for the session this conversation belongs to — the
+    /// ACP session id — when incode's session is the one that can be loaded
+    /// again. Empty for a REPL record, which is resumed by `agent_session`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub incode_session: String,
+    /// Which backend holds `agent_session` (its `id()`), so a session loaded
+    /// on another agent is not handed a conversation id that agent never had.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub agent: String,
 }
 
 /// A subagent conversation spawned by a session.
@@ -98,6 +107,8 @@ impl Record {
             opened: now,
             touched: now,
             title: String::new(),
+            incode_session: String::new(),
+            agent: String::new(),
         }
     }
 
@@ -233,6 +244,18 @@ pub fn save(root: &Path, record: &Record) {
     if let Ok(text) = serde_json::to_string_pretty(&held) {
         let _ = std::fs::write(path, text);
     }
+}
+
+/// The newest record of the conversation incode's session `id` last held in
+/// `workspace`, if one was written.
+#[must_use]
+pub fn of_incode_session(root: &Path, workspace: &Path, id: &str) -> Option<Record> {
+    if id.trim().is_empty() {
+        return None;
+    }
+    for_workspace(root, workspace)
+        .into_iter()
+        .find(|record| record.incode_session == id)
 }
 
 /// Every record from every workspace, newest first.

@@ -102,9 +102,34 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// What receives this thread's writes as they are made, while [`stream`] runs.
+type Sink = Box<dyn FnMut(&str)>;
+
+thread_local! {
+    /// The receiver [`stream`] installed on this thread, if one is running.
+    static STREAMED: std::cell::RefCell<Option<Sink>> = const { std::cell::RefCell::new(None) };
+}
+
 /// Hand `text` to the capture running on this thread, if there is one.
 /// `true` when it was taken.
 fn captured(text: &str) -> bool {
+    let streamed = STREAMED
+        .try_with(|slot| match slot.try_borrow_mut() {
+            Ok(mut held) => match held.as_mut() {
+                Some(sink) => {
+                    sink(text);
+                    true
+                }
+                None => false,
+            },
+            // The sink itself wrote through this module: its words are not
+            // handed back to it, and not shown either.
+            Err(_) => true,
+        })
+        .unwrap_or(false);
+    if streamed {
+        return true;
+    }
     CAPTURED
         .try_with(|slot| match slot.borrow_mut().as_mut() {
             Some(held) => {
@@ -154,6 +179,40 @@ pub fn capture<T>(f: impl FnOnce() -> T) -> (T, String) {
     (value, text)
 }
 
+/// Run `f`, handing everything it writes through this module on THIS thread
+/// to `sink` as it is written, instead of showing it.
+///
+/// [`capture`] for work that takes minutes: `incode --acp` runs the ledger
+/// (`/run`) inside this, so what the run prints reaches the client while the
+/// run goes rather than all at once when it ends. Per thread and without
+/// styling, for the reasons [`capture`] gives. A write made while `sink` is
+/// running is dropped rather than handed back to it.
+pub fn stream<T>(sink: Sink, f: impl FnOnce() -> T) -> T {
+    /// Puts back whatever was streaming before, even if `f` panics.
+    struct Restore(Option<Option<Sink>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            if let Some(previous) = self.0.take() {
+                let _ = STREAMED.try_with(|slot| {
+                    if let Ok(mut held) = slot.try_borrow_mut() {
+                        *held = previous;
+                    }
+                });
+            }
+        }
+    }
+
+    let previous = STREAMED
+        .try_with(|slot| {
+            slot.try_borrow_mut()
+                .ok()
+                .and_then(|mut held| held.replace(sink))
+        })
+        .unwrap_or(None);
+    let _restore = Restore(Some(previous));
+    f()
+}
+
 /// Write text exactly as given, with no newline added.
 ///
 /// Every `print!` in the codebase becomes this, so streaming replies are
@@ -190,10 +249,13 @@ pub fn emit(text: &str) {
 pub fn style<T: std::fmt::Display>(command: T) {
     // Inside a capture the text is what is wanted; an escape code in it would
     // reach a client that is not a terminal as noise.
-    if CAPTURED
+    let held = CAPTURED
         .try_with(|slot| slot.borrow().is_some())
         .unwrap_or(false)
-    {
+        || STREAMED
+            .try_with(|slot| slot.try_borrow().map(|held| held.is_some()).unwrap_or(true))
+            .unwrap_or(false);
+    if held {
         return;
     }
     emit(&command.to_string());
@@ -363,6 +425,33 @@ mod tests {
         assert!(panicked.is_err());
         emit_line("visible");
         assert_eq!(lines(), vec!["visible"], "the panic left capture on");
+    }
+
+    /// **A STREAM HANDS EACH WRITE OVER AS IT IS MADE**, on its own thread
+    /// only, without styling, and the thread writes normally again after.
+    #[test]
+    fn stream_hands_over_each_write_as_it_is_made() {
+        let _g = fresh();
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+        let into = std::rc::Rc::clone(&seen);
+        let value = stream(
+            Box::new(move |text: &str| into.borrow_mut().push(text.to_string())),
+            || {
+                style(crossterm::style::SetForegroundColor(
+                    crossterm::style::Color::Red,
+                ));
+                emit("first ");
+                emit_line("line");
+                std::thread::spawn(|| emit_line("elsewhere"))
+                    .join()
+                    .expect("thread");
+                3
+            },
+        );
+        assert_eq!(value, 3);
+        assert_eq!(*seen.borrow(), vec!["first ", "line", "\n"]);
+        emit_line("after");
+        assert_eq!(lines(), vec!["elsewhere", "after"]);
     }
 
     #[test]

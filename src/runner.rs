@@ -816,6 +816,12 @@ impl OwnerChannel for NoOwner {
 pub trait Progress {
     /// Called when the count of finished tasks changes.
     fn advanced(&mut self, done: usize, total: usize);
+
+    /// The whole ledger as it stands: at the top of every round of the loop
+    /// — so after each task finished, failed or was set aside — and when a
+    /// task is claimed, so the one running now can be named. Told, never
+    /// asked: nothing it does reaches the ledger.
+    fn ledger(&mut self, _ledger: &Ledger) {}
 }
 
 /// Nobody watching.
@@ -1151,6 +1157,7 @@ fn work_the_ledger(
     }
 
     loop {
+        progress.ledger(ledger);
         if cancelled() {
             return RunOutcome {
                 stop: StopReason::Cancelled,
@@ -1381,6 +1388,7 @@ fn work_the_ledger(
             // honest response; looping on a stale view is not.
             continue;
         }
+        progress.ledger(ledger);
         attempted += 1;
 
         // Told what earlier tasks found BEFORE the attempt, not after: a fresh

@@ -11,9 +11,9 @@
 //! Only a command that is dispatched here AND makes sense without a terminal
 //! is announced. Left out on purpose:
 //!
-//! - `/run` — the autonomous loop. It runs for a long time, prints progress
-//!   as it goes and must honour `session/cancel` throughout; its handler is
-//!   written inline in the REPL loop. Offered once it streams over ACP.
+//! `/run` is offered, and run by the caller rather than here: it streams and
+//! sends the ledger as the plan (`super::run`).
+//!
 //! - `/bg`, `/jobs`, `/kill` — background shell jobs. They run a command
 //!   outside the agent and outside the session's permission mode, and their
 //!   completion is reported by the REPL loop between lines; here nothing
@@ -44,8 +44,8 @@ pub(crate) struct Settings {
 
 /// The commands offered, by name, in the order a menu shows them. Each is in
 /// [`COMMANDS`], which gives its description and its argument hint.
-const OFFERED: [&str; 12] = [
-    "undo", "plan", "act", "diff", "links", "roadmap", "doctor", "memories", "remember",
+const OFFERED: [&str; 13] = [
+    "undo", "plan", "act", "diff", "links", "roadmap", "run", "doctor", "memories", "remember",
     "worktree", "agent", "roles",
 ];
 
@@ -181,10 +181,11 @@ mod tests {
     /// is offered, instead of starting it.
     #[test]
     fn a_command_that_is_not_offered_is_not_run() {
-        for typed in ["/run", "/bg echo hi", "/quit", "/forget abc#1", "/nonsense"] {
+        for typed in ["/bg echo hi", "/quit", "/forget abc#1", "/nonsense"] {
             assert!(!is_offered(typed), "{typed}");
         }
         assert!(is_offered("/remember <what to remember>"));
         assert!(is_offered("/Undo"));
+        assert!(is_offered("/run"));
     }
 }

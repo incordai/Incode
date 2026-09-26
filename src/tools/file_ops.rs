@@ -171,6 +171,40 @@ fn compute_diff(old: &str, new: &str, path: &str) -> String {
 /// inside the workspace pointing outside it is caught too — while the returned
 /// path stays in normal (non-verbatim) form so it remains usable and readable
 /// in messages.
+/// A workspace as a session holds it: absolute, symlinks resolved, and in the
+/// plain spelling (`C:\x`, not the verbatim `\\?\C:\x` that `canonicalize`
+/// returns on Windows), made once where the session is prepared.
+///
+/// # Errors
+///
+/// When the directory does not exist or cannot be resolved.
+pub fn workspace_root(workspace: &Path) -> Result<PathBuf> {
+    let resolved = workspace
+        .canonicalize()
+        .with_context(|| format!("the workspace {} is not accessible", workspace.display()))?;
+    if !resolved.is_dir() {
+        anyhow::bail!("the workspace {} is not a directory", workspace.display());
+    }
+    Ok(plain(resolved))
+}
+
+/// `path` without a Windows verbatim disk prefix; anything else unchanged.
+fn plain(path: PathBuf) -> PathBuf {
+    use std::path::{Component, Prefix};
+    let mut components = path.components();
+    match components.next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::VerbatimDisk(letter) => {
+                let mut out = PathBuf::from(format!("{}:\\", char::from(letter)));
+                out.extend(components.filter(|c| !matches!(c, Component::RootDir)));
+                out
+            }
+            _ => path,
+        },
+        _ => path,
+    }
+}
+
 fn resolve_path(workspace: &Path, path_str: &str) -> Result<PathBuf> {
     let requested = Path::new(path_str);
     let joined = if requested.is_absolute() {
@@ -178,6 +212,15 @@ fn resolve_path(workspace: &Path, path_str: &str) -> Result<PathBuf> {
     } else {
         workspace.join(requested)
     };
+    // Anchored before it is normalised. A workspace named relative to this
+    // process (`-w .`) makes `./.` normalise to an EMPTY path and `./new/x`
+    // to one whose first component does not exist — and the walk to the
+    // nearest existing ancestor then ended at nothing, which resolves to no
+    // location at all, so the workspace itself and every new top-level
+    // directory were refused as escapes.
+    let joined = std::path::absolute(&joined).with_context(|| {
+        format!("could not resolve {path_str} against this process's directory")
+    })?;
 
     let normalized = lexically_normalize(&joined);
 
@@ -235,6 +278,11 @@ fn real_location_of(path: &Path) -> PathBuf {
             // Reached a root that does not exist; nothing further to strip.
             _ => break,
         }
+    }
+    // A relative path whose every component is new: its nearest existing
+    // ancestor is the directory it is relative to.
+    if existing.as_os_str().is_empty() {
+        existing = Path::new(".");
     }
 
     let mut base = existing
@@ -381,6 +429,78 @@ mod tests {
             std::fs::read_to_string(workspace.join("newdir/newfile.txt")).unwrap(),
             "hello"
         );
+    }
+
+    /// A workspace named RELATIVE to this process's directory, as `-w .`
+    /// names one: a scratch directory under `target/`, which `cargo test`
+    /// runs from the crate root beside.
+    fn relative_workspace() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::Builder::new()
+            .prefix("relative-ws")
+            .tempdir_in("target")
+            .unwrap();
+        let name = dir.path().file_name().unwrap().to_os_string();
+        (dir, Path::new("target").join(name))
+    }
+
+    /// Removes a directory this test made in the process's directory, even
+    /// when an assertion fails first.
+    struct MadeHere(PathBuf);
+
+    impl Drop for MadeHere {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// **A RELATIVE WORKSPACE IS STILL A WORKSPACE.** With the workspace
+    /// named `.` — `incode -w .` — `LS "."` names the workspace itself, and a
+    /// write into a directory that does not exist yet lands inside it. Both
+    /// were refused as "path escapes the workspace": the path normalised to a
+    /// relative one whose first component did not exist, so the walk to the
+    /// nearest existing ancestor ended at an empty path, which resolves to
+    /// nothing. A `..` out of it is still refused.
+    #[test]
+    fn a_relative_workspace_resolves_itself_and_new_directories() {
+        let workspace = Path::new(".");
+
+        let itself = target_path(workspace, r#"{"path":"."}"#);
+        assert!(itself.is_ok(), "the workspace itself: {itself:?}");
+
+        // A directory that does not exist yet, at the top of the workspace —
+        // the case that walked up to nothing. Removed however the test ends.
+        let fresh = format!("relative-ws-probe-{}", uuid::Uuid::new_v4().simple());
+        let _made = MadeHere(PathBuf::from(&fresh));
+        let input =
+            serde_json::json!({"path": format!("{fresh}/new.txt"), "content": "made"}).to_string();
+        let wrote = write_file(workspace, &input);
+        assert!(wrote.is_ok(), "a write into a new directory: {wrote:?}");
+        assert_eq!(
+            std::fs::read_to_string(Path::new(&fresh).join("new.txt")).unwrap(),
+            "made"
+        );
+
+        let escape = target_path(workspace, r#"{"path":"../outside.txt"}"#);
+        assert!(escape.is_err(), "a `..` out of it: {escape:?}");
+    }
+
+    /// The workspace a session is prepared with is made absolute and
+    /// canonical once, in the plain spelling the rest of the harness prints.
+    #[test]
+    fn a_workspace_root_is_absolute_and_plain() {
+        let (_dir, workspace) = relative_workspace();
+        let root = workspace_root(&workspace).unwrap();
+        assert!(root.is_absolute(), "{}", root.display());
+        assert!(
+            !root.to_string_lossy().starts_with(r"\\?\"),
+            "no verbatim prefix: {}",
+            root.display()
+        );
+        assert_eq!(
+            root.canonicalize().unwrap(),
+            workspace.canonicalize().unwrap()
+        );
+        assert!(workspace_root(Path::new("target/no-such-dir-here")).is_err());
     }
 
     #[test]

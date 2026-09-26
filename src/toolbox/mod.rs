@@ -56,11 +56,13 @@ use crate::agent::AgentBackend;
 mod browser;
 mod cdp;
 mod checks;
+mod client_servers;
 mod convert;
 mod desktop;
 mod edits;
 mod image;
 mod listing;
+mod mcp_client;
 mod outline;
 mod pdf;
 mod shell;
@@ -68,6 +70,7 @@ mod team;
 mod todo;
 mod validate;
 
+pub(crate) use client_servers::ServerSpec;
 pub use desktop::DesktopSetup;
 pub use image::{Image, ImageFormat, ToolOutput};
 pub(crate) use todo::{parse_todos, Priority, TodoStatus};
@@ -217,6 +220,12 @@ pub struct SessionTools {
     /// The desktop child, started on the first desktop call and stopped —
     /// EOF, then its tree — when the session's tools are dropped.
     desktop: Mutex<Option<desktop::DesktopClient>>,
+    /// The MCP servers the session's client handed it, once connected —
+    /// stopped, EOF and then their trees, when the session's tools are
+    /// dropped. See [`client_servers`].
+    client: OnceLock<client_servers::ClientServers>,
+    /// Whether a process these tools start gets the filtered environment.
+    filter_env: bool,
 }
 
 impl SessionTools {
@@ -231,7 +240,37 @@ impl SessionTools {
             todos: Mutex::new(Vec::new()),
             browsers: Mutex::new(browser::Browsers::default()),
             desktop: Mutex::new(None),
+            client: OnceLock::new(),
+            filter_env,
         })
+    }
+
+    /// Start the MCP servers the session's client named, in `cwd`, and offer
+    /// their tools through every toolbox sharing this state. Once per
+    /// session: a second call starts nothing. Returns what happened, a line
+    /// per server and per tool left out.
+    pub(crate) fn connect_client_servers(&self, specs: Vec<ServerSpec>, cwd: &Path) -> Vec<String> {
+        if specs.is_empty() {
+            return Vec::new();
+        }
+        if self.client.get().is_some() {
+            return vec!["this session's MCP servers are already connected".to_string()];
+        }
+        let (servers, said) = client_servers::ClientServers::connect(specs, cwd, self.filter_env);
+        if self.client.set(servers).is_err() {
+            return vec!["this session's MCP servers are already connected".to_string()];
+        }
+        said
+    }
+
+    /// The client's servers, when any were connected.
+    fn client(&self) -> Option<&client_servers::ClientServers> {
+        self.client.get()
+    }
+
+    /// Whether `name` is a tool of one of the client's servers.
+    fn is_client_tool(&self, name: &str) -> bool {
+        name.starts_with(client_servers::PREFIX) && self.client().is_some_and(|c| c.has(name))
     }
 
     /// The session's background jobs.
@@ -897,7 +936,7 @@ impl Toolbox {
     #[must_use]
     pub fn definitions(&self) -> Vec<Value> {
         let browser = self.browser().is_some();
-        catalogue()
+        let mut all: Vec<Value> = catalogue()
             .into_iter()
             .filter(|def| {
                 def.get("name")
@@ -917,7 +956,13 @@ impl Toolbox {
                 }
                 def
             })
-            .collect()
+            .collect();
+        // The tools of the MCP servers the session's client handed it, run
+        // through the same gate as the rest.
+        if let Some(client) = self.state.client() {
+            all.extend(client.definitions());
+        }
+        all
     }
 
     /// The name of every tool offered.
@@ -1163,8 +1208,17 @@ impl Toolbox {
     /// pictures kept, for a caller that can send them on.
     pub fn run_call(&self, call_id: &str, name: &str, input: &Value) -> Result<ToolOutput, String> {
         // A name nobody classified is not a tool: refused before a guard, a
-        // person or the engine is asked about it.
-        let Some(reach) = reach_of(name) else {
+        // person or the engine is asked about it. A tool of the client's MCP
+        // servers RUNS something nobody here can inspect, so it is `run`:
+        // refused read-only, asked under prompt, refused when the engine
+        // cannot decide.
+        let client_tool = self.state.is_client_tool(name);
+        let reach = if client_tool {
+            Some(Reach::Run)
+        } else {
+            reach_of(name)
+        };
+        let Some(reach) = reach else {
             crate::trace!("tool", "{name} REFUSED: no such tool");
             return Err(format!("there is no tool called `{name}`"));
         };
@@ -1182,7 +1236,11 @@ impl Toolbox {
         }
         // The input the tool's own schema promised, before anything is asked
         // or decided about it: a malformed call runs nothing.
-        if let Err(problems) = validate::check(name, input) {
+        let checked = match self.state.client() {
+            Some(client) if client_tool => client.check(name, input),
+            _ => validate::check(name, input),
+        };
+        if let Err(problems) = checked {
             crate::trace!("tool", "{name} REFUSED: input does not match its schema");
             return Err(problems);
         }
@@ -1468,6 +1526,7 @@ impl Toolbox {
                 None => Err(Self::unavailable(name)),
             },
             other if desktop::is_desktop(other) => self.run_desktop(other, input),
+            other if self.state.is_client_tool(other) => self.run_client_tool(other, input),
             other => self.dispatch_text(other, input).map(ToolOutput::from),
         };
         // The OUTCOME, not just the attempt. A tool that ran and failed and a
@@ -1506,6 +1565,20 @@ impl Toolbox {
         match slot.as_mut() {
             Some(client) => client.call(name, input),
             None => Err("the desktop could not be started".to_string()),
+        }
+    }
+
+    /// One tool of the client's MCP servers, run by its server — and given up
+    /// on at once when the turn is stopped.
+    fn run_client_tool(&self, name: &str, input: &Value) -> Result<ToolOutput, String> {
+        let stopped = || {
+            self.cancel
+                .as_ref()
+                .is_some_and(crate::runtime::cancel::CancelToken::is_cancelled)
+        };
+        match self.state.client() {
+            Some(client) => client.call(name, input, &stopped),
+            None => Err(format!("there is no tool called `{name}`")),
         }
     }
 
@@ -1584,3 +1657,9 @@ mod reading_tests;
 
 #[cfg(test)]
 mod picture_tests;
+
+#[cfg(test)]
+mod client_tool_tests;
+
+#[cfg(test)]
+pub(crate) use client_servers::tests::{calls_in as client_server_calls, fake_server};

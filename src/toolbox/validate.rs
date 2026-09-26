@@ -51,6 +51,16 @@ pub(super) fn check(name: &str, input: &Value) -> Result<(), String> {
             "NOT RUN — `{name}` has no input schema, so its input cannot be checked"
         ));
     };
+    check_with(name, entry, input)
+}
+
+/// [`check`], against a schema compiled elsewhere — a tool of an MCP server
+/// the session connected, whose schema is known only once it is listed.
+pub(super) fn check_with(
+    name: &str,
+    entry: &Result<jsonschema::Validator, String>,
+    input: &Value,
+) -> Result<(), String> {
     let validator = entry
         .as_ref()
         .map_err(|why| format!("NOT RUN — the input schema of `{name}` does not compile: {why}"))?;
