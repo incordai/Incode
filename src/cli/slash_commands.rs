@@ -59,6 +59,8 @@ pub enum SlashCommand {
     Worktree(Option<String>),
     /// Diff code or workspace against older versions.
     Diff(Option<String>),
+    /// Send a picture with the next message.
+    Image(String),
     Env,
     Quit,
     /// A REAL command, typed without what it needs. Carries the usage line.
@@ -150,6 +152,10 @@ impl SlashCommand {
             }
             "/worktree" | "/wt" => Self::Worktree(arg),
             "/diff" | "/df" => Self::Diff(arg),
+            "/image" | "/img" => match arg.filter(|path| !path.is_empty()) {
+                Some(path) => Self::Image(path),
+                None => Self::Usage("/image <path to a PNG or JPEG>".to_string()),
+            },
             "/env" => Self::Env,
             "/quit" | "/exit" | "/q" => Self::Quit,
             _ => Self::Unknown(cmd),
@@ -236,6 +242,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "/act",
         "Act mode — the agent applies changes, within the guards",
     ),
+    (
+        "/image <path>",
+        "Send a PNG or JPEG with your next message to the agent",
+    ),
     ("/bg <command>", "Run a bash command in the background"),
     ("/jobs", "List background jobs"),
     ("/kill <id>", "Kill a background job"),
@@ -300,6 +310,53 @@ pub fn handle_undo(
             }
         }
         Err(e) => render::print_error(&e),
+    }
+}
+
+/// The most bytes a picture file `/image` reads may have. Past the image
+/// bounds it is shrunk to fit (`toolbox::image`); this bounds what is read
+/// before that is tried.
+const MAX_IMAGE_FILE_BYTES: u64 = 32 * 1024 * 1024;
+
+/// `/image <path>`: a PNG or JPEG sent with the next message, made to fit the
+/// image bounds as a screenshot is. One picture: a second `/image` before
+/// the message replaces the first. An agent that cannot take pictures says
+/// so here, before anything is sent.
+pub fn handle_image(
+    session: &mut crate::cli::agent_turn::AgentSession,
+    workspace: &std::path::Path,
+    path: &str,
+) {
+    let path = path.trim().trim_matches('"');
+    let file = workspace.join(path);
+    let read = std::fs::metadata(&file)
+        .map_err(|e| format!("`{path}` could not be read: {e}"))
+        .and_then(|meta| {
+            if meta.len() > MAX_IMAGE_FILE_BYTES {
+                Err(format!(
+                    "`{path}` is {} bytes, past {MAX_IMAGE_FILE_BYTES}",
+                    meta.len()
+                ))
+            } else {
+                std::fs::read(&file).map_err(|e| format!("`{path}` could not be read: {e}"))
+            }
+        })
+        .and_then(|bytes| {
+            crate::toolbox::Image::fitted(bytes).map_err(|e| format!("`{path}`: {e}"))
+        });
+    let (picture, note) = match read {
+        Ok(fitted) => fitted,
+        Err(why) => return render::print_error(&why),
+    };
+    let shown = picture.placeholder();
+    match session.attach_images(vec![picture]) {
+        Ok(()) => {
+            outln!("Attached {shown}: it goes with your next message.");
+            if let Some(note) = note {
+                outln!("  ({note})");
+            }
+        }
+        Err(why) => render::print_error(&why),
     }
 }
 
@@ -1515,6 +1572,19 @@ mod tests {
 
     /// The command is the only way a user reaches undo, so both spellings are
     /// pinned — and `/u` must not be swallowed by some other prefix match.
+    /// `/image` takes a path, and without one says what it needs.
+    #[test]
+    fn parses_image() {
+        assert_eq!(
+            SlashCommand::parse("/image shots/a.png"),
+            Some(SlashCommand::Image("shots/a.png".to_string()))
+        );
+        assert!(matches!(
+            SlashCommand::parse("/image"),
+            Some(SlashCommand::Usage(usage)) if usage.starts_with("/image <path")
+        ));
+    }
+
     #[test]
     fn parses_undo() {
         assert_eq!(SlashCommand::parse("/run"), Some(SlashCommand::Run));

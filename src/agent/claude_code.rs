@@ -67,6 +67,11 @@ struct StreamDelta {
     delta_type: String,
     #[serde(default)]
     text: String,
+    /// A `thinking_delta`'s text. Measured on 2.1.283: EMPTY unless the run
+    /// asked for `--thinking-display summarized` (the default display,
+    /// `updates`, sends only `estimated_tokens`).
+    #[serde(default)]
+    thinking: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -302,6 +307,10 @@ pub struct ClaudeCodeBackend {
     /// the write (see [`crate::toolbox::Toolbox`]); these stay as the readable
     /// statement of what the session protects.
     deny: Vec<String>,
+    /// Pictures for the next turn's prompt only, already inside the image
+    /// bounds. A turn that carries any is given its prompt on stdin, as a
+    /// stream-json user message (see [`user_message`]).
+    images: Vec<crate::toolbox::Image>,
 }
 
 /// What THIS agent calls its sub-agent tool.
@@ -348,11 +357,15 @@ fn render_denials(restrictions: &crate::guards::Restrictions) -> Vec<String> {
 impl ClaudeCodeBackend {
     #[must_use]
     pub fn new(workspace: PathBuf) -> Self {
+        // The filtered environment for the shell tool: a command the model
+        // chose must not inherit this process's credentials.
+        let mut tools = crate::toolbox::Toolbox::new(&workspace, true);
+        // The `Agent` tool's sub-agent runs on this same CLI when no model
+        // endpoint is configured.
+        tools.run_subagents_on("claude");
         Self {
             binary: "claude".to_string(),
-            // The filtered environment for the shell tool: a command the model
-            // chose must not inherit this process's credentials.
-            tools: crate::toolbox::Toolbox::new(&workspace, true),
+            tools,
             calls: 0,
             workspace,
             session_id: None,
@@ -364,7 +377,16 @@ impl ClaudeCodeBackend {
             guards: crate::guards::Guards::default(),
             cancel: None,
             deny: Vec::new(),
+            images: Vec::new(),
         }
+    }
+
+    /// The same backend, one level further down the tree of agents: its
+    /// toolbox refuses a delegation past the depth limit.
+    #[must_use]
+    pub fn at_depth(mut self, depth: u8) -> Self {
+        self.tools = self.tools.at_depth(depth);
+        self
     }
 
     /// Let the agent work in directories beyond the workspace.
@@ -475,6 +497,7 @@ impl ClaudeCodeBackend {
     #[must_use]
     pub fn with_binary(mut self, binary: impl Into<String>) -> Self {
         self.binary = binary.into();
+        self.tools.run_subagents_on(&self.binary);
         self
     }
 
@@ -545,11 +568,30 @@ impl ClaudeCodeBackend {
     /// `servers` as its only MCP servers and `allowed` the tool names it may
     /// send without asking. The bridge's address and token are added by the
     /// caller, which holds the bridge.
-    fn command(&self, prompt: &str, context: &str, servers: &str, allowed: &[String]) -> Command {
+    ///
+    /// `prompt` is `None` for a turn carrying pictures, whose prompt goes on
+    /// stdin instead, as one stream-json user message ([`user_message`]): `-p`
+    /// with no prompt and `--input-format stream-json`. Measured on 2.1.283: a
+    /// message with a base64 PNG block was described correctly, and the CLI
+    /// ended when stdin closed.
+    fn command(
+        &self,
+        prompt: Option<&str>,
+        context: &str,
+        servers: &str,
+        allowed: &[String],
+    ) -> Command {
         let mut cmd = Command::new(&self.binary);
-        cmd.arg("-p")
-            .arg(prompt)
-            .arg("--output-format")
+        cmd.arg("-p");
+        match prompt {
+            Some(prompt) => {
+                cmd.arg(prompt);
+            }
+            None => {
+                cmd.arg("--input-format").arg("stream-json");
+            }
+        }
+        cmd.arg("--output-format")
             .arg("stream-json")
             .args(MODEL_ONLY_FLAGS)
             .arg("--mcp-config")
@@ -567,6 +609,12 @@ impl ClaudeCodeBackend {
         }
         if self.partial_messages {
             cmd.arg("--include-partial-messages");
+            // The model's reasoning as text a person can read, streamed as
+            // `thinking_delta`s. Not in `--help` on 2.1.283 (it is in the
+            // CLI's option table, choices summarized / omitted / highlights);
+            // measured: without it every thinking delta arrived EMPTY, with it
+            // the summary arrived word by word, beside an unchanged reply.
+            cmd.arg("--thinking-display").arg("summarized");
         }
         if !context.is_empty() {
             cmd.arg("--append-system-prompt").arg(context);
@@ -616,6 +664,19 @@ impl ClaudeCodeBackend {
     }
 }
 
+/// One stream-json user message: the prompt as a text block, then each
+/// picture as a base64 image block — the shape the CLI reads on stdin with
+/// `--input-format stream-json`, one message per line.
+fn user_message(prompt: &str, images: &[crate::toolbox::Image]) -> String {
+    let mut content = vec![serde_json::json!({"type": "text", "text": prompt})];
+    content.extend(images.iter().map(crate::agent::api::image_block));
+    let message = serde_json::json!({
+        "type": "user",
+        "message": {"role": "user", "content": content},
+    });
+    format!("{message}\n")
+}
+
 /// Map one wire line to zero or more harness events.
 ///
 /// Split out from the process plumbing so it can be tested against captured
@@ -647,6 +708,8 @@ fn map_line(line: &str, outcome: &mut Option<TurnOutcome>) -> Vec<AgentEvent> {
                 if let Some(delta) = e.event.delta {
                     if delta.delta_type == "text_delta" && !delta.text.is_empty() {
                         events.push(AgentEvent::TextDelta(delta.text));
+                    } else if delta.delta_type == "thinking_delta" && !delta.thinking.is_empty() {
+                        events.push(AgentEvent::Thinking(delta.thinking));
                     }
                 }
             }
@@ -1107,6 +1170,19 @@ impl AgentBackend for ClaudeCodeBackend {
         self.tools.names()
     }
 
+    /// The tools are incode's toolbox's on this route, so the toolbox is
+    /// what is watched.
+    fn set_watch(&mut self, watch: std::sync::Arc<dyn crate::watch::Watch>) {
+        self.tools.set_watch(watch);
+    }
+
+    /// Taken headless: the next turn's prompt goes on stdin as a stream-json
+    /// message carrying them — see [`ClaudeCodeBackend::command`].
+    fn attach_images(&mut self, images: Vec<crate::toolbox::Image>) -> Result<(), String> {
+        self.images = images;
+        Ok(())
+    }
+
     fn model(&self) -> Option<&str> {
         ClaudeCodeBackend::model(self)
     }
@@ -1175,6 +1251,9 @@ impl AgentBackend for ClaudeCodeBackend {
     ) -> Result<TurnOutcome, AgentError> {
         let (budgeted_prompt, budgeted_context) =
             crate::agent::budget_for_spawn(prompt, &self.system_context);
+        // This turn's pictures, and only this turn's: taken now, so a turn
+        // that fails to start does not carry them into the next one.
+        let images = std::mem::take(&mut self.images);
 
         // THE TOOLS ARE incode's. The CLI's own are switched off below and the
         // model is handed incode's toolbox through the bridge, which this
@@ -1198,7 +1277,12 @@ impl AgentBackend for ClaudeCodeBackend {
                 })?;
         let (servers, allowed) = servers_for(&exe);
 
-        let mut cmd = self.command(&budgeted_prompt, &budgeted_context, &servers, &allowed);
+        let mut cmd = self.command(
+            images.is_empty().then_some(budgeted_prompt.as_str()),
+            &budgeted_context,
+            &servers,
+            &allowed,
+        );
         // How the tool server finds this process: through the CLI's
         // environment, which the servers it starts inherit — never its argv.
         for (key, value) in bridge.env() {
@@ -1254,16 +1338,31 @@ impl AgentBackend for ClaudeCodeBackend {
         }
 
         // stdin must be closed explicitly, or the CLI waits ~3s for piped input
-        // on every invocation.
+        // on every invocation. A turn with pictures writes its one message
+        // there instead, and closes it.
         crate::agent::process_tree::prepare(&mut cmd);
         let mut child = cmd
             .current_dir(&self.workspace)
-            .stdin(Stdio::null())
+            .stdin(if images.is_empty() {
+                Stdio::null()
+            } else {
+                Stdio::piped()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| AgentError::new(format!("failed to spawn `{}`: {e}", self.binary)))?;
         let tree = crate::agent::process_tree::Tree::adopt(&child);
+        if let Some(mut stdin) = child.stdin.take() {
+            // On a thread of its own: the message can be megabytes, and a
+            // pipe the CLI is not reading yet must not stall this loop.
+            let message = user_message(&budgeted_prompt, &images);
+            std::thread::spawn(move || {
+                use std::io::Write as _;
+                let _ = stdin.write_all(message.as_bytes());
+                // Dropped here: the CLI ends its input, and its turn, on EOF.
+            });
+        }
 
         let stdout = child
             .stdout
@@ -1320,7 +1419,7 @@ impl AgentBackend for ClaudeCodeBackend {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
 
     /// Build a home directory holding the named profiles.
     ///
@@ -2184,7 +2283,7 @@ mod tests {
             "control: there are deny rules that could leak onto the argv"
         );
         let (servers, allowed) = servers_for(std::path::Path::new("incode"));
-        let cmd = backend.command("hi", "", &servers, &allowed);
+        let cmd = backend.command(Some("hi"), "", &servers, &allowed);
         let args = args_of(&cmd);
 
         assert_eq!(
@@ -2397,5 +2496,103 @@ mod tests {
             started.elapsed()
         );
         drop(to);
+    }
+
+    /// **A TURN WITH PICTURES GIVES ITS PROMPT ON STDIN**, as the stream-json
+    /// message the CLI was measured reading: no prompt on the argv, the input
+    /// format named, and the message holding the text then each picture as a
+    /// base64 image block. Thinking is asked for as a readable summary when
+    /// partial messages are on.
+    #[test]
+    fn a_turn_with_pictures_sends_its_prompt_as_a_stream_json_message() {
+        let backend = ClaudeCodeBackend::new(PathBuf::from(".")).streaming(true);
+        let (servers, allowed) = servers_for(std::path::Path::new("incode"));
+        let args = args_of(&backend.command(None, "", &servers, &allowed));
+        assert_eq!(value_after(&args, "-p").as_deref(), Some("--input-format"));
+        assert_eq!(
+            value_after(&args, "--input-format").as_deref(),
+            Some("stream-json")
+        );
+        assert_eq!(
+            value_after(&args, "--thinking-display").as_deref(),
+            Some("summarized")
+        );
+        let plain = args_of(&backend.command(Some("hi"), "", &servers, &allowed));
+        assert_eq!(value_after(&plain, "-p").as_deref(), Some("hi"));
+        assert!(!plain.iter().any(|a| a == "--input-format"), "{plain:?}");
+
+        let picture = crate::toolbox::Image::from_base64(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC",
+        )
+        .expect("a 1x1 png");
+        let line = user_message("what is this", std::slice::from_ref(&picture));
+        assert!(line.ends_with('\n'));
+        let message: serde_json::Value = serde_json::from_str(line.trim()).expect("json");
+        assert_eq!(message["type"], "user");
+        let content = &message["message"]["content"];
+        assert_eq!(
+            content[0],
+            serde_json::json!({"type": "text", "text": "what is this"})
+        );
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["source"]["media_type"], "image/png");
+        assert_eq!(content[1]["source"]["data"], picture.base64());
+    }
+
+    /// A summarized thinking delta is the model's reasoning; an empty one —
+    /// the default display — is nothing.
+    #[test]
+    fn a_thinking_delta_becomes_a_thought_and_an_empty_one_nothing() {
+        let line = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"This is a","estimated_tokens":null}},"session_id":"c2","parent_tool_use_id":null,"thinking_display":"summarized"}"#;
+        let (events, _) = map(line);
+        assert!(
+            matches!(events.as_slice(), [AgentEvent::Thinking(t)] if t == "This is a"),
+            "{events:?}"
+        );
+        let empty = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"","estimated_tokens":50}},"session_id":"d4","parent_tool_use_id":null,"thinking_display":"updates"}"#;
+        assert!(map(empty).0.is_empty());
+    }
+
+    /// A stand-in for the agent CLI, for tests elsewhere in the crate: it prints
+    /// a short stream-json turn — a summarized thinking delta, the reply
+    /// `three files`, the result — and ignores its argv and stdin. With `waits`
+    /// it pauses half a minute after the session starts, so a test can stop it.
+    pub(crate) fn stand_in_cli(dir: &std::path::Path, waits: bool) -> PathBuf {
+        const LINES: [&str; 5] = [
+            r#"{"type":"system","subtype":"init","session_id":"sub-conv-1","model":"fake-sub-model"}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"looking around"}},"parent_tool_use_id":null}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"three files"}},"parent_tool_use_id":null}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"three files"}]},"parent_tool_use_id":null}"#,
+            r#"{"type":"result","is_error":false,"stop_reason":"end_turn","session_id":"sub-conv-1","usage":{"input_tokens":1,"output_tokens":1}}"#,
+        ];
+        #[cfg(windows)]
+        {
+            let mut body = format!("@echo off\r\necho {}\r\n", LINES[0]);
+            if waits {
+                body.push_str("ping -n 30 127.0.0.1 >nul\r\n");
+            }
+            for line in &LINES[1..] {
+                body.push_str(&format!("echo {line}\r\n"));
+            }
+            let path = dir.join(if waits { "slow-agent.cmd" } else { "agent.cmd" });
+            std::fs::write(&path, body).expect("write the stand-in agent");
+            path
+        }
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut body = format!("#!/bin/sh\necho '{}'\n", LINES[0]);
+            if waits {
+                body.push_str("sleep 30\n");
+            }
+            for line in &LINES[1..] {
+                body.push_str(&format!("echo '{line}'\n"));
+            }
+            let path = dir.join(if waits { "slow-agent.sh" } else { "agent.sh" });
+            std::fs::write(&path, body).expect("write the stand-in agent");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("make it runnable");
+            path
+        }
     }
 }

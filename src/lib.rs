@@ -49,6 +49,7 @@ pub mod tools;
 pub mod trace;
 pub mod transcript;
 pub mod verify;
+pub mod watch;
 pub mod web;
 pub mod wiring;
 

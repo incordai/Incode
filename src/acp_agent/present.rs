@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use agent_client_protocol_schema::v1 as acp;
 use serde_json::Value;
 
-use crate::cli::agent_turn::{Before, TurnStart};
+use crate::cli::agent_turn::Before;
 use crate::cli::edits::Asked;
 
 /// The most of one tool's output sent to the client, in bytes.
@@ -31,16 +31,29 @@ pub(crate) const MAX_TOOL_OUTPUT_BYTES: usize = 64 * 1024;
 /// the way output is, and the cut says so.
 pub(crate) const MAX_DIFF_TEXT_BYTES: usize = MAX_TOOL_OUTPUT_BYTES / 2;
 
-/// The instruction a prompt's content blocks make, in the client's order.
+/// What one prompt carries: the instruction its blocks make, and its
+/// pictures.
+#[derive(Debug)]
+pub(crate) struct Prompted {
+    pub(crate) text: String,
+    pub(crate) images: Vec<crate::toolbox::Image>,
+}
+
+/// The instruction a prompt's content blocks make, in the client's order, and
+/// the pictures it carries.
 ///
 /// # What is accepted
 ///
 /// Text, and — as the protocol requires of every agent — resource links. An
 /// embedded TEXT resource is accepted too, because `embeddedContext` is
-/// advertised. Images, audio and binary attachments are not advertised, so
-/// one arriving is refused rather than silently dropped: a prompt that loses
-/// part of what the person attached reads to them as a prompt the agent
-/// ignored.
+/// advertised, and images, because `image` is: each a PNG or a JPEG inside the
+/// toolbox's image bounds (`toolbox::image`), at most
+/// [`crate::toolbox::MAX_IMAGES_PER_RESULT`] of them, checked from their own
+/// bytes whatever the client called them. Audio and binary attachments are
+/// not advertised, so one arriving is refused rather than silently dropped: a
+/// prompt that loses part of what the person attached reads to them as a
+/// prompt the agent ignored. Whether the agent can take the pictures is
+/// decided when they are handed to it.
 ///
 /// # Paths from the client
 ///
@@ -48,11 +61,12 @@ pub(crate) const MAX_DIFF_TEXT_BYTES: usize = MAX_TOOL_OUTPUT_BYTES / 2;
 /// This agent never reads it — the agent CLI does, with its own tools and its
 /// own guards — but naming a path outside the workspace to it would be an
 /// invitation to go there, and the client is not trusted to decide that.
-pub(crate) fn prompt_text(
+pub(crate) fn prompt_parts(
     blocks: &[acp::ContentBlock],
     workspace: &Path,
-) -> Result<String, String> {
+) -> Result<Prompted, String> {
     let mut parts: Vec<String> = Vec::new();
+    let mut images = Vec::new();
     for block in blocks {
         match block {
             acp::ContentBlock::Text(text) => parts.push(text.text.clone()),
@@ -60,8 +74,14 @@ pub(crate) fn prompt_text(
             acp::ContentBlock::Resource(embedded) => {
                 parts.push(embedded_text(embedded, workspace)?)
             }
-            acp::ContentBlock::Image(_) => {
-                return Err("images are not accepted: this agent advertises `image: false`".into())
+            acp::ContentBlock::Image(image) => {
+                if images.len() >= crate::toolbox::MAX_IMAGES_PER_RESULT {
+                    return Err(format!(
+                        "at most {} pictures go with one prompt",
+                        crate::toolbox::MAX_IMAGES_PER_RESULT
+                    ));
+                }
+                images.push(picture(image)?);
             }
             acp::ContentBlock::Audio(_) => {
                 return Err("audio is not accepted: this agent advertises `audio: false`".into())
@@ -69,7 +89,22 @@ pub(crate) fn prompt_text(
             _ => return Err("a kind of content this agent does not accept".into()),
         }
     }
-    Ok(parts.join("\n\n"))
+    Ok(Prompted {
+        text: parts.join("\n\n"),
+        images,
+    })
+}
+
+/// One picture from the client, inside the bounds or refused with the bound
+/// it broke.
+fn picture(image: &acp::ImageContent) -> Result<crate::toolbox::Image, String> {
+    if !matches!(image.mime_type.as_str(), "image/png" | "image/jpeg") {
+        return Err(format!(
+            "a picture of type `{}` was sent; only PNG and JPEG are accepted",
+            image.mime_type
+        ));
+    }
+    crate::toolbox::Image::from_base64(&image.data)
 }
 
 fn linked(link: &acp::ResourceLink, workspace: &Path) -> Result<String, String> {
@@ -307,11 +342,16 @@ impl Edits {
     }
 
     /// The diff a result makes, or `None` when it shows as ordinary output.
+    ///
+    /// `before` says what a file held when the work began: the turn's
+    /// snapshot for the session's own turn
+    /// ([`crate::cli::agent_turn::TurnStart::before`]), nothing
+    /// known for a worker, which has none.
     pub(crate) fn landed(
         &mut self,
         id: &str,
         is_error: bool,
-        start: &TurnStart<'_>,
+        before: &dyn Fn(&Path) -> Before,
     ) -> Option<acp::Diff> {
         let asked = self.pending.remove(id)?;
         if is_error {
@@ -330,7 +370,7 @@ impl Edits {
                 let before = match self.latest.get(&path) {
                     Some(Some(text)) => Before::Held(text.clone()),
                     Some(None) => Before::Unknown,
-                    None => start.before(&path),
+                    None => before(&path),
                 };
                 let diff = match before {
                     Before::Held(old) => {
@@ -462,11 +502,15 @@ pub(crate) fn stop_reason(agent_said: &str) -> acp::StopReason {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     fn text(t: &str) -> acp::ContentBlock {
         acp::ContentBlock::from(t)
+    }
+
+    fn prompt_text(blocks: &[acp::ContentBlock], workspace: &Path) -> Result<String, String> {
+        prompt_parts(blocks, workspace).map(|prompted| prompted.text)
     }
 
     fn uri_of(path: &Path) -> String {
@@ -554,11 +598,49 @@ mod tests {
         assert!(prompt_text(&[web], workspace.path()).is_ok());
     }
 
+    /// A PNG of `width` x `height`, as base64.
+    pub(crate) fn png_base64(width: u32, height: u32) -> String {
+        use base64::Engine as _;
+        let mut bytes = Vec::new();
+        image::RgbImage::from_pixel(width, height, image::Rgb([200, 30, 30]))
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .expect("encode a png");
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    /// **A PICTURE IS TAKEN INSIDE THE BOUNDS, AND REFUSED OUTSIDE THEM —
+    /// NEVER DROPPED.** A PNG arrives beside the text; one past the edge
+    /// bound, one that is not a picture, one of another type and a fifth one
+    /// are each refused with the reason.
     #[test]
-    fn an_image_is_refused_not_dropped() {
+    fn a_picture_is_taken_within_the_bounds_and_refused_past_them() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let image = acp::ContentBlock::Image(acp::ImageContent::new("AAAA", "image/png"));
-        assert!(prompt_text(&[text("look"), image], dir.path()).is_err());
+        let small = acp::ContentBlock::Image(acp::ImageContent::new(png_base64(4, 3), "image/png"));
+        let prompted = prompt_parts(&[text("look"), small.clone()], dir.path()).expect("taken");
+        assert_eq!(prompted.text, "look");
+        assert_eq!(prompted.images.len(), 1);
+        assert_eq!(prompted.images[0].width(), 4);
+
+        let wide = acp::ContentBlock::Image(acp::ImageContent::new(
+            png_base64(crate::toolbox::MAX_IMAGE_EDGE + 1, 1),
+            "image/png",
+        ));
+        let err = prompt_parts(&[text("look"), wide], dir.path()).expect_err("too wide");
+        assert!(err.contains("pixels on a side"), "{err}");
+
+        let junk = acp::ContentBlock::Image(acp::ImageContent::new("AAAA", "image/png"));
+        assert!(prompt_parts(&[text("look"), junk], dir.path()).is_err());
+
+        let gif = acp::ContentBlock::Image(acp::ImageContent::new(png_base64(2, 2), "image/gif"));
+        let err = prompt_parts(&[text("look"), gif], dir.path()).expect_err("gif");
+        assert!(err.contains("only PNG and JPEG"), "{err}");
+
+        let five = vec![small; crate::toolbox::MAX_IMAGES_PER_RESULT + 1];
+        let err = prompt_parts(&five, dir.path()).expect_err("too many");
+        assert!(err.contains("at most"), "{err}");
     }
 
     /// **THE PLAN IS INCODE'S TASK LIST**: sent on the successful result of

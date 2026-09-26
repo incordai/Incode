@@ -51,6 +51,13 @@ pub enum AgentEvent {
     /// what lets an interactive session show a reply arriving rather than
     /// appearing all at once, and it costs nothing when nobody asks for it.
     TextDelta(String),
+    /// A fragment of the model's reasoning, as it is generated.
+    ///
+    /// Only from a backend that streams it — the claude CLI with partial
+    /// messages on, which then sends a summary of the model's thinking
+    /// (`--thinking-display summarized`). Never the reply: a front end shows
+    /// it apart, and the transcript and the stop hook do not hear it.
+    Thinking(String),
     /// The agent invoked one of its own tools.
     /// What a tool actually returned.
     ///
@@ -939,6 +946,29 @@ pub trait AgentBackend {
     fn offered_tools(&self) -> Vec<String> {
         Vec::new()
     }
+
+    /// Who is told what this backend's tools and workers do while they run
+    /// — see [`crate::watch`].
+    ///
+    /// Defaulted to nothing: only a backend whose tools this harness runs
+    /// itself has calls, output and workers of incode's to report.
+    fn set_watch(&mut self, _watch: std::sync::Arc<dyn crate::watch::Watch>) {}
+
+    /// Carry these pictures with the next turn's prompt, and only that turn.
+    ///
+    /// # Errors
+    ///
+    /// The agent cannot take a picture headless — the default, because no
+    /// route may be credited with a capability that was not measured on it.
+    /// The error names the agent, for the person who attached them.
+    fn attach_images(&mut self, images: Vec<crate::toolbox::Image>) -> Result<(), String> {
+        Err(format!(
+            "{} cannot take pictures headless, so {} picture(s) could not be sent; \
+             describe them in words, or pick an agent that takes them",
+            self.id(),
+            images.len()
+        ))
+    }
 }
 
 /// A boxed backend is a backend.
@@ -1045,6 +1075,14 @@ impl AgentBackend for Box<dyn AgentBackend> {
 
     fn offered_tools(&self) -> Vec<String> {
         (**self).offered_tools()
+    }
+
+    fn set_watch(&mut self, watch: std::sync::Arc<dyn crate::watch::Watch>) {
+        (**self).set_watch(watch);
+    }
+
+    fn attach_images(&mut self, images: Vec<crate::toolbox::Image>) -> Result<(), String> {
+        (**self).attach_images(images)
     }
 }
 

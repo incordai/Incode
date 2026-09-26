@@ -70,6 +70,7 @@ mod present;
 mod run;
 mod stdio;
 mod transport;
+mod workers;
 
 use std::collections::HashMap;
 use std::io::{BufReader, Read, Write};
@@ -280,6 +281,7 @@ pub(crate) fn serve<R: Read, F: SessionFactory>(
         outbox: Arc::new(Outbox::new(output)),
         factory: Arc::new(factory),
         sessions: HashMap::new(),
+        subagents: false,
     };
     let mut reader = BufReader::new(input);
     loop {
@@ -309,6 +311,11 @@ struct Server<F: SessionFactory> {
     outbox: Arc<Outbox>,
     factory: Arc<F>,
     sessions: HashMap<String, SessionHandle>,
+    /// The client advertised the draft sub-agent extension
+    /// (`clientCapabilities.subagents`) in `initialize`: workers are shown as
+    /// sub-agents ([`workers`]). Without it they are not announced — a client
+    /// that does not know the two updates may refuse the message.
+    subagents: bool,
 }
 
 /// The reader's hold on one session.
@@ -438,7 +445,16 @@ impl<F: SessionFactory> Server<F> {
     fn request(&mut self, id: acp::RequestId, method: &str, params: Option<Value>) {
         let names = &acp::AGENT_METHOD_NAMES;
         if method == names.initialize {
+            // Not in the stable schema, so read from the raw capabilities.
+            let subagents = params
+                .as_ref()
+                .and_then(|p| p.get("clientCapabilities"))
+                .and_then(|c| c.get("subagents"))
+                .is_some_and(|s| !s.is_null() && s != &Value::Bool(false));
             let answer = decode::<acp::InitializeRequest>(params).map(|_| initialize());
+            if answer.is_ok() {
+                self.subagents = subagents;
+            }
             self.outbox.respond(id, answer);
         } else if method == names.authenticate {
             let answer = decode::<acp::AuthenticateRequest>(params).and_then(|request| {
@@ -518,6 +534,7 @@ impl<F: SessionFactory> Server<F> {
                 workspace,
                 history: None,
                 servers: request.mcp_servers,
+                subagents: self.subagents,
             },
         );
     }
@@ -572,6 +589,7 @@ impl<F: SessionFactory> Server<F> {
                 workspace,
                 history: Some(conversation),
                 servers: request.mcp_servers,
+                subagents: self.subagents,
             },
         );
     }
@@ -801,6 +819,8 @@ struct Start {
     history: Option<Vec<history::Said>>,
     /// The MCP servers the client named.
     servers: Vec<acp::McpServer>,
+    /// The client follows workers as sub-agents.
+    subagents: bool,
 }
 
 /// The client's MCP servers as incode starts them: stdio only, since the
@@ -854,6 +874,7 @@ fn drive<F: SessionFactory>(
         workspace,
         history,
         servers,
+        subagents,
     } = start;
     let session_id = &session_id;
     // A panic is caught here and at each prompt below, never let through: the
@@ -899,6 +920,10 @@ fn drive<F: SessionFactory>(
         Arc::clone(outbox),
         session_id.clone(),
     )));
+    // What the tools print while they run, what the gate decided, and the
+    // workers they start — shown to the client as they happen.
+    let watch = workers::SessionWatch::opened(outbox, session_id, subagents);
+    session.set_watch(Arc::new(watch.clone()));
     // The client's MCP servers, started here as incode's own tools — every
     // call to them goes through the toolbox's gate. Bounded; one that does
     // not start costs its own tools and nothing else.
@@ -925,6 +950,7 @@ fn drive<F: SessionFactory>(
         role: choices.role.clone(),
         shown: choices.options(),
         replay: None,
+        watch,
     };
     let say = |update: acp::SessionUpdate| {
         outbox.notify(
@@ -1001,7 +1027,7 @@ fn drive<F: SessionFactory>(
         // Released BEFORE the answer goes out, so a client that sends its next
         // prompt the moment it reads this one's reply is not refused as busy.
         shared.finish();
-        outbox.respond(prompt.id, answer.map(acp::PromptResponse::new));
+        outbox.respond(prompt.id, answer);
     }
     // The reader let go: `session/close`, or the client went away. Either way
     // the session is over, and the memory engine is told — on this thread,
@@ -1032,6 +1058,8 @@ struct Held {
     /// A loaded session's conversation, for the next turn, when the model's
     /// own could not be resumed.
     replay: Option<String>,
+    /// The session's watch: its turns' steps are shown through it.
+    watch: workers::SessionWatch,
 }
 
 /// One prompt: the same turn an interactive line runs, streamed as updates —
@@ -1042,12 +1070,21 @@ fn run_prompt(
     session_id: &acp::SessionId,
     shared: &Shared,
     blocks: &[acp::ContentBlock],
-) -> Result<acp::StopReason, acp::Error> {
+) -> Result<acp::PromptResponse, acp::Error> {
     let workspace = held.workspace.clone();
     let workspace = workspace.as_path();
-    let text = present::prompt_text(blocks, workspace).map_err(invalid_params)?;
+    let present::Prompted { text, images } =
+        present::prompt_parts(blocks, workspace).map_err(invalid_params)?;
     if text.trim().is_empty() {
         return Err(invalid_params("the prompt has no text"));
+    }
+    // Pictures go to the model with a question; a command runs here and has
+    // nowhere to put them.
+    if !images.is_empty() && crate::cli::slash_commands::SlashCommand::parse(text.trim()).is_some()
+    {
+        return Err(invalid_params(
+            "pictures go with a prompt to the model, not with a slash command",
+        ));
     }
 
     // The mode the client chose, sent to the thing that does the writing —
@@ -1064,23 +1101,24 @@ fn run_prompt(
     config::apply(held, shared, outbox, session_id);
 
     if shared.cancelled() {
-        return Ok(acp::StopReason::Cancelled);
+        return Ok(acp::PromptResponse::new(acp::StopReason::Cancelled));
     }
 
     // `/run` works the ledger for as long as it takes, streaming, with the
-    // ledger as the plan.
+    // ledger as the plan, and its lanes as sub-agents.
     if matches!(
         crate::cli::slash_commands::SlashCommand::parse(text.trim()),
         Some(crate::cli::slash_commands::SlashCommand::Run)
     ) {
-        return Ok(run::run(
+        return Ok(acp::PromptResponse::new(run::run(
             held.runs.as_mut(),
             workspace,
             held.applied,
             outbox,
             session_id,
             shared,
-        ));
+            &held.watch,
+        )));
     }
     let session = &mut held.session;
 
@@ -1112,17 +1150,28 @@ fn run_prompt(
                 acp::CurrentModeUpdate::new(mode.as_str()),
             ));
         }
-        return Ok(if shared.cancelled() {
+        return Ok(acp::PromptResponse::new(if shared.cancelled() {
             acp::StopReason::Cancelled
         } else {
             acp::StopReason::EndTurn
-        });
+        }));
     }
 
+    // The pictures go to the agent that leads now, before anything else is
+    // done with the prompt: an agent that cannot take them refuses the
+    // prompt whole, before the engine or the transcript have heard it.
+    let pictures = !images.is_empty();
+    if pictures {
+        session.attach_images(images).map_err(invalid_params)?;
+    }
     let (instruction, mut context) = match crate::cli::plan_turn(session, workspace, &text, &text) {
         crate::cli::TurnPlan::NextQuestion(reply) | crate::cli::TurnPlan::Greeting(reply) => {
+            if pictures {
+                // No turn runs: the pictures must not ride the next one.
+                let _ = session.attach_images(Vec::new());
+            }
             say_text(&reply);
-            return Ok(acp::StopReason::EndTurn);
+            return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
         }
         crate::cli::TurnPlan::Agent {
             instruction,
@@ -1139,11 +1188,21 @@ fn run_prompt(
     // a cancel that landed during that wait is honoured here, before an agent
     // is started, rather than being cleared when the turn resets its token.
     if shared.cancelled() {
-        return Ok(acp::StopReason::Cancelled);
+        if pictures {
+            let _ = session.attach_images(Vec::new());
+        }
+        return Ok(acp::PromptResponse::new(acp::StopReason::Cancelled));
     }
 
-    let mut edits = present::Edits::new(workspace);
-    let mut plans = present::Plans::new();
+    // Who serves this turn, for every step's `_meta` and the answer's.
+    let who = workers::Who {
+        role: Some(held.role.clone()),
+        agent: Some(held.lead.clone()),
+        model: session.model().map(str::to_string),
+        lane: None,
+    };
+    held.watch.serve_as(who.clone());
+    let mut presenter = held.watch.presenter(workspace);
     let outcome = session.turn_observed(
         workspace,
         &instruction,
@@ -1155,7 +1214,7 @@ fn run_prompt(
         &mut |_status| {},
         Some(&mut |event: &AgentEvent, start: &TurnStart<'_>| {
             shared.hold_cancel();
-            for update in updates_for(event, &mut edits, &mut plans, start) {
+            for update in presenter.updates(event, &|path| start.before(path)) {
                 say(update);
             }
         }),
@@ -1177,60 +1236,14 @@ fn run_prompt(
     // `cancelled` once the client has asked, even if stopping surfaced as an
     // error underneath.
     if shared.cancelled() {
-        return Ok(acp::StopReason::Cancelled);
+        return Ok(acp::PromptResponse::new(acp::StopReason::Cancelled));
     }
     match outcome {
-        Ok(outcome) => Ok(present::stop_reason(&outcome.stop_reason)),
+        Ok(outcome) => Ok(
+            acp::PromptResponse::new(present::stop_reason(&outcome.stop_reason))
+                .meta(workers::prompt_meta(&who)),
+        ),
         Err(why) => Err(internal(why)),
-    }
-}
-
-/// The `session/update`s one agent event becomes. Text is not here: it comes
-/// through the turn's text callback, after the question block is filtered out.
-///
-/// An edit's result becomes a diff when [`present::Edits`] can name both
-/// sides; any other result, and an edit it cannot, is the tool's output. A
-/// task list incode's `TodoWrite` accepted is sent as the plan, after its
-/// result ([`present::Plans`]).
-///
-/// Token counts ([`AgentEvent::Usage`]) and quota ([`AgentEvent::Quota`]) have
-/// no place in the stable protocol: `usage_update` needs the window size too,
-/// and the prompt result's token usage is still an unstable field. Only
-/// [`AgentEvent::Context`] — both numbers, as the agent reported them — goes
-/// out, and without a cost: on a subscription no per-token money is spent.
-fn updates_for(
-    event: &AgentEvent,
-    edits: &mut present::Edits,
-    plans: &mut present::Plans,
-    start: &TurnStart<'_>,
-) -> Vec<acp::SessionUpdate> {
-    match event {
-        AgentEvent::ToolUse { id, name, input } => {
-            edits.called(id, input);
-            plans.called(id, name, input);
-            vec![acp::SessionUpdate::ToolCall(present::tool_call(
-                id, name, input,
-            ))]
-        }
-        AgentEvent::ToolResult {
-            id,
-            output,
-            is_error,
-        } => {
-            let update = match edits.landed(id, *is_error, start) {
-                Some(diff) => present::tool_diff(id, diff),
-                None => present::tool_result(id, output, *is_error),
-            };
-            let mut updates = vec![acp::SessionUpdate::ToolCallUpdate(update)];
-            if let Some(plan) = plans.landed(id, *is_error) {
-                updates.push(acp::SessionUpdate::Plan(plan));
-            }
-            updates
-        }
-        AgentEvent::Context { used, size } => vec![acp::SessionUpdate::UsageUpdate(
-            acp::UsageUpdate::new(*used, *size),
-        )],
-        _ => Vec::new(),
     }
 }
 
@@ -1242,7 +1255,13 @@ fn initialize() -> acp::InitializeResponse {
         .agent_capabilities(
             acp::AgentCapabilities::new()
                 .load_session(true)
-                .prompt_capabilities(acp::PromptCapabilities::new().embedded_context(true))
+                // Pictures inside the toolbox's image bounds; whether the agent
+                // leading the session can take them is decided per prompt.
+                .prompt_capabilities(
+                    acp::PromptCapabilities::new()
+                        .embedded_context(true)
+                        .image(true),
+                )
                 // Stdio servers only — every client may send those — run as
                 // incode's own tools. No HTTP or SSE: the crate has no client
                 // for either.
@@ -1318,6 +1337,9 @@ fn internal(why: String) -> acp::Error {
 mod flow_tests;
 
 #[cfg(test)]
+mod worker_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::agent::{AgentBackend, AgentError, TurnOutcome};
@@ -1353,6 +1375,13 @@ mod tests {
         CallMcp,
         /// Text naming the backend and its model — which agent served.
         Named,
+        /// Workers, shell output, reasoning and the gate's decisions, through
+        /// incode's own Toolbox — see `worker_tests::act`.
+        SubAgent,
+        SubAgentWaits,
+        Shell,
+        Thinks,
+        Protected,
     }
 
     /// The file [`Behaviour::Guarded`] writes, when it is allowed to.
@@ -1369,6 +1398,10 @@ mod tests {
         pub(super) ran: Arc<Mutex<Vec<String>>>,
         /// Every conversation id a backend was told to continue.
         pub(super) resumed: Arc<Mutex<Vec<String>>>,
+        /// Every picture a backend was handed, as its placeholder.
+        pub(super) pictures: Arc<Mutex<Vec<String>>>,
+        /// The stand-in agent CLI the `Agent` tool's sub-agent runs on.
+        pub(super) sub_cli: Option<PathBuf>,
     }
 
     impl Script {
@@ -1379,6 +1412,15 @@ mod tests {
                 engine: None,
                 ran: Arc::default(),
                 resumed: Arc::default(),
+                pictures: Arc::default(),
+                sub_cli: None,
+            }
+        }
+
+        pub(super) fn with_sub_cli(self, cli: PathBuf) -> Self {
+            Self {
+                sub_cli: Some(cli),
+                ..self
             }
         }
 
@@ -1592,6 +1634,14 @@ mod tests {
                     )));
                     Ok(ended("end_turn"))
                 }
+                Behaviour::SubAgent
+                | Behaviour::SubAgentWaits
+                | Behaviour::Shell
+                | Behaviour::Thinks
+                | Behaviour::Protected => {
+                    super::worker_tests::act(self.script.behaviour, self.tools.as_ref(), on_event);
+                    Ok(ended("end_turn"))
+                }
                 Behaviour::CallMcp => {
                     let tools = self
                         .tools
@@ -1715,6 +1765,22 @@ mod tests {
             }
         }
 
+        fn set_watch(&mut self, watch: Arc<dyn crate::watch::Watch>) {
+            if let Some(tools) = &mut self.tools {
+                tools.set_watch(watch);
+            }
+        }
+
+        fn attach_images(&mut self, images: Vec<crate::toolbox::Image>) -> Result<(), String> {
+            let mut seen = self
+                .script
+                .pictures
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            seen.extend(images.iter().map(crate::toolbox::Image::placeholder));
+            Ok(())
+        }
+
         fn set_permission_mode(&mut self, mode: &str) {
             self.script
                 .modes
@@ -1758,13 +1824,21 @@ mod tests {
     /// The fake agent's toolbox: incode's own, over `workspace`, with the
     /// fake engine when the script names one.
     fn fake_tools(script: &Script, workspace: &Path) -> Option<crate::toolbox::Toolbox> {
-        let needs = script.engine.is_some() || matches!(script.behaviour, Behaviour::CallMcp);
+        use Behaviour as B;
+        let needs = script.engine.is_some()
+            || matches!(
+                script.behaviour,
+                B::CallMcp | B::SubAgent | B::SubAgentWaits | B::Shell | B::Protected
+            );
         needs.then(|| {
             let engine = script.engine.as_ref().map(|bin| {
                 crate::hooks::engine::fake::engine(bin.clone()).capped(Duration::from_secs(30))
             });
             let mut tools = crate::toolbox::Toolbox::new(workspace, true).with_engine(engine);
             tools.set_session("acp-test-session");
+            if let Some(cli) = &script.sub_cli {
+                tools.run_subagents_on(&cli.to_string_lossy());
+            }
             tools
         })
     }
@@ -2010,7 +2084,7 @@ mod tests {
             "{reply}"
         );
         assert_eq!(
-            result["agentCapabilities"]["promptCapabilities"]["image"], false,
+            result["agentCapabilities"]["promptCapabilities"]["image"], true,
             "{reply}"
         );
         assert_eq!(result["authMethods"], json!([]), "{reply}");

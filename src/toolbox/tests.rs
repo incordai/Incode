@@ -209,7 +209,7 @@ fn delegation_stops_at_the_depth_limit() {
     // with no ceiling. The refusal happens at the tool, because that is where
     // the new agent would be made.
     let dir = tempfile::tempdir().expect("tmp");
-    let deep = Toolbox::new(dir.path(), true).at_depth(MAX_DEPTH);
+    let deep = Toolbox::new(dir.path(), true).at_depth(subagent::MAX_DEPTH);
     let refused = deep
         .run(AGENT, &json!({"task": "go and do a thing"}))
         .expect_err("past the limit");
@@ -239,7 +239,7 @@ fn the_control_for_the_depth_limit_works() {
     // SAME call one level shallower gets past the depth gate and fails
     // later, on something else.
     let dir = tempfile::tempdir().expect("tmp");
-    let shallow = Toolbox::new(dir.path(), true).at_depth(MAX_DEPTH - 1);
+    let shallow = Toolbox::new(dir.path(), true).at_depth(subagent::MAX_DEPTH - 1);
     let refused = shallow
         .run(AGENT, &json!({"task": "go and do a thing"}))
         .expect_err("no endpoint is configured in a test");

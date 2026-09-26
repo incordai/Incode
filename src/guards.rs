@@ -149,13 +149,43 @@ impl Guards {
         guards
     }
 
+    /// The protected pattern a write to `path` matches, or `None` when the
+    /// write is allowed. The rule [`Self::refuse_write`] names.
+    #[must_use]
+    pub fn protecting(&self, path: &str) -> Option<String> {
+        self.effective()
+            .into_iter()
+            .find(|fragment| matches_path(fragment, path))
+    }
+
+    /// The protected pattern a shell command writes to, or `None`. The rule
+    /// [`Self::refuse_command`] names.
+    #[must_use]
+    pub fn protecting_in_command(&self, command: &str) -> Option<String> {
+        // Only commands that can WRITE are worth inspecting. A `grep` or a
+        // `cat` over the tests is exactly what an agent should be doing.
+        const WRITERS: [&str; 10] = [
+            "rm ", "mv ", "cp ", "sed -i", "truncate", "tee ", "dd ", "chmod ", "> ", ">>",
+        ];
+        let lower = normalise(command);
+        if !WRITERS.iter().any(|w| lower.contains(&normalise(w))) {
+            return None;
+        }
+        // Every whitespace-separated word of the command is treated as a
+        // possible path. Cruder than the file-tool check by necessity — a shell
+        // word is not a resolved path — but it applies the same rules rather
+        // than a second, looser set that would disagree with it.
+        self.effective().into_iter().find(|fragment| {
+            lower
+                .split_whitespace()
+                .any(|word| matches_path(fragment, word.trim_matches(|c| c == '"' || c == '\'')))
+        })
+    }
+
     /// Why a write to this path is refused, or `None` when it is allowed.
     #[must_use]
     pub fn refuse_write(&self, path: &str) -> Option<String> {
-        let matched = self
-            .effective()
-            .into_iter()
-            .find(|fragment| matches_path(fragment, path))?;
+        let matched = self.protecting(path)?;
         Some(format!(
             "`{path}` is protected and cannot be written: it matches `{matched}`. \
              The check that decides whether work is finished must not be editable \
@@ -174,24 +204,7 @@ impl Guards {
     /// pretend to catch a determined route around it.
     #[must_use]
     pub fn refuse_command(&self, command: &str) -> Option<String> {
-        // Only commands that can WRITE are worth inspecting. A `grep` or a
-        // `cat` over the tests is exactly what an agent should be doing.
-        const WRITERS: [&str; 10] = [
-            "rm ", "mv ", "cp ", "sed -i", "truncate", "tee ", "dd ", "chmod ", "> ", ">>",
-        ];
-        let lower = normalise(command);
-        if !WRITERS.iter().any(|w| lower.contains(&normalise(w))) {
-            return None;
-        }
-        // Every whitespace-separated word of the command is treated as a
-        // possible path. Cruder than the file-tool check by necessity — a shell
-        // word is not a resolved path — but it applies the same rules rather
-        // than a second, looser set that would disagree with it.
-        let matched = self.effective().into_iter().find(|fragment| {
-            lower
-                .split_whitespace()
-                .any(|word| matches_path(fragment, word.trim_matches(|c| c == '"' || c == '\'')))
-        })?;
+        let matched = self.protecting_in_command(command)?;
         Some(format!(
             "this command writes to a protected path (`{matched}`), so it is \
              refused. Reading those files is always allowed; changing them is a \

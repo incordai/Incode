@@ -123,6 +123,9 @@ pub struct AgentSession {
     mode: Option<String>,
     /// Who is asked mid-turn, so a backend switched in asks them too.
     prompter: Option<std::sync::Arc<dyn crate::hooks::engine::Prompter>>,
+    /// Who is told what the tools and workers do while they run, so a
+    /// backend switched in tells them too.
+    watch: Option<std::sync::Arc<dyn crate::watch::Watch>>,
 }
 
 /// How wide a tool result panel is drawn in a conversation.
@@ -240,6 +243,7 @@ impl AgentSession {
             usage: crate::runtime::usage::TokenUsage::default(),
             mode: None,
             prompter: None,
+            watch: None,
         }
     }
 
@@ -263,6 +267,9 @@ impl AgentSession {
         }
         if let Some(prompter) = &self.prompter {
             backend.set_prompter(std::sync::Arc::clone(prompter));
+        }
+        if let Some(watch) = &self.watch {
+            backend.set_watch(std::sync::Arc::clone(watch));
         }
         let mut previous = std::mem::replace(&mut self.backend, backend);
         let now = self.backend.id().to_string();
@@ -304,6 +311,9 @@ impl AgentSession {
             }
             s.set_extra_dirs(self.extra_dirs.clone());
             s.share_session_tools(std::sync::Arc::clone(&self.session_tools));
+            if let Some(watch) = &self.watch {
+                s.set_watch(std::sync::Arc::clone(watch));
+            }
         }
         self.standby = standby;
         self
@@ -533,6 +543,27 @@ impl AgentSession {
         for s in &mut self.standby {
             s.set_prompter(std::sync::Arc::clone(&prompter));
         }
+    }
+
+    /// Who is told, as calls run, what they print, what the guards and the
+    /// engine decided about them, and which workers they start — see
+    /// [`crate::watch`]. Standbys get the same one.
+    pub fn set_watch(&mut self, watch: std::sync::Arc<dyn crate::watch::Watch>) {
+        self.watch = Some(std::sync::Arc::clone(&watch));
+        self.backend.set_watch(std::sync::Arc::clone(&watch));
+        for s in &mut self.standby {
+            s.set_watch(std::sync::Arc::clone(&watch));
+        }
+    }
+
+    /// Carry these pictures with the next turn's prompt, on the agent that
+    /// leads now. A standby that takes the turn over does not get them.
+    ///
+    /// # Errors
+    ///
+    /// The agent cannot take pictures headless; the reason names it.
+    pub fn attach_images(&mut self, images: Vec<crate::toolbox::Image>) -> Result<(), String> {
+        self.backend.attach_images(images)
     }
 
     /// The conversations subagents opened, as `(session id, what it was asked)`.

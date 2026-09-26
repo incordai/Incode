@@ -271,6 +271,12 @@ impl Image {
         self.height
     }
 
+    /// The encoded bytes, for a file an agent reads the picture from.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
     /// The encoded bytes as base64, the way every wire shape carries them.
     #[must_use]
     pub fn base64(&self) -> String {

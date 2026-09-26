@@ -51,8 +51,6 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use serde_json::{json, Value};
 
-use crate::agent::AgentBackend;
-
 mod browser;
 mod cdp;
 mod checks;
@@ -66,13 +64,14 @@ mod mcp_client;
 mod outline;
 mod pdf;
 mod shell;
+mod subagent;
 mod team;
 mod todo;
 mod validate;
 
 pub(crate) use client_servers::ServerSpec;
 pub use desktop::DesktopSetup;
-pub use image::{Image, ImageFormat, ToolOutput};
+pub use image::{Image, ImageFormat, ToolOutput, MAX_IMAGES_PER_RESULT, MAX_IMAGE_EDGE};
 pub(crate) use todo::{parse_todos, Priority, TodoStatus};
 
 /// Read a file's contents.
@@ -301,23 +300,29 @@ enum Gate {
     Answered(String),
 }
 
-/// How deep subagents may nest.
-///
-/// One level of delegation is what the pattern is for; the second is slack. A
-/// subagent that can spawn subagents that can spawn subagents is a bill with no
-/// ceiling and a tree nobody can read.
-const MAX_DEPTH: u8 = 2;
+/// The most of the engine's reason a decision carries to a watch, in
+/// characters. The whole reason is still the call's result.
+const MAX_DECISION_REASON_CHARS: usize = 500;
 
-/// What a subagent is told about its position.
-///
-/// Short on purpose. It inherits no conversation, so everything it needs is in
-/// the task it was handed — and a long preamble here is paid on every
-/// delegation.
-const SUBAGENT_SYSTEM: &str = "\
-    You are doing ONE piece of work handed to you by another agent, in its \
-    workspace, with the same tools. You do not have its conversation and cannot \
-    ask it questions. Do the work and report what you found or changed, briefly \
-    and concretely — your reply is the only thing that goes back.";
+/// Why the operator's guards refused a call: the reason the model is told,
+/// and the protected pattern and the path when one matched.
+struct Refusal {
+    why: String,
+    rule: Option<String>,
+    path: Option<String>,
+}
+
+impl Refusal {
+    /// A refusal with no pattern behind it — the guards unreadable, a path
+    /// that could not be worked out.
+    fn said(why: String) -> Self {
+        Self {
+            why,
+            rule: None,
+            path: None,
+        }
+    }
+}
 
 /// One conversation a subagent opened.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -401,6 +406,13 @@ pub struct Toolbox {
     /// Where the desktop is started from, when the operator switched it on.
     /// The desktop tools are offered only then.
     desktop: Option<DesktopSetup>,
+    /// Who is told what a call does while it runs — its output, what the
+    /// gate decided, the workers it starts. See [`crate::watch`].
+    watch: Option<Arc<dyn crate::watch::Watch>>,
+    /// The agent CLI this toolbox's model runs in, when it runs in one: the
+    /// `Agent` tool starts its sub-agent there when no model endpoint is
+    /// configured. See [`subagent`].
+    cli_agent: Option<String>,
 }
 
 impl Toolbox {
@@ -431,7 +443,34 @@ impl Toolbox {
             browser: OnceLock::new(),
             printer: OnceLock::new(),
             desktop: None,
+            watch: None,
+            cli_agent: None,
         }
+    }
+
+    /// Tell `watch` what calls do while they run, from now on.
+    pub fn set_watch(&mut self, watch: Arc<dyn crate::watch::Watch>) {
+        self.watch = Some(watch);
+    }
+
+    /// The agent CLI (`binary`) this toolbox's model runs in: the `Agent`
+    /// tool starts its sub-agent on it when there is no model endpoint.
+    pub fn run_subagents_on(&mut self, binary: &str) {
+        self.cli_agent = Some(binary.to_string());
+    }
+
+    /// Tell the watch, if there is one, what was decided about `call_id`.
+    fn tell_decided(&self, call_id: &str, decision: crate::watch::Decision) {
+        if let Some(watch) = &self.watch {
+            watch.decided(call_id, &decision);
+        }
+    }
+
+    /// Whether the stop was asked for.
+    fn stopped(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .is_some_and(crate::runtime::cancel::CancelToken::is_cancelled)
     }
 
     /// LibreOffice, when it is installed where [`convert::find_soffice`]
@@ -693,130 +732,6 @@ impl Toolbox {
         self.children.lock().map(|c| c.clone()).unwrap_or_default()
     }
 
-    /// Hand one piece of work to a fresh agent.
-    ///
-    /// # Why a subagent is worth the trouble
-    ///
-    /// A long search or a wide read fills the caller's context with material it
-    /// will never need again. Handing that out means only the ANSWER comes back,
-    /// and the reading is paid for in a conversation that is then thrown away.
-    ///
-    /// # The role decides the model
-    ///
-    /// A subagent that greps and one that works out why a bug happens are not
-    /// the same job and should not cost the same. The role is looked up in the
-    /// operator's own table, so which model serves which kind of work stays
-    /// their decision — see [`crate::roles`].
-    fn run_subagent(&self, input: &Value) -> Result<String, String> {
-        if self.depth >= MAX_DEPTH {
-            return Err(format!(
-                "already {} agents deep, which is the limit. Do this work here \
-                 rather than handing it on again.",
-                self.depth
-            ));
-        }
-        let task = input
-            .get("task")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim();
-        if task.is_empty() {
-            return Err(
-                "a subagent needs a task: say what it should do and what to report back"
-                    .to_string(),
-            );
-        }
-        let Some(mut settings) = crate::agent::api::Settings::from_env() else {
-            return Err(
-                "no endpoint is configured, so there is nothing to hand work to".to_string(),
-            );
-        };
-
-        // The operator's routing, not ours. An unknown role leaves the model
-        // alone rather than guessing at one — the parent's model is a working
-        // answer, and a wrong model is a wasted call.
-        let role = input
-            .get("role")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim();
-        let inherited = settings.model.clone();
-        if !role.is_empty() {
-            if let Some(chosen) = crate::roles::RoleTable::from_env().model_for(role) {
-                settings.model = crate::roles::model_name(chosen).to_string();
-            }
-        }
-        // WHICH WORK WENT WHERE. Routing is invisible from outside: a subagent on
-        // the wrong model looks exactly like one on the right model that answered
-        // badly. So the choice says itself — including when it did NOT route, and
-        // why, which is the case that silently costs the most.
-        if role.is_empty() {
-            crate::trace!("route", "subagent: no role given, inheriting {inherited}");
-        } else if settings.model == inherited {
-            crate::trace!(
-                "route",
-                "subagent: role `{role}` is not configured, inheriting {inherited}"
-            );
-        } else {
-            crate::trace!(
-                "route",
-                "subagent: role `{role}` -> {} (parent was {inherited})",
-                settings.model
-            );
-        }
-        crate::trace!(
-            "route",
-            "subagent spawning at depth {}",
-            self.depth.saturating_add(1)
-        );
-
-        let mut child = crate::agent::api::ApiBackend::new(
-            settings,
-            &self.workspace,
-            SUBAGENT_SYSTEM,
-            self.filter_env,
-        )
-        .at_depth(self.depth + 1)
-        // The same guard, the same person to ask, the same stop: a subagent's
-        // write is a write in this workspace.
-        .with_engine(self.engine.clone());
-        if let Some(cp) = &self.checkpoints {
-            child = child.with_checkpoints(cp.clone());
-        }
-        if let Some(prompter) = &self.prompter {
-            child.set_prompter(Arc::clone(prompter));
-        }
-        if let Some(cancel) = &self.cancel {
-            child.set_cancel(cancel.clone());
-        }
-
-        let mut said = String::new();
-        let outcome = child
-            .run_turn(task, &mut |event| {
-                if let crate::agent::AgentEvent::Text(text) = event {
-                    said.push_str(text);
-                }
-            })
-            .map_err(|e| format!("the subagent could not finish: {e}"))?;
-
-        // Recorded whatever it said, INCLUDING a failure: a subagent that ran
-        // and got nowhere is still a conversation that was paid for, and the
-        // session record showing it is how that becomes visible.
-        if let Ok(mut children) = self.children.lock() {
-            children.push(Spawned {
-                session: outcome.session_id.clone(),
-                title: crate::text::truncate(task, 72),
-            });
-        }
-        if outcome.is_error {
-            return Err(outcome.failure());
-        }
-        if said.trim().is_empty() {
-            return Err("the subagent finished without reporting anything".to_string());
-        }
-        Ok(said)
-    }
-
     /// Hand over one skill's text.
     fn read_skill(&self, input: &Value) -> Result<String, String> {
         let name = input.get("name").and_then(Value::as_str).unwrap_or("");
@@ -881,38 +796,48 @@ impl Toolbox {
         }
     }
 
+    /// Whether the operator's guards have anything to say about `name`.
+    ///
+    /// Reads and searches change nothing, so the guards have nothing to say
+    /// about them: they protect against WRITES — every tool that changes a
+    /// file, per file, and the shell.
+    fn guarded(name: &str) -> bool {
+        reach_of(name) == Some(Reach::Change) || name == BASH
+    }
+
     /// Why this call is refused by the operator's guards, if it is.
-    fn refused(&self, name: &str, input: &Value) -> Option<String> {
-        // Reads and searches change nothing, so the guards have nothing to say
-        // about them: they protect against WRITES — every tool that changes a
-        // file, per file, and the shell.
-        let changes_files = reach_of(name) == Some(Reach::Change);
-        if !changes_files && name != BASH {
+    fn refused(&self, name: &str, input: &Value) -> Option<Refusal> {
+        if !Self::guarded(name) {
             return None;
         }
         let guards = match &self.guards {
             Ok(guards) => guards,
             Err(why) => {
-                return Some(format!(
+                return Some(Refusal::said(format!(
                     "the guards could not be read, so nothing may be written until they are \
                      fixed: {why}"
-                ))
+                )))
             }
         };
         if name == BASH {
             let command = input.get("command").and_then(Value::as_str).unwrap_or("");
-            return guards.refuse_command(command);
+            return guards.refuse_command(command).map(|why| Refusal {
+                why,
+                rule: guards.protecting_in_command(command),
+                path: None,
+            });
         }
         let paths = match self.changed_paths(name, input) {
             Ok(paths) => paths,
-            Err(why) => return Some(why),
+            Err(why) => return Some(Refusal::said(why)),
         };
         paths.iter().find_map(|path| self.refuse_path(guards, path))
     }
 
     /// Why a write to `path` is refused by the guards, if it is.
-    fn refuse_path(&self, guards: &crate::guards::Guards, path: &str) -> Option<String> {
+    fn refuse_path(&self, guards: &crate::guards::Guards, path: &str) -> Option<Refusal> {
         let root = self.root_for_path(path);
+        let named = Some(path.to_string());
         if root != self.workspace.as_path() {
             // An added directory: the operator's protected paths apply inside
             // it as they do in the workspace, matched against the path WITHIN
@@ -921,12 +846,24 @@ impl Toolbox {
             let inside = Path::new(path)
                 .strip_prefix(root)
                 .map_or_else(|_| path.to_string(), |p| p.to_string_lossy().into_owned());
-            return guards.refuse_write(&inside);
+            return guards.refuse_write(&inside).map(|why| Refusal {
+                why,
+                rule: guards.protecting(&inside),
+                path: named,
+            });
         }
-        if let Some(reason) = guards.refuse_write(path) {
-            return Some(reason);
+        if let Some(why) = guards.refuse_write(path) {
+            return Some(Refusal {
+                why,
+                rule: guards.protecting(path),
+                path: named,
+            });
         }
-        crate::spec::refuse_source_write(&self.workspace, path)
+        crate::spec::refuse_source_write(&self.workspace, path).map(|why| Refusal {
+            why,
+            rule: None,
+            path: named,
+        })
     }
 
     /// Every tool this session offers, as the model is told about them: the
@@ -1248,8 +1185,18 @@ impl Toolbox {
         // only report a write that already happened; a protected path has to be
         // refused while refusing it still means something.
         if let Some(refusal) = self.refused(name, input) {
-            crate::trace!("tool", "{name} REFUSED by guards: {refusal}");
-            return Err(refusal);
+            crate::trace!("tool", "{name} REFUSED by guards: {}", refusal.why);
+            self.tell_decided(
+                call_id,
+                crate::watch::Decision {
+                    by: crate::watch::Decider::Guards,
+                    allowed: false,
+                    rule: refusal.rule,
+                    path: refusal.path,
+                    reason: None,
+                },
+            );
+            return Err(refusal.why);
         }
         // The session's mode, before the engine: it is decided here, costs
         // nothing, and a call it refuses need not cost an engine process.
@@ -1271,7 +1218,21 @@ impl Toolbox {
                 return Ok(ToolOutput::from(said));
             }
         };
-        let outcome = self.dispatch(name, input, reach);
+        // With no engine, the guards had the last word on a call they look
+        // at, and it was yes.
+        if self.engine.is_none() && Self::guarded(name) && self.guards.is_ok() {
+            self.tell_decided(
+                call_id,
+                crate::watch::Decision {
+                    by: crate::watch::Decider::Guards,
+                    allowed: true,
+                    rule: None,
+                    path: None,
+                    reason: None,
+                },
+            );
+        }
+        let outcome = self.dispatch(call_id, name, input, reach);
         // A write that LANDED is news to the engine — it files the path under
         // the session and queues the file to be read again. Only a write that
         // happened: a refused or failed one changed nothing. Not waited on.
@@ -1395,6 +1356,32 @@ impl Toolbox {
     /// stop. A call that only observes runs, traced. The same rule as the
     /// guards file above: an unreadable guard must not read as no guard.
     fn engine_gate(&self, call_id: &str, name: &str, input: &Value, reach: Reach) -> Gate {
+        let gate = self.engine_gate_inner(call_id, name, input, reach);
+        if self.engine.is_some() {
+            let (allowed, reason) = match &gate {
+                Gate::Run { .. } => (true, None),
+                Gate::Refused(why) => (false, Some(why.clone())),
+                // The owner answered a question in the app: nothing was
+                // refused, and the answer is the result.
+                Gate::Answered(_) => (true, None),
+            };
+            self.tell_decided(
+                call_id,
+                crate::watch::Decision {
+                    by: crate::watch::Decider::Engine,
+                    allowed,
+                    rule: None,
+                    path: None,
+                    reason: reason
+                        .map(|why| crate::text::truncate(&why, MAX_DECISION_REASON_CHARS)),
+                },
+            );
+        }
+        gate
+    }
+
+    /// [`Self::engine_gate`]'s decision, before it is told.
+    fn engine_gate_inner(&self, call_id: &str, name: &str, input: &Value, reach: Reach) -> Gate {
         let Some(engine) = &self.engine else {
             return Gate::Run { context: None };
         };
@@ -1501,7 +1488,13 @@ impl Toolbox {
     }
 
     /// Run the tool itself: guards and the engine have already passed it.
-    fn dispatch(&self, name: &str, input: &Value, reach: Reach) -> Result<ToolOutput, String> {
+    fn dispatch(
+        &self,
+        call_id: &str,
+        name: &str,
+        input: &Value,
+        reach: Reach,
+    ) -> Result<ToolOutput, String> {
         if reach == Reach::Change {
             self.checkpoint(name, input);
         }
@@ -1527,7 +1520,9 @@ impl Toolbox {
             },
             other if desktop::is_desktop(other) => self.run_desktop(other, input),
             other if self.state.is_client_tool(other) => self.run_client_tool(other, input),
-            other => self.dispatch_text(other, input).map(ToolOutput::from),
+            other => self
+                .dispatch_text(call_id, other, input)
+                .map(ToolOutput::from),
         };
         // The OUTCOME, not just the attempt. A tool that ran and failed and a
         // tool that was never reached look identical from the call above.
@@ -1582,8 +1577,35 @@ impl Toolbox {
         }
     }
 
+    /// A foreground shell command: its output shown as it prints when there
+    /// is a watch, and the command stopped — with everything it started — as
+    /// soon as the turn is.
+    fn run_shell(&self, call_id: &str, root: &Path, raw: &str) -> Result<String, String> {
+        let stopped = || self.stopped();
+        let ran = match &self.watch {
+            Some(watch) => {
+                let mut live = crate::watch::LiveOutput::new(watch.as_ref(), call_id);
+                crate::tools::bash::execute_bash_watched(
+                    root,
+                    raw,
+                    self.filter_env,
+                    &stopped,
+                    &mut |piece| live.push(piece),
+                )
+            }
+            None => crate::tools::bash::execute_bash_watched(
+                root,
+                raw,
+                self.filter_env,
+                &stopped,
+                &mut |_| {},
+            ),
+        };
+        ran.map_err(|e| e.to_string())
+    }
+
     /// The tools whose answer is text alone.
-    fn dispatch_text(&self, name: &str, input: &Value) -> Result<String, String> {
+    fn dispatch_text(&self, call_id: &str, name: &str, input: &Value) -> Result<String, String> {
         // The file and shell tools parse their own JSON from a string, which is
         // the interface they were written to; re-serialising here keeps that
         // contract rather than rewriting six working implementations.
@@ -1624,8 +1646,7 @@ impl Toolbox {
                 None => Err("LibreOffice was not found".to_string()),
             },
             BASH if background => shell::start(&self.state, ws, input),
-            BASH => crate::tools::bash::execute_bash(ws, &raw, self.filter_env)
-                .map_err(|e| e.to_string()),
+            BASH => self.run_shell(call_id, ws, &raw),
             BASH_OUTPUT => shell::output(&self.state, input),
             KILL_SHELL => shell::kill(&self.state, input),
             TODO_WRITE => todo::write(&mut self.state.todos(), input),
@@ -1633,7 +1654,14 @@ impl Toolbox {
             crate::verify::VERIFY_TOOL => crate::verify::run_tool(ws),
             crate::recall::INDEX_TOOL => crate::recall::run_index_tool(&raw),
             crate::recall::GET_TOOL => crate::recall::run_get_tool(&raw),
-            crate::recorder::LOOKUP_TOOL => crate::recorder::run_lookup_tool(ws, input),
+            crate::recorder::LOOKUP_TOOL => {
+                crate::recorder::run_lookup_tool(ws, input).map(|found| {
+                    if let Some(watch) = &self.watch {
+                        watch.recorded(call_id, found.hit, found.observations);
+                    }
+                    found.text
+                })
+            }
             SKILL => self.read_skill(input),
             AGENT => self.run_subagent(input),
             ASK_USER_QUESTION => self.ask_here(input),

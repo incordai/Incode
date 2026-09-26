@@ -17,7 +17,24 @@ const MAX_OUTPUT_CHARS: usize = 30_000;
 /// internal URLs that have nothing to do with the command. The background-job
 /// path already filtered; this one did not, which meant `env_filter_enabled`
 /// had no effect on the tool the model actually calls.
-pub fn execute_bash(workspace: &Path, input: &str, filter_env: bool) -> Result<String> {
+///
+/// Each piece of output is handed to `on_output` as the command prints it —
+/// stdout and stderr in the order they arrived — and the command, with
+/// everything it started, is stopped as soon as `stopped` answers true. What
+/// was streamed is a view of the run, not a second copy of its answer: the
+/// result is the whole output, bounded.
+///
+/// # Errors
+///
+/// The input names no command, the shell could not start, the command ran
+/// past its timeout, or it was stopped.
+pub fn execute_bash_watched(
+    workspace: &Path,
+    input: &str,
+    filter_env: bool,
+    stopped: &dyn Fn() -> bool,
+    on_output: &mut dyn FnMut(&[u8]),
+) -> Result<String> {
     let parsed: serde_json::Value =
         serde_json::from_str(input).unwrap_or_else(|_| serde_json::json!({"command": input}));
 
@@ -62,8 +79,16 @@ pub fn execute_bash(workspace: &Path, input: &str, filter_env: bool) -> Result<S
     crate::agent::process_tree::prepare(&mut child);
     let spawned = child.spawn().context("failed to spawn shell")?;
 
-    // Wait with timeout
-    let output = wait_with_timeout(spawned, Duration::from_millis(timeout_ms))?;
+    // Wait with timeout, handing on what it prints as it prints it.
+    let output = wait_streaming(
+        spawned,
+        Duration::from_millis(timeout_ms),
+        &Stop {
+            now: stopped,
+            said: "the turn was stopped, so the command was stopped too",
+        },
+        on_output,
+    )?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -121,56 +146,223 @@ pub(crate) fn wait_with_timeout(
 /// permission hook racing the person at the prompt — so the losing side is
 /// ended at once instead of running to its bound.
 pub(crate) fn wait_with_timeout_or(
-    mut child: std::process::Child,
+    child: std::process::Child,
     timeout: Duration,
     abandon: &dyn Fn() -> bool,
 ) -> Result<std::process::Output> {
-    let tree = crate::agent::process_tree::Tree::adopt(&child);
-    let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(mut pipe) = pipe {
-                let _ = pipe.read_to_end(&mut buf);
+    wait_streaming(
+        child,
+        timeout,
+        &Stop {
+            now: abandon,
+            said: "stopped before it finished: the answer came from elsewhere",
+        },
+        &mut |_| {},
+    )
+}
+
+/// When a wait is given up early, and what that is called.
+struct Stop<'a> {
+    now: &'a dyn Fn() -> bool,
+    said: &'a str,
+}
+
+/// How long the waiter sleeps between looks at the child when nothing
+/// arrives: a stop or a timeout lands within this.
+const WAIT_POLL: Duration = Duration::from_millis(50);
+
+/// Which pipe a piece of output came from.
+enum Piece {
+    Out(Vec<u8>),
+    Err(Vec<u8>),
+    /// One pipe reached its end.
+    Closed,
+}
+
+/// Read `pipe` to its end on a thread of its own, sending each piece as it
+/// arrives.
+fn drain(
+    pipe: Option<Box<dyn std::io::Read + Send>>,
+    to: std::sync::mpsc::Sender<Piece>,
+    wrap: fn(Vec<u8>) -> Piece,
+) {
+    std::thread::spawn(move || {
+        if let Some(mut pipe) = pipe {
+            let mut buf = [0u8; 8192];
+            loop {
+                match pipe.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if to.send(wrap(buf[..n].to_vec())).is_err() {
+                            return;
+                        }
+                    }
+                }
             }
-            buf
-        })
+        }
+        let _ = to.send(Piece::Closed);
+    });
+}
+
+/// The one bounded waiter: [`wait_with_timeout_or`], also handing each piece
+/// of output to `on_output` as it arrives.
+///
+/// The pipes are read while waiting (see [`wait_with_timeout`]); after the
+/// child exits both are read to their end, as before, so nothing it printed
+/// is lost.
+fn wait_streaming(
+    mut child: std::process::Child,
+    timeout: Duration,
+    stop: &Stop<'_>,
+    on_output: &mut dyn FnMut(&[u8]),
+) -> Result<std::process::Output> {
+    let tree = crate::agent::process_tree::Tree::adopt(&child);
+    let (to, arriving) = std::sync::mpsc::channel::<Piece>();
+    drain(
+        child.stdout.take().map(|p| Box::new(p) as _),
+        to.clone(),
+        Piece::Out,
+    );
+    drain(
+        child.stderr.take().map(|p| Box::new(p) as _),
+        to,
+        Piece::Err,
+    );
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut open = 2;
+    // `None` is time passing with nothing new: handed on as an empty piece,
+    // so a watcher holding output back can still show it.
+    let mut take = |piece: Option<Piece>, open: &mut i32| match piece {
+        Some(Piece::Out(bytes)) => {
+            on_output(&bytes);
+            stdout.extend_from_slice(&bytes);
+        }
+        Some(Piece::Err(bytes)) => {
+            on_output(&bytes);
+            stderr.extend_from_slice(&bytes);
+        }
+        Some(Piece::Closed) => *open -= 1,
+        None => on_output(&[]),
     };
-    let stdout = drain(child.stdout.take().map(|p| Box::new(p) as _));
-    let stderr = drain(child.stderr.take().map(|p| Box::new(p) as _));
 
     let start = std::time::Instant::now();
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
-                if abandon() {
+                if (stop.now)() {
                     tree.kill(&mut child);
                     let _ = child.wait();
-                    anyhow::bail!("stopped before it finished: the answer came from elsewhere");
+                    anyhow::bail!("{}", stop.said);
                 }
                 if start.elapsed() > timeout {
                     tree.kill(&mut child);
                     let _ = child.wait();
-                    // The readers are not joined: something outside the tree
-                    // could still hold a pipe, and a timeout must not become
-                    // a hang. They end when the pipes close.
+                    // The readers are not waited for: something outside the
+                    // tree could still hold a pipe, and a timeout must not
+                    // become a hang. They end when the pipes close.
                     anyhow::bail!("command timed out after {}s", timeout.as_secs());
                 }
-                std::thread::sleep(Duration::from_millis(50));
+                // Waiting on the output rather than sleeping: what arrives is
+                // handed on at once, and a quiet child is looked at again
+                // within the poll.
+                match arriving.recv_timeout(WAIT_POLL) {
+                    Ok(piece) => {
+                        take(Some(piece), &mut open);
+                        while let Ok(more) = arriving.try_recv() {
+                            take(Some(more), &mut open);
+                        }
+                    }
+                    // Both pipes are closed and the child still runs: nothing
+                    // more can arrive, so this is an ordinary wait.
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        std::thread::sleep(WAIT_POLL);
+                        take(None, &mut open);
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => take(None, &mut open),
+                }
             }
             Err(e) => return Err(e.into()),
         }
     };
+    // Everything the child printed, to the end of both pipes.
+    while open > 0 {
+        match arriving.recv() {
+            Ok(piece) => take(Some(piece), &mut open),
+            Err(_) => break,
+        }
+    }
     Ok(std::process::Output {
         status,
-        stdout: stdout.join().unwrap_or_default(),
-        stderr: stderr.join().unwrap_or_default(),
+        stdout,
+        stderr,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A line, two seconds of nothing, another line.
+    #[cfg(windows)]
+    const SLOW_TWO_LINES: &str = "echo first&& ping -n 3 127.0.0.1 >nul&& echo second";
+    #[cfg(not(windows))]
+    const SLOW_TWO_LINES: &str = "echo first; sleep 2; echo second";
+
+    /// **OUTPUT IS HANDED ON AS THE COMMAND PRINTS IT**, not when it ends:
+    /// the first line arrives while the command is still sleeping, and the
+    /// result is still the whole output.
+    #[test]
+    fn output_is_handed_on_while_the_command_runs() {
+        let dir = tempfile::tempdir().expect("dir");
+        let started = std::time::Instant::now();
+        let mut first_at = None;
+        let mut seen = Vec::new();
+        let input = serde_json::json!({ "command": SLOW_TWO_LINES }).to_string();
+        let said = execute_bash_watched(dir.path(), &input, false, &|| false, &mut |piece| {
+            seen.extend_from_slice(piece);
+            if first_at.is_none() && String::from_utf8_lossy(&seen).contains("first") {
+                first_at = Some(started.elapsed());
+            }
+        })
+        .expect("runs");
+        let whole = started.elapsed();
+        let first_at = first_at.expect("the first line was handed on");
+        assert!(
+            first_at + Duration::from_millis(1000) < whole,
+            "the first line came at {first_at:?}, the end at {whole:?}"
+        );
+        assert!(said.contains("first") && said.contains("second"), "{said}");
+    }
+
+    /// **A STOPPED TURN STOPS ITS COMMAND**, and everything it started, at
+    /// once rather than at the command's own timeout.
+    #[test]
+    fn a_stop_ends_the_command_at_once() {
+        let dir = tempfile::tempdir().expect("dir");
+        let asked = std::time::Instant::now();
+        #[cfg(windows)]
+        let long = "ping -n 30 127.0.0.1 >nul";
+        #[cfg(not(windows))]
+        let long = "sleep 30";
+        let input = serde_json::json!({ "command": long }).to_string();
+        let stop_at = asked + Duration::from_millis(300);
+        let err = execute_bash_watched(
+            dir.path(),
+            &input,
+            false,
+            &|| std::time::Instant::now() > stop_at,
+            &mut |_| {},
+        )
+        .expect_err("stopped");
+        assert!(err.to_string().contains("stopped"), "{err}");
+        assert!(
+            asked.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            asked.elapsed()
+        );
+    }
 
     /// A shell command that prints `lines` lines of about 70 bytes each.
     fn loud(lines: u32) -> Command {
@@ -264,8 +456,14 @@ mod tests {
 
     fn run(command: &str, filter_env: bool) -> String {
         let input = serde_json::json!({ "command": command }).to_string();
-        execute_bash(std::path::Path::new("."), &input, filter_env)
-            .expect("the shell command should run")
+        execute_bash_watched(
+            std::path::Path::new("."),
+            &input,
+            filter_env,
+            &|| false,
+            &mut |_| {},
+        )
+        .expect("the shell command should run")
     }
 
     /// A secret in this process's environment must not reach a command the

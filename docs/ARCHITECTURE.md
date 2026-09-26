@@ -64,12 +64,12 @@ runs. The code is `src/acp_agent/`; payloads are `agent-client-protocol-schema` 
 
 | Method | What incode does |
 |---|---|
-| `initialize` | protocol version 1; prompts take text and embedded context; `loadSession: true`; `sessionCapabilities` `close` and `list`; `mcpCapabilities` `http: false`, `sse: false` (stdio servers only); no auth methods |
+| `initialize` | protocol version 1; prompts take text, embedded context and images (`image: true`); `loadSession: true`; `sessionCapabilities` `close` and `list`; `mcpCapabilities` `http: false`, `sse: false` (stdio servers only); no auth methods. The client's `clientCapabilities.subagents` (the draft sub-agent extension, not in the schema crate) is read from the raw params: with it, workers are announced as sub-agents |
 | `authenticate` | invalid params — no method was offered; the CLIs hold their own logins |
 | `session/new` | `cwd` must be absolute and an existing directory; it becomes the workspace (made canonical by `prepare_session`). The session is built on its own thread, the client's stdio MCP servers are started, and the answer carries `modes` and `configOptions`; then `available_commands_update` lists its slash commands, and a message chunk says what each MCP server offered or why it did not start |
 | `session/load` | a session kept in `cwd` (its transcript exists): built like `session/new` under the same id, its history replayed as `user_message_chunk` / `agent_message_chunk` BEFORE the answer (`modes`, `configOptions`); the model's own conversation is resumed where it can be (below) |
 | `session/list` | the transcripts in `cwd` (id, title = the first person's line, `updatedAt` = the file's time), newest first, at most 200; with no `cwd`, every workspace an ACP session record names |
-| `session/prompt` | one turn: text as `agent_message_chunk`, tool calls and results as `tool_call` / `tool_call_update`, an edit that landed as a `diff`, the task list as `plan`, the context window's fill as `usage_update`; replies with the stop reason, or a JSON-RPC error if the turn failed. A prompt that is a slash command runs that command instead; `/run` works the ledger and sends it as the plan |
+| `session/prompt` | one turn: text as `agent_message_chunk`, the model's reasoning as `agent_thought_chunk`, tool calls and results as `tool_call` / `tool_call_update` (a running command's output as `in_progress` updates first), an edit that landed as a `diff`, the task list as `plan`, the context window's fill as `usage_update`, each worker as a sub-agent; every step and the reply carry `_meta.incord`; replies with the stop reason, or a JSON-RPC error if the turn failed. Pictures in the prompt go to the agent leading the session, or the prompt is refused. A prompt that is a slash command runs that command instead; `/run` works the ledger and sends it as the plan, its lanes as sub-agents |
 | `session/cancel` | trips the session's cancel token; the prompt answers `cancelled` |
 | `session/set_mode` | `read-only`, `workspace-write`, `danger-full-access`; applied from the next turn |
 | `session/set_config_option` | `agent` or `role` (both selects); answered at once with every option, applied before the next turn (or at once when the session is idle) |
@@ -106,6 +106,117 @@ reports a window, so none sends one. No `cost` is sent: on a subscription the CL
 the prompt result's `usage`, which the schema only has behind
 `unstable_end_turn_token_usage`; it is not enabled.
 
+**What a tool and a worker do while they run (`crate::watch`, `acp_agent::workers`).**
+A turn's events say that a call started and what it returned. What happens in
+between reaches a front end through a `watch::Watch` the session installs on its
+backend (`AgentSession::set_watch` → `AgentBackend::set_watch` → `Toolbox::set_watch`;
+carried into a backend switched in and into standbys): a running command's output,
+what the guards or the engine decided about a call, the recorder's answer to a
+`watchman_lookup`, and the workers a call or a run starts. The REPL installs none;
+`--acp` installs `workers::SessionWatch`, and one `workers::Presenter` turns the
+session's events and every worker's into updates.
+
+- **Workers as sub-agents.** Only when the client advertised
+  `clientCapabilities.subagents`. A worker is announced in its PARENT's session —
+  the session, or the worker that started it — and its own conversation is sent
+  under its own session id (`<session>/<kind>-<n>`), then its end in the parent's.
+  The two updates are not in the stable schema, so they are written as the JSON the
+  owner's app reads (`agentStore.ts`, inside an ordinary `session/update`):
+  `{"sessionUpdate":"subagent_spawned","subagentSessionId","name","task","capabilities":{}}`
+  and `{"sessionUpdate":"subagent_state_update","subagentSessionId","state"}` with
+  `completed`, `failed` or `cancelled` (a tap dropped without an end says `failed`).
+  Under its own id a worker's text streams as `agent_message_chunk` (its whole-block
+  copy not repeated), its reasoning as `agent_thought_chunk`, its calls as
+  `tool_call` / `tool_call_update` with their live output and diffs (a whole-file
+  write with no "before" — a worker has no snapshot — is shown as its output). The
+  workers are: the `Agent` tool's sub-agent (`toolbox::subagent`, named
+  `<role> · sub-agent`; its events reach the tap from the child backend's own
+  `run_turn` callback, and its own toolbox reports to the tap's watch), and each
+  parallel lane of `/run` (`cli::run_ledger::LaneAgent`, named
+  `<role> · lane <n>`, `n` counted per run; the tap is handed to its
+  `AgentBackendWorker`, whose event callback feeds it, and the run's
+  `runner::Progress::watch` is where the lanes get the watch). The team channel is
+  not a worker: it has no process and no conversation, and what is said on it is
+  said by a worker through its `team_*` calls, which appear under that worker.
+- **Cancel reaches the workers.** The `Agent` tool's child gets the session's
+  cancel token, so `session/cancel` kills its process tree within the bridge's poll
+  and its tab says `cancelled`. A lane's backend gets the run's token too: a cancel
+  now stops a running LANE at once (its work is sealed onto its branch when the
+  lane is closed, and not merged), where the sequential task still finishes first.
+- **Live command output.** A foreground `Bash` hands each piece of output on as the
+  command prints it (`tools::bash::execute_bash_watched`, over the one bounded
+  waiter); the toolbox shows the newest `watch::MAX_LIVE_OUTPUT_BYTES` (8 KiB) at
+  most once per `LIVE_OUTPUT_EVERY` (500 ms), the cut said, as a `tool_call_update`
+  with status `in_progress` and the text as its content (the content replaces the
+  card's, as the protocol says, so the card shows the newest tail). The result then
+  replaces it with the whole bounded output. The command is also stopped, with its
+  tree, when the turn is. `BashOutput` is not streamed: it reads what a background
+  job printed since the last read and returns at once, so its result is its output.
+- **Thinking.** `AgentEvent::Thinking` → `agent_thought_chunk`. Only the claude
+  route sends it: its partial messages carry `thinking_delta`s, and — measured on
+  2.1.283 — every one of them is EMPTY unless the run asks for
+  `--thinking-display summarized` (not in `--help`; in the CLI's option table,
+  choices `summarized`/`omitted`/`highlights`), which incode now passes whenever
+  partial messages are on. The API route does not ask its endpoint for thinking,
+  and codex's reasoning items were not measured (no live turn is possible there).
+- **Plan priority.** `TodoWrite`'s own priority, as before. The ledger has no
+  priority field, so `/run`'s plan stays `medium` for every entry — none is invented.
+
+**`_meta.incord` (B2).** Every `tool_call` and `tool_call_update` — the session's
+and every worker's — and the answer to a prompt the model served carry
+`"_meta": {"incord": {…}}` with only the fields incode knows; a field it does not
+know is absent, never `null`, and with nothing known there is no `_meta`:
+
+```jsonc
+"_meta": {"incord": {
+  "role": "plan",                 // the role the session's model was routed by (the picker), or the worker's
+  "agent": "claude-code",         // the catalogue id serving it
+  "model": "opus",                // the model ASKED for, when one was chosen
+  "lane": "lane 2",               // a lane of /run
+  "guard": {                      // on a result, when the guards or the engine decided
+    "by": "guards",               // or "engine"
+    "decision": "blocked",        // or "allowed"
+    "rule": "tests/",             // the protected pattern that matched (guards)
+    "path": "tests/probe.txt",    // the path it was about (guards)
+    "reason": "…"                 // the engine's reason, cut at 500 characters (engine)
+  },
+  "watchman": {"hit": true, "observations": 5}   // on a watchman_lookup result
+}}
+```
+
+`guard` is the last word before the call ran: a guard refusal; else the engine's
+answer (allow, block, or a confirmation settled either way; an engine that could
+not decide is reported as its refusal or its fail-open, with the reason); else,
+with no engine, `allowed` by the guards for a call they look at (a change tool or
+`Bash`). The permission mode's refusals and the person's answers are not in it.
+`watchman` is what the recorder answered — its measured answer has `hit` and
+`observations` and no token figure, so no `savedTokens` is sent. The prompt's
+answer carries `role`, `agent` and `model` only; a slash command's and `/run`'s
+carry none (the run is served by the lanes and the worker agent, not the session's
+model). The owner's app does not draw these yet.
+
+**Pictures in a prompt (A9).** `promptCapabilities.image` is true. An `image` block
+is taken when its `mimeType` is `image/png` or `image/jpeg` and its bytes pass
+`toolbox::Image::from_base64` — sniffed from the bytes, at most
+`MAX_IMAGE_EDGE` px a side, `MAX_IMAGE_PIXELS`, `MAX_IMAGE_BYTES` — at most
+`MAX_IMAGES_PER_RESULT` (4) per prompt; anything else refuses the prompt with the
+bound it broke (`-32602`), and no turn runs. A picture with a slash command is
+refused. The pictures are handed to the agent leading the session
+(`AgentSession::attach_images` → `AgentBackend::attach_images`) BEFORE the engine
+or the transcript hear the prompt, so an agent that cannot take them refuses the
+prompt whole; a standby that takes the turn over does not get them. Per agent:
+
+| Agent | How | Evidence |
+|---|---|---|
+| claude | the prompt goes on stdin as one stream-json user message — its text, then `{"type":"image","source":{"type":"base64","media_type","data"}}` per picture — with `-p --input-format stream-json` and no prompt on the argv | live, 2.1.283: a PNG of a red rectangle and a blue circle was described as exactly that; the CLI ended when stdin closed |
+| API route | the user message's content becomes `[text, image…]`, the same image block a tool result's pictures use (`api::image_block`) | unit test on the request body |
+| codex | each picture written to a file in the temp directory, passed as `--image <file>` right after `exec` / `exec resume` (before any other flag, so the multi-value list cannot swallow the prompt), removed after the turn | `codex exec --help` and `codex exec resume --help` (0.153.4) list `-i, --image <FILE>...`; NOT run live — every codex turn here answers with the usage limit |
+| agy | refused, naming the agent | `agy --help` (1.2.11) has no image flag; its `--input-format stream-json` message shape is not measured |
+
+The REPL takes one too: `/image <path>` (a file in the workspace, at most 32 MiB,
+made to fit like a screenshot — `Image::fitted`) goes with the next message, or is
+refused by an agent that cannot take it.
+
 **Slash commands.** `/undo`, `/plan`, `/act`, `/diff`, `/links`, `/roadmap`, `/run`,
 `/doctor`, `/memories`, `/remember`, `/worktree`, `/agent` and `/roles` are announced,
 with the description and argument hint from `slash_commands::COMMANDS`. A prompt that
@@ -131,8 +242,9 @@ text); every entry is `medium`, because a ledger task has no priority. A plan is
 only when it changed. The app shows it as "Plan · n of m". `session/cancel` trips the
 session's token, which the run looks at between tasks — where Ctrl-C and the
 interface's stop file (still watched) land — so the task already running finishes and
-is verified first, and the prompt then answers `cancelled`. A run is refused in a
-`read-only` session: every task changes files.
+is verified first, and the prompt then answers `cancelled` — except a parallel
+lane, whose agent is stopped at once (see "Cancel reaches the workers" below). A
+run is refused in a `read-only` session: every task changes files.
 
 **The pickers (`acp_agent::config`).** `configOptions` holds two selects, in the flat
 shape the owner's app reads: `agent` — the catalogue's usable agents
@@ -566,6 +678,8 @@ a live `-p` run before it was relied on:
 | No skills | `--disable-slash-commands` | `init` listed 18 skills without it, `skills: []` and `slash_commands: []` with it. Its agent list is still reported, but with no `Task`/`Agent` tool of its own nothing can start one. |
 | Calls reach incode without a CLI prompt | `--allowedTools mcp__incode mcp__team …` | 0 `permission_denials`. |
 | NOT usable | `--bare` | reads only an API key; with a subscription login it returned `Not logged in · Please run /login`. |
+| Readable thinking (2.1.283) | `--thinking-display summarized`, with `--include-partial-messages` | without it a hard prompt streamed a `thinking` block whose deltas were all empty (`"thinking":""`, `estimated_tokens`); with it the summary arrived word by word as `thinking_delta`s, the reply unchanged. Not in `--help`. |
+| A prompt with pictures (2.1.283) | `-p --input-format stream-json`, the prompt on stdin | one `{"type":"user","message":{"role":"user","content":[text, image]}}` line, stdin closed: the model described the picture, exit 0. |
 
 Live, through incode: "create hello.txt containing hi" ran `Write` in incode's toolbox
 (trace `tool Write <- {"path":"hello.txt","content":"hi"}`, engine pre-tool 3.2 s, exit
@@ -658,8 +772,8 @@ for a patch). The ACP kind is `acp_agent::present::tool_kind`.
 | `Glob`, `Grep` | observe | search | Glob `MAX_GLOB_RESULTS` 500 (rest counted); Grep `MAX_GREP_MATCHES` 100 matching lines (says it stopped), 300 chars a line, 30 000 chars, files over 50 MiB counted not searched | ripgrep's engine (`tools::search`). One walker for Glob, Grep and LS: `.gitignore`, `.ignore`, `.git/info/exclude` with `require_git(false)`, hidden files, `node_modules` and any directory holding `CACHEDIR.TAG` skipped. The model's glob is applied with globset AFTER the walk (an override or type filter re-admits hidden files — measured); no `/` matches a name at any depth, a `/` anchors to `path`. Grep: context lines, case-insensitive, a matching binary file reported without its bytes, non-matching binaries counted, BOM-marked UTF-16 transcoded. |
 | `Outline` | observe | read | `MAX_OUTLINE_SYMBOLS` 400, `MAX_OUTLINE_BYTES` 4 MiB, 10 s parse | tree-sitter queries for rs, ts/tsx, js/jsx/mjs/cjs, py, go (`toolbox::outline`); kind, name, signature and line range, nested; a syntax error's line is reported; another language is refused by name. Each grammar is a cargo feature (`lang-rust`, `lang-ts`, `lang-python`, `lang-go`, `lang-js`), all default. |
 | `ConvertDocument` | change | edit | `CONVERT_DEADLINE` 120 s, whole-tree kill | OFFERED ONLY when `soffice` is found: `INCODE_SOFFICE` (alone, when set), then `PATH`, then the platform's install paths. Headless, `--norestore --nologo --nodefault --nolockcheck`, a private `-env:UserInstallation` profile in a temp dir, PDF made there and copied into place; the guards and the checkpoint see the OUTPUT path. The conversion itself has run only against a fake `soffice`: LibreOffice is not installed on the development machine. |
-| `Bash` | run | execute | output 30 000 chars; timeout | `run_in_background` starts a session job (`MAX_RUNNING_JOBS` 8) |
-| `BashOutput` | observe | read | `MAX_JOB_READ_BYTES` 30 000 per read; `MAX_JOB_BUFFER_BYTES` 1 MiB kept per stream | new output since the last read; loss past the buffer is counted |
+| `Bash` | run | execute | output 30 000 chars; timeout; live view 8 KiB per 500 ms | `run_in_background` starts a session job (`MAX_RUNNING_JOBS` 8). In the foreground its output is handed to the watch as it prints (`--acp`: `in_progress` updates), and the command's tree is killed when the turn is stopped |
+| `BashOutput` | observe | read | `MAX_JOB_READ_BYTES` 30 000 per read; `MAX_JOB_BUFFER_BYTES` 1 MiB kept per stream | new output since the last read; loss past the buffer is counted. Returns at once, so nothing is streamed |
 | `KillShell` | run | execute | — | kills the job's process tree |
 | `TodoWrite` | session | think | `MAX_TODOS` 100, `MAX_TODO_CHARS` 500 | kept per session; `--acp` sends it as the plan, with its priority, on the call's successful result |
 | `Diagnostics` | run | execute | `PROJECT_CHECK_TIMEOUT` 300 s, `MAX_PROJECT_FINDINGS` 50, `MAX_DIAGNOSTIC_FILES` 50 | `INCORD_CHECK_CMD`, else `cargo check` / `tsc --noEmit` |
@@ -670,7 +784,7 @@ for a patch). The ACP kind is `acp_agent::present::tool_kind`.
 | `click_element`, `type_text`, `paste_text`, `key`, `scroll`, `drag`, `move_mouse`, `click` | run | other | a call 120 s | the same; refused read-only, asked under prompt, refused when the engine cannot decide |
 | `WebSearch` | observe | fetch | 15 s, 512 KiB, 8 results | provider from `admin.json` `web_search` — contract in `web::search_with` |
 | `Skill` | observe | other | — | |
-| `Agent` | run | other | depth 2 | |
+| `Agent` | run | other | depth 2 | on the model endpoint when one is configured; otherwise on the agent CLI this toolbox's model runs in (`Toolbox::run_subagents_on`, set by the claude backend): a second headless run of it as a model only, its own toolbox one level down, the session's mode, guards, engine, person to ask, cancel and memory session id, its role routing its model (the operator's candidates, then the CLI's own ladder). Neither: refused. A worker — see "What a tool and a worker do while they run" |
 | `AskUserQuestion` | session | other | — | |
 | `verify` | run | other | 600 s | |
 | `recall_index`, `recall_get`, `memory_search`, `find_symbol`, `code_skeleton`, `git_blast_radius` | observe | other | 8 s | the memory service |

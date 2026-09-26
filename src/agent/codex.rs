@@ -147,6 +147,42 @@ pub struct CodexBackend {
     /// System context blocks prepended to the prompt.
     system_context: Vec<String>,
     cancel: Option<crate::runtime::cancel::CancelToken>,
+    /// Pictures for the next turn's prompt only.
+    images: Vec<crate::toolbox::Image>,
+    /// Where this turn's pictures were written, while its command is built.
+    image_files: Vec<PathBuf>,
+}
+
+/// A turn's pictures as files for `--image`, removed when the turn is over.
+struct ImageFiles {
+    paths: Vec<PathBuf>,
+}
+
+impl ImageFiles {
+    /// Write each picture to a file of its own in the system's temporary
+    /// directory, named so no two turns share one.
+    fn write(images: &[crate::toolbox::Image]) -> Result<Self, String> {
+        let mut written = Self { paths: Vec::new() };
+        for image in images {
+            let path = std::env::temp_dir().join(format!(
+                "incode-prompt-{}.{}",
+                uuid::Uuid::new_v4(),
+                image.format().word()
+            ));
+            std::fs::write(&path, image.bytes())
+                .map_err(|e| format!("a picture could not be written for the agent: {e}"))?;
+            written.paths.push(path);
+        }
+        Ok(written)
+    }
+}
+
+impl Drop for ImageFiles {
+    fn drop(&mut self) {
+        for path in &self.paths {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 impl CodexBackend {
@@ -163,6 +199,8 @@ impl CodexBackend {
             team_identity: None,
             system_context: Vec::new(),
             cancel: None,
+            images: Vec::new(),
+            image_files: Vec::new(),
         }
     }
 
@@ -226,9 +264,20 @@ impl CodexBackend {
             cmd.env(crate::team_mcp::IDENTITY_ENV, role);
         }
 
+        // The pictures for this turn, as files — `codex exec -i, --image
+        // <FILE>...` (and the same on `exec resume`). Each goes FIRST, before
+        // any other flag, so the next flag ends the list: `--image` takes
+        // several values, and one placed before the prompt would take the
+        // prompt for a file name.
+        let images = |cmd: &mut Command| {
+            for file in &self.image_files {
+                cmd.arg("--image").arg(file);
+            }
+        };
         if let Some(tid) = &self.thread_id {
             cmd.arg("exec");
             cmd.arg("resume");
+            images(&mut cmd);
             cmd.arg("--skip-git-repo-check");
             cmd.arg("--json");
             cmd.arg("--dangerously-bypass-approvals-and-sandbox");
@@ -244,6 +293,7 @@ impl CodexBackend {
             cmd.arg(prompt);
         } else {
             cmd.arg("exec");
+            images(&mut cmd);
             cmd.arg("--skip-git-repo-check");
             cmd.arg("--json");
             cmd.arg("-c")
@@ -364,13 +414,26 @@ impl AgentBackend for CodexBackend {
         self.cancel = Some(token);
     }
 
+    /// As files, with `--image` — in `codex exec --help` (0.153.4) for both
+    /// `exec` and `exec resume`. Not run live here: every live turn on this
+    /// machine answers with the account's usage limit.
+    fn attach_images(&mut self, images: Vec<crate::toolbox::Image>) -> Result<(), String> {
+        self.images = images;
+        Ok(())
+    }
+
     fn run_turn(
         &mut self,
         prompt: &str,
         on_event: &mut dyn FnMut(&AgentEvent),
     ) -> Result<TurnOutcome, AgentError> {
         let sent = self.full_prompt(prompt);
+        // Held to the end of the turn, then removed.
+        let pictures =
+            ImageFiles::write(&std::mem::take(&mut self.images)).map_err(AgentError::new)?;
+        self.image_files.clone_from(&pictures.paths);
         let mut command = self.command(&sent);
+        self.image_files.clear();
         crate::agent::process_tree::prepare(&mut command);
         let mut child = command
             .stdout(Stdio::piped())
@@ -757,6 +820,42 @@ mod tests {
     fn enforces_claims_nothing() {
         let backend = CodexBackend::new(PathBuf::from("."));
         assert_eq!(backend.enforces(), crate::guards::Enforcement::NOTHING);
+    }
+
+    /// **A TURN'S PICTURES GO AS `--image` FILES, BEFORE ANY OTHER FLAG**, on
+    /// a new thread and on a resumed one, so the prompt is never read as one
+    /// more file; the files are removed when the turn's hold on them ends.
+    #[test]
+    fn pictures_go_first_as_image_files_and_are_removed_after() {
+        let picture = crate::toolbox::Image::from_base64(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC",
+        )
+        .expect("a 1x1 png");
+        let files = ImageFiles::write(std::slice::from_ref(&picture)).expect("written");
+        let path = files.paths[0].clone();
+        assert_eq!(std::fs::read(&path).expect("on disk"), picture.bytes());
+        let mut backend = CodexBackend::new(PathBuf::from("."));
+        backend.image_files.clone_from(&files.paths);
+        for resumed in [false, true] {
+            if resumed {
+                backend.thread_id = Some("t-1".to_string());
+            }
+            let args: Vec<String> = backend
+                .command("the prompt")
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            let at = if resumed { 2 } else { 1 };
+            assert_eq!(args[at], "--image", "{args:?}");
+            assert_eq!(args[at + 1], path.to_string_lossy(), "{args:?}");
+            assert!(
+                args[at + 2].starts_with("--"),
+                "the list is ended: {args:?}"
+            );
+            assert_eq!(args.last().map(String::as_str), Some("the prompt"));
+        }
+        drop(files);
+        assert!(!path.exists(), "the picture outlived its turn");
     }
 
     #[test]

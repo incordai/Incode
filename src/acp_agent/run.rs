@@ -110,9 +110,15 @@ struct PlanFeed<'a> {
     /// Text the run printed that has not ended its line yet; sent before a
     /// plan, so the two arrive in the order they happened.
     pending: Rc<RefCell<String>>,
+    /// The session's watch: each lane of the run is shown as a sub-agent.
+    watch: &'a super::workers::SessionWatch,
 }
 
 impl Progress for PlanFeed<'_> {
+    fn watch(&self) -> Option<Arc<dyn crate::watch::Watch>> {
+        Some(Arc::new(self.watch.clone()))
+    }
+
     fn advanced(&mut self, _done: usize, _total: usize) {
         self.shared.hold_cancel();
     }
@@ -166,6 +172,7 @@ pub(super) fn run(
     outbox: &Arc<Outbox>,
     session_id: &acp::SessionId,
     shared: &Shared,
+    watch: &super::workers::SessionWatch,
 ) -> acp::StopReason {
     let pending: Rc<RefCell<String>> = Rc::default();
     let sink = {
@@ -188,6 +195,7 @@ pub(super) fn run(
         shared,
         last: None,
         pending: Rc::clone(&pending),
+        watch,
     };
     crate::cli::console::stream(sink, || {
         runs.run(workspace, &shared.cancel, mode, &mut feed);

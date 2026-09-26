@@ -535,6 +535,22 @@ fn to_usage(wire: &WireUsage) -> crate::runtime::usage::TokenUsage {
 mod tests {
     use super::*;
 
+    /// **AN AGENT THAT CANNOT TAKE A PICTURE HEADLESS SAYS SO, BY NAME.**
+    /// `agy --help` (1.2.11) has no image flag, and its stream-json input
+    /// shape is not measured, so pictures are refused rather than dropped.
+    #[test]
+    fn pictures_are_refused_by_name() {
+        let picture = crate::toolbox::Image::from_base64(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC",
+        )
+        .expect("a 1x1 png");
+        let mut backend = AgyBackend::new(PathBuf::from("."));
+        let why = backend
+            .attach_images(vec![picture])
+            .expect_err("agy takes no pictures");
+        assert!(why.starts_with("agy cannot take pictures"), "{why}");
+    }
+
     fn parse(line: &str) -> Wire {
         serde_json::from_str(line).expect("a wire line")
     }

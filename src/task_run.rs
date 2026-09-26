@@ -401,7 +401,7 @@ fn show(
                 outln!("{line}");
             }
         }
-        AgentEvent::TextDelta(_) | AgentEvent::Context { .. } => {}
+        AgentEvent::TextDelta(_) | AgentEvent::Thinking(_) | AgentEvent::Context { .. } => {}
     }
 }
 

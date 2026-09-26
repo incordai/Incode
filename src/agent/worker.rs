@@ -241,6 +241,10 @@ pub struct AgentBackendWorker<B: AgentBackend> {
     /// Preserved across retry attempts so that if attempt 1 tampers with a
     /// protected file, attempt 2 does not adopt the tampered state as baseline.
     task_baseline: Option<(String, crate::guards::Sentinel)>,
+    /// Where every event of this worker's turns also goes, when someone is
+    /// following the worker as it works — a lane of `/run` under
+    /// `incode --acp`. See [`crate::watch`].
+    tap: Option<Box<dyn crate::watch::WorkerTap>>,
 }
 
 impl<B: AgentBackend> AgentBackendWorker<B> {
@@ -279,7 +283,20 @@ impl<B: AgentBackend> AgentBackendWorker<B> {
             moved_to: None,
             owner: Box::new(crate::runner::NoOwner),
             task_baseline: None,
+            tap: None,
         }
+    }
+
+    /// Hand every event of this worker's turns to `tap` as well.
+    #[must_use]
+    pub fn with_tap(mut self, tap: Box<dyn crate::watch::WorkerTap>) -> Self {
+        self.tap = Some(tap);
+        self
+    }
+
+    /// The tap, once the work is over, for the caller to say how it ended.
+    pub fn take_tap(&mut self) -> Option<Box<dyn crate::watch::WorkerTap>> {
+        self.tap.take()
     }
 
     /// Who to ask when a protected file moved.
@@ -371,9 +388,13 @@ impl<B: AgentBackend> AgentBackendWorker<B> {
         let transcript = &mut self.transcript;
         let watch_edits = &mut self.watch_edits;
         let show = &mut self.show;
+        let tap = &mut self.tap;
         let mut on_event = |event: &AgentEvent| {
             if let Some(open) = transcript.as_mut() {
                 open.record(event);
+            }
+            if let Some(tap) = tap.as_mut() {
+                tap.event(event);
             }
             // FILE CHANGES, AS THEY LAND. A run works unattended for minutes
             // behind a status bar; this is the part of it a person can act on

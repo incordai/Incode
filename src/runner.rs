@@ -822,6 +822,12 @@ pub trait Progress {
     /// task is claimed, so the one running now can be named. Told, never
     /// asked: nothing it does reaches the ledger.
     fn ledger(&mut self, _ledger: &Ledger) {}
+
+    /// Who follows the run's workers as they work — each parallel lane, with
+    /// its own conversation — when anyone does. See [`crate::watch`].
+    fn watch(&self) -> Option<std::sync::Arc<dyn crate::watch::Watch>> {
+        None
+    }
 }
 
 /// Nobody watching.

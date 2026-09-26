@@ -779,6 +779,9 @@ impl CliApp {
                     SlashCommand::Undo => {
                         slash_commands::handle_undo(&mut session, &workspace);
                     }
+                    SlashCommand::Image(path) => {
+                        slash_commands::handle_image(&mut session, &workspace, &path);
+                    }
                     SlashCommand::Roadmap => {
                         slash_commands::handle_roadmap(&workspace);
                     }

@@ -124,7 +124,9 @@ pub fn line_for(event: &AgentEvent) -> Option<serde_json::Value> {
             "is_error": is_error,
             "output": clip(output),
         }),
+        // Reasoning is not the work's record: the reply and the calls are.
         AgentEvent::TextDelta(_)
+        | AgentEvent::Thinking(_)
         | AgentEvent::Quota { .. }
         | AgentEvent::Usage { .. }
         | AgentEvent::Context { .. } => return None,

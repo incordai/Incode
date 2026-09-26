@@ -498,16 +498,7 @@ pub fn tool_result_message(results: &[(String, ToolOutput, bool)]) -> Value {
                 json!(output.text)
             } else {
                 let mut parts = vec![json!({"type": "text", "text": output.text})];
-                parts.extend(output.images.iter().map(|image| {
-                    json!({
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": image.format().mime(),
-                            "data": image.base64(),
-                        }
-                    })
-                }));
+                parts.extend(output.images.iter().map(image_block));
                 Value::Array(parts)
             };
             json!({
@@ -519,6 +510,32 @@ pub fn tool_result_message(results: &[(String, ToolOutput, bool)]) -> Value {
         })
         .collect();
     json!({"role": "user", "content": blocks})
+}
+
+/// One picture as a base64 `image` content block — the shape a tool result
+/// carries it in here, and a person's prompt carries it in on this route and
+/// on the claude CLI's stream-json input.
+#[must_use]
+pub fn image_block(image: &crate::toolbox::Image) -> Value {
+    json!({
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": image.format().mime(),
+            "data": image.base64(),
+        }
+    })
+}
+
+/// A person's prompt as a user message: the plain string it always was, or
+/// — with pictures — its text, then one image block per picture.
+fn user_prompt(prompt: &str, images: &[crate::toolbox::Image]) -> Value {
+    if images.is_empty() {
+        return json!({"role": "user", "content": prompt});
+    }
+    let mut content = vec![json!({"type": "text", "text": prompt})];
+    content.extend(images.iter().map(image_block));
+    json!({"role": "user", "content": content})
 }
 
 /// A model driven over an API, with this harness supplying its tools.
@@ -541,6 +558,8 @@ pub struct ApiBackend {
     served_by: Vec<String>,
     /// Tripped when the operator asks to stop.
     cancel: Option<crate::runtime::cancel::CancelToken>,
+    /// Pictures for the next turn's prompt only.
+    images: Vec<crate::toolbox::Image>,
 }
 
 impl ApiBackend {
@@ -563,6 +582,7 @@ impl ApiBackend {
             tools,
             served_by: Vec::new(),
             cancel: None,
+            images: Vec::new(),
         }
     }
 
@@ -622,8 +642,8 @@ impl ApiBackend {
                 model: self.settings.model.clone(),
             });
         }
-        self.messages
-            .push(json!({"role": "user", "content": prompt}));
+        let images = std::mem::take(&mut self.images);
+        self.messages.push(user_prompt(prompt, &images));
 
         let definitions = self.tools.definitions();
         for _ in 0..MAX_STEPS {
@@ -915,6 +935,17 @@ impl AgentBackend for ApiBackend {
         self.tools.names()
     }
 
+    fn set_watch(&mut self, watch: std::sync::Arc<dyn crate::watch::Watch>) {
+        self.tools.set_watch(watch);
+    }
+
+    /// Sent as image blocks in the next turn's user message, as a tool
+    /// result's pictures already are.
+    fn attach_images(&mut self, images: Vec<crate::toolbox::Image>) -> Result<(), String> {
+        self.images = images;
+        Ok(())
+    }
+
     fn clear_session(&mut self) {
         // The conversation IS the session here, so forgetting it is the whole
         // operation — there is nothing on the far side to tell.
@@ -1068,6 +1099,35 @@ mod tests {
             "usage": {"input_tokens": 5, "output_tokens": 7}
         })
         .to_string()
+    }
+
+    /// **A PROMPT'S PICTURES GO AS IMAGE BLOCKS, ON THAT TURN ONLY**: the
+    /// user message holds the text then the picture, in the shape a tool
+    /// result's pictures already take; the next turn is plain text again.
+    #[test]
+    fn a_prompts_pictures_go_as_image_blocks_on_that_turn_only() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let picture = crate::toolbox::Image::from_base64(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC",
+        )
+        .expect("a 1x1 png");
+        let transport = Canned::new(&[&said("a dot"), &said("still here")]);
+        let mut api = backend(dir.path());
+        api.attach_images(vec![picture.clone()]).expect("taken");
+        api.run_turn_with(&transport, "what is this", &mut |_| {})
+            .expect("a turn");
+        api.run_turn_with(&transport, "and now", &mut |_| {})
+            .expect("a turn");
+        let sent = transport.sent.borrow();
+        let first = &sent[0]["messages"][0]["content"];
+        assert_eq!(first[0], json!({"type": "text", "text": "what is this"}));
+        assert_eq!(first[1], image_block(&picture));
+        assert_eq!(first[1]["source"]["media_type"], "image/png");
+        let later = sent[1]["messages"]
+            .as_array()
+            .and_then(|all| all.last())
+            .expect("the second prompt");
+        assert_eq!(later["content"], "and now");
     }
 
     #[test]
