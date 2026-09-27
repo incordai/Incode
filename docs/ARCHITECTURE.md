@@ -50,14 +50,16 @@ Every body-facing module reaches the service over its plain HTTP API on `127.0.0
 
 The harness used to carry its own MCP client, and attaching it to the service looked
 obvious — it did not work, because that client was **stdio-only** while the service
-registers over **HTTP**. That is still the case: incode has no HTTP MCP client.
+registers over **HTTP**. incode now has an HTTP MCP client (`toolbox::mcp_http`), but
+it serves one route only: the HTTP servers an ACP client names under `incode --acp`.
+The body-facing modules still use the plain HTTP API.
 
 MCP in incode today is three things, none of them the agent's own settings: the tool
 bridge (`incode --tool-server`, §5a), the only MCP server a bridged claude is given
 (`--strict-mcp-config`); `incode --team-mcp` and `incode --desktop-mcp`, handed to
-codex, which is not bridged; and an ACP client's stdio servers under `incode --acp`,
-which incode connects to itself (`toolbox::mcp_client`) and runs as its own tools
-(below).
+codex, which is not bridged; and an ACP client's stdio and HTTP servers under
+`incode --acp`, which incode connects to itself (`toolbox::mcp_client`,
+`toolbox::mcp_http`) and runs as its own tools (below).
 
 ### `incode --acp`: incode as the agent an editor drives
 
@@ -70,7 +72,7 @@ runs. The code is `src/acp_agent/`; payloads are `agent-client-protocol-schema` 
 
 | Method | What incode does |
 |---|---|
-| `initialize` | protocol version 1; prompts take text, embedded context and images (`image: true`); `loadSession: true`; `sessionCapabilities` `close` and `list`; `mcpCapabilities` `http: false`, `sse: false` (stdio servers only); no auth methods. The client's `clientCapabilities.subagents` (the draft sub-agent extension, not in the schema crate) is read from the raw params: with it, workers are announced as sub-agents |
+| `initialize` | protocol version 1; prompts take text, embedded context and images (`image: true`); `loadSession: true`; `sessionCapabilities` `close` and `list`; `mcpCapabilities` `http: true`, `sse: false` (stdio and Streamable HTTP servers); no auth methods. The client's `clientCapabilities.subagents` (the draft sub-agent extension, not in the schema crate) is read from the raw params: with it, workers are announced as sub-agents |
 | `authenticate` | invalid params — no method was offered; the CLIs hold their own logins |
 | `session/new` | `cwd` must be absolute and an existing directory; it becomes the workspace (made canonical by `prepare_session`). The session is built on its own thread, the client's stdio MCP servers are started, and the answer carries `modes` and `configOptions`; then `available_commands_update` lists its slash commands, and a message chunk says what each MCP server offered or why it did not start |
 | `session/load` | a session kept in `cwd` (its transcript exists): built like `session/new` under the same id, its history replayed as `user_message_chunk` / `agent_message_chunk` BEFORE the answer (`modes`, `configOptions`); the model's own conversation is resumed where it can be (below) |
@@ -285,9 +287,27 @@ a call 120 s, abandoned at once when the turn is stopped; at most 16 servers and
 tools each; stdout lines 16 MiB. A server gets the filtered environment plus the
 client's variables, and runs in the workspace. The servers are children of incode,
 held in `SessionTools`: when the session ends they get EOF, 2 s, then their process
-trees are killed. HTTP and SSE servers are not started (no HTTP MCP client exists in
-the crate), and `initialize` says so — so the owner's app, which sends its Incord
-Memory server only when `http` is true, sends none.
+trees are killed.
+
+*HTTP servers (`toolbox::mcp_http`).* An `http` entry is spoken to over MCP's
+Streamable HTTP by the same `McpClient`, through a second `Link`: each JSON-RPC message
+is one POST to the entry's `url` (`Accept: application/json, text/event-stream`), sent
+from the shared runtime so the client's waits, bounds and stop work unchanged. The
+answer is a JSON body (one message or a batch), an event stream read as it arrives
+and let go at the reply (a server may hold it open), or `202` for a notification. An
+`Mcp-Session-Id` the server names goes back on every later request, and a DELETE ends
+the session when the tools are dropped. Refused: a url other than https, or plain
+http to anywhere but this machine (`catalogue::key_may_travel_to`), before anything is
+sent; any redirect (`runtime::http::no_redirect_client`, connect bounded at 10 s); an
+answer past 16 MiB, declared or streamed. The entry's headers are sent as given and
+written nowhere — not the trace, not a message, not `Debug` — and neither is the url.
+A failure costs one request, not the server: an unreachable server, an HTTP error, or
+an answer refused or unreadable becomes a JSON-RPC error for that request's id, since
+a server behind a url can come back; an answer that never comes still marks the
+server broken, as for a child. Each POST is capped at the call bound (120 s). SSE —
+the older HTTP transport, a GET stream beside the POSTs — is not spoken, and
+`initialize` says `sse: false`. The owner's app sends its Incord Memory server (`http`,
+`<base>/v1/memory/mcp`, no headers) only when `http` is true, which it now is.
 
 **Loading a session (`acp_agent::history`).** An ACP session always keeps its
 transcript (`MemoryHooks::keep_transcript`, with or without an engine), and after each
@@ -317,8 +337,8 @@ the owner's app answers every agent request other than `session/request_permissi
 with `-32601`, so the model is told the question went unanswered, with its options.
 
 Not offered: `session/resume` (stable in the schema; not needed by the owner's app,
-which calls neither it nor `session/load`), HTTP / SSE MCP servers, elicitation, and
-fs / terminal.
+which calls neither it nor `session/load`), SSE MCP servers, elicitation, and fs /
+terminal.
 
 **The workspace is made absolute once.** `prepare_session` canonicalises the workspace
 (`file_ops::workspace_root`, the plain `C:\x` spelling, not `\\?\C:\x`), and

@@ -216,17 +216,48 @@ fn a_picked_role_routes_the_next_turns_model() {
 /// without reaching the server.
 #[test]
 fn a_clients_mcp_server_is_called_through_the_gate_and_refused_read_only() {
-    let mut client = client(Behaviour::CallMcp);
-    let dir = tempfile::tempdir().expect("ws");
     let logs = tempfile::tempdir().expect("logs");
     let log = logs.path().join("calls.log");
     let spec = crate::toolbox::fake_server("fake", &log);
+    let crate::toolbox::Transport::Stdio { command, args, env } = spec.transport else {
+        panic!("the fake is a stdio server");
+    };
     let server = json!({
         "name": spec.name,
-        "command": spec.command,
-        "args": spec.args,
-        "env": spec.env.iter().map(|(name, value)| json!({"name": name, "value": value})).collect::<Vec<_>>(),
+        "command": command,
+        "args": args,
+        "env": env.iter().map(|(name, value)| json!({"name": name, "value": value})).collect::<Vec<_>>(),
     });
+    called_through_the_gate_and_refused_read_only(server, "1 tool(s)", || {
+        crate::toolbox::client_server_calls(&log).len()
+    });
+}
+
+/// **THE CLIENT'S HTTP MCP SERVER IS INCODE'S OWN TOOL TOO** — the entry the
+/// desktop app sends once `mcpCapabilities.http` is true: connected over
+/// Streamable HTTP, called through the same gate, refused read-only.
+#[test]
+fn a_clients_http_mcp_server_is_called_through_the_gate_and_refused_read_only() {
+    let fake = crate::toolbox::FakeHttp::start();
+    let server = json!({
+        "type": "http",
+        "name": "fake",
+        "url": fake.url,
+        "headers": [{"name": "x-fake-token", "value": "t0ken-value"}],
+    });
+    called_through_the_gate_and_refused_read_only(server, "4 tool(s)", || fake.calls());
+}
+
+/// Open a session handed `server` — a fake whose tools include `echo` —
+/// call `mcp__fake__echo` through the gate, then again once read-only.
+/// `calls` counts the calls that reached the server.
+fn called_through_the_gate_and_refused_read_only(
+    server: Value,
+    listed: &str,
+    calls: impl Fn() -> usize,
+) {
+    let mut client = client(Behaviour::CallMcp);
+    let dir = tempfile::tempdir().expect("ws");
     let id = client.request(
         "session/new",
         json!({"cwd": dir.path(), "mcpServers": [server]}),
@@ -244,7 +275,10 @@ fn a_clients_mcp_server_is_called_through_the_gate_and_refused_read_only() {
             said.push_str(text);
         }
     }
-    assert!(said.contains("MCP server `fake`: 1 tool(s)"), "{said}");
+    assert!(
+        said.contains(&format!("MCP server `fake`: {listed}")),
+        "{said}"
+    );
 
     let (streamed, reply) = prompt_in(&mut client, &session, "call the echo");
     assert_eq!(reply["result"]["stopReason"], "end_turn", "{reply}");
@@ -258,7 +292,7 @@ fn a_clients_mcp_server_is_called_through_the_gate_and_refused_read_only() {
         result.to_string().contains("echo: from the model"),
         "{result}"
     );
-    assert_eq!(crate::toolbox::client_server_calls(&log).len(), 1);
+    assert_eq!(calls(), 1);
 
     let set = client.call(
         "session/set_mode",
@@ -273,11 +307,7 @@ fn a_clients_mcp_server_is_called_through_the_gate_and_refused_read_only() {
         .unwrap_or_else(|| panic!("no result: {streamed:#?}"));
     assert_eq!(refused["status"], "failed", "{refused}");
     assert!(refused.to_string().contains("read-only"), "{refused}");
-    assert_eq!(
-        crate::toolbox::client_server_calls(&log).len(),
-        1,
-        "a refused call reached the server"
-    );
+    assert_eq!(calls(), 1, "a refused call reached the server");
     client.close();
 }
 

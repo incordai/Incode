@@ -85,3 +85,41 @@ fn a_client_mcp_tool_is_refused_when_the_engine_cannot_decide() {
     assert!(client_server_calls(&log).is_empty());
     assert_eq!(fake::calls(engine.path(), "pre-tool"), 1);
 }
+
+/// **AN HTTP SERVER'S TOOL FAILS CLOSED TOO.** Reached over HTTP rather than
+/// a pipe, it is the same kind of tool: run in a writing session, refused
+/// when the engine cannot decide, and refused read-only — neither refusal
+/// reaching the server.
+#[test]
+fn a_client_http_mcp_tool_is_gated_like_a_stdio_one() {
+    let ws = tempfile::tempdir().expect("ws");
+    let engine = tempfile::tempdir().expect("engine");
+    let server = FakeHttp::start();
+    let state = SessionTools::new(false);
+    let spec = mcp_http::tests::http_spec("web", &server.url);
+    let said = state.connect_client_servers(vec![spec], ws.path());
+    let mut open = Toolbox::new(ws.path(), true);
+    open.share_session(Arc::clone(&state));
+    open.set_permission_mode(PermissionMode::WorkspaceWrite);
+    let ran = open
+        .run("mcp__web__echo", &json!({"text": "hi"}))
+        .unwrap_or_else(|e| panic!("{e}; connecting said {said:?}"));
+    assert_eq!(ran, "echo: hi");
+
+    let bin = fake::write(engine.path(), &[("pre-tool", Reply::exit(1))]);
+    let mut undecided = Toolbox::new(ws.path(), true)
+        .with_engine(Some(fake::engine(bin).capped(Duration::from_secs(30))));
+    undecided.share_session(Arc::clone(&state));
+    undecided.set_permission_mode(PermissionMode::WorkspaceWrite);
+    let refused = undecided
+        .run("mcp__web__echo", &json!({"text": "hi"}))
+        .expect_err("fail closed");
+    assert!(refused.contains("could not decide"), "{refused}");
+
+    open.set_permission_mode(PermissionMode::ReadOnly);
+    let read_only = open
+        .run("mcp__web__echo", &json!({"text": "hi"}))
+        .expect_err("refused read-only");
+    assert!(read_only.contains("read-only"), "{read_only}");
+    assert_eq!(server.calls(), 1, "a refused call reached the server");
+}

@@ -61,6 +61,7 @@ mod edits;
 mod image;
 mod listing;
 mod mcp_client;
+mod mcp_http;
 mod outline;
 mod pdf;
 mod shell;
@@ -69,7 +70,7 @@ mod team;
 mod todo;
 mod validate;
 
-pub(crate) use client_servers::ServerSpec;
+pub(crate) use client_servers::{ServerSpec, Transport};
 pub use desktop::DesktopSetup;
 pub use image::{Image, ImageFormat, ToolOutput, MAX_IMAGES_PER_RESULT, MAX_IMAGE_EDGE};
 pub(crate) use todo::{parse_todos, Priority, TodoStatus};
@@ -1886,3 +1887,6 @@ mod hook_tests;
 
 #[cfg(test)]
 pub(crate) use client_servers::tests::{calls_in as client_server_calls, fake_server};
+
+#[cfg(test)]
+pub(crate) use mcp_http::tests::FakeHttp;

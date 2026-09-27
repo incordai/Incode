@@ -15,6 +15,29 @@ pub static SHARED_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .unwrap_or_default()
 });
 
+/// How long a connection to a server a client named may take to open.
+pub const CONNECT_BOUND: Duration = Duration::from_secs(10);
+
+/// For a server someone ELSE named (an ACP client's HTTP MCP server): follows
+/// no redirect, since a redirect could carry the headers it was handed to a
+/// host its address was never checked against, and bounds the connect. It has
+/// no overall timeout of its own: each request sets one.
+///
+/// `Err` when the client could not be built, which is said rather than
+/// replaced by a default client that WOULD follow redirects.
+static NO_REDIRECT_CLIENT: LazyLock<Result<reqwest::Client, String>> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(CONNECT_BOUND)
+        .build()
+        .map_err(|e| format!("no HTTP client: {e}"))
+});
+
+/// The shared client that follows no redirect; see [`NO_REDIRECT_CLIENT`].
+pub fn no_redirect_client() -> Result<&'static reqwest::Client, String> {
+    NO_REDIRECT_CLIENT.as_ref().map_err(Clone::clone)
+}
+
 pub static SHARED_RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()

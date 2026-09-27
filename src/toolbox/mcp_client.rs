@@ -1,5 +1,7 @@
 //! The client half of MCP, for a server incode started itself as a child: the
-//! desktop executor, and the stdio servers an ACP client hands a session.
+//! desktop executor, and the stdio servers an ACP client hands a session. An
+//! HTTP server an ACP client names is the same client over another [`Link`]
+//! ([`super::mcp_http`]).
 //!
 //! One line of JSON-RPC each way ([`crate::mcp_stdio`] is the server half).
 //! Every wait is bounded, a line is bounded, and a call can be abandoned when
@@ -17,7 +19,7 @@ use super::image::ToolOutput;
 
 /// The longest line read from a server: a screenshot, base64, inside the
 /// image bounds, with room to be refused by those bounds.
-const MAX_LINE_BYTES: u64 = 16 * 1024 * 1024;
+pub(super) const MAX_LINE_BYTES: u64 = 16 * 1024 * 1024;
 /// How long a child has to exit on its own once its stdin closes, before its
 /// tree is killed.
 const EXIT_GRACE: Duration = Duration::from_secs(2);

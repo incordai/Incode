@@ -22,9 +22,17 @@
 //!
 //! Starting a server and listing its tools: [`START_BOUND`] for each request,
 //! every server on its own thread. One call: [`CALL_BOUND`], and abandoned at
-//! once when the turn is stopped. Only stdio servers: the crate has no HTTP
-//! MCP client. The children die with the session's tools — EOF, then their
-//! process trees.
+//! once when the turn is stopped. The children die with the session's tools —
+//! EOF, then their process trees.
+//!
+//! # Two transports
+//!
+//! A stdio server is a child this process starts. An HTTP server is an address
+//! the client names, spoken to over MCP's Streamable HTTP
+//! ([`super::mcp_http`]): https anywhere, plain http only to this machine, no
+//! redirect followed, its headers sent as given and written nowhere else.
+//! Either is the same [`McpClient`] and the same gate. SSE — the older HTTP
+//! transport, a GET stream beside the POSTs — is not spoken.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -34,7 +42,8 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use super::image::ToolOutput;
-use super::mcp_client::{ChildLink, McpClient};
+use super::mcp_client::{ChildLink, Link, McpClient};
+use super::mcp_http::HttpLink;
 
 /// How long a server has to answer `initialize`, and then `tools/list`.
 pub(crate) const START_BOUND: Duration = Duration::from_secs(20);
@@ -49,13 +58,49 @@ pub(crate) const PREFIX: &str = "mcp__";
 /// The longest tool name a model is handed: what the model APIs accept.
 const MAX_NAME: usize = 64;
 
-/// A stdio server, as the client named it.
+/// A server, as the client named it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ServerSpec {
     pub(crate) name: String,
-    pub(crate) command: PathBuf,
-    pub(crate) args: Vec<String>,
-    pub(crate) env: Vec<(String, String)>,
+    pub(crate) transport: Transport,
+}
+
+/// How a server is reached.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum Transport {
+    /// A child this process starts, spoken to on its stdin and stdout.
+    Stdio {
+        command: PathBuf,
+        args: Vec<String>,
+        env: Vec<(String, String)>,
+    },
+    /// An MCP endpoint over Streamable HTTP, and the headers to send it.
+    Http {
+        url: String,
+        headers: Vec<(String, String)>,
+    },
+}
+
+impl std::fmt::Debug for Transport {
+    /// Names only: a header's or a variable's value, or the address, can
+    /// carry a token.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let names = |pairs: &[(String, String)]| -> Vec<String> {
+            pairs.iter().map(|(name, _)| name.clone()).collect()
+        };
+        match self {
+            Self::Stdio { command, args, env } => f
+                .debug_struct("Stdio")
+                .field("command", command)
+                .field("args", args)
+                .field("env", &names(env))
+                .finish(),
+            Self::Http { headers, .. } => f
+                .debug_struct("Http")
+                .field("headers", &names(headers))
+                .finish_non_exhaustive(),
+        }
+    }
 }
 
 /// One tool of one server.
@@ -208,23 +253,32 @@ impl ClientServers {
     }
 }
 
-/// Start one server and list its tools.
+/// Start one server — a child, or a link to an address — and list its tools.
 fn start(
     spec: &ServerSpec,
     server: &str,
     cwd: &Path,
     filter_env: bool,
 ) -> Result<(McpClient, Vec<Value>), String> {
-    let mut command = Command::new(&spec.command);
-    command.args(&spec.args).current_dir(cwd);
-    if filter_env {
-        command.env_clear();
-        command.envs(crate::tools::env_filter::filtered_env());
-    }
-    command.envs(spec.env.iter().map(|(k, v)| (k, v)));
     let what = format!("MCP server `{server}`");
-    let link = ChildLink::spawn(command, &what)?;
-    let mut client = McpClient::open(Box::new(link), &what, START_BOUND)?;
+    let link: Box<dyn Link> = match &spec.transport {
+        Transport::Stdio { command, args, env } => {
+            let mut command = Command::new(command);
+            command.args(args).current_dir(cwd);
+            if filter_env {
+                command.env_clear();
+                command.envs(crate::tools::env_filter::filtered_env());
+            }
+            command.envs(env.iter().map(|(k, v)| (k, v)));
+            Box::new(ChildLink::spawn(command, &what)?)
+        }
+        // Each POST is capped at the longest a call may take; `McpClient`
+        // bounds each request more tightly where it must.
+        Transport::Http { url, headers } => {
+            Box::new(HttpLink::connect(url, headers, CALL_BOUND, &what)?)
+        }
+    };
+    let mut client = McpClient::open(link, &what, START_BOUND)?;
     let listed = client.list_tools(START_BOUND)?;
     Ok((client, listed))
 }
@@ -348,17 +402,19 @@ pub(crate) mod tests {
     pub(crate) fn fake_server(name: &str, log: &Path) -> ServerSpec {
         ServerSpec {
             name: name.to_string(),
-            command: std::env::current_exe().unwrap_or_default(),
-            args: [
-                "--exact",
-                "toolbox::client_servers::tests::fake_mcp_server_child",
-                "--nocapture",
-                "--test-threads=1",
-                "-q",
-            ]
-            .map(str::to_string)
-            .to_vec(),
-            env: vec![(CHILD.to_string(), log.to_string_lossy().into_owned())],
+            transport: Transport::Stdio {
+                command: std::env::current_exe().unwrap_or_default(),
+                args: [
+                    "--exact",
+                    "toolbox::client_servers::tests::fake_mcp_server_child",
+                    "--nocapture",
+                    "--test-threads=1",
+                    "-q",
+                ]
+                .map(str::to_string)
+                .to_vec(),
+                env: vec![(CHILD.to_string(), log.to_string_lossy().into_owned())],
+            },
         }
     }
 
@@ -379,9 +435,11 @@ pub(crate) mod tests {
         let log = dir.path().join("calls.log");
         let missing = ServerSpec {
             name: "gone".to_string(),
-            command: dir.path().join("no-such-program.exe"),
-            args: Vec::new(),
-            env: Vec::new(),
+            transport: Transport::Stdio {
+                command: dir.path().join("no-such-program.exe"),
+                args: Vec::new(),
+                env: Vec::new(),
+            },
         };
         let (servers, said) =
             ClientServers::connect(vec![fake_server("fake", &log), missing], dir.path(), false);
@@ -403,6 +461,24 @@ pub(crate) mod tests {
         assert!(servers
             .check("mcp__fake__echo", &json!({"text": 5}))
             .is_err());
+    }
+
+    /// A spec's `Debug` names its headers and variables, never their values.
+    #[test]
+    fn a_spec_never_shows_a_value_in_debug() {
+        let http = ServerSpec {
+            name: "web".to_string(),
+            transport: Transport::Http {
+                url: "https://example.test/mcp?key=k3y".to_string(),
+                headers: vec![("authorization".to_string(), "Bearer s3cret".to_string())],
+            },
+        };
+        let shown = format!("{http:?}");
+        assert!(shown.contains("authorization"), "{shown}");
+        assert!(
+            !shown.contains("s3cret") && !shown.contains("k3y"),
+            "{shown}"
+        );
     }
 
     #[test]

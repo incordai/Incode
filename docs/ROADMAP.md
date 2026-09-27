@@ -48,9 +48,11 @@ This is fully true for claude; section 0b says what is not.
   `c98757a`; not in HEAD. gemini, opencode and cursor are detected, not driven.
 - **Provider agents** from `api_providers` are listed and marked not usable: the
   contract does not yet say where their turns go.
-- **No HTTP MCP client.** An ACP client's HTTP/SSE MCP servers are not started, and
-  `initialize` says so. Also not offered over ACP: `session/resume`, elicitation,
-  fs and terminal.
+- **No SSE MCP transport.** An ACP client's HTTP MCP servers are spoken to over
+  Streamable HTTP (`toolbox::mcp_http`, `mcpCapabilities.http: true`); the older SSE
+  transport is not, and `initialize` says so. A server that forgets its session
+  (`404`) is not re-initialized: its calls fail until the next session. Also not
+  offered over ACP: `session/resume`, elicitation, fs and terminal.
 - **Windows workspace-write sandbox.** Left unconfined: the only sound route
   rewrites the workspace ACL on every command (~2.5 s each way on a 28,000-file
   tree). Read-only is confined.

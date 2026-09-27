@@ -825,29 +825,38 @@ struct Start {
     subagents: bool,
 }
 
-/// The client's MCP servers as incode starts them: stdio only, since the
-/// crate has no HTTP MCP client (and `initialize` says so). What is left out
-/// is said.
+/// The client's MCP servers as incode connects them: stdio and HTTP, not SSE
+/// (and `initialize` says so). What is left out is said.
 fn server_specs(servers: &[acp::McpServer]) -> (Vec<crate::toolbox::ServerSpec>, Vec<String>) {
+    use crate::toolbox::{ServerSpec, Transport};
     let mut specs = Vec::new();
     let mut said = Vec::new();
     for server in servers {
         match server {
-            acp::McpServer::Stdio(stdio) => specs.push(crate::toolbox::ServerSpec {
+            acp::McpServer::Stdio(stdio) => specs.push(ServerSpec {
                 name: stdio.name.clone(),
-                command: stdio.command.clone(),
-                args: stdio.args.clone(),
-                env: stdio
-                    .env
-                    .iter()
-                    .map(|var| (var.name.clone(), var.value.clone()))
-                    .collect(),
+                transport: Transport::Stdio {
+                    command: stdio.command.clone(),
+                    args: stdio.args.clone(),
+                    env: stdio
+                        .env
+                        .iter()
+                        .map(|var| (var.name.clone(), var.value.clone()))
+                        .collect(),
+                },
             }),
-            acp::McpServer::Http(http) => said.push(format!(
-                "MCP server `{}` was not started: HTTP servers are not supported \
-                 (`mcpCapabilities.http` is false)",
-                http.name
-            )),
+            // The headers go as given; they are never written anywhere else.
+            acp::McpServer::Http(http) => specs.push(ServerSpec {
+                name: http.name.clone(),
+                transport: Transport::Http {
+                    url: http.url.clone(),
+                    headers: http
+                        .headers
+                        .iter()
+                        .map(|header| (header.name.clone(), header.value.clone()))
+                        .collect(),
+                },
+            }),
             acp::McpServer::Sse(sse) => said.push(format!(
                 "MCP server `{}` was not started: SSE servers are not supported \
                  (`mcpCapabilities.sse` is false)",
@@ -1264,10 +1273,10 @@ fn initialize() -> acp::InitializeResponse {
                         .embedded_context(true)
                         .image(true),
                 )
-                // Stdio servers only — every client may send those — run as
-                // incode's own tools. No HTTP or SSE: the crate has no client
-                // for either.
-                .mcp_capabilities(acp::McpCapabilities::new().http(false).sse(false))
+                // Stdio servers — every client may send those — and HTTP ones
+                // (MCP's Streamable HTTP), each run as incode's own tools. No
+                // SSE: the older HTTP transport is not spoken.
+                .mcp_capabilities(acp::McpCapabilities::new().http(true).sse(false))
                 .session_capabilities(
                     acp::SessionCapabilities::new()
                         .close(acp::SessionCloseCapabilities::new())
@@ -2058,7 +2067,7 @@ mod tests {
 
     /// **THE HANDSHAKE.** Version 1, and only the capabilities incode really
     /// has: text and embedded context, loading and listing sessions, stdio
-    /// MCP servers only (no HTTP, no SSE), no auth methods.
+    /// and HTTP MCP servers (no SSE), no auth methods.
     #[test]
     fn initialize_negotiates_version_one_and_states_real_capabilities() {
         let mut client = client(Behaviour::Stream);
@@ -2070,7 +2079,7 @@ mod tests {
         assert_eq!(result["protocolVersion"], 1, "{reply}");
         assert_eq!(result["agentCapabilities"]["loadSession"], true, "{reply}");
         assert_eq!(
-            result["agentCapabilities"]["mcpCapabilities"]["http"], false,
+            result["agentCapabilities"]["mcpCapabilities"]["http"], true,
             "{reply}"
         );
         assert_eq!(
