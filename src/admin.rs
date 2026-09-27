@@ -258,14 +258,15 @@ pub struct ApiProvider {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PdfRenderer {
-    /// incord-browser when its PDFs carry text (probed once per session),
-    /// else the system headless browser, else incord-browser as it is.
+    /// The headless browser (the browser tool) when its PDFs carry text
+    /// (probed once per session), else the system headless browser, else the
+    /// headless browser as it is.
     #[default]
     Auto,
-    /// Only the system headless browser.
-    Chromium,
-    /// Only incord-browser.
-    IncordBrowser,
+    /// Only the system's headless Chromium-family browser (Edge, Chrome).
+    System,
+    /// Only the headless browser: the configured browser tool.
+    Browser,
 }
 
 /// The web search service `WebSearch` asks.
@@ -1217,7 +1218,7 @@ mod tests {
                 provides: Some("browser".to_string()),
                 ..crate::ext_tools::ToolEntry::default()
             }],
-            pdf_renderer: Some(PdfRenderer::IncordBrowser),
+            pdf_renderer: Some(PdfRenderer::Browser),
             sandbox: Some("read-only".to_string()),
             sandbox_network: Some("deny".to_string()),
             // The Bash tool's shell, which the owner may pin on Windows.

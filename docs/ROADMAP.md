@@ -115,7 +115,15 @@ This is fully true for claude; section 0b says what is not.
 - **incord-browser: what is still open upstream.** Re-measured 2026-09-27 on
   078786a against headless Edge; incode now uses the fixes (RenderPdf prefers
   incord-browser when its probe finds text, and passes `preferCSSPageSize` when
-  it is honoured). Fixed: #6, #7, #9, #11, #12, #14. Still open:
+  it is honoured). Fixed: #6, #7, #9, #11, #12, #14. Why the code probes the
+  print rather than trusting a version (history the code comments no longer
+  carry): a build from before incordai/incord-browser#11 was fixed (measured
+  on 971d3e8) prints pictures of the page with no text layer, and refuses
+  `preferCSSPageSize` with `-32601`; a build with the fix prints a text layer,
+  laid out again for the paper as a system browser does (the same two Letter
+  pages as Edge for one article, 1864 characters extracted where Edge gives
+  1884). The image-only note a RenderPdf result carries is for the first kind.
+  Still open:
   - #8, part: an inline SVG is centred now, but SVG `<text font-family="Arial"
     font-size="24">` still draws in the inherited serif at a smaller size, with
     or without `--font-dir`.

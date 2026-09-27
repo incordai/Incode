@@ -431,7 +431,7 @@ pub struct Toolbox {
     soffice: OnceLock<Option<PathBuf>>,
     /// The headless browser, looked for once. Screenshot is offered, and
     /// `WebFetch` runs script, only when it was found.
-    browser: OnceLock<Option<PathBuf>>,
+    browser: OnceLock<Option<browser::Found>>,
     /// What `RenderPdf` prints with, chosen once; not offered when `None`.
     printer: OnceLock<Option<pdf::Printer>>,
     /// Where the desktop is started from, when the operator switched it on.
@@ -591,12 +591,17 @@ impl Toolbox {
     /// The headless browser, when it is named or installed where
     /// [`browser::find`] looks.
     fn browser(&self) -> Option<&Path> {
-        self.browser.get_or_init(Self::detect_browser).as_deref()
+        self.found_browser().map(|f| f.path.as_path())
+    }
+
+    /// The headless browser and the name a result calls it by.
+    fn found_browser(&self) -> Option<&browser::Found> {
+        self.browser.get_or_init(Self::detect_browser).as_ref()
     }
 
     /// [`browser::find`] over this process's environment, `admin.json`'s
     /// `browser_bin`, and the installed tool that provides `browser`.
-    fn detect_browser() -> Option<PathBuf> {
+    fn detect_browser() -> Option<browser::Found> {
         let data_dir = crate::admin::AdminConfig::default_dir();
         let admin = crate::admin::AdminConfig::load_default();
         let provided = crate::ext_tools::provider("browser", &admin.tools, &data_dir);
@@ -617,7 +622,7 @@ impl Toolbox {
                 pdf::choose(
                     setting,
                     pdf::find_chromium(&|name| std::env::var_os(name)),
-                    self.browser().map(Path::to_path_buf),
+                    self.found_browser().cloned(),
                 )
             })
             .as_ref()
@@ -682,10 +687,12 @@ impl Toolbox {
 
     /// This toolbox with the headless browser at `browser`, or none —
     /// whatever this machine has installed — and no system browser to print
-    /// with, so `RenderPdf` prints with `browser` when there is one.
+    /// with, so `RenderPdf` prints with `browser` when there is one. The
+    /// browser is called by its file stem, as a named executable is.
     #[cfg(test)]
     pub(crate) fn with_browser(self, browser: Option<PathBuf>) -> Self {
-        let printer = pdf::choose(crate::admin::PdfRenderer::Auto, None, browser.clone());
+        let found = browser.clone().map(browser::Found::by_stem);
+        let printer = pdf::choose(crate::admin::PdfRenderer::Auto, None, found);
         self.with_printer(browser, printer)
     }
 
@@ -694,7 +701,7 @@ impl Toolbox {
     #[cfg(test)]
     fn with_printer(self, browser: Option<PathBuf>, printer: Option<pdf::Printer>) -> Self {
         Self {
-            browser: OnceLock::from(browser),
+            browser: OnceLock::from(browser.map(browser::Found::by_stem)),
             printer: OnceLock::from(printer),
             ..self
         }

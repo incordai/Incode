@@ -918,7 +918,8 @@ the bridge's other half) that does not fit is left out, with a line saying why.
 
 ### The headless browser (phase 6b)
 
-The headless browser (`toolbox::browser`), found by `INCODE_BROWSER` (alone when set),
+The headless browser (`toolbox::browser`) is a headless browser installed as a tool (e.g.
+`release: "incordai/incord-browser"`). It is found by `INCODE_BROWSER` (alone when set),
 then `admin.json` `browser_bin` (alone when set) — both for development — then the
 installed external tool whose entry says `"provides": "browser"` (`ext_tools::provider`;
 see "External tools" below). `PATH` is never searched and no browser name is written in
@@ -927,7 +928,7 @@ the code. Not found: Screenshot is not offered (a call is told how to install on
 only with a system browser. The subcommands below are the upstream browser's CLI
 (`fetch`, `serve`).
 
-- **WebFetch with script:** `obscura fetch <url> --dump html --quiet --timeout 20 -o
+- **WebFetch with script:** `<browser> fetch <url> --dump html --quiet --timeout 20 -o
   <temp>`, one child per call, whole tree killed 10 s past its own timeout, 2 MiB read
   back, then `html_to_markdown`. The url passes `web::check_public` (by name and by
   resolution) before the browser starts. Kept on incode's own conversion rather than the
@@ -941,7 +942,7 @@ only with a system browser. The subcommands below are the upstream browser's CLI
   without it (script sees `getBoundingClientRect().width` 0 either way), while a page that
   queries layout pays the font load (449 ms vs 51 ms). It matters for `fetch -s`, which
   incode does not use; Screenshot's `serve` passes it.
-- **Screenshot:** `obscura serve --host 127.0.0.1 --port <picked> --quiet --font-dir
+- **Screenshot:** `<browser> serve --host 127.0.0.1 --port <picked> --quiet --font-dir
   <system fonts>`, started lazily, once per session, held in `SessionTools` and killed with
   its tree when the session's tools are dropped. Driven over DevTools (`toolbox::cdp`, a
   synchronous `tungstenite` client over loopback; every read has a deadline):
@@ -961,14 +962,14 @@ only with a system browser. The subcommands below are the upstream browser's CLI
   files (an `iframe`, an `img`); incode confines the path it opens, not what that page
   loads.
 
-**RenderPdf** (`toolbox::pdf`) has two printers. incord-browser prints over DevTools
+**RenderPdf** (`toolbox::pdf`) has two printers. The headless browser prints over DevTools
 `Page.printToPDF` (`printBackground`, Letter unless the page's `@page { size }` is
 honoured). A system headless browser of the Chromium family — `INCODE_PDF_BROWSER` (alone
 when set), then `PATH`, then the standard install paths, the x86 program directory first
 on Windows — prints as `--headless --disable-gpu --no-pdf-header-footer
 --user-data-dir=<temp> --print-to-pdf=<temp>`.
 
-What incord-browser's print gives is MEASURED, once per session, never read off a version
+What the headless browser's print gives is MEASURED, once per session, never read off a version
 (`browser::print_ability`, cached in the session's `Browsers`): a `data:` page carrying a
 probe word is printed on the web instance (no file access, no network) with
 `preferCSSPageSize: true` — again without it if that is refused with `-32601` — and its
@@ -978,12 +979,15 @@ kept too, with its reason. Measured on 078786a: text found, `preferCSSPageSize` 
 (a `13.333in 7.5in` `@page` prints at 960x540 pt, as Edge's CLI print does); on
 971d3e8 (before incordai/incord-browser#11 was fixed): no text, `-32601`.
 
-`admin.json` `pdf_renderer`: `"auto"` (default) prints with incord-browser when its probe
-found text, else with the system browser; if incord-browser then fails on the page, the
-system browser prints it and the result says why. With only one of them installed, that
-one prints. `"chromium"` / `"incord-browser"`: only that one. The result names the printer
-(`with incord-browser`, `with msedge`), and a print by an incord-browser whose probe found
-no text says the PDF is IMAGE-ONLY. Measured against Edge on the same article: 2 Letter
+`admin.json` `pdf_renderer`: `"auto" | "system" | "browser"`. `"auto"` (default) prints
+with the headless browser when its probe found text, else with the system browser; if the
+headless browser then fails on the page, the system browser prints it and the result says
+why. With only one of them installed, that one prints. `"system"` (the OS's headless
+Chromium-family browser) / `"browser"` (the configured browser tool): only that one. The
+result names the printer as the owner configured it, never by a name written in the code:
+the browser tool entry's `name` (`with browser`), a browser named by `INCODE_BROWSER` /
+`browser_bin` by its file stem, the system browser by its file stem (`with msedge`). A
+print by a headless browser whose probe found no text says the PDF is IMAGE-ONLY. Measured against Edge on the same article: 2 Letter
 pages each, 1864 characters extracted vs 1884. The pages are still a raster with an
 invisible text layer over it, not vector drawing (about 2.5x Edge's file size).
 

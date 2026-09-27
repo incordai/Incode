@@ -372,12 +372,17 @@ fn program_in(folder: &Path, program: &str) -> Option<PathBuf> {
     None
 }
 
-/// The executable of the installed tool that provides `capability`, if any.
-pub(crate) fn provider(capability: &str, tools: &[ToolEntry], data_dir: &Path) -> Option<PathBuf> {
+/// The installed tool that provides `capability`, if any: its `name` as the
+/// owner wrote it, and its executable.
+pub(crate) fn provider(
+    capability: &str,
+    tools: &[ToolEntry],
+    data_dir: &Path,
+) -> Option<(String, PathBuf)> {
     tools
         .iter()
         .filter(|t| t.provides.as_deref() == Some(capability))
-        .find_map(|t| executable(t, data_dir))
+        .find_map(|t| executable(t, data_dir).map(|program| (t.name.clone(), program)))
 }
 
 /// The MCP servers a session starts for the installed tools, and a line for

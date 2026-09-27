@@ -312,8 +312,10 @@ see only a placeholder such as `[image 1280x720 png]`.
 
 ### Optional programs, and how they are found
 
-- **Headless browser.** The installed [external tool](#external-tools) whose
-  entry says `"provides": "browser"`. For development, `INCODE_BROWSER` (only
+- **Headless browser.** A headless browser installed as a tool (e.g.
+  `release: "incordai/incord-browser"`): the installed
+  [external tool](#external-tools) whose entry says `"provides": "browser"`.
+  For development, `INCODE_BROWSER` (only
   there when set), then `admin.json` `browser_bin` (only there when set), name
   an executable directly and win over the installed tool. `PATH` is never
   searched. Found, it adds `Screenshot`, `WebFetch`'s `render_js`, and a
@@ -326,8 +328,10 @@ see only a placeholder such as `[image 1280x720 png]`.
   otherwise a system Chromium-family browser (`INCODE_PDF_BROWSER`, only there
   when set, then `PATH`, then the standard install paths). A headless browser
   whose probe found no text still prints when it is the only printer, and the
-  result says the PDF is image-only. `admin.json` `pdf_renderer`: `auto`
-  (default), `chromium` or `incord-browser`.
+  result says the PDF is image-only. `admin.json` `pdf_renderer`: `"auto"`
+  (default), `"system"` (only the system browser) or `"browser"` (only the
+  browser tool). The result names its printer as you configured it: the tool
+  entry's `name`, or the executable's file stem (`with msedge`).
 - **LibreOffice.** `INCODE_SOFFICE` (only there when set), then `PATH`, then the
   platform's install paths.
 

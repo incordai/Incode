@@ -390,7 +390,7 @@ fn an_install_is_checked_unpacked_and_recorded() {
     assert!(program.starts_with(&folder), "{}", program.display());
     assert_eq!(
         provider("browser", std::slice::from_ref(&tool), data.path()),
-        Some(program.clone())
+        Some(("browser".to_string(), program.clone()))
     );
     let (specs, said) = session_servers(std::slice::from_ref(&tool), data.path());
     assert!(said.is_empty(), "{said:?}");

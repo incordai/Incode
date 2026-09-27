@@ -1,8 +1,8 @@
 //! Pictures through the toolbox: the image result on every route, the
 //! headless browser's tools, `RenderPdf`, and the desktop behind the gate.
 //!
-//! The browser tests run the real `incord-browser` when this machine's own
-//! detection finds one (`INCODE_BROWSER`, `admin.json`, `PATH`), and say
+//! The browser tests run the real headless browser when this machine's own
+//! detection finds one (`INCODE_BROWSER`, `admin.json`), and say
 //! SKIPPED on stderr when it does not. The PDF test runs the real system
 //! browser when one is installed.
 
@@ -404,7 +404,7 @@ fn render_pdf_with_the_system_browser_has_extractable_text() {
     );
 }
 
-/// **INCORD-BROWSER'S PDF IS WHAT ITS PROBE SAYS IT IS.** A build that prints
+/// **THE HEADLESS BROWSER'S PDF IS WHAT ITS PROBE SAYS IT IS.** A build that prints
 /// text: no image-only note, and Read returns the page's words. A build that
 /// prints pictures: the note, and no words. Either way the probe and Read
 /// agree — the probe is what decides the note and the `auto` order.
@@ -424,7 +424,8 @@ fn render_pdf_with_the_headless_browser_matches_its_probe() {
         .expect("printed");
     let ability = browser::print_ability(&tools.state.browsers, &bin, true).expect("probed");
     eprintln!("probe of {}: {ability:?}", bin.display());
-    assert!(said.contains("with incord-browser"), "{said}");
+    let name = browser::Found::by_stem(bin.clone()).name;
+    assert!(said.contains(&format!("with {name}")), "{said}");
     let bytes = std::fs::read(ws.path().join("article.pdf")).expect("written");
     assert!(bytes.starts_with(b"%PDF"));
     let read = tools
@@ -443,7 +444,7 @@ fn render_pdf_with_the_headless_browser_matches_its_probe() {
 }
 
 /// **`AUTO` WITH BOTH PRINTERS INSTALLED ALWAYS GIVES A PDF WITH TEXT**: by
-/// incord-browser when its probe found text, else by the system browser.
+/// the headless browser when its probe found text, else by the system browser.
 #[test]
 fn render_pdf_auto_prints_text_with_the_right_printer() {
     let Some(bin) = browser::tests::test_browser() else {
@@ -455,10 +456,11 @@ fn render_pdf_auto_prints_text_with_the_right_printer() {
     };
     let ws = tempfile::tempdir().expect("ws");
     std::fs::write(ws.path().join("article.html"), ARTICLE).expect("seed");
+    let owner = browser::Found::by_stem(bin.clone());
     let printer = pdf::choose(
         crate::admin::PdfRenderer::Auto,
         Some(edge.clone()),
-        Some(bin.clone()),
+        Some(owner.clone()),
     );
     let tools = Toolbox::new(ws.path(), true).with_printer(Some(bin.clone()), printer);
     let said = tools
@@ -474,7 +476,7 @@ fn render_pdf_auto_prints_text_with_the_right_printer() {
         .to_string_lossy()
         .into_owned();
     if ability.text {
-        assert!(said.contains("with incord-browser"), "{said}");
+        assert!(said.contains(&format!("with {}", owner.name)), "{said}");
     } else {
         assert!(said.contains(&format!("with {system}")), "{said}");
     }
@@ -503,7 +505,7 @@ fn media_box(pdf: &[u8]) -> Option<(i64, i64)> {
     }
 }
 
-/// **A PAGE'S OWN `@page` SIZE IS HONOURED** by an incord-browser whose probe
+/// **A PAGE'S OWN `@page` SIZE IS HONOURED** by a headless browser whose probe
 /// found `preferCSSPageSize` supported — as the system browser's print does —
 /// and Letter otherwise.
 #[test]
