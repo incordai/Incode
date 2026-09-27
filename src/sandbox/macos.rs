@@ -43,7 +43,7 @@ pub(super) fn available() -> bool {
 pub(super) fn wrap(
     policy: SandboxPolicy,
     roots: &[PathBuf],
-    shell: (&str, &str),
+    shell: &crate::tools::shell_choice::Shell,
     command: &str,
 ) -> Option<Command> {
     if !available() {
@@ -67,8 +67,8 @@ pub(super) fn wrap(
         writable_roots.len(),
         policy.network,
     ));
-    // The shell pair is honoured, so a caller that runs `zsh -c` still does.
-    cmd.arg(shell.0).arg(shell.1).arg(command);
+    // The shell is honoured, so a caller that runs another one still does.
+    cmd.args(shell.argv(command));
     Some(cmd)
 }
 

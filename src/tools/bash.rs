@@ -1,4 +1,7 @@
 //! Bash tool — execute shell commands with timeout.
+//!
+//! The shell is [`super::shell_choice`]'s: `sh -c` on macOS and Linux, and on
+//! Windows Git Bash, else PowerShell — never cmd.exe.
 
 use std::path::Path;
 use std::time::Duration;
@@ -7,12 +10,6 @@ use anyhow::{Context, Result};
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000; // 2 minutes
 const MAX_OUTPUT_CHARS: usize = 30_000;
-
-/// How this platform runs a command string: the shell and the "run this" flag.
-#[cfg(windows)]
-pub(crate) const SHELL: (&str, &str) = ("cmd", "/C");
-#[cfg(not(windows))]
-pub(crate) const SHELL: (&str, &str) = ("sh", "-c");
 
 /// Execute a bash command in the workspace directory.
 ///
@@ -51,12 +48,13 @@ pub fn execute_bash_watched(
 
     // The command runs under the session's OS sandbox where the platform can
     // confine it, and through the plain shell where it cannot — `wrap` decides,
-    // and traces which. `cmd /C` gets the command verbatim (it does not parse
-    // MSVC quoting, so `arg` would backslash every quote), which `wrap` handles.
+    // and traces which. The shell is chosen for the sandbox: on Windows the
+    // token that confines a command cannot start Git Bash.
     if !sandbox.is_off() {
         crate::trace!("sandbox", "{}", sandbox.note());
     }
-    let mut child = sandbox.wrap(SHELL, command);
+    let shell = super::shell_choice::for_sandbox(sandbox).map_err(|why| anyhow::anyhow!(why))?;
+    let mut child = sandbox.wrap(&shell, command);
 
     child
         .current_dir(workspace)
@@ -303,11 +301,47 @@ mod tests {
         crate::sandbox::Sandbox::off()
     }
 
+    /// Whether the tool's shell here is a POSIX one (Git Bash on Windows, `sh`
+    /// elsewhere) rather than the PowerShell fallback.
+    fn posix() -> bool {
+        crate::tools::shell_choice::for_sandbox(&no_sandbox())
+            .is_ok_and(|s| s.flavor() == crate::tools::shell_choice::Flavor::Posix)
+    }
+
+    /// `posix` in a POSIX shell, `powershell` in PowerShell.
+    fn either(posix: &str, powershell: &str) -> String {
+        if self::posix() { posix } else { powershell }.to_string()
+    }
+
+    /// **THE BUG THIS TOOL HAD**: `mkdir -p a/b && echo $((1+2))` ran through
+    /// cmd.exe on Windows, which made a directory literally called `-p` and
+    /// printed the arithmetic unexpanded. Through a real shell it makes
+    /// `a/b`, prints 3, and no `-p` appears.
+    #[test]
+    fn a_posix_command_runs_as_posix() {
+        let dir = tempfile::tempdir().expect("dir");
+        let input = serde_json::json!({ "command": "mkdir -p a/b && echo $((1+2))" }).to_string();
+        let said = execute_bash_watched(
+            dir.path(),
+            &input,
+            true,
+            &no_sandbox(),
+            &|| false,
+            &mut |_| {},
+        )
+        .expect("runs");
+        assert_eq!(said.trim(), "3", "{said}");
+        assert!(dir.path().join("a").join("b").is_dir(), "a/b was not made");
+        assert!(!dir.path().join("-p").exists(), "a `-p` directory appeared");
+    }
+
     /// A line, two seconds of nothing, another line.
-    #[cfg(windows)]
-    const SLOW_TWO_LINES: &str = "echo first&& ping -n 3 127.0.0.1 >nul&& echo second";
-    #[cfg(not(windows))]
-    const SLOW_TWO_LINES: &str = "echo first; sleep 2; echo second";
+    fn slow_two_lines() -> String {
+        either(
+            "echo first; sleep 2; echo second",
+            "echo first; Start-Sleep 2; echo second",
+        )
+    }
 
     /// **OUTPUT IS HANDED ON AS THE COMMAND PRINTS IT**, not when it ends:
     /// the first line arrives while the command is still sleeping, and the
@@ -318,7 +352,7 @@ mod tests {
         let started = std::time::Instant::now();
         let mut first_at = None;
         let mut seen = Vec::new();
-        let input = serde_json::json!({ "command": SLOW_TWO_LINES }).to_string();
+        let input = serde_json::json!({ "command": slow_two_lines() }).to_string();
         let said = execute_bash_watched(
             dir.path(),
             &input,
@@ -348,10 +382,7 @@ mod tests {
     fn a_stop_ends_the_command_at_once() {
         let dir = tempfile::tempdir().expect("dir");
         let asked = std::time::Instant::now();
-        #[cfg(windows)]
-        let long = "ping -n 30 127.0.0.1 >nul";
-        #[cfg(not(windows))]
-        let long = "sleep 30";
+        let long = either("sleep 30", "Start-Sleep 30");
         let input = serde_json::json!({ "command": long }).to_string();
         let stop_at = asked + Duration::from_millis(300);
         let err = execute_bash_watched(
@@ -454,12 +485,9 @@ mod tests {
         );
     }
 
-    /// Echo a variable in a way both shells understand.
+    /// Echo a variable in the tool's shell.
     fn echo_var(name: &str) -> String {
-        #[cfg(windows)]
-        return format!("echo %{name}%");
-        #[cfg(not(windows))]
-        return format!("echo ${name}");
+        either(&format!("echo ${name}"), &format!("echo $env:{name}"))
     }
 
     fn run(command: &str, filter_env: bool) -> String {
@@ -549,10 +577,10 @@ mod tests {
         );
         std::fs::write(&path, &content).expect("write fixture");
 
-        #[cfg(windows)]
-        let command = format!("type \"{}\"", path.display());
-        #[cfg(not(windows))]
-        let command = format!("cat \"{}\"", path.display());
+        let command = either(
+            &format!("cat \"{}\"", path.display()),
+            &format!("Get-Content -Raw -Encoding UTF8 \"{}\"", path.display()),
+        );
 
         let out = run(&command, false);
         let _ = std::fs::remove_file(&path);

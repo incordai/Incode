@@ -695,12 +695,38 @@ mod tests {
 
     /// Run `command` through the real helper under `grant`, as `wrap` would.
     fn run(live: &Live, grant: &Grant, command: &str) -> (bool, String) {
-        let args = super::super::helper_args(
+        run_as(
+            live,
             crate::sandbox::SandboxMode::WorkspaceWrite,
             Some(grant),
             command,
         )
-        .expect("args");
+    }
+
+    /// Run `command` through the real helper in `mode`, in the shell the
+    /// `Bash` tool picks for that sandbox — as `wrap` would.
+    fn run_as(
+        live: &Live,
+        mode: crate::sandbox::SandboxMode,
+        grant: Option<&Grant>,
+        command: &str,
+    ) -> (bool, String) {
+        let policy = crate::sandbox::SandboxPolicy {
+            mode,
+            network: crate::sandbox::SandboxNetwork::Allow,
+            named: true,
+        };
+        let shell = crate::tools::shell_choice::for_sandbox(&crate::sandbox::Sandbox::new(
+            policy,
+            vec![live.dir.clone()],
+        ))
+        .expect("a shell for the sandbox");
+        eprintln!(
+            "shell: {} ({:?})",
+            shell.program().display(),
+            shell.flavor()
+        );
+        let args = super::super::helper_args(mode, grant, &shell, command).expect("args");
         let out = std::process::Command::new(&live.bin)
             .args(args)
             .current_dir(&live.dir)
@@ -744,12 +770,14 @@ mod tests {
         assert!(sandbox.note().contains("confined by"), "{}", sandbox.note());
         assert!(acl_names(&live.dir, &grant.sid), "the root carries the ACE");
 
+        // The commands are PowerShell: the shell the Bash tool runs under this
+        // token (Git Bash cannot start under it).
         // Inside: allowed.
         let inside = live.dir.join("live_inside.txt");
         let (ok, out) = run(
             &live,
             &grant,
-            &format!("echo inside> \"{}\"", inside.display()),
+            &format!("Set-Content -Path \"{}\" -Value inside", inside.display()),
         );
         eprintln!("inside: ok={ok} {out}");
         assert!(ok && inside.exists(), "a write inside the workspace: {out}");
@@ -764,7 +792,7 @@ mod tests {
         let (_, out) = run(
             &live,
             &grant,
-            &format!("echo x> \"{}\"", documents.display()),
+            &format!("Set-Content -Path \"{}\" -Value x", documents.display()),
         );
         eprintln!("documents: {out}");
         let landed = documents.exists();
@@ -775,7 +803,11 @@ mod tests {
 
         // Outside the tree: refused.
         let outside = live.outside.join("live_outside.txt");
-        let (_, out) = run(&live, &grant, &format!("echo x> \"{}\"", outside.display()));
+        let (_, out) = run(
+            &live,
+            &grant,
+            &format!("Set-Content -Path \"{}\" -Value x", outside.display()),
+        );
         eprintln!("outside: {out}");
         assert!(!outside.exists(), "a write outside was NOT refused: {out}");
 
@@ -785,7 +817,7 @@ mod tests {
         let (ok, out) = run(
             &live,
             &grant,
-            &format!("icacls \"{}\" /grant *S-1-1-0:F", victim.display()),
+            &format!("icacls \"{}\" /grant '*S-1-1-0:F'", victim.display()),
         );
         eprintln!("re-acl outside: ok={ok} {out}");
         assert!(
@@ -797,7 +829,7 @@ mod tests {
         let (ok, out) = run(
             &live,
             &grant,
-            "echo %TEMP%& echo t> \"%TEMP%\\live_temp.txt\"",
+            "Write-Output $env:TEMP; Set-Content -Path \"$env:TEMP\\live_temp.txt\" -Value t",
         );
         eprintln!("temp: ok={ok} {out}");
         assert!(
@@ -807,7 +839,11 @@ mod tests {
         assert!(grant.temp.join("live_temp.txt").exists(), "{out}");
 
         // Deleting inside: allowed.
-        let (ok, out) = run(&live, &grant, &format!("del \"{}\"", inside.display()));
+        let (ok, out) = run(
+            &live,
+            &grant,
+            &format!("Remove-Item \"{}\"", inside.display()),
+        );
         assert!(ok && !inside.exists(), "a delete inside: {out}");
 
         let began = Instant::now();
@@ -818,6 +854,57 @@ mod tests {
         let after = snapshot(&live.dir, &snaps.join("session_after.txt"));
         assert!(before == after, "the tree's ACLs differ after the session");
         eprintln!("ACL snapshot identical: {} bytes", after.len());
+    }
+
+    /// A READ-ONLY command, live, in the shell the Bash tool picks for it: it
+    /// reads the workspace, and every write — inside the workspace, outside
+    /// it, to Documents — is refused and lands nowhere. No ACL is changed.
+    #[test]
+    #[ignore = "live: runs the built helper named by INCODE_SANDBOX_LIVE_BIN"]
+    fn live_read_only_confines_the_bash_tools_shell() {
+        let Some(live) = live() else {
+            eprintln!("INCODE_SANDBOX_LIVE_* not set; skipped");
+            return;
+        };
+        let ro = crate::sandbox::SandboxMode::ReadOnly;
+        let readable = live.dir.join("live_ro_readable.txt");
+        std::fs::write(&readable, "readable-by-the-command").expect("fixture");
+
+        let (ok, out) = run_as(
+            &live,
+            ro,
+            None,
+            &format!("Get-Content \"{}\"", readable.display()),
+        );
+        eprintln!("read: ok={ok} {out}");
+        assert!(ok && out.contains("readable-by-the-command"), "{out}");
+
+        let profile = std::env::var_os("USERPROFILE")
+            .map(PathBuf::from)
+            .expect("profile");
+        for target in [
+            live.dir.join("live_ro_inside.txt"),
+            live.outside.join("live_ro_outside.txt"),
+            profile.join("Documents").join("incode_ro_live_probe.txt"),
+        ] {
+            let (_, out) = run_as(
+                &live,
+                ro,
+                None,
+                &format!("Set-Content -Path \"{}\" -Value x", target.display()),
+            );
+            let landed = target.exists();
+            if landed {
+                let _ = std::fs::remove_file(&target);
+            }
+            eprintln!("write {}: landed={landed}", target.display());
+            assert!(
+                !landed,
+                "a read-only write landed at {}: {out}",
+                target.display()
+            );
+        }
+        let _ = std::fs::remove_file(&readable);
     }
 
     /// The crash half: a child process takes a grant and is killed. The ACE

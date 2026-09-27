@@ -968,6 +968,16 @@ impl Toolbox {
                         }
                     }
                 }
+                // The shell the command will actually run in, named, so the
+                // model writes that shell's syntax: chosen once per process,
+                // and PowerShell where the Windows sandbox cannot start bash.
+                if def.get("name").and_then(Value::as_str) == Some(BASH) {
+                    let sandbox = crate::sandbox::Sandbox::new(self.sandbox, Vec::new());
+                    let shell = crate::tools::shell_choice::describe(&sandbox);
+                    if let Some(text) = def.get("description").and_then(Value::as_str) {
+                        def["description"] = json!(format!("{text} {shell}"));
+                    }
+                }
                 if !browser
                     && def.get("name").and_then(Value::as_str) == Some(crate::web::FETCH_TOOL)
                 {

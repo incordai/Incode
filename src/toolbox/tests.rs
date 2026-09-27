@@ -98,6 +98,25 @@ fn the_file_schema_names_the_field_the_implementation_reads() {
     );
 }
 
+/// **THE BASH TOOL NAMES THE SHELL ITS COMMANDS RUN IN**, as offered — the
+/// one this process chose for this session's sandbox — so the model writes
+/// that shell's syntax rather than guessing.
+#[test]
+fn the_bash_description_names_the_shell_in_use() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let defs = toolbox(dir.path()).definitions();
+    let bash = defs
+        .iter()
+        .find(|d| d["name"] == BASH)
+        .expect("Bash is offered");
+    let text = bash["description"].as_str().expect("a description");
+    let shell = crate::tools::shell_choice::describe(&crate::sandbox::Sandbox::off());
+    assert!(text.ends_with(&shell), "{text}");
+    assert!(shell.starts_with("Commands run in "), "{shell}");
+    #[cfg(windows)]
+    assert!(!text.contains("cmd"), "{text}");
+}
+
 #[test]
 fn reading_a_file_works_through_the_toolbox() {
     let dir = tempfile::tempdir().expect("tmp");

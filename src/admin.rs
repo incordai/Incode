@@ -159,6 +159,12 @@ pub struct AdminConfig {
     /// reports. `INCORD_SANDBOX_NETWORK` wins over it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_network: Option<String>,
+    /// The shell the `Bash` tool runs commands in on Windows, as a path or a
+    /// program on `PATH` — see `tools::shell_choice`. `INCODE_SHELL` wins over
+    /// it. Unset, Git for Windows' bash is used, then PowerShell; never
+    /// cmd.exe, and never the WSL launcher.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell: Option<String>,
     /// The capability ladder, named by the operator.
     ///
     /// A tier is a list of models that can do the same JOB — `"top"` might hold
@@ -1198,6 +1204,8 @@ mod tests {
             pdf_renderer: Some(PdfRenderer::IncordBrowser),
             sandbox: Some("read-only".to_string()),
             sandbox_network: Some("deny".to_string()),
+            // The Bash tool's shell, which the owner may pin on Windows.
+            shell: Some("C:/Program Files/Git/bin/bash.exe".to_string()),
             // The ladder has to survive the file too — a tier an operator
             // writes and cannot read back is a setting that does not exist.
             tiers: BTreeMap::from([(

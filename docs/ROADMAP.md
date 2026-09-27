@@ -62,6 +62,14 @@ This is fully true for claude; section 0b says what is not.
   unconfined. Open: whether to make it the default, and a size cap — the grant is
   linear in the tree (a `node_modules`-heavy workspace pays per object, once per
   session). Not yet driven end to end through a real model session.
+- **The `Bash` tool's shell on Windows.** Fixed: it was cmd.exe; it is now Git Bash
+  (or `INCODE_SHELL` / `admin.json` `shell`), else PowerShell, and its description
+  names the shell (`ARCHITECTURE.md`, "Which shell"). Open: under the Windows sandbox
+  token Git Bash cannot start (msys maps a per-user shared section the token may not
+  write), so a read-only session — and a named workspace-write one — runs PowerShell.
+  Running msys under the token would mean granting that section to the session SID.
+  The operator's own hooks and `verify_command` still run through cmd.exe: they are
+  the operator's commands, written for it.
 - **Network isolation — partial.** `sandbox_network: "deny"` (or
   `INCORD_SANDBOX_NETWORK`) is enforced on macOS (Seatbelt; loopback and Unix
   sockets kept) and on Linux 6.7+ (Landlock ABI v4, TCP only, loopback included);

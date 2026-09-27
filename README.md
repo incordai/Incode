@@ -282,7 +282,7 @@ anything runs.
 | `NotebookEdit` | change | Replace, insert or delete one notebook cell. |
 | `LS` · `Glob` · `Grep` | observe | List a directory · find files · search contents. One ripgrep-based walker that honours `.gitignore`, `.ignore` and `.git/info/exclude`, reports binary files, reads UTF-16, and says when it hit its cap. |
 | `Outline` | observe | A source file's symbols (kind, name, signature, lines, nesting) for Rust, TypeScript, JavaScript, Python and Go, via tree-sitter. |
-| `Bash` | run | A shell command, in the foreground (output streamed live over `--acp`) or with `run_in_background` (at most 8 jobs). Runs inside the OS sandbox where one applies. |
+| `Bash` | run | A shell command, in the foreground (output streamed live over `--acp`) or with `run_in_background` (at most 8 jobs). Runs inside the OS sandbox where one applies. The shell is `sh` on macOS and Linux; on Windows it is `INCODE_SHELL` or `admin.json` `shell` if set, else Git Bash, else PowerShell — never cmd.exe — and PowerShell wherever the Windows sandbox token applies (Git Bash cannot start under it). The tool's description names the shell in use. |
 | `BashOutput` · `KillShell` | observe · run | Read a background job's new output · stop a job and its process tree. |
 | `TodoWrite` | session | The model's task list; sent over `--acp` as the plan. |
 | `Diagnostics` | run | The project's checker: `INCORD_CHECK_CMD`, else `cargo check` or `tsc --noEmit`. |

@@ -816,7 +816,7 @@ for a patch). The ACP kind is `acp_agent::present::tool_kind`.
 | `Glob`, `Grep` | observe | search | Glob `MAX_GLOB_RESULTS` 500 (rest counted); Grep `MAX_GREP_MATCHES` 100 matching lines (says it stopped), 300 chars a line, 30 000 chars, files over 50 MiB counted not searched | ripgrep's engine (`tools::search`). One walker for Glob, Grep and LS: `.gitignore`, `.ignore`, `.git/info/exclude` with `require_git(false)`, hidden files, `node_modules` and any directory holding `CACHEDIR.TAG` skipped. The model's glob is applied with globset AFTER the walk (an override or type filter re-admits hidden files — measured); no `/` matches a name at any depth, a `/` anchors to `path`. Grep: context lines, case-insensitive, a matching binary file reported without its bytes, non-matching binaries counted, BOM-marked UTF-16 transcoded. |
 | `Outline` | observe | read | `MAX_OUTLINE_SYMBOLS` 400, `MAX_OUTLINE_BYTES` 4 MiB, 10 s parse | tree-sitter queries for rs, ts/tsx, js/jsx/mjs/cjs, py, go (`toolbox::outline`); kind, name, signature and line range, nested; a syntax error's line is reported; another language is refused by name. Each grammar is a cargo feature (`lang-rust`, `lang-ts`, `lang-python`, `lang-go`, `lang-js`), all default. |
 | `ConvertDocument` | change | edit | `CONVERT_DEADLINE` 120 s, whole-tree kill | OFFERED ONLY when `soffice` is found: `INCODE_SOFFICE` (alone, when set), then `PATH`, then the platform's install paths. Headless, `--norestore --nologo --nodefault --nolockcheck`, a private `-env:UserInstallation` profile in a temp dir, PDF made there and copied into place; the guards and the checkpoint see the OUTPUT path. The conversion itself has run only against a fake `soffice`: LibreOffice is not installed on the development machine. |
-| `Bash` | run | execute | output 30 000 chars; timeout; live view 8 KiB per 500 ms | `run_in_background` starts a session job (`MAX_RUNNING_JOBS` 8). In the foreground its output is handed to the watch as it prints (`--acp`: `in_progress` updates), and the command's tree is killed when the turn is stopped |
+| `Bash` | run | execute | output 30 000 chars; timeout; live view 8 KiB per 500 ms; shell version probe 10 s, once per process | `run_in_background` starts a session job (`MAX_RUNNING_JOBS` 8). In the foreground its output is handed to the watch as it prints (`--acp`: `in_progress` updates), and the command's tree is killed when the turn is stopped. The shell is `tools::shell_choice`'s (below), and the tool's description names it |
 | `BashOutput` | observe | read | `MAX_JOB_READ_BYTES` 30 000 per read; `MAX_JOB_BUFFER_BYTES` 1 MiB kept per stream | new output since the last read; loss past the buffer is counted. Returns at once, so nothing is streamed |
 | `KillShell` | run | execute | — | kills the job's process tree |
 | `TodoWrite` | session | think | `MAX_TODOS` 100, `MAX_TODO_CHARS` 500 | kept per session; `--acp` sends it as the plan, with its priority, on the call's successful result |
@@ -1020,6 +1020,36 @@ enforced: …`, never silence:
 Both the foreground `Bash` and background `/bg`-style jobs run through `Sandbox::wrap`
 (`tools::bash`, `tools::bash_jobs`); the operator's own `/bg` at the REPL runs unconfined
 (it is their command, not the model's).
+
+**Which shell (`tools::shell_choice`).** The tool is called `Bash` and models write
+POSIX shell, so it never runs cmd.exe: on Windows `cmd /C` turned `mkdir -p .backups &&
+cp a ".backups/a.$(date +%s)"` into a directory named `-p` and a file named with a
+literal `$(date …)`. The shell is chosen once per process:
+
+| OS | order |
+|---|---|
+| macOS, Linux | `sh -c`, as before |
+| Windows | 1. `INCODE_SHELL`, then `admin.json` `shell` (a path or a name on `PATH`; `pwsh`/`powershell` run as PowerShell, anything else as a POSIX shell with `-c`; cmd.exe and the WSL launcher are refused and the refusal traced). 2. Git for Windows' `bin\bash.exe`, found above a `git.exe` on `PATH` (`<Git>\cmd`, `<Git>\bin`, `<Git>\mingw64\bin`) or under `ProgramFiles`, `ProgramW6432`, `ProgramFiles(x86)`, `%LOCALAPPDATA%\Programs` — never a `bash.exe` under the Windows directory, which is WSL and runs in another filesystem namespace. 3. PowerShell: `pwsh.exe` on `PATH`, then Windows PowerShell. None: every call fails saying where it looked |
+
+A candidate is used only once it has answered its version probe (10 s bound), which
+also gives the name the model is told: the `Bash` description ends with e.g. "Commands
+run in Git Bash (bash 5.2) on Windows: write POSIX shell …" or "Commands run in Windows
+PowerShell 5.1, not bash, …". Every argument is quoted whole by the C runtime's rules
+(`quote_windows`), because `Command::arg` leaves an argument without spaces unquoted and
+the msys runtime GLOBS an unquoted argument from a Windows parent; PowerShell gets
+`-NoProfile -NonInteractive -Command <script>` with UTF-8 output and progress off (not
+`-EncodedCommand`, which makes Windows PowerShell write its errors as CLIXML).
+
+**Git Bash cannot run under the Windows token.** Measured: every msys program started
+under the write-restricted token died at once with `CreateFileMapping <user SID>.1,
+Win32 error 5` — the msys runtime maps a per-user shared section that the user's other
+msys processes created, and a write-restricted token may not map it writable. So
+wherever the token applies (read-only; workspace-write when named) the command runs in
+PowerShell, which runs under the token and is confined by it (live: reads work; writes
+inside the workspace, outside it and to Documents are refused under read-only; the
+workspace-write session test passes with the ACL snapshot byte-identical after it), and
+the description says so (`Sandbox::posix_shell_runs`). Unconfined sessions — every
+writing session unless workspace-write is named — run Git Bash.
 
 Per OS, all measured live except where noted:
 

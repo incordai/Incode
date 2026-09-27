@@ -231,9 +231,11 @@ impl BashJobManager {
         }
 
         // Under the session's OS sandbox where the platform can confine it,
-        // through the plain shell where it cannot — `wrap` decides, and passes
-        // the command to `cmd /C` verbatim (which does not parse MSVC quoting).
-        let mut cmd_builder = sandbox.wrap(super::bash::SHELL, command);
+        // through the plain shell where it cannot — `wrap` decides. The shell
+        // is the Bash tool's own, chosen for the sandbox.
+        let shell =
+            super::shell_choice::for_sandbox(sandbox).map_err(|why| anyhow::anyhow!(why))?;
+        let mut cmd_builder = sandbox.wrap(&shell, command);
 
         cmd_builder
             .current_dir(workspace)

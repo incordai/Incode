@@ -65,6 +65,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 
+use crate::tools::shell_choice::Shell;
+
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
@@ -268,11 +270,10 @@ impl Sandbox {
     /// [`Self::note`] says which. The caller still sets the working
     /// directory, the environment and the pipes.
     ///
-    /// The `shell` pair is how this platform runs a command string, e.g.
-    /// `("cmd", "/C")` or `("sh", "-c")` — used unchanged when the sandbox is
-    /// off or cannot apply.
+    /// `shell` is the Bash tool's shell ([`crate::tools::shell_choice`]) —
+    /// used unchanged when the sandbox is off or cannot apply.
     #[must_use]
-    pub fn wrap(&self, shell: (&str, &str), command: &str) -> Command {
+    pub(crate) fn wrap(&self, shell: &Shell, command: &str) -> Command {
         if self.is_off() {
             return plain(shell, command);
         }
@@ -310,6 +311,24 @@ impl Sandbox {
         }
     }
 
+    /// Whether a POSIX shell's runtime can start under this sandbox. False
+    /// only on Windows when the write-restricted token applies (read-only, or
+    /// a named workspace-write): Git Bash's msys runtime maps a per-user
+    /// shared section the token may not map writable, and every msys program
+    /// dies at once with `CreateFileMapping ..., Win32 error 5` (measured).
+    /// Decided from the policy alone, so it can be asked before any grant.
+    #[must_use]
+    pub fn posix_shell_runs(&self) -> bool {
+        #[cfg(windows)]
+        {
+            !windows::applies(self.policy, windows::needs_grant(self.policy))
+        }
+        #[cfg(not(windows))]
+        {
+            true
+        }
+    }
+
     /// Whether this platform confines this filesystem mode.
     fn applies(&self) -> bool {
         #[cfg(target_os = "linux")]
@@ -332,7 +351,7 @@ impl Sandbox {
 
     /// The confined command, or `None` when this platform confines nothing
     /// of this policy (the caller then runs it unconfined).
-    fn wrap_confined(&self, shell: (&str, &str), command: &str) -> Option<Command> {
+    fn wrap_confined(&self, shell: &Shell, command: &str) -> Option<Command> {
         #[cfg(target_os = "linux")]
         {
             let _ = shell;
@@ -405,21 +424,9 @@ fn network_support() -> Result<&'static str, &'static str> {
     }
 }
 
-/// The plain way this platform runs a command string, unconfined.
-fn plain(shell: (&str, &str), command: &str) -> Command {
-    let mut cmd = Command::new(shell.0);
-    #[cfg(windows)]
-    {
-        // `cmd /C` does not parse MSVC quoting, so the command is passed
-        // verbatim — the same reasoning as `tools::bash`.
-        use std::os::windows::process::CommandExt;
-        cmd.arg(shell.1).raw_arg(command);
-    }
-    #[cfg(not(windows))]
-    {
-        cmd.arg(shell.1).arg(command);
-    }
-    cmd
+/// The plain way `shell` runs a command string, unconfined.
+fn plain(shell: &Shell, command: &str) -> Command {
+    shell.command(command)
 }
 
 /// What this OS's sandbox can and cannot do, for the report.
@@ -549,8 +556,10 @@ pub fn exec(args: &[String]) -> anyhow::Result<std::convert::Infallible> {
 /// run the command under it, returning its exit code — [`windows::run_helper`].
 /// There is no exec on Windows, so this launches a confined child and waits.
 ///
-/// The argv is `<mode> [--sid <SID> --temp <dir>] -- <command>`: the SID and
-/// the temp directory are the session's grant, and only workspace-write has one.
+/// The argv is `<mode> [--sid <SID> --temp <dir>] --shell <exe> --shell-kind
+/// <posix|powershell> -- <command>`: the SID and the temp directory are the
+/// session's grant, and only workspace-write has one; the shell is the one
+/// [`crate::tools::shell_choice`] chose for the command.
 ///
 /// # Errors
 ///
@@ -564,6 +573,8 @@ pub fn run_windows_helper(args: &[String]) -> anyhow::Result<i32> {
         .ok_or_else(|| anyhow::anyhow!("--sandbox-exec needs a mode first"))?;
     let mut sid = None;
     let mut temp = None;
+    let mut program = None;
+    let mut kind = None;
     let mut command = None;
     while let Some(arg) = it.next() {
         let mut value = |flag: &str| {
@@ -574,6 +585,8 @@ pub fn run_windows_helper(args: &[String]) -> anyhow::Result<i32> {
         match arg.as_str() {
             "--sid" => sid = Some(value("--sid")?),
             "--temp" => temp = Some(PathBuf::from(value("--temp")?)),
+            "--shell" => program = Some(PathBuf::from(value("--shell")?)),
+            "--shell-kind" => kind = Some(value("--shell-kind")?),
             // The command is ONE argument after `--` (wrap passed it whole),
             // so multiple spaces and quotes survive.
             "--" => {
@@ -589,7 +602,12 @@ pub fn run_windows_helper(args: &[String]) -> anyhow::Result<i32> {
         (None, None) => None,
         _ => anyhow::bail!("--sandbox-exec needs --sid and --temp together"),
     };
-    windows::run_helper(mode, grant, &command)
+    let flavor = kind
+        .as_deref()
+        .and_then(crate::tools::shell_choice::Flavor::parse)
+        .ok_or_else(|| anyhow::anyhow!("--sandbox-exec needs --shell-kind posix|powershell"))?;
+    let program = program.ok_or_else(|| anyhow::anyhow!("--sandbox-exec needs --shell <exe>"))?;
+    windows::run_helper(mode, grant, &Shell::from_parts(program, flavor), &command)
 }
 
 /// The parsed argv of `--sandbox-exec <mode> [--network <allow|deny>]
@@ -702,10 +720,15 @@ mod tests {
     fn off_runs_the_plain_shell() {
         let sandbox = Sandbox::off();
         assert!(sandbox.is_off());
-        let cmd = sandbox.wrap(("sh", "-c"), "echo hi");
+        let shell = Shell::from_parts(
+            PathBuf::from("sh"),
+            crate::tools::shell_choice::Flavor::Posix,
+        );
+        let cmd = sandbox.wrap(&shell, "echo hi");
         assert!(sandbox.note().contains("off"));
         // The program is the shell itself, not a wrapper.
         assert_eq!(cmd.get_program().to_string_lossy(), "sh");
+        assert!(sandbox.posix_shell_runs());
     }
 
     /// A mode round-trips through its word, and an unknown one is refused.

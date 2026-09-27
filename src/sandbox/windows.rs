@@ -45,17 +45,22 @@
 //! # How it reaches a command
 //!
 //! [`wrap`] returns a `Command` that runs `incode --sandbox-exec <mode>
-//! [--sid <SID> --temp <dir>] -- <command>`. incode spawns THAT through its
-//! ordinary shell machinery, so the pipes, the live output, the timeout and
-//! the job all work unchanged; the helper ([`run_helper`]) builds the token and
-//! launches `cmd /S /C <command>` with `CreateProcessAsUserW`, inheriting the
-//! helper's own std handles (which are incode's pipes) and joining incode's
-//! job, then waits and exits with the command's code.
+//! [--sid <SID> --temp <dir>] --shell <exe> --shell-kind <kind> -- <command>`.
+//! incode spawns THAT through its ordinary shell machinery, so the pipes, the
+//! live output, the timeout and the job all work unchanged; the helper
+//! ([`run_helper`]) builds the token and launches the named shell on the
+//! command with `CreateProcessAsUserW`, inheriting the helper's own std handles
+//! (which are incode's pipes) and joining incode's job, then waits and exits
+//! with the command's code.
+//!
+//! The shell is PowerShell whenever the token applies: Git Bash cannot start
+//! under it (see [`super::Sandbox::posix_shell_runs`]).
 
 use std::path::PathBuf;
 use std::process::Command;
 
 use super::{PerOs, SandboxMode, SandboxPolicy};
+use crate::tools::shell_choice::Shell;
 
 pub(super) mod acl;
 
@@ -90,15 +95,10 @@ pub(super) fn applies(policy: SandboxPolicy, granted: bool) -> bool {
 pub(super) fn wrap(
     mode: SandboxMode,
     grant: Option<&acl::Grant>,
-    shell: (&str, &str),
+    shell: &Shell,
     command: &str,
 ) -> Option<Command> {
-    // `cmd /C` is the only shell this path launches; a caller asking for a
-    // different one is not confined here rather than run unconfined-looking.
-    if shell.0 != "cmd" {
-        return None;
-    }
-    let args = helper_args(mode, grant, command)?;
+    let args = helper_args(mode, grant, shell, command)?;
     let exe = std::env::current_exe().ok()?;
     let mut cmd = Command::new(exe);
     cmd.args(args);
@@ -106,11 +106,12 @@ pub(super) fn wrap(
 }
 
 /// The helper's arguments after the binary: `--sandbox-exec <mode>`, the grant
-/// for workspace-write, then `-- <command>` as ONE argument. `None` for a mode
-/// this platform does not confine without more than it was given.
+/// for workspace-write, the shell, then `-- <command>` as ONE argument. `None`
+/// for a mode this platform does not confine without more than it was given.
 fn helper_args(
     mode: SandboxMode,
     grant: Option<&acl::Grant>,
+    shell: &Shell,
     command: &str,
 ) -> Option<Vec<String>> {
     let mut args = vec!["--sandbox-exec".to_string(), mode.as_str().to_string()];
@@ -124,6 +125,10 @@ fn helper_args(
         }
         _ => return None,
     }
+    args.push("--shell".to_string());
+    args.push(shell.program().to_string_lossy().into_owned());
+    args.push("--shell-kind".to_string());
+    args.push(shell.flavor().as_str().to_string());
     args.push("--".to_string());
     args.push(command.to_string());
     Some(args)
@@ -146,20 +151,22 @@ pub(super) fn per_os() -> PerOs {
 /// run `command` under it, returning the command's exit code. Read-only
 /// restricts to incode's fixed SID (granted nowhere); workspace-write to the
 /// session's SID in `grant`, with `TEMP`/`TMP` pointed at the session's own
-/// granted temp directory. Off runs the command through the plain shell.
+/// granted temp directory. Off runs the command through the plain shell. The
+/// command runs in `shell`.
 ///
 /// # Errors
 ///
 /// When the command could not be started at all, or workspace-write came
 /// without its grant. A command that ran and failed returns its own non-zero
 /// code, not an error.
-pub fn run_helper(
+pub(crate) fn run_helper(
     mode: SandboxMode,
     grant: Option<(String, PathBuf)>,
+    shell: &Shell,
     command: &str,
 ) -> anyhow::Result<i32> {
     let sid = match (mode, grant) {
-        (SandboxMode::Off, _) => return plain(command),
+        (SandboxMode::Off, _) => return plain(shell, command),
         (SandboxMode::ReadOnly, _) => imp::INCODE_SID.to_string(),
         (SandboxMode::WorkspaceWrite, Some((sid, temp))) => {
             if !sid.starts_with(acl::SID_PREFIX) {
@@ -180,7 +187,7 @@ pub fn run_helper(
             "workspace-write needs the session's grant (--sid, --temp), so the command was not run"
         ),
     };
-    match imp::run_restricted(command, &sid) {
+    match imp::run_restricted(&shell.command_line(command), &sid) {
         Ok(code) => Ok(code),
         Err(e) => {
             // A sandbox that could not be built must not silently run the
@@ -195,13 +202,8 @@ pub fn run_helper(
 }
 
 /// Run `command` through the plain shell, unconfined, returning its code.
-fn plain(command: &str) -> anyhow::Result<i32> {
-    use std::os::windows::process::CommandExt;
-    let status = Command::new("cmd")
-        .arg("/S")
-        .arg("/C")
-        .raw_arg(format!("\"{command}\""))
-        .status()?;
+fn plain(shell: &Shell, command: &str) -> anyhow::Result<i32> {
+    let status = shell.command(command).status()?;
     Ok(status.code().unwrap_or(-1))
 }
 
@@ -269,12 +271,12 @@ pub(super) mod imp {
         Ok(LocalSid(out))
     }
 
-    /// Run `command` under a write-restricted token restricted to `private`
-    /// (plus `Everyone` and the logon SID), returning its exit code. The token
-    /// writes only where a restricting SID is granted: for read-only `private`
-    /// is granted nowhere; for workspace-write it is the session SID, granted
-    /// on the roots.
-    pub(super) fn run_restricted(command: &str, private: &str) -> Result<i32, String> {
+    /// Run `command_line` (the shell and its arguments, whole) under a
+    /// write-restricted token restricted to `private` (plus `Everyone` and the
+    /// logon SID), returning its exit code. The token writes only where a
+    /// restricting SID is granted: for read-only `private` is granted nowhere;
+    /// for workspace-write it is the session SID, granted on the roots.
+    pub(super) fn run_restricted(command_line: &str, private: &str) -> Result<i32, String> {
         // SAFETY: the whole sequence is Win32 handle work; each call is checked
         // and every handle this owns is closed. The pointers handed to the API
         // outlive the calls that read them (the SIDs and the array live to the
@@ -328,7 +330,7 @@ pub(super) mod imp {
             drop((incode, everyone, logon));
 
             set_default_dacl(base.0, restricted.0, private)?;
-            launch(restricted.0, command)
+            launch(restricted.0, command_line)
         }
     }
 
@@ -421,9 +423,9 @@ pub(super) mod imp {
         Ok(text)
     }
 
-    /// Launch `cmd /S /C <command>` under `token`, inheriting this process's std
+    /// Launch `command_line` under `token`, inheriting this process's std
     /// handles (which are incode's pipes), and wait for it.
-    unsafe fn launch(token: HANDLE, command: &str) -> Result<i32, String> {
+    unsafe fn launch(token: HANDLE, command_line: &str) -> Result<i32, String> {
         // Inherit the helper's own std handles: they are the pipes incode gave
         // it, so the command's output reaches incode unchanged.
         let stdin = GetStdHandle(STD_INPUT_HANDLE);
@@ -442,9 +444,8 @@ pub(super) mod imp {
         si.hStdOutput = stdout;
         si.hStdError = stderr;
 
-        // `/S /C "<command>"`: /S strips the outer quotes and runs the rest
-        // verbatim, so a command with its own quotes is untouched.
-        let mut line = wide(format!("cmd.exe /S /C \"{command}\""));
+        // The shell's own line, every argument quoted by `Shell`.
+        let mut line = wide(command_line);
         let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
         if CreateProcessAsUserW(
             token,
@@ -554,17 +555,31 @@ mod tests {
                 .map(|a| a.to_string_lossy().into_owned())
                 .collect()
         };
-        let read = args_of(
-            wrap(SandboxMode::ReadOnly, None, ("cmd", "/C"), "echo hi").expect("read-only"),
+        let ps = Shell::from_parts(
+            PathBuf::from(r"C:\ps\powershell.exe"),
+            crate::tools::shell_choice::Flavor::PowerShell,
         );
-        assert_eq!(read, ["--sandbox-exec", "read-only", "--", "echo hi"]);
+        let read = args_of(wrap(SandboxMode::ReadOnly, None, &ps, "echo hi").expect("read-only"));
+        assert_eq!(
+            read,
+            [
+                "--sandbox-exec",
+                "read-only",
+                "--shell",
+                r"C:\ps\powershell.exe",
+                "--shell-kind",
+                "powershell",
+                "--",
+                "echo hi"
+            ]
+        );
 
         let grant = grant();
         let write = args_of(
             wrap(
                 SandboxMode::WorkspaceWrite,
                 Some(&grant),
-                ("cmd", "/C"),
+                &ps,
                 "echo  \"hi\"",
             )
             .expect("granted"),
@@ -578,13 +593,28 @@ mod tests {
                 grant.sid.as_str(),
                 "--temp",
                 r"C:\t\77.tmp",
+                "--shell",
+                r"C:\ps\powershell.exe",
+                "--shell-kind",
+                "powershell",
                 "--",
                 "echo  \"hi\""
             ]
         );
-        assert!(wrap(SandboxMode::WorkspaceWrite, None, ("cmd", "/C"), "echo hi").is_none());
-        assert!(wrap(SandboxMode::Off, Some(&grant), ("cmd", "/C"), "echo hi").is_none());
-        assert!(wrap(SandboxMode::ReadOnly, None, ("sh", "-c"), "echo hi").is_none());
+        assert!(wrap(SandboxMode::WorkspaceWrite, None, &ps, "echo hi").is_none());
+        assert!(wrap(SandboxMode::Off, Some(&grant), &ps, "echo hi").is_none());
+    }
+
+    /// Git Bash cannot start under the token, so a POSIX shell is said to
+    /// run only where the token does not apply: off, and workspace-write left
+    /// to the permission-mode default.
+    #[test]
+    fn a_posix_shell_runs_only_where_the_token_does_not_apply() {
+        let with = |mode, named| crate::sandbox::Sandbox::new(policy(mode, named), Vec::new());
+        assert!(with(SandboxMode::Off, false).posix_shell_runs());
+        assert!(with(SandboxMode::WorkspaceWrite, false).posix_shell_runs());
+        assert!(!with(SandboxMode::WorkspaceWrite, true).posix_shell_runs());
+        assert!(!with(SandboxMode::ReadOnly, false).posix_shell_runs());
     }
 
     /// The helper parses back exactly what wrap wrote, and refuses — rather
@@ -592,7 +622,21 @@ mod tests {
     /// grant, or a SID that is not an incode session's.
     #[test]
     fn the_helper_refuses_workspace_write_without_a_proper_grant() {
-        let s = |v: &[&str]| v.iter().map(|a| (*a).to_string()).collect::<Vec<_>>();
+        // Every argv names its shell, as `wrap` writes it.
+        let s = |v: &[&str]| {
+            let mut all: Vec<String> = v[..v.len() - 2].iter().map(|a| (*a).to_string()).collect();
+            all.extend(
+                [
+                    "--shell",
+                    r"C:\ps\powershell.exe",
+                    "--shell-kind",
+                    "powershell",
+                ]
+                .map(String::from),
+            );
+            all.extend(v[v.len() - 2..].iter().map(|a| (*a).to_string()));
+            all
+        };
         let err = crate::sandbox::run_windows_helper(&s(&["workspace-write", "--", "echo hi"]))
             .expect_err("no grant");
         assert!(err.to_string().contains("was not run"), "{err}");
@@ -619,5 +663,10 @@ mod tests {
             err.to_string().contains("not an incode session SID"),
             "{err}"
         );
+        // No shell named: refused, never a default one.
+        let err =
+            crate::sandbox::run_windows_helper(&["read-only", "--", "echo hi"].map(String::from))
+                .expect_err("no shell");
+        assert!(err.to_string().contains("--shell"), "{err}");
     }
 }
