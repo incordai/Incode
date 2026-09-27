@@ -389,7 +389,8 @@ impl Events {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::toolbox::client_servers::{ClientServers, ServerSpec, Transport};
+    use crate::toolbox::client_servers::tests::Connected;
+    use crate::toolbox::client_servers::{ServerSpec, Transport};
     use http_body_util::combinators::UnsyncBoxBody;
     use http_body_util::{BodyExt, Full};
     use hyper::body::{Bytes, Frame, Incoming};
@@ -630,9 +631,9 @@ pub(crate) mod tests {
         Ok(reply)
     }
 
-    fn connect(url: &str) -> (ClientServers, Vec<String>) {
+    fn connect(url: &str) -> (Connected, Vec<String>) {
         let dir = tempfile::tempdir().expect("dir");
-        ClientServers::connect(vec![http_spec("web", url)], dir.path(), false)
+        Connected::now(vec![http_spec("web", url)], dir.path())
     }
 
     /// **AN HTTP SERVER IS INITIALIZED, LISTED AND CALLED**, its tools named

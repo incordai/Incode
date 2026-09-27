@@ -5,11 +5,64 @@ use crate::hooks::engine::fake::{self, Reply};
 use crate::permissions::PermissionMode;
 use std::time::Duration;
 
+/// Session state whose client servers are `specs`, waited for until each has
+/// connected or been dropped; returns what was said about them.
+fn connect(specs: Vec<ServerSpec>, ws: &Path) -> (Arc<SessionTools>, Vec<String>) {
+    let state = SessionTools::new(false);
+    let (on, later) = client_servers::tests::collector();
+    let mut said = state.connect_client_servers(specs, ws, &on);
+    assert!(
+        client_servers::tests::wait_connected(&state.client, Duration::from_secs(60)),
+        "still connecting after 60s"
+    );
+    said.extend(later.lock().expect("said").iter().cloned());
+    (state, said)
+}
+
 /// A toolbox sharing `state`, whose client servers are the fake one.
 fn connected(ws: &Path, log: &Path) -> (Arc<SessionTools>, Vec<String>) {
+    connect(vec![fake_server("fake", log)], ws)
+}
+
+/// **SESSION STATE IS READY AT ONCE; A SLOW SERVER'S TOOL JOINS LATER.**
+/// Connecting returns while the server is still listing its tools, and every
+/// toolbox sharing the state offers the tool from the first list after it
+/// has — which is what the next turn asks for.
+#[test]
+fn a_slow_servers_tool_is_offered_from_the_next_list_after_it_connects() {
+    let ws = tempfile::tempdir().expect("ws");
+    let logs = tempfile::tempdir().expect("logs");
+    let log = logs.path().join("calls.log");
     let state = SessionTools::new(false);
-    let said = state.connect_client_servers(vec![fake_server("fake", log)], ws);
-    (state, said)
+    let (on, _) = client_servers::tests::collector();
+    let began = std::time::Instant::now();
+    state.connect_client_servers(
+        vec![client_servers::tests::slow_fake_server("slow", &log, 3000)],
+        ws.path(),
+        &on,
+    );
+    assert!(
+        began.elapsed() < Duration::from_millis(1500),
+        "{:?}",
+        began.elapsed()
+    );
+    let mut tools = Toolbox::new(ws.path(), true);
+    tools.share_session(Arc::clone(&state));
+    assert!(!tools.names().iter().any(|n| n == "mcp__slow__echo"));
+    assert_eq!(state.client_servers_connecting(), ["slow"]);
+    assert!(client_servers::tests::wait_connected(
+        &state.client,
+        Duration::from_secs(60)
+    ));
+    assert!(tools.names().iter().any(|n| n == "mcp__slow__echo"));
+    assert!(state.client_servers_connecting().is_empty());
+    tools.set_permission_mode(PermissionMode::WorkspaceWrite);
+    assert_eq!(
+        tools
+            .run("mcp__slow__echo", &json!({"text": "late"}))
+            .expect("runs"),
+        "echo: late"
+    );
 }
 
 /// **A CLIENT'S MCP TOOL RUNS THROUGH THE ONE GATE.** Offered under its
@@ -95,9 +148,8 @@ fn a_client_http_mcp_tool_is_gated_like_a_stdio_one() {
     let ws = tempfile::tempdir().expect("ws");
     let engine = tempfile::tempdir().expect("engine");
     let server = FakeHttp::start();
-    let state = SessionTools::new(false);
     let spec = mcp_http::tests::http_spec("web", &server.url);
-    let said = state.connect_client_servers(vec![spec], ws.path());
+    let (state, said) = connect(vec![spec], ws.path());
     let mut open = Toolbox::new(ws.path(), true);
     open.share_session(Arc::clone(&state));
     open.set_permission_mode(PermissionMode::WorkspaceWrite);

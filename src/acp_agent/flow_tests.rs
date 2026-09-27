@@ -248,6 +248,87 @@ fn a_clients_http_mcp_server_is_called_through_the_gate_and_refused_read_only() 
     called_through_the_gate_and_refused_read_only(server, "4 tool(s)", || fake.calls());
 }
 
+/// The text of every message from the client's next ones, read until one
+/// says `wanted` — at most 20 messages.
+fn said_until(client: &mut Client, wanted: &str) -> String {
+    let mut said = String::new();
+    for _ in 0..20 {
+        let message = client.next();
+        if let Some(text) = message["params"]["update"]["content"]["text"].as_str() {
+            said.push_str(text);
+        }
+        if said.contains(wanted) {
+            return said;
+        }
+    }
+    panic!("never said {wanted:?}: {said}");
+}
+
+/// **THE MODEL IS TOLD WHICH SERVERS ARE STILL CONNECTING**, by name, and
+/// told nothing when none is.
+#[test]
+fn the_model_is_told_which_servers_are_still_connecting() {
+    assert_eq!(super::connecting_note(&[]), None);
+    let note =
+        super::connecting_note(&["incord-memory".to_string(), "web".to_string()]).expect("a note");
+    assert!(note.contains("`incord-memory`, `web`"), "{note}");
+    assert!(note.contains("still connecting"), "{note}");
+}
+
+/// **`session/new` DOES NOT WAIT FOR THE CLIENT'S MCP SERVERS.** A server
+/// that takes 4 s to list its tools does not hold the answer; the client is
+/// told it is connecting, then — once it has listed — its tools, and a later
+/// turn calls one through the gate.
+#[test]
+fn session_new_answers_before_a_slow_server_has_listed_its_tools() {
+    let logs = tempfile::tempdir().expect("logs");
+    let log = logs.path().join("calls.log");
+    let spec = crate::toolbox::slow_fake_server("fake", &log, 4000);
+    let crate::toolbox::Transport::Stdio { command, args, env } = spec.transport else {
+        panic!("the fake is a stdio server");
+    };
+    let server = json!({
+        "name": spec.name,
+        "command": command,
+        "args": args,
+        "env": env.iter().map(|(name, value)| json!({"name": name, "value": value})).collect::<Vec<_>>(),
+    });
+    let mut client = client(Behaviour::CallMcp);
+    let dir = tempfile::tempdir().expect("ws");
+    let asked = Instant::now();
+    let id = client.request(
+        "session/new",
+        json!({"cwd": dir.path(), "mcpServers": [server]}),
+    );
+    let (_, reply) = client.until_response(id);
+    let answered = asked.elapsed();
+    assert!(
+        answered < Duration::from_millis(3000),
+        "session/new waited for the server: {answered:?}"
+    );
+    let session = result_of(&reply)["sessionId"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let said = said_until(&mut client, "MCP server `fake`: 1 tool(s)");
+    assert!(said.contains("connecting in the background"), "{said}");
+    assert!(
+        asked.elapsed() >= Duration::from_secs(4),
+        "listed before its delay"
+    );
+
+    let (streamed, reply) = prompt_in(&mut client, &session, "call the echo");
+    assert_eq!(reply["result"]["stopReason"], "end_turn", "{reply}");
+    let updates = updates_of(&streamed);
+    let result = updates
+        .iter()
+        .find(|u| u["sessionUpdate"] == "tool_call_update" && u["toolCallId"] == "m1")
+        .unwrap_or_else(|| panic!("no result: {streamed:#?}"));
+    assert_eq!(result["status"], "completed", "{result}");
+    assert_eq!(crate::toolbox::client_server_calls(&log).len(), 1);
+    client.close();
+}
+
 /// Open a session handed `server` — a fake whose tools include `echo` —
 /// call `mcp__fake__echo` through the gate, then again once read-only.
 /// `calls` counts the calls that reached the server.
@@ -267,18 +348,10 @@ fn called_through_the_gate_and_refused_read_only(
         .as_str()
         .expect("id")
         .to_string();
-    // The commands, then what the servers did.
-    let mut said = String::new();
-    for _ in 0..2 {
-        let message = client.next();
-        if let Some(text) = message["params"]["update"]["content"]["text"].as_str() {
-            said.push_str(text);
-        }
-    }
-    assert!(
-        said.contains(&format!("MCP server `fake`: {listed}")),
-        "{said}"
-    );
+    // The commands, that the server is connecting, then — from the
+    // background — what it listed.
+    let said = said_until(&mut client, &format!("MCP server `fake`: {listed}"));
+    assert!(said.contains("connecting in the background"), "{said}");
 
     let (streamed, reply) = prompt_in(&mut client, &session, "call the echo");
     assert_eq!(reply["result"]["stopReason"], "end_turn", "{reply}");

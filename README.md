@@ -188,8 +188,9 @@ Options shared by the session modes:
 sub-agents and `/run` lanes as sub-agent sessions (when the client advertises
 them); context-window usage; `session/load` and `session/list` from incode's own
 transcripts; `session/set_mode`; pickers for the lead agent and the role; a set
-of slash commands; pictures in a prompt; and the client's stdio MCP servers,
-which incode connects itself and runs through the same gate as its own tools.
+of slash commands; pictures in a prompt; and the client's MCP servers (stdio and
+HTTP), which incode connects itself — in the background, so `session/new` does
+not wait for them — and runs through the same gate as its own tools.
 Details: `docs/ARCHITECTURE.md` §2.
 
 ## Choosing agents and models
@@ -301,7 +302,7 @@ anything runs.
 | `watchman_lookup` | observe | Ask the recorder whether this step was already solved. |
 | `remember` · `forget_memory` · `save_brief` | record | Write to the memory service. |
 | `team_ask` · `team_tell` · `team_answer` · `team_read` | record (`team_read`: observe) | The team channel between workers (`docs/TEAMWORK.md`). |
-| `mcp__<server>__<tool>` | run | Tools of an ACP client's stdio MCP servers, connected by incode. |
+| `mcp__<server>__<tool>` | run | Tools of an ACP client's MCP servers (stdio or HTTP), connected by incode in the background: offered from the first turn after the server answers, and until then the model is told it is still connecting. |
 
 A tool result can carry pictures (PNG or JPEG, bounded in bytes, edge, pixels
 and count). The model receives them; incode's own events, transcript and memory
@@ -563,7 +564,8 @@ Per-project state lives **in the project**; `~/.incord-code` is yours.
 
 - `codex` and `agy` still use their own tools; only `claude` runs as a model
   only. On those routes the guards are a sentinel (detection), not a gate.
-- MCP servers are stdio only; there is no HTTP MCP client.
+- A client's MCP servers are stdio or Streamable HTTP; the older SSE transport is
+  not spoken.
 - The Windows sandbox does not confine workspace-write, and no OS restricts
   the network.
 - Provider agents from `api_providers` are listed but not driven.

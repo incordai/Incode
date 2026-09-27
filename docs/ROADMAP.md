@@ -62,6 +62,13 @@ This is fully true for claude; section 0b says what is not.
   unconfined. Open: whether to make it the default, and a size cap — the grant is
   linear in the tree (a `node_modules`-heavy workspace pays per object, once per
   session). Not yet driven end to end through a real model session.
+- **`session/new` is still 12–14 s, but no longer because of MCP.** The client's
+  MCP servers now connect in the background (their tools join from the next turn;
+  a turn meanwhile is told which are still connecting), which took the memory
+  service's 28 s out of it: 42 s before, 14.0 s after, 12.4 s with no server at
+  all. Traced: the memory engine's `session-start` hook is 8.2 s of that, the
+  spec note 1.2 s, a guards request to the service 1.2 s, and the agent catalogue
+  and discovery 1.5 s together. Open: run `session-start` off the answer too.
 - **The `Bash` tool's shell on Windows.** Fixed: it was cmd.exe; it is now Git Bash
   (or `INCODE_SHELL` / `admin.json` `shell`), else PowerShell, and its description
   names the shell (`ARCHITECTURE.md`, "Which shell"). Open: under the Windows sandbox

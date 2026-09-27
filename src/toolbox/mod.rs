@@ -47,7 +47,7 @@
 //! tool at all — the call is refused before anything else is asked.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock};
 
 use serde_json::{json, Value};
 
@@ -70,7 +70,7 @@ mod team;
 mod todo;
 mod validate;
 
-pub(crate) use client_servers::{ServerSpec, Transport};
+pub(crate) use client_servers::{OnConnected, ServerSpec, Transport};
 pub use desktop::DesktopSetup;
 pub use image::{Image, ImageFormat, ToolOutput, MAX_IMAGES_PER_RESULT, MAX_IMAGE_EDGE};
 pub(crate) use todo::{parse_todos, Priority, TodoStatus};
@@ -220,10 +220,10 @@ pub struct SessionTools {
     /// The desktop child, started on the first desktop call and stopped —
     /// EOF, then its tree — when the session's tools are dropped.
     desktop: Mutex<Option<desktop::DesktopClient>>,
-    /// The MCP servers the session's client handed it, once connected —
-    /// stopped, EOF and then their trees, when the session's tools are
-    /// dropped. See [`client_servers`].
-    client: OnceLock<client_servers::ClientServers>,
+    /// The MCP servers the session's client handed it, each added once it
+    /// has connected in the background — stopped, EOF and then their trees,
+    /// when the session's tools are dropped. See [`client_servers`].
+    client: Arc<RwLock<client_servers::ClientServers>>,
     /// Whether a process these tools start gets the filtered environment.
     filter_env: bool,
 }
@@ -240,37 +240,67 @@ impl SessionTools {
             todos: Mutex::new(Vec::new()),
             browsers: Mutex::new(browser::Browsers::default()),
             desktop: Mutex::new(None),
-            client: OnceLock::new(),
+            client: Arc::default(),
             filter_env,
         })
     }
 
-    /// Start the MCP servers the session's client named, in `cwd`, and offer
-    /// their tools through every toolbox sharing this state. Once per
-    /// session: a second call starts nothing. Returns what happened, a line
-    /// per server and per tool left out.
-    pub(crate) fn connect_client_servers(&self, specs: Vec<ServerSpec>, cwd: &Path) -> Vec<String> {
+    /// Start the MCP servers the session's client named, in `cwd`, in the
+    /// background, and offer each one's tools through every toolbox sharing
+    /// this state as soon as it has listed them. Returns at once, with a line
+    /// per server started or refused; what became of each server later is
+    /// handed to `on_connected`. Once per session: a second call starts
+    /// nothing.
+    pub(crate) fn connect_client_servers(
+        &self,
+        specs: Vec<ServerSpec>,
+        cwd: &Path,
+        on_connected: &OnConnected,
+    ) -> Vec<String> {
+        self.connect_client_servers_within(
+            specs,
+            cwd,
+            client_servers::Bounds::DEFAULT,
+            on_connected,
+        )
+    }
+
+    /// [`Self::connect_client_servers`], with each kind of server given
+    /// `bounds` to start.
+    fn connect_client_servers_within(
+        &self,
+        specs: Vec<ServerSpec>,
+        cwd: &Path,
+        bounds: client_servers::Bounds,
+        on_connected: &OnConnected,
+    ) -> Vec<String> {
         if specs.is_empty() {
             return Vec::new();
         }
-        if self.client.get().is_some() {
-            return vec!["this session's MCP servers are already connected".to_string()];
-        }
-        let (servers, said) = client_servers::ClientServers::connect(specs, cwd, self.filter_env);
-        if self.client.set(servers).is_err() {
-            return vec!["this session's MCP servers are already connected".to_string()];
-        }
-        said
+        client_servers::ClientServers::connect_in_background(
+            &self.client,
+            specs,
+            cwd,
+            self.filter_env,
+            bounds,
+            on_connected,
+        )
     }
 
-    /// The client's servers, when any were connected.
-    fn client(&self) -> Option<&client_servers::ClientServers> {
-        self.client.get()
+    /// The client's servers started and still connecting, by name — for the
+    /// model, which is told their tools are not offered yet.
+    pub(crate) fn client_servers_connecting(&self) -> Vec<String> {
+        self.client().connecting()
+    }
+
+    /// The client's servers, as they stand now.
+    fn client(&self) -> std::sync::RwLockReadGuard<'_, client_servers::ClientServers> {
+        self.client.read().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Whether `name` is a tool of one of the client's servers.
     fn is_client_tool(&self, name: &str) -> bool {
-        name.starts_with(client_servers::PREFIX) && self.client().is_some_and(|c| c.has(name))
+        name.starts_with(client_servers::PREFIX) && self.client().has(name)
     }
 
     /// The session's background jobs.
@@ -992,14 +1022,14 @@ impl Toolbox {
             })
             .collect();
         // The tools of the MCP servers the session's client handed it, run
-        // through the same gate as the rest.
-        if let Some(client) = self.state.client() {
-            all.extend(client.definitions().into_iter().filter(|def| {
-                def.get("name")
-                    .and_then(Value::as_str)
-                    .is_some_and(|name| self.allows(name))
-            }));
-        }
+        // through the same gate as the rest — read now, so a server that
+        // finished connecting since the last list is offered.
+        let client = self.state.client().definitions();
+        all.extend(client.into_iter().filter(|def| {
+            def.get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| self.allows(name))
+        }));
         all
     }
 
@@ -1289,9 +1319,10 @@ impl Toolbox {
         }
         // The input the tool's own schema promised, before anything is asked
         // or decided about it: a malformed call runs nothing.
-        let checked = match self.state.client() {
-            Some(client) if client_tool => client.check(name, input),
-            _ => validate::check(name, input),
+        let checked = if client_tool {
+            self.state.client().check(name, input)
+        } else {
+            validate::check(name, input)
         };
         if let Err(problems) = checked {
             crate::trace!("tool", "{name} REFUSED: input does not match its schema");
@@ -1785,10 +1816,7 @@ impl Toolbox {
                 .as_ref()
                 .is_some_and(crate::runtime::cancel::CancelToken::is_cancelled)
         };
-        match self.state.client() {
-            Some(client) => client.call(name, input, &stopped),
-            None => Err(format!("there is no tool called `{name}`")),
-        }
+        client_servers::call(&self.state.client, name, input, &stopped)
     }
 
     /// A foreground shell command: its output shown as it prints when there
@@ -1910,7 +1938,9 @@ mod client_tool_tests;
 mod hook_tests;
 
 #[cfg(test)]
-pub(crate) use client_servers::tests::{calls_in as client_server_calls, fake_server};
+pub(crate) use client_servers::tests::{
+    calls_in as client_server_calls, fake_server, slow_fake_server,
+};
 
 #[cfg(test)]
 pub(crate) use mcp_http::tests::FakeHttp;

@@ -18,12 +18,26 @@
 //! refused in a read-only session, asked about in a prompting one, and REFUSED
 //! when the memory engine cannot decide (fail closed).
 //!
+//! # Connected in the background
+//!
+//! `session/new` does not wait for them. The owner's memory service takes 1 to
+//! 15 s to list its tools, and more than 20 s cold (measured), so a session
+//! that waited took 42 s to open. [`ClientServers::connect_in_background`]
+//! starts every server on a thread of its own and returns at once; each
+//! server's tools join the session's toolbox the moment it has listed them,
+//! so the next `tools/list` — the bridge asks once per turn, the API route
+//! every request — offers them. Until then the server is named as still
+//! connecting ([`ClientServers::connecting`]), and what became of it is
+//! handed to a callback, a line per server and per tool left out.
+//!
 //! # Bounds
 //!
-//! Starting a server and listing its tools: [`START_BOUND`] for each request,
-//! every server on its own thread. One call: [`CALL_BOUND`], and abandoned at
-//! once when the turn is stopped. The children die with the session's tools —
-//! EOF, then their process trees.
+//! Starting a server and listing its tools: [`START_BOUND`] for each request
+//! to a stdio server, [`HTTP_START_BOUND`] to an HTTP one; a server that has
+//! not answered by then is dropped, and said so. One call: [`CALL_BOUND`], and
+//! abandoned at once when the turn is stopped. The children die with the
+//! session's tools — EOF, then their process trees — and a server still
+//! connecting when the session ends is dropped the moment it finishes.
 //!
 //! # Two transports
 //!
@@ -36,7 +50,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -45,8 +59,13 @@ use super::image::ToolOutput;
 use super::mcp_client::{ChildLink, Link, McpClient};
 use super::mcp_http::HttpLink;
 
-/// How long a server has to answer `initialize`, and then `tools/list`.
+/// How long a stdio server has to answer `initialize`, and then `tools/list`.
 pub(crate) const START_BOUND: Duration = Duration::from_secs(20);
+/// The same for an HTTP server. Longer: the owner's memory service was
+/// measured taking 1 to 15 s to list its tools, and more than 20 s cold — and
+/// since connecting no longer holds `session/new`, a long bound costs nothing
+/// but a thread.
+pub(crate) const HTTP_START_BOUND: Duration = Duration::from_secs(60);
 /// How long one tool call may take.
 pub(crate) const CALL_BOUND: Duration = Duration::from_secs(120);
 /// The most servers one session starts.
@@ -120,11 +139,37 @@ struct Server {
     tools: Vec<ClientTool>,
 }
 
-/// Every server a session was handed, once connected.
+/// Every server a session was handed: those connected, and those still
+/// connecting.
 #[derive(Default)]
 pub(super) struct ClientServers {
-    servers: Vec<Server>,
+    /// Shared, so a call runs without holding the list: a server that
+    /// finishes connecting meanwhile is added at once.
+    servers: Vec<Arc<Server>>,
+    /// The servers started and not yet connected or dropped, by name.
+    connecting: Vec<String>,
+    /// Whether this session's servers were started. Once per session.
+    opened: bool,
 }
+
+/// How long each kind of server has to start: [`START_BOUND`] and
+/// [`HTTP_START_BOUND`], except in a test.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Bounds {
+    pub(super) stdio: Duration,
+    pub(super) http: Duration,
+}
+
+impl Bounds {
+    pub(super) const DEFAULT: Self = Self {
+        stdio: START_BOUND,
+        http: HTTP_START_BOUND,
+    };
+}
+
+/// Told what became of each server, a line at a time, from the thread that
+/// connected it.
+pub(crate) type OnConnected = Arc<dyn Fn(String) + Send + Sync>;
 
 /// `text` with everything outside `[A-Za-z0-9_-]` replaced by `_`.
 fn safe(text: &str) -> String {
@@ -140,17 +185,28 @@ fn safe(text: &str) -> String {
 }
 
 impl ClientServers {
-    /// Start every server, each on its own thread, and list its tools. What
-    /// could not be started, and what was left out, is said in the lines
-    /// returned; a server that failed costs its own tools and nothing else.
-    pub(super) fn connect(
+    /// Start every server into `shared`, each on its own thread, and return
+    /// at once: the lines returned say what was started and what was refused
+    /// before starting. Each server's tools join `shared` the moment it has
+    /// listed them, and what became of it — its tools, what was left out, or
+    /// why it was dropped — is handed to `on_connected`. A server that fails
+    /// costs its own tools and nothing else. Once per session: a second call
+    /// starts nothing.
+    pub(super) fn connect_in_background(
+        shared: &Arc<RwLock<Self>>,
         specs: Vec<ServerSpec>,
         cwd: &Path,
         filter_env: bool,
-    ) -> (Self, Vec<String>) {
+        bounds: Bounds,
+        on_connected: &OnConnected,
+    ) -> Vec<String> {
         let mut said = Vec::new();
+        let mut all = shared.write().unwrap_or_else(PoisonError::into_inner);
+        if all.opened {
+            return vec!["this session's MCP servers are already connected".to_string()];
+        }
+        all.opened = true;
         let mut taken: Vec<String> = Vec::new();
-        let mut started = Vec::new();
         for (index, spec) in specs.into_iter().enumerate() {
             let server = safe(spec.name.trim());
             if index >= MAX_SERVERS {
@@ -168,34 +224,68 @@ impl ClientServers {
                 continue;
             }
             taken.push(server.clone());
-            let cwd = cwd.to_path_buf();
-            started.push((
-                server.clone(),
-                std::thread::spawn(move || start(&spec, &server, &cwd, filter_env)),
+            let bound = match spec.transport {
+                Transport::Stdio { .. } => bounds.stdio,
+                Transport::Http { .. } => bounds.http,
+            };
+            said.push(format!(
+                "MCP server `{server}`: connecting in the background (up to {}s for each \
+                 request); its tools are offered from the first turn after it answers",
+                bound.as_secs()
             ));
-        }
-        let mut servers = Vec::new();
-        for (server, handle) in started {
-            match handle.join() {
-                Ok(Ok((client, listed))) => {
-                    let (tools, notes) = tools_of(&server, listed);
-                    said.extend(notes);
-                    said.push(format!(
-                        "MCP server `{server}`: {} tool(s), run through incode's own gate",
-                        tools.len()
-                    ));
-                    servers.push(Server {
-                        client: Mutex::new(client),
-                        tools,
-                    });
+            all.connecting.push(server.clone());
+            let into = Arc::downgrade(shared);
+            let cwd = cwd.to_path_buf();
+            let on_connected = Arc::clone(on_connected);
+            std::thread::spawn(move || {
+                let started = start(&spec, &server, &cwd, filter_env, bound);
+                // The session may have ended meanwhile: then nothing is
+                // added, and a server that did connect is dropped here — EOF,
+                // then its tree.
+                let Some(shared) = into.upgrade() else {
+                    return;
+                };
+                let lines = shared
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .joined(&server, started);
+                drop(shared);
+                for line in lines {
+                    on_connected(line);
                 }
-                Ok(Err(why)) => said.push(format!("MCP server `{server}` was not started: {why}")),
-                Err(_) => said.push(format!(
-                    "MCP server `{server}` was not started: starting it panicked"
-                )),
-            }
+            });
         }
-        (Self { servers }, said)
+        said
+    }
+
+    /// `server`, connected or not: its tools added, and it no longer counted
+    /// as connecting. Returns what to say about it.
+    fn joined(
+        &mut self,
+        server: &str,
+        started: Result<(McpClient, Vec<Value>), String>,
+    ) -> Vec<String> {
+        self.connecting.retain(|name| name != server);
+        match started {
+            Ok((client, listed)) => {
+                let (tools, mut said) = tools_of(server, listed);
+                said.push(format!(
+                    "MCP server `{server}`: {} tool(s), run through incode's own gate",
+                    tools.len()
+                ));
+                self.servers.push(Arc::new(Server {
+                    client: Mutex::new(client),
+                    tools,
+                }));
+                said
+            }
+            Err(why) => vec![format!("MCP server `{server}` was not started: {why}")],
+        }
+    }
+
+    /// The servers started and still connecting, by name.
+    pub(super) fn connecting(&self) -> Vec<String> {
+        self.connecting.clone()
     }
 
     fn find(&self, name: &str) -> Option<(&Server, &ClientTool)> {
@@ -204,7 +294,7 @@ impl ClientServers {
                 .tools
                 .iter()
                 .find(|tool| tool.name == name)
-                .map(|tool| (server, tool))
+                .map(|tool| (&**server, tool))
         })
     }
 
@@ -229,36 +319,49 @@ impl ClientServers {
         }
     }
 
-    /// Run one tool on its server, within [`CALL_BOUND`], abandoned when
-    /// `stopped` says so.
-    pub(super) fn call(
-        &self,
-        name: &str,
-        input: &Value,
-        stopped: &dyn Fn() -> bool,
-    ) -> Result<ToolOutput, String> {
-        let (server, tool) = self
-            .find(name)
-            .ok_or_else(|| format!("there is no tool called `{name}`"))?;
-        let mut client = server
-            .client
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if client.is_broken() {
-            return Err(format!(
-                "{name} is not available: its MCP server stopped answering"
-            ));
-        }
-        client.call(&tool.remote, input, CALL_BOUND, stopped)
+    /// The server that runs `name`, and the name it knows the tool by.
+    fn route(&self, name: &str) -> Option<(Arc<Server>, String)> {
+        self.servers.iter().find_map(|server| {
+            server
+                .tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .map(|tool| (Arc::clone(server), tool.remote.clone()))
+        })
     }
 }
 
-/// Start one server — a child, or a link to an address — and list its tools.
+/// Run one tool of `shared`'s servers, within [`CALL_BOUND`], abandoned when
+/// `stopped` says so. The list is not held while the call runs, so a server
+/// that finishes connecting meanwhile is not kept waiting.
+pub(super) fn call(
+    shared: &RwLock<ClientServers>,
+    name: &str,
+    input: &Value,
+    stopped: &dyn Fn() -> bool,
+) -> Result<ToolOutput, String> {
+    let (server, remote) = shared
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .route(name)
+        .ok_or_else(|| format!("there is no tool called `{name}`"))?;
+    let mut client = server.client.lock().unwrap_or_else(PoisonError::into_inner);
+    if client.is_broken() {
+        return Err(format!(
+            "{name} is not available: its MCP server stopped answering"
+        ));
+    }
+    client.call(&remote, input, CALL_BOUND, stopped)
+}
+
+/// Start one server — a child, or a link to an address — and list its tools,
+/// giving each request `bound`.
 fn start(
     spec: &ServerSpec,
     server: &str,
     cwd: &Path,
     filter_env: bool,
+    bound: Duration,
 ) -> Result<(McpClient, Vec<Value>), String> {
     let what = format!("MCP server `{server}`");
     let link: Box<dyn Link> = match &spec.transport {
@@ -278,8 +381,8 @@ fn start(
             Box::new(HttpLink::connect(url, headers, CALL_BOUND, &what)?)
         }
     };
-    let mut client = McpClient::open(link, &what, START_BOUND)?;
-    let listed = client.list_tools(START_BOUND)?;
+    let mut client = McpClient::open(link, &what, bound)?;
+    let listed = client.list_tools(bound)?;
     Ok((client, listed))
 }
 
@@ -354,6 +457,8 @@ pub(crate) mod tests {
     /// Set only in the child [`fake_server`] starts; its value is the file
     /// every call that reaches the server is written to.
     const CHILD: &str = "INCODE_FAKE_MCP_CHILD";
+    /// How long the child waits before answering `tools/list`, in ms.
+    const LIST_DELAY: &str = "INCODE_FAKE_MCP_LIST_DELAY_MS";
 
     /// The child half: this test binary, serving one tool over MCP on its
     /// real stdin and stdout. Returns at once — passing — unless started by
@@ -369,6 +474,11 @@ pub(crate) mod tests {
                 "fake"
             }
             fn tools(&mut self) -> Result<Vec<Value>, String> {
+                let delay = std::env::var(LIST_DELAY)
+                    .ok()
+                    .and_then(|ms| ms.parse().ok())
+                    .unwrap_or(0);
+                std::thread::sleep(std::time::Duration::from_millis(delay));
                 Ok(vec![json!({"name": "echo", "description": "Say it back.",
                            "inputSchema": {"type": "object",
                                            "properties": {"text": {"type": "string"}},
@@ -418,6 +528,85 @@ pub(crate) mod tests {
         }
     }
 
+    /// [`fake_server`], answering `tools/list` only after `delay_ms` — a
+    /// slow server, or with a long enough delay one that never answers.
+    pub(crate) fn slow_fake_server(name: &str, log: &Path, delay_ms: u64) -> ServerSpec {
+        let mut spec = fake_server(name, log);
+        if let Transport::Stdio { env, .. } = &mut spec.transport {
+            env.push((LIST_DELAY.to_string(), delay_ms.to_string()));
+        }
+        spec
+    }
+
+    /// Wait, bounded, until none of `shared`'s servers is still connecting.
+    pub(crate) fn wait_connected(shared: &RwLock<ClientServers>, bound: Duration) -> bool {
+        let deadline = std::time::Instant::now() + bound;
+        while std::time::Instant::now() < deadline {
+            if shared
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .connecting
+                .is_empty()
+            {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    /// A session's servers, connected and waited for: what a test calls.
+    pub(crate) struct Connected(Arc<RwLock<ClientServers>>);
+
+    impl Connected {
+        /// Connect `specs` from `cwd` and wait until each has connected or
+        /// been dropped; also returns every line said about them.
+        pub(crate) fn now(specs: Vec<ServerSpec>, cwd: &Path) -> (Self, Vec<String>) {
+            let shared: Arc<RwLock<ClientServers>> = Arc::default();
+            let (on, later) = collector();
+            let mut said = ClientServers::connect_in_background(
+                &shared,
+                specs,
+                cwd,
+                false,
+                Bounds::DEFAULT,
+                &on,
+            );
+            assert!(wait_connected(&shared, Duration::from_secs(60)));
+            said.extend(later.lock().expect("said").iter().cloned());
+            (Self(shared), said)
+        }
+
+        pub(crate) fn definitions(&self) -> Vec<Value> {
+            self.0.read().expect("servers").definitions()
+        }
+
+        pub(crate) fn has(&self, name: &str) -> bool {
+            self.0.read().expect("servers").has(name)
+        }
+
+        pub(crate) fn call(
+            &self,
+            name: &str,
+            input: &Value,
+            stopped: &dyn Fn() -> bool,
+        ) -> Result<ToolOutput, String> {
+            call(&self.0, name, input, stopped)
+        }
+    }
+
+    /// Collects what [`ClientServers::connect_in_background`] reports.
+    pub(crate) fn collector() -> (OnConnected, Arc<Mutex<Vec<String>>>) {
+        let said: Arc<Mutex<Vec<String>>> = Arc::default();
+        let into = Arc::clone(&said);
+        let on: OnConnected = Arc::new(move |line| {
+            into.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(line);
+        });
+        (on, said)
+    }
+
     /// The calls that reached the fake server, one per line.
     pub(crate) fn calls_in(log: &Path) -> Vec<String> {
         std::fs::read_to_string(log)
@@ -441,8 +630,19 @@ pub(crate) mod tests {
                 env: Vec::new(),
             },
         };
-        let (servers, said) =
-            ClientServers::connect(vec![fake_server("fake", &log), missing], dir.path(), false);
+        let shared: Arc<RwLock<ClientServers>> = Arc::default();
+        let (on, said) = collector();
+        ClientServers::connect_in_background(
+            &shared,
+            vec![fake_server("fake", &log), missing],
+            dir.path(),
+            false,
+            Bounds::DEFAULT,
+            &on,
+        );
+        assert!(wait_connected(&shared, Duration::from_secs(60)));
+        let said = said.lock().expect("said").clone();
+        let servers = shared.read().expect("servers");
         let names: Vec<String> = servers
             .definitions()
             .iter()
@@ -453,14 +653,91 @@ pub(crate) mod tests {
             said.iter().any(|s| s.contains("`gone` was not started")),
             "{said:?}"
         );
-        let out = servers
-            .call("mcp__fake__echo", &json!({"text": "hi"}), &|| false)
-            .expect("called");
-        assert_eq!(out.text, "echo: hi");
-        assert_eq!(calls_in(&log).len(), 1);
         assert!(servers
             .check("mcp__fake__echo", &json!({"text": 5}))
             .is_err());
+        drop(servers);
+        let out = call(&shared, "mcp__fake__echo", &json!({"text": "hi"}), &|| {
+            false
+        })
+        .expect("called");
+        assert_eq!(out.text, "echo: hi");
+        assert_eq!(calls_in(&log).len(), 1);
+    }
+
+    /// **A SLOW SERVER DOES NOT HOLD UP THE SESSION.** Connecting returns
+    /// while the server is still listing its tools; it is named as
+    /// connecting, and its tool joins once it has answered.
+    #[test]
+    fn a_slow_server_joins_after_connecting_returned() {
+        let dir = tempfile::tempdir().expect("dir");
+        let log = dir.path().join("calls.log");
+        let shared: Arc<RwLock<ClientServers>> = Arc::default();
+        let (on, said) = collector();
+        let began = std::time::Instant::now();
+        let lines = ClientServers::connect_in_background(
+            &shared,
+            vec![slow_fake_server("slow", &log, 3000)],
+            dir.path(),
+            false,
+            Bounds::DEFAULT,
+            &on,
+        );
+        let returned = began.elapsed();
+        assert!(returned < Duration::from_millis(1500), "{returned:?}");
+        assert!(
+            lines[0].contains("connecting in the background"),
+            "{lines:?}"
+        );
+        {
+            let servers = shared.read().expect("servers");
+            assert_eq!(servers.connecting(), ["slow"]);
+            assert!(servers.definitions().is_empty(), "offered before it listed");
+        }
+        assert!(wait_connected(&shared, Duration::from_secs(60)));
+        let servers = shared.read().expect("servers");
+        assert!(servers.has("mcp__slow__echo"));
+        assert!(servers.connecting().is_empty());
+        let said = said.lock().expect("said").clone();
+        assert!(
+            said.iter().any(|s| s.contains("`slow`: 1 tool(s)")),
+            "{said:?}"
+        );
+    }
+
+    /// **A SERVER THAT NEVER ANSWERS IS DROPPED, AND SAID SO**, at its
+    /// bound, its child with it; it offers nothing and is no longer counted
+    /// as connecting.
+    #[test]
+    fn a_server_that_never_answers_is_dropped_with_a_message() {
+        let dir = tempfile::tempdir().expect("dir");
+        let log = dir.path().join("calls.log");
+        let shared: Arc<RwLock<ClientServers>> = Arc::default();
+        let (on, said) = collector();
+        let bound = Duration::from_secs(2);
+        let began = std::time::Instant::now();
+        ClientServers::connect_in_background(
+            &shared,
+            vec![slow_fake_server("mute", &log, 600_000)],
+            dir.path(),
+            false,
+            Bounds {
+                stdio: bound,
+                http: bound,
+            },
+            &on,
+        );
+        assert!(wait_connected(&shared, Duration::from_secs(60)));
+        let took = began.elapsed();
+        assert!(took >= bound, "dropped before its bound: {took:?}");
+        assert!(took < Duration::from_secs(30), "{took:?}");
+        let servers = shared.read().expect("servers");
+        assert!(servers.definitions().is_empty());
+        let said = said.lock().expect("said").clone();
+        assert!(
+            said.iter().any(|s| s.contains("`mute` was not started")),
+            "{said:?}"
+        );
     }
 
     /// A spec's `Debug` names its headers and variables, never their values.

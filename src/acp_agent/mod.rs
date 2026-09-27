@@ -870,6 +870,70 @@ fn server_specs(servers: &[acp::McpServer]) -> (Vec<crate::toolbox::ServerSpec>,
     (specs, said)
 }
 
+/// What the client's MCP servers said while it could not be told at once.
+#[derive(Default)]
+struct Later {
+    /// Whether the session has been answered, so the client knows its id.
+    open: bool,
+    lines: Vec<String>,
+}
+
+/// Where what became of each client MCP server goes, once it has connected or
+/// been dropped: always the log, and the client as an agent message — at once
+/// when the session is answered and no prompt is running, else into `later`,
+/// which the session's thread says between turns, so it never lands inside
+/// the model's own text or ahead of the session's own answer.
+fn connected_later(
+    outbox: &Arc<Outbox>,
+    session_id: &acp::SessionId,
+    shared: &Arc<Shared>,
+    later: &Arc<Mutex<Later>>,
+) -> crate::toolbox::OnConnected {
+    let outbox = Arc::clone(outbox);
+    let session_id = session_id.clone();
+    let shared = Arc::clone(shared);
+    let later = Arc::clone(later);
+    Arc::new(move |line: String| {
+        eprintln!("incode acp: {line}");
+        // Decided and sent under the turn lock and the queue's, so neither a
+        // prompt nor the session's thread can move between the look and the
+        // message.
+        let state = shared.state();
+        let mut held = later
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.running || !held.open {
+            held.lines.push(line);
+        } else {
+            outbox.notify(
+                acp::CLIENT_METHOD_NAMES.session_update,
+                acp::SessionNotification::new(
+                    session_id.clone(),
+                    acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                        acp::ContentBlock::from(format!("{line}\n")),
+                    )),
+                ),
+            );
+        }
+    })
+}
+
+/// What the model is told about the client's MCP servers still connecting
+/// when a turn starts: their tools are not offered to it yet. `None` when
+/// none is.
+fn connecting_note(connecting: &[String]) -> Option<String> {
+    if connecting.is_empty() {
+        return None;
+    }
+    let names: Vec<String> = connecting.iter().map(|n| format!("`{n}`")).collect();
+    Some(format!(
+        "The client's MCP server(s) {} are still connecting: their tools (`mcp__<server>__...`) \
+         are not offered this turn, and will be from the first turn after they answer. Do not \
+         conclude those tools do not exist; say they are still connecting if the task needs them.",
+        names.join(", ")
+    ))
+}
+
 /// One session's thread: build it, answer `session/new` or `session/load`,
 /// then run prompts until the reader lets go.
 fn drive<F: SessionFactory>(
@@ -877,7 +941,7 @@ fn drive<F: SessionFactory>(
     outbox: &Arc<Outbox>,
     opened_by: acp::RequestId,
     start: Start,
-    shared: &Shared,
+    shared: &Arc<Shared>,
     work: &Receiver<Work>,
 ) {
     let Start {
@@ -936,14 +1000,18 @@ fn drive<F: SessionFactory>(
     let watch = workers::SessionWatch::opened(outbox, session_id, subagents);
     session.set_watch(Arc::new(watch.clone()));
     // The client's MCP servers, started here as incode's own tools — every
-    // call to them goes through the toolbox's gate. Bounded; one that does
-    // not start costs its own tools and nothing else.
+    // call to them goes through the toolbox's gate. In the background:
+    // `session/new` is answered without waiting for them (a slow server once
+    // held it for 42 s), and each one's tools are offered from the first turn
+    // after it has connected. Bounded; one that does not start costs its own
+    // tools and nothing else.
     let (specs, mut connected) = server_specs(&servers);
-    connected.extend(
-        session
-            .session_tools()
-            .connect_client_servers(specs, &workspace),
-    );
+    let later: Arc<Mutex<Later>> = Arc::default();
+    connected.extend(session.session_tools().connect_client_servers(
+        specs,
+        &workspace,
+        &connected_later(outbox, session_id, shared, &later),
+    ));
     for line in &connected {
         eprintln!("incode acp: {line}");
     }
@@ -1003,7 +1071,28 @@ fn drive<F: SessionFactory>(
         ));
     }
 
+    // What a server that finished connecting before the answer, or during a
+    // turn, had to say — said here, between turns, and never inside the
+    // model's own text. The first call opens the session to being told at
+    // once.
+    let say_later = || {
+        let mut held = later
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        held.open = true;
+        if !held.lines.is_empty() {
+            say(acp::SessionUpdate::AgentMessageChunk(
+                acp::ContentChunk::new(acp::ContentBlock::from(format!(
+                    "{}\n",
+                    held.lines.join("\n")
+                ))),
+            ));
+            held.lines.clear();
+        }
+    };
+    say_later();
     while let Ok(next) = work.recv() {
+        say_later();
         let prompt = match next {
             Work::Prompt(prompt) => prompt,
             Work::Apply => {
@@ -1039,6 +1128,7 @@ fn drive<F: SessionFactory>(
         // prompt the moment it reads this one's reply is not refused as busy.
         shared.finish();
         outbox.respond(prompt.id, answer);
+        say_later();
     }
     // The reader let go: `session/close`, or the client went away. Either way
     // the session is over, and the memory engine is told — on this thread,
@@ -1193,6 +1283,11 @@ fn run_prompt(
     // given it here, once, ahead of everything else the turn carries.
     if let Some(earlier) = held.replay.take() {
         context.insert(0, earlier);
+    }
+    // A turn does not wait for the client's MCP servers still connecting: it
+    // runs without their tools, and the model is told so, by name.
+    if let Some(note) = connecting_note(&session.session_tools().client_servers_connecting()) {
+        context.push(note);
     }
 
     // Looked at again AFTER the plan, which can wait on the memory service:

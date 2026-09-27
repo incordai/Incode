@@ -282,12 +282,34 @@ server's `inputSchema` compiled once and checked on every call). Every such call
 through `Toolbox::run_call`'s gate like any other: schema, guards, the permission mode,
 the engine's `pre-tool`, the person to ask — with reach `run`, so it is refused
 read-only, asked under `prompt`, and refused when the engine cannot decide (fail
-closed). Bounds: `initialize` and `tools/list` 20 s each, servers started in parallel;
-a call 120 s, abandoned at once when the turn is stopped; at most 16 servers and 128
-tools each; stdout lines 16 MiB. A server gets the filtered environment plus the
-client's variables, and runs in the workspace. The servers are children of incode,
-held in `SessionTools`: when the session ends they get EOF, 2 s, then their process
-trees are killed.
+closed). Bounds: `initialize` and `tools/list` 20 s each for a stdio server and 60 s
+each for an HTTP one (`HTTP_START_BOUND`: the owner's memory service was measured at 1–15
+s to list, more than 20 s cold), servers started in parallel; a call 120 s, abandoned at
+once when the turn is stopped; at most 16 servers and 128 tools each; stdout lines 16
+MiB. A server gets the filtered environment plus the client's variables, and runs in
+the workspace. The servers are children of incode, held in `SessionTools`: when the
+session ends they get EOF, 2 s, then their process trees are killed; one still
+connecting then is dropped the moment it finishes.
+
+*Connected in the background.* `session/new` does not wait for them: with the memory
+service handed in, it took 42 s. `ClientServers::connect_in_background` starts each
+server on its own thread and returns at once; the answer carries "MCP server `x`:
+connecting in the background". Each server's tools join the session's `RwLock`ed list
+the moment it has listed them, so the next `tools/list` offers them — the bridge's is
+asked once per turn (claude is started per turn), the API route's every request. A
+call routes to its server and runs without holding the list. What became of each
+server (its tool count, what was left out, or why it was dropped at its bound) goes to
+stderr (`incode acp: …`) at once, and to the client as an agent message: at once when
+the session is answered and idle, else queued and said between turns
+(`connected_later`), so it never lands inside the model's text or ahead of the session
+id. **A turn does not wait** for a server still connecting: it runs without that
+server's tools, and the model is told which servers are still connecting, by name
+(`connecting_note`). Chosen over a short wait because the measured start is 1–15 s
+and sometimes over 20 s, so no short bound would cover it, and the lifecycle hooks
+already bring memory context into the turn; the tools arrive for the next turn.
+Measured after the change: `session/new` with the memory service is 14.0 s, and 12.4 s
+with no server at all — the rest is the session's own start, mostly the engine's
+`session-start` hook (8.2 s), not the MCP servers.
 
 *HTTP servers (`toolbox::mcp_http`).* An `http` entry is spoken to over MCP's
 Streamable HTTP by the same `McpClient`, through a second `Link`: each JSON-RPC message
