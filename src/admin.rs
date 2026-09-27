@@ -153,6 +153,12 @@ pub struct AdminConfig {
     /// default; naming one here pins it across every session and mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<String>,
+    /// Whether a sandboxed shell command may use the network: `allow` (the
+    /// default, and the behaviour before this existed) or `deny` — see
+    /// [`crate::sandbox`] for what each OS can enforce and what it only
+    /// reports. `INCORD_SANDBOX_NETWORK` wins over it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_network: Option<String>,
     /// The capability ladder, named by the operator.
     ///
     /// A tier is a list of models that can do the same JOB — `"top"` might hold
@@ -688,6 +694,42 @@ impl AdminConfig {
         }
     }
 
+    /// Whether a sandboxed command may use the network, and where that was
+    /// decided: the environment, then the settings, then `allow`. An
+    /// unrecognised word is `allow` from the built-in layer — the same answer
+    /// as unset, and reported as such rather than guessed at.
+    #[must_use]
+    pub fn resolve_sandbox_network(&self) -> Resolved<crate::sandbox::SandboxNetwork> {
+        let named = |raw: &str| crate::sandbox::SandboxNetwork::parse(raw.trim());
+        if let Some(network) = std::env::var(crate::sandbox::SANDBOX_NETWORK_ENV)
+            .ok()
+            .as_deref()
+            .and_then(named)
+        {
+            return Resolved::new(network, Source::Environment);
+        }
+        match self.sandbox_network.as_deref().and_then(named) {
+            Some(network) => Resolved::new(network, Source::AdminFile),
+            None => Resolved::new(crate::sandbox::SandboxNetwork::Allow, Source::BuiltIn),
+        }
+    }
+
+    /// The whole sandbox policy for a session in `permission_mode`: the mode,
+    /// the network, and whether the operator named the mode (which Windows
+    /// needs before it changes a workspace's ACL for workspace-write).
+    #[must_use]
+    pub fn sandbox_policy(
+        &self,
+        permission_mode: crate::permissions::PermissionMode,
+    ) -> crate::sandbox::SandboxPolicy {
+        let mode = self.resolve_sandbox(permission_mode);
+        crate::sandbox::SandboxPolicy {
+            mode: mode.value,
+            network: self.resolve_sandbox_network().value,
+            named: mode.source != Source::BuiltIn,
+        }
+    }
+
     /// The check that decides whether work is finished, and where it came from.
     #[must_use]
     pub fn resolve_verify(&self, workspace: &Path) -> Option<Resolved<Vec<String>>> {
@@ -844,6 +886,8 @@ mod tests {
 
     fn clear_env() {
         std::env::remove_var(DATA_DIR_ENV);
+        std::env::remove_var(crate::sandbox::SANDBOX_ENV);
+        std::env::remove_var(crate::sandbox::SANDBOX_NETWORK_ENV);
         std::env::remove_var(AGENT_ENV);
         std::env::remove_var(crate::config::MODEL_ENV);
         std::env::remove_var(crate::budget::BUDGET_ENV);
@@ -1153,6 +1197,7 @@ mod tests {
             browser_bin: Some("C:/tools/incord-browser.exe".to_string()),
             pdf_renderer: Some(PdfRenderer::IncordBrowser),
             sandbox: Some("read-only".to_string()),
+            sandbox_network: Some("deny".to_string()),
             // The ladder has to survive the file too — a tier an operator
             // writes and cannot read back is a setting that does not exist.
             tiers: BTreeMap::from([(
@@ -1182,6 +1227,51 @@ mod tests {
             admin,
             "what was written must be what comes back"
         );
+    }
+
+    /// The sandbox policy says whether the operator NAMED the mode (Windows
+    /// changes an ACL for workspace-write only then) and resolves the network:
+    /// unset is `allow`, a word nobody uses is `allow` from the built-in layer,
+    /// and the environment wins over the file.
+    #[test]
+    fn the_sandbox_policy_says_whether_the_mode_was_named_and_resolves_the_network() {
+        use crate::permissions::PermissionMode as P;
+        use crate::sandbox::{SandboxMode, SandboxNetwork, SANDBOX_ENV, SANDBOX_NETWORK_ENV};
+        let _guard = lock();
+        clear_env();
+
+        let unset = AdminConfig::default().sandbox_policy(P::WorkspaceWrite);
+        assert_eq!(unset.mode, SandboxMode::WorkspaceWrite);
+        assert!(!unset.named, "the permission-mode default is not named");
+        assert_eq!(unset.network, SandboxNetwork::Allow);
+
+        let admin = AdminConfig {
+            sandbox: Some("workspace-write".to_string()),
+            sandbox_network: Some("deny".to_string()),
+            ..Default::default()
+        };
+        let named = admin.sandbox_policy(P::ReadOnly);
+        assert_eq!(named.mode, SandboxMode::WorkspaceWrite);
+        assert!(named.named);
+        assert_eq!(named.network, SandboxNetwork::Deny);
+        assert_eq!(admin.resolve_sandbox_network().source, Source::AdminFile);
+
+        let typo = AdminConfig {
+            sandbox_network: Some("block".to_string()),
+            ..Default::default()
+        };
+        let resolved = typo.resolve_sandbox_network();
+        assert_eq!(resolved.value, SandboxNetwork::Allow);
+        assert_eq!(resolved.source, Source::BuiltIn);
+
+        std::env::set_var(SANDBOX_NETWORK_ENV, "allow");
+        std::env::set_var(SANDBOX_ENV, "read-only");
+        let env = admin.sandbox_policy(P::WorkspaceWrite);
+        assert_eq!(env.network, SandboxNetwork::Allow);
+        assert_eq!(env.mode, SandboxMode::ReadOnly);
+        assert!(env.named, "the environment names it too");
+        assert_eq!(admin.resolve_sandbox_network().source, Source::Environment);
+        clear_env();
     }
 
     /// **"NONE" IS NOT AN ANSWER AN OPERATOR CAN ACT ON.**

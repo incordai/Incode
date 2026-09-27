@@ -426,7 +426,10 @@ pub struct Toolbox {
     /// builds; set for real work from the session's mode and the settings. The
     /// writable roots are the workspace and the extra directories, taken when a
     /// command runs so a directory added mid-session is covered.
-    sandbox: crate::sandbox::SandboxMode,
+    sandbox: crate::sandbox::SandboxPolicy,
+    /// What the sandbox holds for this session — on Windows workspace-write,
+    /// the ACE granted on each root — released when the toolbox drops.
+    sandbox_grant: crate::sandbox::SessionGrant,
 }
 
 impl Toolbox {
@@ -461,28 +464,39 @@ impl Toolbox {
             cli_agent: None,
             allowed: None,
             hooks: None,
-            sandbox: crate::sandbox::SandboxMode::Off,
+            sandbox: crate::sandbox::SandboxPolicy::OFF,
+            sandbox_grant: crate::sandbox::SessionGrant::default(),
         }
     }
 
-    /// Confine the model's shell commands to `mode` from now on — see
+    /// Confine the model's shell commands to `policy` from now on — see
     /// [`crate::sandbox`]. Opt-in, and given by the code that builds a backend
     /// for real work, so a toolbox built for a test runs commands unconfined.
     #[must_use]
-    pub fn with_sandbox(mut self, mode: crate::sandbox::SandboxMode) -> Self {
-        self.sandbox = mode;
+    pub fn with_sandbox(mut self, policy: crate::sandbox::SandboxPolicy) -> Self {
+        self.sandbox = policy;
         self
     }
 
-    /// The sandbox for a shell command now: the mode, over the workspace and
-    /// every added directory (plus the temp dir, added by the sandbox itself).
-    fn sandbox(&self) -> crate::sandbox::Sandbox {
-        if self.sandbox == crate::sandbox::SandboxMode::Off {
-            return crate::sandbox::Sandbox::off();
+    /// The sandbox for a shell command now: the policy, over the workspace and
+    /// every added directory (plus the temp dir, added by the sandbox itself),
+    /// with whatever the session must hold for it taken first.
+    ///
+    /// # Errors
+    ///
+    /// When the sandbox the operator named could not be made ready (a Windows
+    /// workspace-write grant refused or failed). The command must not run.
+    fn sandbox(&self) -> Result<crate::sandbox::Sandbox, String> {
+        if self.sandbox == crate::sandbox::SandboxPolicy::OFF {
+            return Ok(crate::sandbox::Sandbox::off());
         }
         let mut roots = vec![self.workspace.clone()];
         roots.extend(self.extra_dirs.iter().cloned());
         crate::sandbox::Sandbox::new(self.sandbox, roots)
+            .prepared(&self.sandbox_grant)
+            .map_err(|e| {
+                format!("the shell sandbox could not be set up, so the command was not run: {e}")
+            })
     }
 
     /// Run the operator's own commands around every call from now on — see
@@ -1772,7 +1786,7 @@ impl Toolbox {
     /// soon as the turn is.
     fn run_shell(&self, call_id: &str, root: &Path, raw: &str) -> Result<String, String> {
         let stopped = || self.stopped();
-        let sandbox = self.sandbox();
+        let sandbox = self.sandbox()?;
         let ran = match &self.watch {
             Some(watch) => {
                 let mut live = crate::watch::LiveOutput::new(watch.as_ref(), call_id);
@@ -1838,7 +1852,7 @@ impl Toolbox {
                 }
                 None => Err("LibreOffice was not found".to_string()),
             },
-            BASH if background => shell::start(&self.state, ws, input, &self.sandbox()),
+            BASH if background => shell::start(&self.state, ws, input, &self.sandbox()?),
             BASH => self.run_shell(call_id, ws, &raw),
             BASH_OUTPUT => shell::output(&self.state, input),
             KILL_SHELL => shell::kill(&self.state, input),

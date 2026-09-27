@@ -53,10 +53,22 @@ This is fully true for claude; section 0b says what is not.
   transport is not, and `initialize` says so. A server that forgets its session
   (`404`) is not re-initialized: its calls fail until the next session. Also not
   offered over ACP: `session/resume`, elicitation, fs and terminal.
-- **Windows workspace-write sandbox.** Left unconfined: the only sound route
-  rewrites the workspace ACL on every command (~2.5 s each way on a 28,000-file
-  tree). Read-only is confined.
-- **Network isolation.** No sandbox mode restricts the network on any OS.
+- **Windows workspace-write sandbox — opt-in, not the default.** Built as a
+  per-SESSION grant (one ACE for a private session SID on each root, revoked at
+  session end, a crashed session's ACE swept by the next): 2.3–3.2 s each way on
+  an 18,673-object tree, measured and live-tested on a scratch copy
+  (`ARCHITECTURE.md` §5b). Applied only when `sandbox: "workspace-write"` or
+  `INCORD_SANDBOX` names it; the permission-mode default still leaves it
+  unconfined. Open: whether to make it the default, and a size cap — the grant is
+  linear in the tree (a `node_modules`-heavy workspace pays per object, once per
+  session). Not yet driven end to end through a real model session.
+- **Network isolation — partial.** `sandbox_network: "deny"` (or
+  `INCORD_SANDBOX_NETWORK`) is enforced on macOS (Seatbelt; loopback and Unix
+  sockets kept) and on Linux 6.7+ (Landlock ABI v4, TCP only, loopback included);
+  reported NOT enforced on older Linux kernels and on Windows (only an
+  AppContainer could, and it cannot read the workspace or toolchains ungranted).
+  Not verified live: the macOS profile (the Mac was offline) and the Linux
+  enforced path (WSL's kernel is 5.15, ABI V1).
 - **A full macOS build and test of HEAD is not verified.** The Mac was offline, and
   since tree-sitter's C grammars went in (`079988b`), the crate can no longer be
   compile-checked for macOS from Windows. The macOS sandbox profile itself was

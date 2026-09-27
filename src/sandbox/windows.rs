@@ -11,102 +11,184 @@
 //! process injection into `explorer` were refused, while reads and `> NUL`
 //! still worked.
 //!
-//! **workspace-write is deliberately NOT applied on Windows.** The only sound
-//! way to let a write-restricted command write inside the workspace is to add
-//! an ACE for incode's private SID to the workspace's real DACL before each
-//! command and remove it after — which, measured on a 28,000-file tree, costs
-//! about 2.5 s to grant and 2.5 s to revoke, mutates the operator's own files,
-//! and leaves the ACE behind if incode is killed mid-command. Doing that
-//! silently on every shell command is the "safety with a cost the operator did
-//! not agree to" this project avoids, so a workspace-write session runs
-//! unconfined here and [`super::Sandbox::note`] says so. A read-only session —
-//! `/plan`, or `sandbox: "read-only"` — is confined.
+//! **workspace-write is applied only when the operator NAMED it** (`sandbox:
+//! "workspace-write"` in `admin.json`, or `INCORD_SANDBOX`), through a
+//! per-SESSION grant ([`acl`]): the first sandboxed command of the session adds
+//! ONE inheritable ACE for a private per-process SID to each root's DACL, every
+//! command runs under a write-restricted token whose restricting SIDs are that
+//! SID, `Everyone` and the logon SID — so it writes only where the SID was
+//! granted — and the ACE is removed when the session ends. A session that
+//! crashed leaves its ACE behind; the next grant sweeps it first.
 //!
-//! **Network is not restricted by either token.** Measured: raw TCP, http and
-//! Python's https all succeeded under the token; only an AppContainer (heavy
-//! setup, everything must be granted read access) blocks the network, so it is
-//! not used.
+//! Measured on a 18,673-object copy of incode's own tree (the scratch copy,
+//! never a real project): grant 2.41–2.49 s and revoke 2.40–2.58 s over three
+//! runs (6.0 s the first, cold); every object received the inherited ACE (that
+//! is how NTFS inheritance works — it is written, not computed at access
+//! time), but no file's contents or mtime changed and `git diff-files` stayed
+//! clean; propagation did not follow a junction out of the tree; and the
+//! `icacls /save` of the whole tree after the revoke was byte-identical to the
+//! one before. Once per session that is a cost worth paying; per command (the
+//! only route found before) it was not, which is why this was left off. Left
+//! to the permission-mode default, workspace-write still runs unconfined here
+//! and [`super::Sandbox::note`] says so. A read-only session — `/plan`, or
+//! `sandbox: "read-only"` — is confined as before.
+//!
+//! **Network is not restricted by any token.** Measured: raw TCP, http and
+//! Python's https all succeeded under the token. Only an AppContainer without
+//! the internet capabilities blocks it, and an AppContainer reads only what is
+//! granted to it or to `ALL APPLICATION PACKAGES` — measured here: `System32`
+//! and Git's `cmd` are, but the workspace (`D:\Projects\…`), `~\.cargo\bin`
+//! and the whole user profile are not. Granting all of them read access for a
+//! session would be a far larger ACL change than the workspace grant, so
+//! `sandbox_network: "deny"` is NOT enforced on Windows, and the note says so.
 //!
 //! # How it reaches a command
 //!
-//! [`wrap`] returns a `Command` that runs `incode --sandbox-exec read-only --
-//! <command>`. incode spawns THAT through its ordinary shell machinery, so the
-//! pipes, the live output, the timeout and the job all work unchanged; the
-//! helper ([`run_helper`]) builds the token and launches `cmd /S /C <command>`
-//! with `CreateProcessAsUserW`, inheriting the helper's own std handles (which
-//! are incode's pipes) and joining incode's job, then waits and exits with the
-//! command's code.
+//! [`wrap`] returns a `Command` that runs `incode --sandbox-exec <mode>
+//! [--sid <SID> --temp <dir>] -- <command>`. incode spawns THAT through its
+//! ordinary shell machinery, so the pipes, the live output, the timeout and
+//! the job all work unchanged; the helper ([`run_helper`]) builds the token and
+//! launches `cmd /S /C <command>` with `CreateProcessAsUserW`, inheriting the
+//! helper's own std handles (which are incode's pipes) and joining incode's
+//! job, then waits and exits with the command's code.
 
 use std::path::PathBuf;
 use std::process::Command;
 
-use super::{PerOs, SandboxMode};
+use super::{PerOs, SandboxMode, SandboxPolicy};
 
-/// Whether Windows confines `mode`. Read-only is enforced; workspace-write is
-/// left off (see the module note), and off is not a thing to apply.
-pub(super) fn applies(mode: SandboxMode) -> bool {
-    mode == SandboxMode::ReadOnly
+pub(super) mod acl;
+
+/// Why `sandbox_network: "deny"` is not enforced here — the note's wording.
+pub(super) const NETWORK_NOT_ENFORCED: &str =
+    "Windows has no sound way to block it for a command: only an AppContainer can, and an \
+     AppContainer cannot read the workspace or the user's toolchains unless each is granted \
+     to it";
+
+/// Whether Windows workspace-write must grant the roots first: only when the
+/// operator named the mode.
+pub(super) fn needs_grant(policy: SandboxPolicy) -> bool {
+    policy.mode == SandboxMode::WorkspaceWrite && policy.named
 }
 
-/// The command that runs `command` under the read-only sandbox: incode
-/// re-invoked as the `--sandbox-exec` helper. `None` for a mode Windows does
-/// not confine, or when incode cannot name its own binary — the caller then
-/// runs the command unconfined, [`super::Sandbox::note`] having said so.
+/// Whether Windows confines this policy's filesystem mode. Read-only always;
+/// workspace-write when it was named AND the session's grant is in hand; off
+/// is not a thing to apply.
+pub(super) fn applies(policy: SandboxPolicy, granted: bool) -> bool {
+    match policy.mode {
+        SandboxMode::ReadOnly => true,
+        SandboxMode::WorkspaceWrite => needs_grant(policy) && granted,
+        SandboxMode::Off => false,
+    }
+}
+
+/// The command that runs `command` under the sandbox: incode re-invoked as the
+/// `--sandbox-exec` helper, carrying the session's grant for workspace-write.
+/// `None` for a mode not confined here (workspace-write without a grant, off),
+/// or when incode cannot name its own binary — the caller then runs the
+/// command unconfined, [`super::Sandbox::note`] having said so.
 pub(super) fn wrap(
     mode: SandboxMode,
-    _roots: &[PathBuf],
+    grant: Option<&acl::Grant>,
     shell: (&str, &str),
     command: &str,
 ) -> Option<Command> {
-    if !applies(mode) {
-        return None;
-    }
     // `cmd /C` is the only shell this path launches; a caller asking for a
     // different one is not confined here rather than run unconfined-looking.
     if shell.0 != "cmd" {
         return None;
     }
+    let args = helper_args(mode, grant, command)?;
     let exe = std::env::current_exe().ok()?;
     let mut cmd = Command::new(exe);
-    cmd.arg("--sandbox-exec")
-        .arg(mode.as_str())
-        .arg("--")
-        .arg(command);
+    cmd.args(args);
     Some(cmd)
+}
+
+/// The helper's arguments after the binary: `--sandbox-exec <mode>`, the grant
+/// for workspace-write, then `-- <command>` as ONE argument. `None` for a mode
+/// this platform does not confine without more than it was given.
+fn helper_args(
+    mode: SandboxMode,
+    grant: Option<&acl::Grant>,
+    command: &str,
+) -> Option<Vec<String>> {
+    let mut args = vec!["--sandbox-exec".to_string(), mode.as_str().to_string()];
+    match (mode, grant) {
+        (SandboxMode::ReadOnly, _) => {}
+        (SandboxMode::WorkspaceWrite, Some(grant)) => {
+            args.push("--sid".to_string());
+            args.push(grant.sid.clone());
+            args.push("--temp".to_string());
+            args.push(grant.temp.to_string_lossy().into_owned());
+        }
+        _ => return None,
+    }
+    args.push("--".to_string());
+    args.push(command.to_string());
+    Some(args)
 }
 
 /// What the Windows sandbox can and cannot do, for the report.
 pub(super) fn per_os() -> PerOs {
     PerOs {
-        mechanism: "a write-restricted token (read-only mode only)",
-        cannot: "workspace-write needs a per-command change to the workspace's real ACL, so it is \
-                 left unconfined on Windows",
-        network: "not restricted (a token cannot block it; only an AppContainer can)",
+        mechanism: "a write-restricted token (workspace-write through a per-session ACE on each \
+                    root)",
+        cannot: "workspace-write changes each root's ACL for the session, so it is applied only \
+                 when named (`sandbox: \"workspace-write\"` or INCORD_SANDBOX) and its grant was \
+                 made",
+        network: "not enforced (a token cannot block it; only an AppContainer can, and one cannot \
+                  read the workspace or the user's toolchains without granting them to it)",
     }
 }
 
 /// The `--sandbox-exec` helper on Windows: build the write-restricted token and
-/// run `command` under it, returning the command's exit code. Only read-only is
-/// enforced; any other mode runs the command through the plain shell, so a
-/// command still runs.
+/// run `command` under it, returning the command's exit code. Read-only
+/// restricts to incode's fixed SID (granted nowhere); workspace-write to the
+/// session's SID in `grant`, with `TEMP`/`TMP` pointed at the session's own
+/// granted temp directory. Off runs the command through the plain shell.
 ///
 /// # Errors
 ///
-/// When the command could not be started at all. A command that ran and failed
-/// returns its own non-zero code, not an error.
-pub fn run_helper(mode: SandboxMode, command: &str) -> anyhow::Result<i32> {
-    if mode != SandboxMode::ReadOnly {
-        // Not confined here; run it plainly so the operator still gets a result.
-        return plain(command);
-    }
-    match imp::run_restricted(command) {
+/// When the command could not be started at all, or workspace-write came
+/// without its grant. A command that ran and failed returns its own non-zero
+/// code, not an error.
+pub fn run_helper(
+    mode: SandboxMode,
+    grant: Option<(String, PathBuf)>,
+    command: &str,
+) -> anyhow::Result<i32> {
+    let sid = match (mode, grant) {
+        (SandboxMode::Off, _) => return plain(command),
+        (SandboxMode::ReadOnly, _) => imp::INCODE_SID.to_string(),
+        (SandboxMode::WorkspaceWrite, Some((sid, temp))) => {
+            if !sid.starts_with(acl::SID_PREFIX) {
+                anyhow::bail!(
+                    "--sid {sid} is not an incode session SID, so the command was not run"
+                );
+            }
+            // The command's temp is the session's own granted directory: the
+            // user's %TEMP% is not granted, and too many tools fail without
+            // one. Set here, in the helper, because the caller may clear the
+            // environment it hands over. Single-threaded: `main` runs this
+            // before any thread starts.
+            std::env::set_var("TEMP", &temp);
+            std::env::set_var("TMP", &temp);
+            sid
+        }
+        (SandboxMode::WorkspaceWrite, None) => anyhow::bail!(
+            "workspace-write needs the session's grant (--sid, --temp), so the command was not run"
+        ),
+    };
+    match imp::run_restricted(command, &sid) {
         Ok(code) => Ok(code),
         Err(e) => {
             // A sandbox that could not be built must not silently run the
             // command UNCONFINED — that is the failure mode this exists to
             // avoid. Report it; the caller shows it as the command's error.
             Err(anyhow::anyhow!(
-                "the read-only sandbox could not be applied, so the command was not run: {e}"
+                "the {} sandbox could not be applied, so the command was not run: {e}",
+                mode.as_str()
             ))
         }
     }
@@ -123,7 +205,7 @@ fn plain(command: &str) -> anyhow::Result<i32> {
     Ok(status.code().unwrap_or(-1))
 }
 
-mod imp {
+pub(super) mod imp {
     use std::os::windows::ffi::OsStrExt;
 
     use windows_sys::Win32::Foundation::{
@@ -149,24 +231,23 @@ mod imp {
 
     /// Everyone, S-1-1-0.
     const EVERYONE: &str = "S-1-1-0";
-    /// incode's own private restricting SID. Fixed, so re-runs are idempotent
-    /// and only incode's tokens ever carry it. A high, otherwise-unused RID
-    /// under the NT-authority non-unique range.
-    const INCODE_SID: &str = "S-1-5-21-1111111111-2222222222-3333333333-4242";
+    /// incode's own private restricting SID for READ-ONLY. Fixed, and granted
+    /// nowhere, so a token restricted to it writes nothing. A high,
+    /// otherwise-unused RID under the NT-authority non-unique range; the
+    /// workspace-write session SIDs share its prefix ([`super::acl::SID_PREFIX`]).
+    pub(in crate::sandbox) const INCODE_SID: &str =
+        "S-1-5-21-1111111111-2222222222-3333333333-4242";
     /// `TOKEN_ALL_ACCESS`, spelled numerically for the same reason.
     const TOKEN_ALL: TOKEN_ACCESS_MASK = 0x000f_01ff;
 
     /// A wide, NUL-terminated string for a Win32 W-API.
-    fn wide(s: &str) -> Vec<u16> {
-        std::ffi::OsStr::new(s)
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect()
+    pub(in crate::sandbox) fn wide(s: impl AsRef<std::ffi::OsStr>) -> Vec<u16> {
+        s.as_ref().encode_wide().chain(std::iter::once(0)).collect()
     }
 
     /// A SID pointer freed on drop with `LocalFree` (how
     /// `ConvertStringSidToSidW` allocates it).
-    struct LocalSid(*mut core::ffi::c_void);
+    pub(in crate::sandbox) struct LocalSid(pub(in crate::sandbox) *mut core::ffi::c_void);
     impl Drop for LocalSid {
         fn drop(&mut self) {
             if !self.0.is_null() {
@@ -177,7 +258,7 @@ mod imp {
     }
 
     /// Build a SID from its string form.
-    fn sid(s: &str) -> Result<LocalSid, String> {
+    pub(in crate::sandbox) fn sid(s: &str) -> Result<LocalSid, String> {
         let mut out: *mut core::ffi::c_void = std::ptr::null_mut();
         // SAFETY: `wide(s)` is NUL-terminated; `&mut out` is the `*mut PSID` the
         // API writes the owned SID pointer into.
@@ -188,8 +269,12 @@ mod imp {
         Ok(LocalSid(out))
     }
 
-    /// Run `command` under a write-restricted token, returning its exit code.
-    pub(super) fn run_restricted(command: &str) -> Result<i32, String> {
+    /// Run `command` under a write-restricted token restricted to `private`
+    /// (plus `Everyone` and the logon SID), returning its exit code. The token
+    /// writes only where a restricting SID is granted: for read-only `private`
+    /// is granted nowhere; for workspace-write it is the session SID, granted
+    /// on the roots.
+    pub(super) fn run_restricted(command: &str, private: &str) -> Result<i32, String> {
         // SAFETY: the whole sequence is Win32 handle work; each call is checked
         // and every handle this owns is closed. The pointers handed to the API
         // outlive the calls that read them (the SIDs and the array live to the
@@ -202,10 +287,10 @@ mod imp {
             }
             let base = OwnedHandle(base);
 
-            // The three restricting SIDs: incode's private one, Everyone (so
+            // The three restricting SIDs: the private one, Everyone (so
             // `> NUL` still works) and this logon's SID (so the shell and the
             // tools it starts can run at all).
-            let incode = sid(INCODE_SID)?;
+            let incode = sid(private)?;
             let everyone = sid(EVERYONE)?;
             let logon = logon_sid(base.0)?;
             let restricting = [
@@ -242,17 +327,17 @@ mod imp {
             // Keep the SID allocations alive until the token is built.
             drop((incode, everyone, logon));
 
-            set_default_dacl(base.0, restricted.0)?;
+            set_default_dacl(base.0, restricted.0, private)?;
             launch(restricted.0, command)
         }
     }
 
     /// Give the restricted token a default DACL that lets it open its own
     /// process — without one the child's own `OpenProcessToken` fails.
-    unsafe fn set_default_dacl(base: HANDLE, token: HANDLE) -> Result<(), String> {
+    unsafe fn set_default_dacl(base: HANDLE, token: HANDLE, private: &str) -> Result<(), String> {
         let user = token_user_sid(base)?;
-        // The user, SYSTEM and incode's private SID, all full access.
-        let sddl = format!("D:(A;;GA;;;{user})(A;;GA;;;SY)(A;;GA;;;{INCODE_SID})");
+        // The user, SYSTEM and the private restricting SID, all full access.
+        let sddl = format!("D:(A;;GA;;;{user})(A;;GA;;;SY)(A;;GA;;;{private})");
         let mut sd: *mut core::ffi::c_void = std::ptr::null_mut();
         if ConvertStringSecurityDescriptorToSecurityDescriptorW(
             wide(&sddl).as_ptr(),
@@ -359,7 +444,7 @@ mod imp {
 
         // `/S /C "<command>"`: /S strips the outer quotes and runs the rest
         // verbatim, so a command with its own quotes is untouched.
-        let mut line = wide(&format!("cmd.exe /S /C \"{command}\""));
+        let mut line = wide(format!("cmd.exe /S /C \"{command}\""));
         let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
         if CreateProcessAsUserW(
             token,
@@ -393,7 +478,7 @@ mod imp {
     }
 
     /// A handle closed once on drop.
-    struct OwnedHandle(HANDLE);
+    pub(in crate::sandbox) struct OwnedHandle(pub(in crate::sandbox) HANDLE);
     impl Drop for OwnedHandle {
         fn drop(&mut self) {
             if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
@@ -404,7 +489,7 @@ mod imp {
     }
 
     /// A `LocalAlloc`-owned pointer freed once on drop.
-    struct LocalPtr(*mut core::ffi::c_void);
+    pub(in crate::sandbox) struct LocalPtr(pub(in crate::sandbox) *mut core::ffi::c_void);
     impl Drop for LocalPtr {
         fn drop(&mut self) {
             if !self.0.is_null() {
@@ -415,7 +500,7 @@ mod imp {
     }
 
     /// The last Win32 error, named by the call that produced it.
-    fn last_error(call: &str) -> String {
+    pub(in crate::sandbox) fn last_error(call: &str) -> String {
         // SAFETY: reads the calling thread's error value; no arguments.
         let code = unsafe { windows_sys::Win32::Foundation::GetLastError() };
         format!("{call} failed with error {code}")
@@ -426,27 +511,113 @@ mod imp {
 mod tests {
     use super::*;
 
-    /// Read-only is confined on Windows; workspace-write and off are not
-    /// applied here.
-    #[test]
-    fn only_read_only_is_applied_on_windows() {
-        assert!(applies(SandboxMode::ReadOnly));
-        assert!(!applies(SandboxMode::WorkspaceWrite));
-        assert!(!applies(SandboxMode::Off));
+    use crate::sandbox::SandboxNetwork;
+
+    fn policy(mode: SandboxMode, named: bool) -> SandboxPolicy {
+        SandboxPolicy {
+            mode,
+            network: SandboxNetwork::Allow,
+            named,
+        }
     }
 
-    /// wrap re-invokes incode as the helper for read-only, and declines the
-    /// modes it does not confine.
+    fn grant() -> acl::Grant {
+        acl::Grant {
+            sid: format!("{}77", acl::SID_PREFIX),
+            temp: PathBuf::from(r"C:\t\77.tmp"),
+        }
+    }
+
+    /// Read-only is always confined. Workspace-write is confined only when the
+    /// operator NAMED it and its grant is in hand — the permission-mode
+    /// default does not change anyone's ACL. Off is not applied.
     #[test]
-    fn wrap_builds_the_helper_only_for_read_only() {
-        let cmd = wrap(SandboxMode::ReadOnly, &[], ("cmd", "/C"), "echo hi").expect("read-only");
-        let args: Vec<String> = cmd
-            .get_args()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(args[0], "--sandbox-exec");
-        assert_eq!(args[1], "read-only");
-        assert_eq!(args.last().map(String::as_str), Some("echo hi"));
-        assert!(wrap(SandboxMode::WorkspaceWrite, &[], ("cmd", "/C"), "echo hi").is_none());
+    fn workspace_write_applies_only_when_named_and_granted() {
+        assert!(applies(policy(SandboxMode::ReadOnly, false), false));
+        assert!(!applies(policy(SandboxMode::WorkspaceWrite, false), false));
+        assert!(!applies(policy(SandboxMode::WorkspaceWrite, false), true));
+        assert!(!applies(policy(SandboxMode::WorkspaceWrite, true), false));
+        assert!(applies(policy(SandboxMode::WorkspaceWrite, true), true));
+        assert!(!applies(policy(SandboxMode::Off, true), true));
+        assert!(needs_grant(policy(SandboxMode::WorkspaceWrite, true)));
+        assert!(!needs_grant(policy(SandboxMode::WorkspaceWrite, false)));
+        assert!(!needs_grant(policy(SandboxMode::ReadOnly, true)));
+    }
+
+    /// wrap re-invokes incode as the helper for read-only, and for
+    /// workspace-write only with the session's grant — carrying its SID and
+    /// temp directory — and declines everything else.
+    #[test]
+    fn wrap_builds_the_helper_for_read_only_and_granted_workspace_write() {
+        let args_of = |cmd: Command| -> Vec<String> {
+            cmd.get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+        let read = args_of(
+            wrap(SandboxMode::ReadOnly, None, ("cmd", "/C"), "echo hi").expect("read-only"),
+        );
+        assert_eq!(read, ["--sandbox-exec", "read-only", "--", "echo hi"]);
+
+        let grant = grant();
+        let write = args_of(
+            wrap(
+                SandboxMode::WorkspaceWrite,
+                Some(&grant),
+                ("cmd", "/C"),
+                "echo  \"hi\"",
+            )
+            .expect("granted"),
+        );
+        assert_eq!(
+            write,
+            [
+                "--sandbox-exec",
+                "workspace-write",
+                "--sid",
+                grant.sid.as_str(),
+                "--temp",
+                r"C:\t\77.tmp",
+                "--",
+                "echo  \"hi\""
+            ]
+        );
+        assert!(wrap(SandboxMode::WorkspaceWrite, None, ("cmd", "/C"), "echo hi").is_none());
+        assert!(wrap(SandboxMode::Off, Some(&grant), ("cmd", "/C"), "echo hi").is_none());
+        assert!(wrap(SandboxMode::ReadOnly, None, ("sh", "-c"), "echo hi").is_none());
+    }
+
+    /// The helper parses back exactly what wrap wrote, and refuses — rather
+    /// than running unconfined — workspace-write without a grant, half a
+    /// grant, or a SID that is not an incode session's.
+    #[test]
+    fn the_helper_refuses_workspace_write_without_a_proper_grant() {
+        let s = |v: &[&str]| v.iter().map(|a| (*a).to_string()).collect::<Vec<_>>();
+        let err = crate::sandbox::run_windows_helper(&s(&["workspace-write", "--", "echo hi"]))
+            .expect_err("no grant");
+        assert!(err.to_string().contains("was not run"), "{err}");
+        let err = crate::sandbox::run_windows_helper(&s(&[
+            "workspace-write",
+            "--sid",
+            &format!("{}77", acl::SID_PREFIX),
+            "--",
+            "echo hi",
+        ]))
+        .expect_err("half a grant");
+        assert!(err.to_string().contains("together"), "{err}");
+        let err = crate::sandbox::run_windows_helper(&s(&[
+            "workspace-write",
+            "--sid",
+            "S-1-1-0",
+            "--temp",
+            r"C:\t",
+            "--",
+            "echo hi",
+        ]))
+        .expect_err("a foreign SID");
+        assert!(
+            err.to_string().contains("not an incode session SID"),
+            "{err}"
+        );
     }
 }

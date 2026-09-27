@@ -990,7 +990,8 @@ at all, but neither stops a command that writes outside the workspace through a
 variable, a glob or a script it wrote first (§8, "Shell is not sandboxed"). `src/sandbox`
 hands the command to the operating system's own confinement so the write is
 PREVENTED. It is a setting — `admin.json` `sandbox: off | workspace-write | read-only`,
-or `INCORD_SANDBOX` — tied to the session's permission mode by default:
+or `INCORD_SANDBOX` — tied to the session's permission mode by default (plus a separate
+network switch, below):
 
 | permission mode | default sandbox |
 |---|---|
@@ -1003,10 +1004,22 @@ or `INCORD_SANDBOX` — tied to the session's permission mode by default:
   workspace and each `--add-dir`) and the temp directory.
 - **`off`** — unconfined.
 
-**Network is not restricted by any mode, on any OS** — reported by `sandbox::per_os`,
-never pretended. Both the foreground `Bash` and background `/bg`-style jobs run through
-`Sandbox::wrap` (`tools::bash`, `tools::bash_jobs`); the operator's own `/bg` at the
-REPL runs unconfined (it is their command, not the model's).
+**The network is a separate, opt-in switch:** `admin.json` `sandbox_network: "allow" |
+"deny"`, or `INCORD_SANDBOX_NETWORK` (which wins). The default is `allow` — the behaviour
+before the switch existed. `deny` is independent of the filesystem mode (it applies under
+`off` too), and each OS does what it soundly can; `Sandbox::note` (traced for every
+sandboxed command) says `network denied by …` or `network deny requested but NOT
+enforced: …`, never silence:
+
+| OS | `sandbox_network: "deny"` | verified |
+|---|---|---|
+| Linux | Landlock ABI v4 (Linux 6.7+): every TCP `bind` and `connect` refused, **loopback included** (Landlock matches ports, not addresses). UDP (so DNS) is not covered by any ABI. On an older kernel the network rights are dropped by the crate's best-effort level, so the helper reads the effective ABI back after `restrict_self` and traces NOT enforced; the parent asks first with a hard-requirement ruleset that is created but never applied (`linux::network_enforceable`) | WSL2 kernel 5.15 (ABI V1): the NOT-enforced path, live. The enforced path is compile- and unit-checked only — no ABI v4 kernel was at hand |
+| macOS | the Seatbelt profile adds `(deny network*)` and re-allows **loopback** (`localhost:*` bind, inbound and outbound — a local dev server or a test suite still works) and Unix-domain sockets (ssh-agent, local daemons). A decision: this blocks reaching the outside, not local IPC. A dual-stack socket bound to `::ffff:127.0.0.1` is not matched by `localhost` and so is refused | the profile string is unit-tested on every platform; NOT run on a Mac (it was offline). The filter forms are the ones shipping Seatbelt profiles use |
+| Windows | **not enforced**, and said so. A token cannot block the network; only an AppContainer without the internet capabilities can, and an AppContainer reads only what is granted to it or to `ALL APPLICATION PACKAGES` — measured: `System32` and Git's `cmd` are, but the workspace, `~\.cargo\bin` and the whole user profile are not. Granting all of them for a session is a far larger ACL change than the workspace grant below | the note's wording is unit-tested |
+
+Both the foreground `Bash` and background `/bg`-style jobs run through `Sandbox::wrap`
+(`tools::bash`, `tools::bash_jobs`); the operator's own `/bg` at the REPL runs unconfined
+(it is their command, not the model's).
 
 Per OS, all measured live except where noted:
 
@@ -1025,23 +1038,48 @@ Per OS, all measured live except where noted:
   is refused and not created, a child is refused, `git`/`cc`/`mktemp` and `curl` work.
   `sandbox-exec` is marked deprecated by Apple but present and silent. The profile
   string (`sandbox::seatbelt_profile`) is compiled and unit-tested on every platform.
-- **Windows — a write-restricted token for read-only; workspace-write left OFF.** The
-  command runs through `incode --sandbox-exec`, whose helper (`sandbox::windows`) builds
-  a token with `WRITE_RESTRICTED` and three restricting SIDs — incode's own private SID,
-  `Everyone` (so `> NUL` works) and this logon's SID (so the shell and its tools run) —
-  plus a default DACL, and launches `cmd /S /C` under it with `CreateProcessAsUserW`,
-  inheriting incode's pipes and joining incode's job. Measured without elevation: a write
-  inside the workspace and a write to `Documents` are both refused and no file lands,
-  `reg add HKCU` / `schtasks` / injection into `explorer` are refused, reads and `> NUL`
-  work. **workspace-write is deliberately not applied on Windows:** the only sound route
-  is to add an ACE for incode's SID to the workspace's real DACL before each command and
-  remove it after — about 2.5 s each way on a 28,000-file tree, mutating the operator's
-  own files and leaving the ACE behind on a crash. Doing that silently on every command
-  is a cost the operator did not agree to, so a workspace-write session runs unconfined
-  and the trace says so. A read-only session, or `sandbox: "read-only"` in any session,
-  is confined. Low integrity and AppContainer were measured too (AppContainer is the
-  only thing that blocks the network, at the cost of granting read access to every tool
-  and directory); neither is used.
+- **Windows — a write-restricted token; workspace-write through a per-SESSION grant,
+  opt-in.** The command runs through `incode --sandbox-exec`, whose helper
+  (`sandbox::windows`) builds a token with `WRITE_RESTRICTED` and three restricting SIDs —
+  a private SID, `Everyone` (so `> NUL` works) and this logon's SID (so the shell and its
+  tools run) — plus a default DACL, and launches `cmd /S /C` under it with
+  `CreateProcessAsUserW`, inheriting incode's pipes and joining incode's job. The token
+  writes only where one of those SIDs is granted.
+  - **read-only** restricts to incode's fixed SID (`…-4242`), granted nowhere. Measured
+    without elevation: a write inside the workspace and a write to `Documents` are both
+    refused and no file lands, `reg add HKCU` / `schtasks` / injection into `explorer` are
+    refused, reads and `> NUL` work.
+  - **workspace-write** (`sandbox::windows::acl`) restricts to a per-process session SID
+    (`S-1-5-21-1111111111-2222222222-3333333333-<random>`). The first sandboxed command of
+    the session adds ONE inheritable `Modify` ACE for that SID to each root (workspace and
+    `--add-dir`, a root nested in another folded into it) and to a session temp directory
+    (`<data dir>/sandbox-grants/<rid>.tmp`, which the helper points `TEMP`/`TMP` at — the
+    user's `%TEMP%` is not granted); the ACE is removed when the last toolbox holding the
+    grant drops (sub-agents in the same process share it, refcounted per root). A drive
+    root or a directory holding the user profile is refused, and the command is then NOT
+    run. Applied **only when the operator named the mode** (`sandbox: "workspace-write"`
+    or `INCORD_SANDBOX`); left to the permission-mode default it stays unconfined and the
+    trace says so, because it changes the operator's ACL for the session.
+  - **The crash sweep.** Each grant is written down first (`<rid>.grant`: SID, temp,
+    roots) and the process holds a named mutex `Global\incode-sandbox-<rid>` while it
+    holds any grant. The next session's first grant revokes every record whose mutex is
+    gone, removes its temp directory and deletes the record; a record whose revoke failed
+    is kept for the next sweep. ACL changes are serialised across incode processes by a
+    second named mutex, so two read-modify-writes of one DACL cannot lose one.
+  - **Measured** on a scratch copy of incode's tree (17,679 files + 990 directories,
+    never a real project): grant 2.41–2.49 s / revoke 2.40–2.58 s by .NET over three runs
+    (6.0 s the first, cold), and 2.32–2.94 s / 2.37–3.23 s through incode's own Win32
+    path over four live sessions. NTFS inheritance is WRITTEN into every descendant, so all 18,673 objects got the
+    inherited ACE — but no file's contents or mtime changed and `git diff-files` stayed
+    clean; propagation did not follow a junction out of the tree; and `icacls /save` of
+    the whole tree after each session was byte-identical to before. Live, through the real
+    helper: a write inside the tree and a delete are allowed; a write to `Documents`, a
+    write to a directory outside the tree, and `icacls /grant` on a file outside are all
+    refused ("Access is denied"); `%TEMP%` is the session's and writable. A child process
+    killed mid-session (TerminateProcess) left its ACE on the root; the next grant swept
+    it (sweep + grant 4.66–6.01 s) and the tree matched the pristine snapshot again.
+    Before this, the only route found was a grant and revoke per COMMAND, which is why it
+    was left off. Low integrity and AppContainer were measured too; neither is used.
 
 The `--sandbox-exec` helper is its own CLI mode, handled in `main` before any thread
 starts. On Unix it applies the confinement and execs; on Windows it launches the
@@ -1107,7 +1145,14 @@ compiler):
 
 The Windows sandbox needs no new crate: it turns on the `Win32_Security_Authorization`
 feature of `windows-sys` 0.61, already in the lock, for the write-restricted token's
-SID and DACL calls.
+SID and DACL calls. The workspace-write grant and the network switch added NO crate and
+NO feature: `GetNamedSecurityInfoW` / `SetEntriesInAclW` / `SetNamedSecurityInfoW` are in
+`Win32_Security_Authorization`, `GetSecurityDescriptorControl` in `Win32_Security`, and
+`CreateMutexW` / `OpenMutexW` / `ReleaseMutex` in `Win32_System_Threading` — all already
+on (checked in the cached 0.61.2 source); the two file-rights constants that live in the
+unenabled `Win32_Storage_FileSystem` are spelled numerically instead. The session RID
+comes from `uuid` v4, already a dependency. Landlock's network rights (`AccessNet`,
+ABI v4) are in the pinned `landlock` 0.4.7.
 
 ---
 
@@ -1157,10 +1202,11 @@ shape passes happily while the request goes nowhere.
 - **Shell is not sandboxed** (mostly closed, phase 8). `guards.rs` catches direct textual
   routes to a protected file; a variable, a glob, or a script that writes on the agent's
   behalf gets past it. The OS sandbox (`src/sandbox`, §5b) now confines the shell where
-  the platform can — Landlock on Linux, Seatbelt on macOS, a write-restricted token for
-  read-only on Windows — and says plainly where it cannot (Windows workspace-write, and
-  the network everywhere). The permission tier remains the boundary in the `off` mode and
-  wherever the sandbox is not applied.
+  the platform can — Landlock on Linux, Seatbelt on macOS, a write-restricted token on
+  Windows (workspace-write there only when named, through a per-session ACE) — and says
+  plainly where it cannot (Windows workspace-write left to the default, the network on
+  Windows and on Linux kernels before 6.7, UDP on Linux). The permission tier remains the
+  boundary in the `off` mode and wherever the sandbox is not applied.
 - **Contracts are checked by name, not by type.** Types belong to the project's own
   compiler, which already runs.
 - **One runner, no concurrency.** Multiple runners over one ledger needs a claim

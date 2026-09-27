@@ -8,8 +8,13 @@
 //! Validated live on macOS 26.6.2: a write inside the workspace succeeds, a
 //! write to `$HOME` is refused ("Operation not permitted") and the file is not
 //! created, a child process is refused too, `git`/`cc`/`ls` and `mktemp` still
-//! run, and `curl` still reaches the network (the profile does not restrict it).
+//! run, and `curl` still reaches the network (that profile did not restrict it).
 //! `sandbox-exec` is marked deprecated by Apple but present and silent.
+//!
+//! `sandbox_network: "deny"` adds `(deny network*)` and re-allows loopback and
+//! Unix sockets ([`super::seatbelt_profile`]). That profile is unit-tested on
+//! every platform but has NOT been run on a Mac: the Mac was offline when it
+//! was written.
 //!
 //! Two things the profile depends on, both measured:
 //! - **Real paths only.** Seatbelt matches resolved paths, so the roots and the
@@ -21,7 +26,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use super::SandboxMode;
+use super::{SandboxMode, SandboxPolicy};
 
 /// Where the tool is. A fixed path: it is a system binary, and looking it up on
 /// `PATH` would let a workspace shadow it.
@@ -32,9 +37,11 @@ pub(super) fn available() -> bool {
     Path::new(SANDBOX_EXEC).exists()
 }
 
-/// The confined command, or `None` when `sandbox-exec` is missing.
+/// The confined command, or `None` when `sandbox-exec` is missing. The
+/// network half of the policy is in the same profile
+/// ([`super::seatbelt_profile`]), so one `sandbox-exec` carries both.
 pub(super) fn wrap(
-    mode: SandboxMode,
+    policy: SandboxPolicy,
     roots: &[PathBuf],
     shell: (&str, &str),
     command: &str,
@@ -47,7 +54,7 @@ pub(super) fn wrap(
     // The temp directory is writable in BOTH modes: too many tools fail
     // without it, and it is not the workspace.
     cmd.arg("-D").arg(format!("TMP={}", temp.display()));
-    let writable_roots: Vec<PathBuf> = if mode == SandboxMode::WorkspaceWrite {
+    let writable_roots: Vec<PathBuf> = if policy.mode == SandboxMode::WorkspaceWrite {
         roots.iter().map(|r| real(r)).collect()
     } else {
         Vec::new()
@@ -55,8 +62,11 @@ pub(super) fn wrap(
     for (i, root) in writable_roots.iter().enumerate() {
         cmd.arg("-D").arg(format!("WS{i}={}", root.display()));
     }
-    cmd.arg("-p")
-        .arg(super::seatbelt_profile(writable_roots.len()));
+    cmd.arg("-p").arg(super::seatbelt_profile(
+        policy.mode,
+        writable_roots.len(),
+        policy.network,
+    ));
     // The shell pair is honoured, so a caller that runs `zsh -c` still does.
     cmd.arg(shell.0).arg(shell.1).arg(command);
     Some(cmd)

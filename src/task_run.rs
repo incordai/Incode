@@ -403,8 +403,7 @@ fn drive(
                     .with_operator_hooks(crate::hooks::HookRunner::from_settings())
                     .with_sandbox(
                         crate::admin::AdminConfig::load_default()
-                            .resolve_sandbox(crate::permissions::PermissionMode::WorkspaceWrite)
-                            .value,
+                            .sandbox_policy(crate::permissions::PermissionMode::WorkspaceWrite),
                     ),
                 ),
                 "a model over the configured API".to_string(),

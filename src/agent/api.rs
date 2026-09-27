@@ -615,8 +615,8 @@ impl ApiBackend {
 
     /// Confine this model's shell commands to `mode` — see [`crate::sandbox`].
     #[must_use]
-    pub fn with_sandbox(mut self, mode: crate::sandbox::SandboxMode) -> Self {
-        self.tools = self.tools.with_sandbox(mode);
+    pub fn with_sandbox(mut self, policy: crate::sandbox::SandboxPolicy) -> Self {
+        self.tools = self.tools.with_sandbox(policy);
         self
     }
 

@@ -1310,10 +1310,8 @@ fn desktop_enabled_from_env() -> bool {
 
 /// How the OS confines a model's shell commands, from the settings and the
 /// session's permission mode — the same resolution `/admin` reports.
-fn sandbox_for(mode: crate::permissions::PermissionMode) -> crate::sandbox::SandboxMode {
-    crate::admin::AdminConfig::load_default()
-        .resolve_sandbox(mode)
-        .value
+fn sandbox_for(mode: crate::permissions::PermissionMode) -> crate::sandbox::SandboxPolicy {
+    crate::admin::AdminConfig::load_default().sandbox_policy(mode)
 }
 
 /// The backend for one catalogue route: the configured API when the route is
