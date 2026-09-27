@@ -12,6 +12,7 @@ pub mod config;
 pub mod contracts;
 pub mod desktop;
 pub mod doctor;
+pub mod ext_tools;
 pub mod findings;
 pub mod fleet;
 pub mod goal;

@@ -137,12 +137,19 @@ pub struct AdminConfig {
     /// configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web_search: Option<SearchProvider>,
-    /// The owner's headless browser (`incord-browser`), when it is not on
-    /// `PATH`. The `INCODE_BROWSER` variable wins over it. Unset and not
-    /// found, the Screenshot tool is not offered and `WebFetch` runs no
-    /// script — see `toolbox::browser`.
+    /// The headless browser's executable, for development: the
+    /// `INCODE_BROWSER` variable wins over it, and it wins over an installed
+    /// tool that provides `browser` (`tools`). None of the three, and the
+    /// Screenshot tool is not offered and `WebFetch` runs no script — see
+    /// `toolbox::browser`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser_bin: Option<String>,
+    /// External tools, each downloaded from a configured release when the
+    /// owner asks (`/tools add <name>`, `incode --install-tools`), checked
+    /// against its sha256, and started as an MCP server in every session —
+    /// see [`crate::ext_tools`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<crate::ext_tools::ToolEntry>,
     /// Which program `RenderPdf` prints with. Unset is `auto`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pdf_renderer: Option<PdfRenderer>,
@@ -1201,6 +1208,15 @@ mod tests {
             }),
             // The browser and the PDF switch, which the owner flips by hand.
             browser_bin: Some("C:/tools/incord-browser.exe".to_string()),
+            // An external tool, as `/tools add` reads it back.
+            tools: vec![crate::ext_tools::ToolEntry {
+                name: "browser".to_string(),
+                release: Some("owner/repo".to_string()),
+                asset: Some("b-{arch}-{os}.{ext}".to_string()),
+                run: vec!["b".to_string(), "mcp".to_string()],
+                provides: Some("browser".to_string()),
+                ..crate::ext_tools::ToolEntry::default()
+            }],
             pdf_renderer: Some(PdfRenderer::IncordBrowser),
             sandbox: Some("read-only".to_string()),
             sandbox_network: Some("deny".to_string()),

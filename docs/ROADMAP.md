@@ -90,6 +90,22 @@ This is fully true for claude; section 0b says what is not.
   since tree-sitter's C grammars went in (`079988b`), the crate can no longer be
   compile-checked for macOS from Windows. The macOS sandbox profile itself was
   validated live on macOS during phase 8.
+- **External tools — done; the owner's own release is not published yet.** A
+  program incode runs is an `admin.json` `tools` entry, downloaded from its
+  release only when asked (`/tools add|update|remove`, `incode --install-tools`),
+  checked against GitHub's sha256 digest or a pinned one (neither: refused),
+  unpacked with path, link, entry and size guards, and started as an MCP server in
+  every mode; `provides: "browser"` makes it the browser Screenshot, RenderPdf and
+  `render_js` use, and `PATH` is no longer searched for a browser
+  (`ARCHITECTURE.md` §5b, "External tools"). Live-tested against upstream
+  `h4ckf0r0day/obscura` v0.2.3 in a scratch data dir: installed and checked; its
+  37 MCP tools listed; `browser_navigate` + `browser_evaluate` on a loopback page
+  returned its title through the gate (pre-tool hook, reach run); a built-in
+  Screenshot ran on the installed binary; a byte-flipped copy was refused. Open:
+  `incordai/incord-browser` has no published release, so the owner's entry cannot be
+  installed until one exists; a tool installed mid-session is offered from the next
+  session (a session's servers connect once); the macOS/Linux tar.gz path is
+  unit-tested only, not run live.
 - **incord-browser: what is still open upstream.** Re-measured 2026-09-27 on
   078786a against headless Edge; incode now uses the fixes (RenderPdf prefers
   incord-browser when its probe finds text, and passes `preferCSSPageSize` when

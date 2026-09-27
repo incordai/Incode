@@ -74,6 +74,7 @@ impl CliApp {
         // makes one for each `session/new`.
         let session_id = uuid::Uuid::new_v4().to_string();
         let mut prepared = prepare_session(&self.config, cancel.clone(), booted_at, &session_id)?;
+        connect_ext_tools(&prepared);
         // Someone is at the keyboard only when both ends are a terminal; piped,
         // a mid-turn question would wait on input nobody can give.
         if std::io::IsTerminal::is_terminal(&std::io::stdin())
@@ -84,6 +85,27 @@ impl CliApp {
                 .set_prompter(std::sync::Arc::new(prompt::Terminal));
         }
         self.repl(prepared, cancel, booted_at)
+    }
+}
+
+/// Start the owner's installed external tools as MCP servers for the REPL's
+/// session, in the background — their tools join the toolbox once each has
+/// listed them — and say which configured tools are not installed. What
+/// became of each server is traced, never printed over the prompt.
+fn connect_ext_tools(prepared: &Prepared) {
+    let (specs, said) =
+        crate::ext_tools::session_servers(&prepared.admin.tools, &prepared.incord_code_dir);
+    for line in said {
+        render::print_info(&line);
+    }
+    let on_connected: crate::toolbox::OnConnected =
+        std::sync::Arc::new(|line| crate::trace!("tool", "{line}"));
+    for line in prepared.session.session_tools().connect_client_servers(
+        specs,
+        &prepared.workspace,
+        &on_connected,
+    ) {
+        crate::trace!("tool", "{line}");
     }
 }
 
@@ -848,14 +870,17 @@ impl CliApp {
                             "The agent manages its own context and compacts it automatically. Use /clear to start a fresh session.",
                         );
                     }
-                    SlashCommand::Tools => {
+                    SlashCommand::Tools(arg) => {
                         // The tools incode runs itself for the current agent,
                         // read from the backend so the list cannot drift.
-                        slash_commands::handle_delegated_tools(
-                            &agent.display_name,
-                            &session.offered_tools(),
-                        );
-                        render::print_info(&tool_cache.summary_line());
+                        if arg.is_none() {
+                            slash_commands::handle_delegated_tools(
+                                &agent.display_name,
+                                &session.offered_tools(),
+                            );
+                            render::print_info(&tool_cache.summary_line());
+                        }
+                        slash_commands::handle_ext_tools(arg.as_deref(), &incord_code_dir);
                     }
                     SlashCommand::Skills => {
                         slash_commands::handle_skills_from_store(&incord_code_dir);

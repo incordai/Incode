@@ -1,4 +1,6 @@
-//! The MCP servers an ACP client hands a session, as incode's own tools.
+//! The MCP servers an ACP client hands a session, as incode's own tools — and
+//! the external tools the owner installed ([`crate::ext_tools`]), which are
+//! connected the same way in every mode.
 //!
 //! # Why incode connects to them itself
 //!
@@ -435,7 +437,7 @@ fn tools_of(server: &str, listed: Vec<Value>) -> (Vec<ClientTool>, Vec<String>) 
             .and_then(Value::as_str)
             .unwrap_or("")
             .trim();
-        let description = format!("From the client's MCP server `{server}`. {said}");
+        let description = format!("From the MCP server `{server}`. {said}");
         tools.push(ClientTool {
             definition: json!({
                 "name": name,

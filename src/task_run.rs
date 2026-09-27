@@ -285,6 +285,9 @@ fn run_task_reporting(
     // takes the person's line, stops, and ends.
     let session_id = uuid::Uuid::new_v4().to_string();
     report.session.clone_from(&session_id);
+    // The owner's installed external tools, started as MCP servers now, in
+    // the background, so they connect while the memory session opens.
+    let tools = connect_ext_tools(workspace);
     let mut memory = crate::hooks::memory::MemoryHooks::new(
         crate::hooks::engine::Engine::locate(),
         workspace,
@@ -307,10 +310,32 @@ fn run_task_reporting(
         sentinel: &sentinel,
         prompt: &prompt,
         system: &system,
+        tools: &tools,
     };
     let ran = drive(&task, &mut memory, report);
     memory.end("other");
     ran
+}
+
+/// Session tools for one run, with the installed external tools connecting
+/// in the background. A configured tool that is not installed is named on
+/// stderr, which a JSON run keeps apart from its output.
+fn connect_ext_tools(workspace: &Path) -> std::sync::Arc<crate::toolbox::SessionTools> {
+    let tools = crate::toolbox::SessionTools::new(true);
+    let data_dir = crate::admin::AdminConfig::default_dir();
+    let configured = crate::admin::AdminConfig::load(&data_dir)
+        .map(|admin| admin.tools)
+        .unwrap_or_default();
+    let (specs, said) = crate::ext_tools::session_servers(&configured, &data_dir);
+    for line in said {
+        eprintln!("incode: {line}");
+    }
+    let on_connected: crate::toolbox::OnConnected =
+        std::sync::Arc::new(|line| crate::trace!("tool", "{line}"));
+    for line in tools.connect_client_servers(specs, workspace, &on_connected) {
+        crate::trace!("tool", "{line}");
+    }
+    tools
 }
 
 /// One instruction, as it is handed to each agent that might run it.
@@ -324,6 +349,8 @@ struct Task<'a> {
     prompt: &'a str,
     /// What rides its system context.
     system: &'a [String],
+    /// The run's session tools, with the external tools' servers.
+    tools: &'a std::sync::Arc<crate::toolbox::SessionTools>,
 }
 
 /// The instruction, through each usable agent in turn until one runs it.
@@ -340,6 +367,7 @@ fn drive(
         sentinel,
         prompt,
         system,
+        tools,
     } = *task;
     // WHICH ROUTE, and the CLI requirement belongs INSIDE the choice.
     //
@@ -418,6 +446,9 @@ fn drive(
         };
         // Its calls are filed under this run's session, as its stop is.
         backend.set_memory_session(memory.session());
+        // The run's one set of session tools, holding the external tools'
+        // servers, is every candidate's.
+        backend.share_session_tools(std::sync::Arc::clone(tools));
 
         if let Some(m) = model {
             backend.set_models(&[m.to_string()]);

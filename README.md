@@ -120,9 +120,9 @@ The design is in `docs/ARCHITECTURE.md`; the tool layer is its §5a and §5b.
 - **Optional:** the Incord Memory service on `http://127.0.0.1:9180` and its
   engine binary. Without them incode still works and knows less. Point
   elsewhere with `INCORD_MEMORY_URL` and `INCORD_ENGINE_BIN`.
-- **Optional programs** that add tools when found: the `incord-browser`
-  headless browser, a Chromium-family browser for text PDFs, and LibreOffice
-  for `ConvertDocument` (see [Tools](#tools)).
+- **Optional programs** that add tools when found: a headless browser
+  installed as an [external tool](#external-tools), a Chromium-family browser
+  for text PDFs, and LibreOffice for `ConvertDocument` (see [Tools](#tools)).
 
 ## Install
 
@@ -166,6 +166,7 @@ incode -t "add a health endpoint and a test for it"
 | `incode --serve [--port N]` | A local viewer on `127.0.0.1` for what a run in this workspace is doing. Reads, plus two writes behind a per-run token in `.incord/serve.token`: stop the running `/run`, and answer an agent's question. |
 | `incode --admin` | Print the resolved settings and which layer decided each. |
 | `incode --desktop-stop` | Halt the desktop driving this workspace. |
+| `incode --install-tools` | Download, check and unpack every [external tool](#external-tools) in `admin.json`, then exit (non-zero if any was not installed). |
 | `incode --tool-server` | Internal. Started by the agent CLI that incode launched; offers incode's tools over MCP and runs nothing itself. |
 | `incode --desktop-mcp` | Internal. The desktop tools' executor, started by incode's toolbox. |
 | `incode --team-mcp --team-channel <p>` | Internal. The team channel as an MCP server, for `codex`. |
@@ -262,7 +263,8 @@ installed is skipped. Changes apply from the next `/run` and the next session.
 | `/bg <cmd>` · `/jobs` · `/kill <id>` | Background shell jobs (shared with the model's background `Bash`) |
 | `/worktree [cmd]` | Git worktree create / list / remove |
 | `/add-dir <path>` | Also work in this directory — guards and undo extend to it too |
-| `/tools` · `/mcp` · `/env` · `/compact` | Information screens |
+| `/tools add <name>` · `/tools update [name]` · `/tools remove <name>` | Install, update or remove an [external tool](#external-tools) (also over `--acp`) |
+| `/tools` · `/mcp` · `/env` · `/compact` | Information screens (`/tools` also lists the external tools and what is installed) |
 | `/quit` | Exit |
 
 ## Tools
@@ -302,7 +304,7 @@ anything runs.
 | `watchman_lookup` | observe | Ask the recorder whether this step was already solved. |
 | `remember` · `forget_memory` · `save_brief` | record | Write to the memory service. |
 | `team_ask` · `team_tell` · `team_answer` · `team_read` | record (`team_read`: observe) | The team channel between workers (`docs/TEAMWORK.md`). |
-| `mcp__<server>__<tool>` | run | Tools of an ACP client's MCP servers (stdio or HTTP), connected by incode in the background: offered from the first turn after the server answers, and until then the model is told it is still connecting. |
+| `mcp__<server>__<tool>` | run | Tools of an ACP client's MCP servers (stdio or HTTP) and of the installed [external tools](#external-tools), connected by incode in the background: offered from the first turn after the server answers, and until then the model is told it is still connecting. |
 
 A tool result can carry pictures (PNG or JPEG, bounded in bytes, edge, pixels
 and count). The model receives them; incode's own events, transcript and memory
@@ -310,11 +312,13 @@ see only a placeholder such as `[image 1280x720 png]`.
 
 ### Optional programs, and how they are found
 
-- **Headless browser (`incord-browser`).** Looked for in `INCODE_BROWSER` (only
-  there when set), then `admin.json` `browser_bin` (only there when set), then
-  `PATH` as `obscura` or `incord-browser`. Found, it adds `Screenshot`,
-  `WebFetch`'s `render_js`, and a printer for `RenderPdf`. Not
-  found, those are not offered and nothing else changes. incode checks every
+- **Headless browser.** The installed [external tool](#external-tools) whose
+  entry says `"provides": "browser"`. For development, `INCODE_BROWSER` (only
+  there when set), then `admin.json` `browser_bin` (only there when set), name
+  an executable directly and win over the installed tool. `PATH` is never
+  searched. Found, it adds `Screenshot`, `WebFetch`'s `render_js`, and a
+  printer for `RenderPdf`. Not found, those are not offered, `Screenshot`
+  says how to install one, and nothing else changes. incode checks every
   address before the browser starts and never passes it
   `--allow-private-network`.
 - **`RenderPdf` printer.** The headless browser when its PDFs carry text —
@@ -326,6 +330,61 @@ see only a placeholder such as `[image 1280x720 png]`.
   (default), `chromium` or `incord-browser`.
 - **LibreOffice.** `INCODE_SOFFICE` (only there when set), then `PATH`, then the
   platform's install paths.
+
+### External tools
+
+A program incode runs for you — the headless browser, or any MCP server — is
+named in `admin.json` `tools` and downloaded from its release, never taken from
+`PATH` or from a folder on one machine:
+
+```json
+"tools": [
+  { "name": "browser",
+    "release": "<owner>/<repo>",
+    "version": "latest",
+    "asset": "<prefix>-{arch}-{os}.{ext}",
+    "run": ["<program>", "mcp"],
+    "provides": "browser" }
+]
+```
+
+- `{os}` is `windows`, `macos` or `linux`; `{arch}` is `x86_64` or `aarch64`;
+  `{ext}` is `zip` on Windows and `tar.gz` elsewhere. A repo that names its
+  assets otherwise gives `"assets": { "x86_64-windows": "<file>", … }`.
+- `version` is `latest` or a release tag. A source that is not a GitHub release
+  gives `url` (a template over the same names and `{version}`) instead of
+  `release`, and then must pin `sha256`.
+- `sha256` pins the asset's digest: one hex digest, or one per target
+  (`{ "x86_64-windows": "<hex>" }`).
+
+Nothing is downloaded until you ask: `/tools add <name>` (in the REPL or over
+`--acp`), `/tools update [name]`, `/tools remove <name>`, or
+`incode --install-tools` for every entry. A session that finds an entry not
+installed says so once and downloads nothing. An install:
+
+1. resolves the release through GitHub's API (`releases/latest` or
+   `releases/tags/<version>`);
+2. knows the asset's sha256 before downloading it — GitHub's published
+   `digest`, or the pinned `sha256`, which must agree when both exist. With
+   neither, the install is **refused**;
+3. downloads over https (plain http only to this machine), following redirects
+   only to https, at most 512 MiB and 15 minutes, sending no credential and a
+   User-Agent of `incode` alone;
+4. refuses a download whose sha256 differs, deletes it and unpacks nothing;
+5. unpacks zip or tar.gz into `~/.incord-code/tools/<name>/<version>/`,
+   refusing any entry that would land outside it and any link, at most 10,000
+   entries and 2 GiB, and records the version, asset and sha256 in
+   `tools/<name>/installed.json`.
+
+`run[0]` is resolved inside that folder only. Every installed tool is started
+as an MCP server on stdio at session start — in the background, in the REPL,
+with `-t` and under `--acp` — and its tools are offered as
+`mcp__<name>__<tool>`, through the same gate as every other tool (reach
+**run**: refused in read-only, asked about when prompting, refused when the
+memory engine cannot decide). A tool with `"provides": "browser"` is also the
+browser incode's own `Screenshot`, `RenderPdf` and `WebFetch` `render_js` use.
+Its tools join the session after it starts; a tool installed during a session
+is offered from the next one.
 
 ## Safety
 
@@ -475,7 +534,9 @@ and `--admin` prints which layer decided each value.
   "engine_bin": "/path/to/incord-memory-service",
   "api_providers": [{ "name": "team", "url": "https://agents.example", "key_env": "TEAM_API_KEY" }],
   "web_search": { "url": "https://search.example/api", "key_env": "SEARCH_KEY" },
-  "browser_bin": "/path/to/incord-browser",
+  "tools": [{ "name": "browser", "release": "<owner>/<repo>", "version": "latest",
+              "asset": "<prefix>-{arch}-{os}.{ext}", "run": ["<program>", "mcp"],
+              "provides": "browser" }],
   "pdf_renderer": "auto",
   "sandbox": "workspace-write",
   "hooks": { "pre_tool_use": ["my-check"], "post_tool_use": ["my-log"] },
@@ -494,7 +555,8 @@ and `--admin` prints which layer decided each value.
 | `memory_url` · `engine_bin` | Where the memory service listens · where its engine binary is |
 | `api_providers` | Services that list API agents ([contract](#the-api-providers-contract)) |
 | `web_search` | `WebSearch`'s endpoint (`url`, the query sent as `q`) and the name of its key's variable. The key is sent only over https or to loopback |
-| `browser_bin` · `pdf_renderer` | The headless browser · which program `RenderPdf` uses |
+| `tools` | [External tools](#external-tools): each one's release, version, asset, `run` and `provides` |
+| `browser_bin` · `pdf_renderer` | For development, a headless browser executable that wins over the installed one · which program `RenderPdf` uses |
 | `sandbox` | `off` · `workspace-write` · `read-only`; unset follows the permission mode |
 | `hooks` (also `desktop_hooks`) | Your `pre_tool_use` / `post_tool_use` commands, run for every tool. The event is JSON on stdin; exit 2 on a pre-tool command denies; bounded at 10 s |
 | `plugins` | Which memory-service parts are used; all on by default |
@@ -528,6 +590,7 @@ Environment variables:
 | `~/.incord-code/agents/*.md` | Your sub-agents, for every project |
 | `~/.incord-code/sessions/<workspace>.json` | Session pointers, so a conversation can be reopened |
 | `~/.incord-code/history.txt` | The lines you typed |
+| `~/.incord-code/tools/<name>/` | An installed external tool: `<version>/` and `installed.json` |
 | `<project>/.incord/ledger.json` | What is being worked on in *this* checkout |
 | `<project>/.incord/contracts.json` | Interfaces frozen before the work was split up |
 | `<project>/.incord/guards.json` | Extra protected paths for this project |

@@ -200,6 +200,12 @@ pub(crate) trait SessionFactory: Send + Sync + 'static {
 
     /// Where the operator's settings and session records live.
     fn data_dir(&self) -> PathBuf;
+
+    /// The installed external tools, as MCP servers each session starts, and
+    /// a line for each configured tool that is not installed. None by default.
+    fn tool_servers(&self) -> (Vec<crate::toolbox::ServerSpec>, Vec<String>) {
+        (Vec::new(), Vec::new())
+    }
 }
 
 /// The production factory: the interactive CLI's own session builder.
@@ -269,6 +275,14 @@ impl SessionFactory for CliSessions {
 
     fn data_dir(&self) -> PathBuf {
         crate::admin::AdminConfig::default_dir()
+    }
+
+    fn tool_servers(&self) -> (Vec<crate::toolbox::ServerSpec>, Vec<String>) {
+        let data_dir = self.data_dir();
+        let tools = crate::admin::AdminConfig::load(&data_dir)
+            .map(|admin| admin.tools)
+            .unwrap_or_default();
+        crate::ext_tools::session_servers(&tools, &data_dir)
     }
 }
 
@@ -1005,7 +1019,12 @@ fn drive<F: SessionFactory>(
     // held it for 42 s), and each one's tools are offered from the first turn
     // after it has connected. Bounded; one that does not start costs its own
     // tools and nothing else.
-    let (specs, mut connected) = server_specs(&servers);
+    let (mut specs, mut connected) = server_specs(&servers);
+    // The owner's installed external tools join the same way, in the same
+    // call: a session's servers are connected once.
+    let (tools, about_tools) = factory.tool_servers();
+    specs.extend(tools);
+    connected.extend(about_tools);
     let later: Arc<Mutex<Later>> = Arc::default();
     connected.extend(session.session_tools().connect_client_servers(
         specs,
@@ -2580,7 +2599,7 @@ mod tests {
             names,
             [
                 "undo", "rewind", "plan", "act", "diff", "links", "roadmap", "run", "doctor",
-                "memories", "remember", "worktree", "agent", "agents", "roles"
+                "memories", "remember", "worktree", "agent", "agents", "roles", "tools"
             ],
             "{announced}"
         );

@@ -141,6 +141,17 @@ jsonschema = { version = "=0.58.0", default-features = false }
 # data-encoding, log and thiserror were already there.
 tungstenite = { version = "=0.30.0", default-features = false, features = ["handshake"] }
 
+# External tools (`admin.json` `tools`, `src/ext_tools`): a release asset is
+# checked against its sha256 and unpacked. sha2 0.10.9 and flate2 1.1.10 are
+# ALREADY in Cargo.lock (sha2 under several crates, flate2 under zip's
+# `deflate`), so declaring them adds no package. tar is a NEW PACKAGE: 0.4.46 is
+# the latest, MIT OR Apache-2.0, rust-version 1.63; `default-features = false`
+# drops `xattr`, so it brings only filetime beside it (see ARCHITECTURE.md,
+# "External tools").
+sha2 = "=0.10.9"
+flate2 = "=1.1.10"
+tar = { version = "=0.4.46", default-features = false }
+
 # Computer use — see docs/COMPUTER_USE.md. THESE ARE NEW PACKAGES, unlike every
 # other entry in this file, and the vetting is recorded in .incord/RULE_ACK:
 # latest stable as resolved from the live index on 2026-09-16, pinned, MSRV

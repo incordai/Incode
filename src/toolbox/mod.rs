@@ -588,15 +588,23 @@ impl Toolbox {
             .as_deref()
     }
 
-    /// The headless browser, when it is installed where [`browser::find`]
-    /// looks.
+    /// The headless browser, when it is named or installed where
+    /// [`browser::find`] looks.
     fn browser(&self) -> Option<&Path> {
-        self.browser
-            .get_or_init(|| {
-                let configured = crate::admin::AdminConfig::load_default().browser_bin;
-                browser::find(&|name| std::env::var_os(name), configured.as_deref())
-            })
-            .as_deref()
+        self.browser.get_or_init(Self::detect_browser).as_deref()
+    }
+
+    /// [`browser::find`] over this process's environment, `admin.json`'s
+    /// `browser_bin`, and the installed tool that provides `browser`.
+    fn detect_browser() -> Option<PathBuf> {
+        let data_dir = crate::admin::AdminConfig::default_dir();
+        let admin = crate::admin::AdminConfig::load_default();
+        let provided = crate::ext_tools::provider("browser", &admin.tools, &data_dir);
+        browser::find(
+            &|name| std::env::var_os(name),
+            admin.browser_bin.as_deref(),
+            provided,
+        )
     }
 
     /// What `RenderPdf` prints with, per `admin.json` `pdf_renderer`.
@@ -639,8 +647,10 @@ impl Toolbox {
                 convert::SOFFICE_ENV
             ),
             SCREENSHOT => format!(
-                "{name} is not available: the headless browser was not found (set {} or \
-                 `browser_bin` in admin.json)",
+                "{name} is not available: no headless browser is installed. Add an entry to \
+                 `tools` in admin.json with `\"provides\": \"browser\"` and install it with \
+                 `/tools add <name>` (or `incode --install-tools`); for development, {} or \
+                 `browser_bin` names one directly",
                 browser::BROWSER_ENV
             ),
             RENDER_PDF => format!(

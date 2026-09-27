@@ -674,6 +674,7 @@ yet") rather than routed to an endpoint nothing is known to answer.
 | `<repo-parent>/worktrees/` | machine | one checkout per lane, removed after; the **branch is kept** |
 | `~/.incord-code/admin.json` | human sets once | model, roles, ceiling, check |
 | `~/.incord-code/sessions/<workspace>.json` | machine | session pointers (the agent's conversation id, the model), one file per workspace — not transcripts |
+| `~/.incord-code/tools/<name>/` | machine, when the owner asks | an installed external tool: `<version>/` (the unpacked release) and `installed.json` (version, asset, sha256, source); see §5b, "External tools" |
 
 Finished work is also written to the **shared memory** every agent on this machine
 reads, under the subject `<project>#<agent-fingerprint>` — which turns "what has this
@@ -890,10 +891,14 @@ the bridge's other half) that does not fit is left out, with a line saying why.
 
 ### The headless browser (phase 6b)
 
-The owner's `incord-browser` (`toolbox::browser`), found by `INCODE_BROWSER` (alone when
-set), then `admin.json` `browser_bin` (alone when set), then `PATH` (`obscura`,
-`incord-browser`). Not found: Screenshot is not offered, `WebFetch` runs no script and is
-advertised without `render_js`, and RenderPdf is offered only with a system browser.
+The headless browser (`toolbox::browser`), found by `INCODE_BROWSER` (alone when set),
+then `admin.json` `browser_bin` (alone when set) — both for development — then the
+installed external tool whose entry says `"provides": "browser"` (`ext_tools::provider`;
+see "External tools" below). `PATH` is never searched and no browser name is written in
+the code. Not found: Screenshot is not offered (a call is told how to install one),
+`WebFetch` runs no script and is advertised without `render_js`, and RenderPdf is offered
+only with a system browser. The subcommands below are the upstream browser's CLI
+(`fetch`, `serve`).
 
 - **WebFetch with script:** `obscura fetch <url> --dump html --quiet --timeout 20 -o
   <temp>`, one child per call, whole tree killed 10 s past its own timeout, 2 MiB read
@@ -954,6 +959,59 @@ one prints. `"chromium"` / `"incord-browser"`: only that one. The result names t
 no text says the PDF is IMAGE-ONLY. Measured against Edge on the same article: 2 Letter
 pages each, 1864 characters extracted vs 1884. The pages are still a raster with an
 invisible text layer over it, not vector drawing (about 2.5x Edge's file size).
+
+### External tools (`ext_tools`)
+
+A program incode runs for the owner is an entry of `admin.json` `tools` (`name`,
+`release` = `<owner>/<repo>` or `url`, `version`, `asset` or `assets`, `sha256`, `run`,
+`provides`), downloaded from its release when the owner asks and never looked up on
+`PATH`. The owner renames or replaces the browser by editing that entry; nothing in the
+code names it.
+
+- **Asked for, never automatic.** `/tools add <name>…`, `/tools update [name]`,
+  `/tools remove <name>` (REPL and ACP, one handler: `ext_tools::command`) and
+  `incode --install-tools` (`ext_tools::install_all`). A session that finds an entry not
+  installed says so — a REPL info line, an ACP agent message beside the MCP lines, a
+  `-t` stderr line — and downloads nothing.
+- **Resolved before fetched** (`ext_tools::fetch`). GitHub's API
+  (`releases/latest` or `releases/tags/<version>`) gives the tag, the asset's
+  `browser_download_url`, its `size` and its `digest` (`sha256:<hex>`). The expected
+  sha256 is that digest or the entry's pinned `sha256`; both present and different, or
+  neither present, and the install is refused before a byte is downloaded. A `url` source
+  has no digest, so it needs the pin.
+- **Downloaded bounded.** Over the crate's shared no-redirect client
+  (`runtime::http::no_redirect_client`), redirects followed here one hop at a time, each
+  address checked by `agent::catalogue::key_may_travel_to` (https anywhere, plain http
+  to loopback only); at most 5 hops, 512 MiB (or the size the release declares) counted
+  as it arrives, 15 minutes for the transfer, 30 s and 4 MiB for the release lookup.
+  Headers: `Accept` and `User-Agent: incode` (GitHub's API requires one) — no credential,
+  nothing about the operator. Hashed while streaming; a mismatch deletes the download
+  and unpacks nothing. A transport error carries its whole cause chain.
+- **Unpacked guarded** (`ext_tools::unpack`). zip via `zip`, tar.gz via `flate2` +
+  `tar`, written entry by entry by incode (never the crates' own extract): each name must
+  be relative and made of plain components (`ext_tools::inside_path`; for zip the crate's
+  `enclosed_name` must agree), a `:` stream name is refused on Windows, links (symbolic
+  and hard) are refused, and the archive stops at 10,000 entries or 2 GiB unpacked,
+  counted as the bytes come out. Into a staging folder, then renamed to
+  `~/.incord-code/tools/<name>/<version>/`; `run[0]` must exist there or nothing is
+  installed. `tools/<name>/installed.json` records name, version, folder, asset, sha256
+  and source. Older version folders are removed (one still running on Windows stays until
+  the next update).
+- **Run from its own folder.** `ext_tools::executable` resolves `run[0]` inside the
+  installed folder (`.exe` added on Windows when the name has no extension), never on
+  `PATH`. `ext_tools::session_servers` turns every installed entry into a stdio
+  `ServerSpec` (`run[1..]` as arguments) and hands it to the same
+  `SessionTools::connect_client_servers` an ACP client's servers use: in the background,
+  at session start, in the REPL (`cli::connect_ext_tools`), with `-t`
+  (`task_run::connect_ext_tools`, one `SessionTools` shared by every candidate backend)
+  and under `--acp` (`SessionFactory::tool_servers`, merged with the client's servers in
+  the one connect call). Its tools are `mcp__<name>__<tool>`, reach **run**, fail closed.
+- **Measured live** (2026-09-27, upstream `h4ckf0r0day/obscura` v0.2.3, scratch
+  `INCORD_CODE_DIR`): `--install-tools` resolved the tag, checked
+  `obscura-x86_64-windows.zip` (68,156,208 bytes) against GitHub's digest `781a1b8b…`,
+  and unpacked `obscura.exe` + `obscura-worker.exe` in 8.8 s. The same asset with one
+  byte flipped, served on loopback against the pinned digest, was refused with both
+  digests named and nothing left in `tools/browser/`.
 
 ### The desktop (phase 6b)
 
@@ -1210,6 +1268,15 @@ on (checked in the cached 0.61.2 source); the two file-rights constants that liv
 unenabled `Win32_Storage_FileSystem` are spelled numerically instead. The session RID
 comes from `uuid` v4, already a dependency. Landlock's network rights (`AccessNet`,
 ABI v4) are in the pinned `landlock` 0.4.7.
+
+External tools (`ext_tools`) added one, vetted against the live index on 2026-09-27:
+
+| Crate | Pin | Why |
+|---|---|---|
+| `tar` | 0.4.46, no default features | reading a release's tar.gz entry by entry, so every name is checked and every byte counted by incode. The latest release; MIT OR Apache-2.0; rust-version 1.63. `default-features = false` drops `xattr`. It adds TWO packages to the lock — itself and `filetime` 0.2.29 (MIT/Apache-2.0, rust-version 1.75) — whose `cfg-if` and `libc` were already there |
+
+`sha2` 0.10.9 and `flate2` 1.1.10 are declared too, adding no package: both were already
+resolved in the lock (sha2 under several crates, flate2 under `zip`'s `deflate`).
 
 ---
 

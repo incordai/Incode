@@ -15,7 +15,9 @@ pub enum SlashCommand {
     Help,
     Status,
     Compact,
-    Tools,
+    /// The tools incode runs, or with an argument the external tools:
+    /// `add <name>…`, `update [name]`, `remove <name>`.
+    Tools(Option<String>),
     Skills,
     Mcp,
     Model(Option<String>),
@@ -108,7 +110,7 @@ impl SlashCommand {
             "/admin" => Self::Admin,
             "/agent" => Self::Agent(arg),
             "/roles" => Self::Roles(arg),
-            "/tools" | "/t" => Self::Tools,
+            "/tools" | "/t" => Self::Tools(arg.filter(|a| !a.is_empty())),
             "/skills" | "/sk" => Self::Skills,
             "/mcp" => Self::Mcp,
             "/model" | "/m" => Self::Model(arg),
@@ -216,7 +218,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "/links <file>",
         "What else uses what this file defines, and what it depends on",
     ),
-    ("/tools", "List the tools incode runs for this agent"),
+    (
+        "/tools [add|update|remove <name>]",
+        "List incode's tools and the external ones; install, update or remove an external tool",
+    ),
     (
         "/skills",
         "List the skills this session loaded from the shared store",
@@ -754,6 +759,15 @@ pub fn handle_roadmap(workspace: &std::path::Path) {
 /// The agent runs its own loop with its own tools, so listing this harness's
 /// would name things nothing calls. What the harness still does is said plainly
 /// instead of implied by an empty list.
+/// `/tools` and its verbs for the external tools configured in `admin.json`
+/// under `data_dir`: what is installed, or install, update or remove one.
+pub fn handle_ext_tools(arg: Option<&str>, data_dir: &std::path::Path) {
+    render::print_header("External tools");
+    for line in crate::ext_tools::command(arg.unwrap_or_default(), data_dir) {
+        outln!("  {line}");
+    }
+}
+
 /// `/tools`: the tools incode runs itself for this agent, or — for an agent
 /// whose CLI still uses its own tools — that plainly.
 pub fn handle_delegated_tools(agent: &str, offered: &[String]) {
@@ -1581,7 +1595,14 @@ mod tests {
         assert_eq!(SlashCommand::parse("/help"), Some(SlashCommand::Help));
         assert_eq!(SlashCommand::parse("/status"), Some(SlashCommand::Status));
         assert_eq!(SlashCommand::parse("/compact"), Some(SlashCommand::Compact));
-        assert_eq!(SlashCommand::parse("/tools"), Some(SlashCommand::Tools));
+        assert_eq!(
+            SlashCommand::parse("/tools"),
+            Some(SlashCommand::Tools(None))
+        );
+        assert_eq!(
+            SlashCommand::parse("/tools add browser"),
+            Some(SlashCommand::Tools(Some("add browser".to_string())))
+        );
         assert_eq!(SlashCommand::parse("/quit"), Some(SlashCommand::Quit));
         assert_eq!(
             SlashCommand::parse("/model opus"),

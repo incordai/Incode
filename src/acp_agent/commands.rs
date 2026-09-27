@@ -23,8 +23,10 @@
 //!   the session's lifetime, and `cwd` is the only root a client may name.
 //! - `/forget` — deleting a memory is a two-step confirmation typed by a
 //!   person at the terminal.
-//! - `/help`, `/status`, `/compact`, `/tools`, `/skills`, `/mcp`, `/env`,
-//!   `/guards`, `/admin` — terminal information screens, not asked for here.
+//! - `/help`, `/status`, `/compact`, `/skills`, `/mcp`, `/env`, `/guards`,
+//!   `/admin` — terminal information screens, not asked for here. `/tools` is
+//!   offered for the external tools alone: what is installed, and `add`,
+//!   `update`, `remove`.
 
 use std::path::{Path, PathBuf};
 
@@ -44,9 +46,9 @@ pub(crate) struct Settings {
 
 /// The commands offered, by name, in the order a menu shows them. Each is in
 /// [`COMMANDS`], which gives its description and its argument hint.
-const OFFERED: [&str; 15] = [
+const OFFERED: [&str; 16] = [
     "undo", "rewind", "plan", "act", "diff", "links", "roadmap", "run", "doctor", "memories",
-    "remember", "worktree", "agent", "agents", "roles",
+    "remember", "worktree", "agent", "agents", "roles", "tools",
 ];
 
 /// The list `available_commands_update` carries.
@@ -123,6 +125,11 @@ pub(crate) fn run(
         ),
         SlashCommand::Roles(arg) => {
             slash_commands::handle_roles(arg.as_deref(), &settings.data_dir)
+        }
+        // Only the external tools here: the list of incode's own is a
+        // terminal screen.
+        SlashCommand::Tools(arg) => {
+            slash_commands::handle_ext_tools(arg.as_deref(), &settings.data_dir);
         }
         SlashCommand::Usage(usage) if is_offered(&usage) => slash_commands::handle_usage(&usage),
         _ => not_offered(typed),

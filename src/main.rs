@@ -43,6 +43,8 @@ OPTIONS:
         --sandbox-exec        Apply this platform's OS sandbox to this process,
                               then exec the shell command after `--`. Launched BY
                               incode's Bash tool on Unix, not by hand
+        --install-tools       Download, check (sha256) and unpack every tool in
+                              admin.json `tools`, then exit
         --tool-server         Speak MCP on stdin/stdout, offering incode's tools to
                               an agent CLI that incode started. Runs nothing
                               itself: every call goes back to that incode.
@@ -164,6 +166,18 @@ fn main() -> anyhow::Result<()> {
             // when none is ambient. Nothing may reach stdout — `run_stdio`
             // moves the standard handles before anything is printed.
             return incord_code::acp_agent::run_stdio(*config);
+        }
+        Parsed::InstallTools => {
+            let (lines, all) = incord_code::ext_tools::install_all(
+                &incord_code::admin::AdminConfig::default_dir(),
+            );
+            for line in lines {
+                println!("{line}");
+            }
+            if !all {
+                anyhow::bail!("not every configured tool is installed");
+            }
+            return Ok(());
         }
         Parsed::ToolServer => {
             // stdout is the protocol channel; this process prints nothing
@@ -354,6 +368,9 @@ enum Parsed {
     /// from the environment that incode gave the CLI and the CLI passed on.
     ToolServer,
 
+    /// Install every tool `admin.json` `tools` names, then exit.
+    InstallTools,
+
     /// Be an Agent Client Protocol agent on stdio.
     ///
     /// Carries the config for the flags that apply to every session it opens
@@ -382,6 +399,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> anyhow::Result<Parsed> {
     let mut team_channel: Option<std::path::PathBuf> = None;
     let mut acp = false;
     let mut tool_server = false;
+    let mut install_tools = false;
     // `None` asks the OS for a free port and publishes the answer, so nothing
     // collides with whatever else this machine is already running.
     let mut port: Option<u16> = None;
@@ -477,6 +495,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> anyhow::Result<Parsed> {
             // Answered after the loop, before the workspace check.
             "--acp" => acp = true,
             "--tool-server" => tool_server = true,
+            "--install-tools" => install_tools = true,
             // Which conversation. A PATH, like --desktop-journal: this process
             // is told the one file it may append to rather than given a
             // workspace to find its own way around.
@@ -491,6 +510,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> anyhow::Result<Parsed> {
     // cwd it has, and a flag beside it would be one this mode ignores.
     if tool_server {
         let alone = !acp
+            && !install_tools
             && task.is_none()
             && !serve
             && !admin_only
@@ -506,6 +526,27 @@ fn parse_args(args: impl Iterator<Item = String>) -> anyhow::Result<Parsed> {
             );
         }
         return Ok(Parsed::ToolServer);
+    }
+
+    // Alone, and before the workspace check: it installs into the data
+    // directory and touches no workspace.
+    if install_tools {
+        let alone = !acp
+            && task.is_none()
+            && !serve
+            && !admin_only
+            && !desktop_mcp
+            && !desktop_stop
+            && !team_mcp
+            && check_findings.is_none()
+            && desktop_journal.is_none()
+            && team_channel.is_none();
+        if !alone {
+            anyhow::bail!(
+                "`--install-tools` is its own mode and cannot be combined with another\n\n{USAGE}"
+            );
+        }
+        return Ok(Parsed::InstallTools);
     }
 
     // FIRST, and before the workspace check: an ACP client launches this from
@@ -897,6 +938,20 @@ mod tests {
         assert!(USAGE.contains("--tool-server"));
     }
 
+    /// `--install-tools` installs and exits: its own mode, before the
+    /// workspace check, and refused beside another mode.
+    #[test]
+    fn install_tools_is_its_own_mode() {
+        assert!(matches!(
+            parse(&["--install-tools", "-w", "/no/such/directory/anywhere"]).expect("valid"),
+            Parsed::InstallTools
+        ));
+        assert!(parse(&["--install-tools", "--acp"]).is_err());
+        assert!(parse(&["--install-tools", "--tool-server"]).is_err());
+        assert!(parse(&["--install-tools", "-t", "x"]).is_err());
+        assert!(USAGE.contains("--install-tools"));
+    }
+
     /// It must not care about the workspace.
     ///
     /// An MCP client launches this process with whatever cwd it happens to
@@ -997,6 +1052,7 @@ mod tests {
             | Parsed::CheckFindings { .. }
             | Parsed::TeamMcp { .. }
             | Parsed::ToolServer
+            | Parsed::InstallTools
             | Parsed::Acp(_) => {
                 panic!("expected a runnable config")
             }
