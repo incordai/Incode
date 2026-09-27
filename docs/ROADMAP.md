@@ -8,6 +8,78 @@ runs before anything is pushed, and every load-bearing change gets a control.
 **Status as of 2026-09-22:** 1288 lib + 38 bin tests, clippy 0, fmt clean,
 43 unwired capabilities (67 at the start of the day).
 
+**Status as of 2026-09-26 (HEAD `b39a99e`):** the models-only harness, `--acp`, the
+full toolbox and the memory lifecycle landed (section 0). The unwired ratchet
+`MAX_UNWIRED` is 42. Test counts were not re-measured for this update.
+
+---
+
+## 0. The models-only harness — 2026-09-24 to 2026-09-26
+
+The owner's principle: incode is the harness. claude, codex and agy are used only
+as models, headless, on the owner's subscriptions, and every tool is incode's own.
+This is fully true for claude; section 0b says what is not.
+
+### 0a. Done
+
+| What | Commit |
+|---|---|
+| One agent catalogue (local CLIs, the API route, `api_providers`); `/agent`, `/agent <id>`, `/agent sub <id>` | `5640c0e` |
+| `/roles`: list, set and clear each role's models; `/run` reads roles from `admin.json` at start | `3a3ca3f` |
+| `incode --acp`: incode as an Agent Client Protocol agent (initialize, session/new, prompt, cancel, set_mode, close); stdout kept pure | `f9a8491` |
+| ACP: `usage_update`, edits as diff blocks, slash commands | `63fc212` |
+| The memory engine's `pre-tool` run in incode's Toolbox; fail closed for changes; Allow/Reject raced against `permission-request`; `AskUserQuestion` as a tool | `d7f5d41` |
+| The bridge: claude runs with its own tools, settings, hooks, CLAUDE.md and skills off; its only tools are incode's, over `incode --tool-server` | `27cf90f` |
+| The memory lifecycle fired by incode on every route (`session-start`, `user-prompt`, `code-edit`, `capture`, `session-end`); transcripts in `.incord/transcripts/`; CLAUDE.md and AGENTS.md read by incode | `4802719` |
+| Toolbox: MultiEdit, ApplyPatch, LS, NotebookEdit, background Bash with BashOutput/KillShell, WebFetch, WebSearch, TodoWrite, Diagnostics, watchman_lookup, the team verbs; one reach table; WebFetch no longer leaks the search key | `d80b02a` |
+| ripgrep-based Glob/Grep/LS, Outline (tree-sitter), documents in Read, schema check on every call; ConvertDocument when LibreOffice is found | `079988b` |
+| Pictures in tool results; the headless browser (WebFetch `render_js`, Screenshot, RenderPdf); the desktop tools behind the Toolbox gate | `70c5556` |
+| ACP: agent and role pickers, the client's stdio MCP servers run by incode, `/run` as a live plan, `session/load` and `session/list` | `fd2ffec` |
+| ACP: sub-agent tabs, `_meta.incord`, live command output, thinking, pictures in a prompt; the `Agent` tool on the session's own CLI | `eac0322` |
+| User-defined sub-agents and `/agents`; `-t --output-format stream-json\|json`; checkpoints on disk with `/undo` after restart and `/rewind <n>`; the OS sandbox; operator hooks on every tool; `/run` workers as memory sessions; codex `--disable hooks`; `run_on_compact` allowlisted (A5) | `b39a99e` |
+
+### 0b. Still open
+
+- **codex and agy still use their own tools.** agy has no switch to turn them off
+  or add MCP per run; codex has no switch for `apply_patch` / `update_plan`, and
+  its candidate flags could not be proved (usage limit). On both routes the guards
+  are the Sentinel (detection), not a gate (`ARCHITECTURE.md` §5a).
+- **Driving ACP agents (opencode, gemini).** Built in `fcfa2d9`, reverted in
+  `c98757a`; not in HEAD. gemini, opencode and cursor are detected, not driven.
+- **Provider agents** from `api_providers` are listed and marked not usable: the
+  contract does not yet say where their turns go.
+- **No HTTP MCP client.** An ACP client's HTTP/SSE MCP servers are not started, and
+  `initialize` says so. Also not offered over ACP: `session/resume`, elicitation,
+  fs and terminal.
+- **Windows workspace-write sandbox.** Left unconfined: the only sound route
+  rewrites the workspace ACL on every command (~2.5 s each way on a 28,000-file
+  tree). Read-only is confined.
+- **Network isolation.** No sandbox mode restricts the network on any OS.
+- **A full macOS build and test of HEAD is not verified.** The Mac was offline, and
+  since tree-sitter's C grammars went in (`079988b`), the crate can no longer be
+  compile-checked for macOS from Windows. The macOS sandbox profile itself was
+  validated live on macOS during phase 8.
+- **incord-browser (incordai/incord-browser #6–#9, #11–#14).** All eight were
+  closed upstream on 2026-09-25/26 (#10 is a pull request). incode has not been
+  re-measured against the fixed browser. In particular #11 (image-only PDFs) was
+  fixed upstream: `RenderPdf`'s fallback still describes that PDF as image-only,
+  the `pdf_renderer` default is still `auto`, and the earlier measurement that
+  the browser refuses `preferCSSPageSize` predates the fix.
+- **App-side work (the owner's desktop app, outside this repo):** a resume list
+  (it calls neither `session/list` nor `session/load`); drawing image content;
+  drawing the `_meta.incord` badges; a question card for `AskUserQuestion` (the app
+  answers every agent request but `session/request_permission` with `-32601`);
+  withdrawing a permission card when the engine answers first (no agent-side
+  cancel).
+- **`/undo` after a restart has not been run live.** Unit-tested against the
+  on-disk checkpoints only.
+- **codex pictures have not been run live.** `--image` is taken from `codex exec
+  --help`; every codex turn here answered with the usage limit.
+- **ConvertDocument** has run only against a fake `soffice`: LibreOffice is not
+  installed on the development machine.
+- **Thinking** arrives only on the claude route; the API route does not ask for
+  it and codex's reasoning items were not measured.
+
 ---
 
 ## A. The 51 unwired capabilities
@@ -90,6 +162,9 @@ exists and a second display may not be reachable.
 `bash_jobs::get_output`, `usage::current_turn_usage`, `usage::cumulative_usage`,
 `lifecycle::run_on_compact`.
 
+`run_on_compact` is settled (`b39a99e`): allowlisted in `DELIBERATELY_UNWIRED`,
+because incode never compacts — the model CLI compacts inside its own process.
+
 ### A6 — Superseded by a live replacement (2)
 
 `slash_commands::handle_model` and `handle_tool_status`. Both have working
@@ -125,6 +200,9 @@ Writing it blind produces code that compiles and has never run.
 
 **Needs:** a machine of that kind, or an explicit decision to ship it untested
 and say so in the docs.
+
+The desktop is unchanged by section 0; only the OS sandbox for shell commands
+was validated on macOS (phase 8).
 
 ### B2 — The codex MCP tool call
 

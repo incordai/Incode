@@ -25,17 +25,20 @@ server that exported it, and a second binary were deleted rather than improved.
 
 There are **three** processes and they are not peers.
 
-| | The harness (`incode`) | The agent (an installed CLI) | The body (memory service) |
+| | The harness (`incode`) | The model (an installed CLI, headless) | The body (memory service) |
 |---|---|---|---|
-| **Owns** | the plan, the check, the guards, the ledger, the budget, the terminal | the loop, its own tools, its own subagents, its own context | recall, rules, the proxy, the auditor, the recorder, the owner queue |
+| **Owns** | the plan, the check, the guards, the ledger, the budget, the terminal, and every tool call (the `Toolbox`, §5a–§5b) | the model's reasoning and its conversation; codex and agy also still run their own tools (§5a) | recall, rules, the proxy, the auditor, the recorder, the owner queue |
 | **State** | one workspace | one conversation, which it stores itself | every project, every agent on the machine |
-| **Reached by** | the person, at a prompt | spawned as a child process | HTTP on `127.0.0.1`, default port in `brief.rs` |
+| **Reached by** | the person, at a prompt, or an ACP client | spawned as a child process | HTTP on `127.0.0.1`, default port in `brief.rs`; the engine binary's hooks |
 | **Lifetime** | a session | a turn | a machine |
 | **Costs** | nothing | the operator's subscription | nothing |
 
-**The harness does not talk to a model.** It holds no API credential and has no
-provider client: it decides what is worth doing and whether it was actually done, and
-delegates the doing. That is why a subscription is enough to run all of it.
+**The harness uses the CLI as a model only.** It holds no subscription login: the CLI
+authenticates itself, and incode decides what is worth doing, runs the tools the model
+asks for, and checks whether the work was actually done. The one route where incode
+talks to a model directly is the optional API route (`agent::api`, `INCORD_API_URL` /
+`INCORD_API_KEY` / `INCORD_API_MODEL`): the key is read from the environment when a
+request is made and never stored, and incode runs the tool loop itself.
 
 Everything the harness knows that outlives a session, it asks for. It caches none of
 it. A cache here is a second source of truth, and a second source of truth is the
@@ -47,11 +50,14 @@ Every body-facing module reaches the service over its plain HTTP API on `127.0.0
 
 The harness used to carry its own MCP client, and attaching it to the service looked
 obvious — it did not work, because that client was **stdio-only** while the service
-registers over **HTTP**. The client is gone along with the rest of the tool layer:
-MCP servers are the agent's business now, configured in the agent's own settings and
-connected by it. The harness proxies nothing. The one exception is an ACP client's
-stdio servers under `incode --acp`, which incode connects to itself and runs as its
-own tools (below).
+registers over **HTTP**. That is still the case: incode has no HTTP MCP client.
+
+MCP in incode today is three things, none of them the agent's own settings: the tool
+bridge (`incode --tool-server`, §5a), the only MCP server a bridged claude is given
+(`--strict-mcp-config`); `incode --team-mcp` and `incode --desktop-mcp`, handed to
+codex, which is not bridged; and an ACP client's stdio servers under `incode --acp`,
+which incode connects to itself (`toolbox::mcp_client`) and runs as its own tools
+(below).
 
 ### `incode --acp`: incode as the agent an editor drives
 
@@ -86,7 +92,9 @@ stdout line to be JSON-RPC.
 
 **Edits as diffs.** A successful edit call's `tool_call_update` carries one `diff`
 content block instead of the tool's output text (`acp_agent::present::Edits`). The
-agent CLI writes files itself, so nothing is read at the moment of the write: a splice
+call and its result are incode's own on the bridged and API routes (a CLI that still
+edits with its own tools reports its own); either way nothing is read at the moment
+of the write: a splice
 (`old_string` / `new_string`) is sent as the call carries it; a whole-file write
 (`content`) is sent against what the file held before — the pre-turn snapshot the turn
 already takes for `/undo` (`AgentSession::turn_observed` hands it to the observer as
@@ -218,7 +226,8 @@ made to fit like a screenshot — `Image::fitted`) goes with the next message, o
 refused by an agent that cannot take it.
 
 **Slash commands.** `/undo`, `/plan`, `/act`, `/diff`, `/links`, `/roadmap`, `/run`,
-`/doctor`, `/memories`, `/remember`, `/worktree`, `/agent` and `/roles` are announced,
+`/doctor`, `/memories`, `/remember`, `/worktree`, `/agent`, `/agents`, `/roles` and
+`/rewind` are announced (`acp_agent::commands::OFFERED`),
 with the description and argument hint from `slash_commands::COMMANDS`. A prompt that
 parses as a slash command runs the REPL's own handler inside `console::capture`, which
 returns what the handler printed on that thread; that text is the reply, and the agent
@@ -321,9 +330,10 @@ and the walk to the nearest existing ancestor ended at nothing.
 ### The engine's hooks, run by incode for its own tools
 
 `hooks::engine` runs the memory engine's lifecycle hooks at the moment incode's own
-Toolbox is about to act. Only calls that go through the Toolbox are covered: today
-that is the API route (`agent::api`). A CLI child (Claude, Codex, Antigravity) runs
-its own tools inside its own process, so no call it makes passes this gate.
+Toolbox is about to act. Only calls that go through the Toolbox are covered: the API
+route (`agent::api`) and the bridged claude route (§5a), with their sub-agents. codex
+and Antigravity still run their own tools inside their own processes, so no call they
+make passes this gate.
 
 - **Binary:** `INCORD_ENGINE_BIN`, then `engine_bin` in `admin.json`, then the engine's
   install location — `%LOCALAPPDATA%\Incord Memory\incord-memory-service.exe`, which is
@@ -335,18 +345,20 @@ its own tools inside its own process, so no call it makes passes this gate.
   workspace, the event JSON written to a PIPED stdin that is then closed — never an
   inherited one, which under `--acp` is the protocol stream — stdout and stderr piped,
   the tree contained by `process_tree` and bounded by `tools::bash::wait_with_timeout_or`.
-- **Bounds:** 610 s for `pre-tool`, `permission-request` and (pinned for later)
-  `capture` — the engine's own 600 s registration plus a margin, so the engine's
+- **Bounds:** 610 s for `pre-tool`, `permission-request` and `capture` — the engine's
+  own 600 s registration plus a margin, so the engine's
   deadline fires first. Not the operator hooks' 10 s. A stopped turn (the cancel token)
   ends a wait at once.
-- **Order in `Toolbox::run_call`:** the operator's guards → `hook pre-tool` → snapshot →
-  dispatch. A guard refusal never spawns the engine.
+- **Order in `Toolbox::run_call`:** schema → the protected-path guards → the permission
+  mode → the operator's pre-tool commands → `hook pre-tool` → snapshot → dispatch. A
+  refusal at any earlier step never spawns the engine.
 - **Replies:** exit 2 → refused, stderr is the reason (for `AskUserQuestion`, exit 2 is
   the owner's answer and returned as a NON-error result); exit 0 silent → run; exit 0
   `permissionDecision: allow` → run, and `additionalContext` is appended to the result;
   `ask` → the permission flow below; any other exit, a timeout, or a spawn failure →
-  **fail closed for `Write`/`Edit`/`Bash`, fail open for everything else** (owner's
-  decision).
+  **fail closed for record, change and run tools, fail open for observe and session
+  tools** (owner's decision; the reach of each tool is `toolbox::reach_of`, §5b — this
+  began as Write/Edit/Bash only).
 - **The permission flow (`Engine::settle`):** `hook permission-request` runs with the
   byte-identical `tool_input`, on a thread, while the session's `Prompter` asks here.
   The first answer wins and the loser is stopped (the hook's tree is killed; the prompt
@@ -457,34 +469,37 @@ That is why the fallback is traced rather than silent.
 | `roles.rs` | Which model serves which kind of work, with an ordered fallback and a warning when the reviewer shares the writer's lineage. |
 | `findings.rs` | **Work that produces information is judged by its artifact, never by the build.** A research task writes a findings file at a path fixed before it ran, and the check reads that file. It proves the deliverable exists and is not a shrug; it does not, and cannot, prove the findings are right. See `RUNNER.md` §6d. |
 | `wiring.rs` | **A capability nothing calls is not a capability.** Counts production mentions of every `pub fn`; a declaration mentioned only once is dead. Ratcheted, so the number can fall and never rise. See `CONVENTIONS.md` §13. |
-| `permissions.rs` | **What the session may do reaches every place that does it.** A mode governs the agent's file writing *and* the desktop: `-p read-only` means the agent may look at the screen and not touch it. The policy applies at `desktop::mcp::call_tool`, the one tool dispatcher left in this process. |
-| `hooks.rs` | **The operator can put their own command in front of an action.** Pre-tool hooks run on the desktop server and refuse with exit code 2; post-tool hooks run only for calls that happened and cannot deny. Bounded at 10s, because a hook runs between the agent asking and the screen moving. `hooks/engine.rs` is the other half: the memory engine's own hooks, run before each Toolbox call with a piped stdin and the engine's 600 s bounds — see §2, "The engine's hooks". |
+| `permissions.rs` | **What the session may do reaches every place that does it.** A mode governs every tool call *and* the desktop: `-p read-only` means the agent may look at the screen and not touch it. The policy applies in `Toolbox::run_call` for every tool (§5b), and again at `desktop::mcp::call_tool` in the desktop's executor. |
+| `hooks.rs` | **The operator can put their own command in front of an action.** Pre-tool hooks run before every Toolbox tool (the desktop's in its executor) and refuse with exit code 2; post-tool hooks run only for calls that happened and cannot deny. Bounded at 10s, because a hook runs between the agent asking and the screen moving. `hooks/engine.rs` is the other half: the memory engine's own hooks, run before each Toolbox call with a piped stdin and the engine's 600 s bounds — see §2, "The engine's hooks". |
 | `admin.rs` | One settings file, one precedence ladder, every value able to say which layer decided it. |
 | `research.rs` | A dependency the build links and the document never argued for is a decision nobody recorded. |
 | `identity.rs` | **The agent is the identity; the model is an attribute of the attempt.** A fallback changes what answered without changing who asked, so an identity built on the model would split one worker's history the first time a provider was busy. |
 
 ### The mechanical half
 
-`agent/` discovers an installed agent and drives it — `claude_code.rs` speaks its
-stream protocol, `worker.rs` hands it one ledger task at a time. `cli/` is the
-terminal, and `cli/agent_turn.rs` is one interactive turn. `tools/` is no longer a
-tool layer at all: it is what the harness does to a workspace **itself** — run the
-check, snapshot a tree so a turn can be undone, read the git context, report what is
-installed. `runtime/` is what outlived the loop: two error types, the token counter
-and the cancel flag.
+`agent/` discovers an installed agent and drives it as a model — `claude_code.rs`
+speaks its stream protocol and opens the tool bridge per turn, `api.rs` is the API
+route's own tool loop, `catalogue.rs` is the one list of agents, `worker.rs` hands one
+ledger task at a time. `cli/` is the terminal, and `cli/agent_turn.rs` is one
+interactive turn. `toolbox/` is the tool layer: every tool a model can call, behind
+one gate (§5b). `tools/` is what those tools and the harness do to a workspace — run
+the check, search, read documents, snapshot a tree so a turn can be undone, read the
+git context, report what is installed. `runtime/` holds two error types, the token
+counter and the cancel flag.
 
-`desktop/` and `team_mcp.rs` are the harness's two **MCP servers** — the only way a
-delegated agent gains a capability, since there is no model loop here to dispatch one.
-Both run as separate processes (`incode --desktop-mcp`, `incode --team-mcp`) so a crash
-in either cannot take a live session with it, and both are registered into a single
-`mcpServers` object because each config is a whole map and two of them means the second
-wins. See `COMPUTER_USE.md` and `TEAMWORK.md`.
+`tool_bridge.rs` (`incode --tool-server`) is how a bridged model reaches the toolbox
+(§5a). `desktop/` and `team_mcp.rs` are MCP servers that run as separate processes
+(`incode --desktop-mcp`, `incode --team-mcp`) so a crash in either cannot take a live
+session with it. Their tools are now Toolbox tools on the bridged and API routes; the
+servers are handed directly only to codex, which is not bridged. See
+`COMPUTER_USE.md` and `TEAMWORK.md`.
 
-**What used to be here and is not:** the harness's own agentic loop
+**What used to be here and was removed:** an earlier agentic loop
 (`ConversationRuntime`), its provider clients (`provider/`), its tool dispatch and
-permission tiers, its transcript and compaction. Around 12,000 lines. Every one of
-those things exists in the installed agent, done better, and keeping a second worse
-copy meant holding an API key to run it.
+permission tiers, and its compaction — around 12,000 lines, deleted when the harness
+first delegated everything to the installed agent. The tool layer and a smaller API
+loop have since come back in a different shape (§5a, §5b), because the models-only
+rule needs incode, not the CLI, to run every tool; compaction has not.
 
 ---
 
@@ -508,6 +523,11 @@ the line the user typed ─┬─► rules::context_for_turn ──► the owner
                                        │
                                        └─► dynamic context (rules FIRST)
 ```
+
+With the memory engine present, its `user-prompt` block replaces
+`rules::context_for_turn` for the turn, and its `session-start` block replaces the
+rules, recorder and auditor blocks at session start (§2, "The engine's session
+lifecycle").
 
 Rules go before recalled context because they govern how everything else is treated,
 and the block says in words that rules **are** instructions while everything else
@@ -606,10 +626,12 @@ yet") rather than routed to an endpoint nothing is known to answer.
 | `.incord/findings/<task>.md` | **agent** | one research task's answer, and the thing its check reads |
 | `.incord/brief.cache.json` | machine | the last complete brief, so an unreachable memory service does not stop a run |
 | `.incord/checkpoints/<session>/` | machine | each turn's "before", so `/undo` and `/rewind <n>` survive a restart (bounded: newest 20 turns, ≤ 256 MiB; a manifest naming a path outside the session's roots is not trusted) |
-| `.incord/agents/*.md` | **human** | the project's user-defined sub-agents (`~/.incord-code/agents/*.md` for every project); see §5c |
+| `.incord/agents/*.md` | **human** | the project's user-defined sub-agents (`~/.incord-code/agents/*.md` for every project); see §5b, "User-defined sub-agents" |
+| `.incord/transcripts/<session>.jsonl` | machine | the session's transcript in the memory engine's shape, when an engine is present or the session is an ACP one; newest 200 kept |
+| `.incord/context/` | machine | an oversized `session-start` / `user-prompt` block, written whole; newest 200 kept |
 | `<repo-parent>/worktrees/` | machine | one checkout per lane, removed after; the **branch is kept** |
 | `~/.incord-code/admin.json` | human sets once | model, roles, ceiling, check |
-| `~/.incord-code/sessions/` | machine | session transcripts |
+| `~/.incord-code/sessions/<workspace>.json` | machine | session pointers (the agent's conversation id, the model), one file per workspace — not transcripts |
 
 Finished work is also written to the **shared memory** every agent on this machine
 reads, under the subject `<project>#<agent-fingerprint>` — which turns "what has this
@@ -1083,9 +1105,10 @@ shape passes happily while the request goes nowhere.
 
 ## 8. What this architecture does not do
 
-- **It has never run against a live model.** No credential on the development machine.
-  Everything here compiles, passes its tests, and appears in the built binary; none of
-  it has completed a real task end to end.
+- **Live runs are partial.** The claude route has run live through the bridge, `-t`,
+  `--acp` and the memory lifecycle (§2, §5a, §5b record each measurement). codex could
+  not be run past its usage limit, the API route and the provider agents have no live
+  endpoint here, and `/run` has not completed a full roadmap end to end on record.
 - **Shell is not sandboxed** (mostly closed, phase 8). `guards.rs` catches direct textual
   routes to a protected file; a variable, a glob, or a script that writes on the agent's
   behalf gets past it. The OS sandbox (`src/sandbox`, §5b) now confines the shell where

@@ -10,6 +10,12 @@ transcript, compaction and permission tiers — around 12,000 lines that existed
 drive a raw model. An installed agent does all of it, on the operator's own
 subscription, and this harness holds no API credential at all.
 
+> **Superseded 2026-09-26 in one respect.** Under the models-only rule the CLI is only
+> the model, so incode runs every tool again — a new Toolbox, a tool bridge for claude,
+> and a small tool loop for the optional API route, whose key is read from the
+> environment and never stored. See §2 and `docs/ARCHITECTURE.md` §5a. The numbers in
+> this document are still those of 2026-09-01.
+
 Every number and claim in this document was verified against the current source.
 Nothing here is recalled or assumed. See [§10 Method](#10-how-this-was-produced) for
 how, and for the two things that could not be verified at all.
@@ -216,10 +222,13 @@ That is three separate failures wearing one coat:
 
 ## 2. What it is today
 
-`incode` is a Rust CLI that plans work, delegates it to an installed agent CLI on
-the operator's own subscription, and proves it was done. It holds no API credential
-and runs no agentic loop of its own — the agent it drives already has both, and does
-them better.
+`incode` is a Rust CLI that plans work, has a model do it, and proves it was done.
+**incode is the harness.** The installed agent CLIs — claude, codex and agy — are used
+only as models, headless, on the operator's own subscriptions; incode holds none of
+their logins. Every tool the model calls is incode's own and runs through incode's
+gate: the guards, the permission mode, the memory engine's pre-tool check and a
+checkpoint (`docs/ARCHITECTURE.md` §5a–§5b). As of 2026-09-26 that is complete for
+claude; codex and agy still run their own tools, watched by the sentinel.
 
 Three things separate it from a wrapper.
 

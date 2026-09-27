@@ -216,17 +216,14 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "/links <file>",
         "What else uses what this file defines, and what it depends on",
     ),
-    (
-        "/tools",
-        "Say where the tools live — the agent brings its own",
-    ),
+    ("/tools", "List the tools incode runs for this agent"),
     (
         "/skills",
         "List the skills this session loaded from the shared store",
     ),
     (
         "/mcp",
-        "Say where MCP servers are configured — in the agent's settings",
+        "Say where MCP servers connect — through incode's toolbox",
     ),
     (
         "/model [name]",
@@ -757,15 +754,20 @@ pub fn handle_roadmap(workspace: &std::path::Path) {
 /// The agent runs its own loop with its own tools, so listing this harness's
 /// would name things nothing calls. What the harness still does is said plainly
 /// instead of implied by an empty list.
-pub fn handle_delegated_tools(agent: &str) {
+/// `/tools`: the tools incode runs itself for this agent, or — for an agent
+/// whose CLI still uses its own tools — that plainly.
+pub fn handle_delegated_tools(agent: &str, offered: &[String]) {
     render::print_header("Tools");
-    outln!("  {agent} brings its own tools and runs its own loop.");
-    outln!("  This harness does not dispatch tools; it decides what is worth doing");
-    outln!("  and whether it was actually done:");
-    outln!("    · protected paths, enforced as deny rules the agent applies itself");
-    outln!("    · the check that settles whether a task is finished");
-    outln!("    · the contracts a change must honour");
-    outln!("    · the ledger, the budget, and the owner channel");
+    if offered.is_empty() {
+        outln!("  {agent} still runs its own tools on this route; incode checks the");
+        outln!("  result afterwards (protected paths, the check, the ledger).");
+    } else {
+        outln!("  incode runs every tool {agent} calls, through its own gate");
+        outln!("  (schema, guards, the memory engine, the permission mode):");
+        for chunk in offered.chunks(6) {
+            outln!("    {}", chunk.join(", "));
+        }
+    }
     outln!();
     outln!("  Installed on this machine:");
 }

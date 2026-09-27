@@ -849,23 +849,23 @@ impl CliApp {
                         );
                     }
                     SlashCommand::Tools => {
-                        // The agent brings its own tools and runs its own loop,
-                        // so listing this harness's would name things nothing
-                        // uses. What IS this harness's business is stated.
-                        slash_commands::handle_delegated_tools(&agent.display_name);
+                        // The tools incode runs itself for the current agent,
+                        // read from the backend so the list cannot drift.
+                        slash_commands::handle_delegated_tools(
+                            &agent.display_name,
+                            &session.offered_tools(),
+                        );
                         render::print_info(&tool_cache.summary_line());
                     }
                     SlashCommand::Skills => {
                         slash_commands::handle_skills_from_store(&incord_code_dir);
                     }
                     SlashCommand::Mcp => {
-                        // MCP servers are configured for the agent, in the
-                        // agent's own settings — not here. Saying so beats
-                        // printing an empty list this harness would never use.
-                        render::print_info(&format!(
-                            "MCP servers are configured in {}'s own settings and connect there, not in this harness.",
-                            agent.display_name
-                        ));
+                        // The model is started with only incode's own servers;
+                        // anything else connects through incode's toolbox.
+                        render::print_info(
+                            "MCP servers connect through incode: an ACP client's servers join the toolbox as mcp__<server>__<tool> and run through its gate. The model's own MCP settings are not loaded.",
+                        );
                     }
                     SlashCommand::Model(new_model) => {
                         match new_model.as_deref() {

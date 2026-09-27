@@ -330,6 +330,13 @@ impl AgentSession {
         self.backend.id()
     }
 
+    /// The tools incode runs itself for the current backend — empty for a
+    /// backend whose CLI still uses its own (see `docs/ARCHITECTURE.md` §5a).
+    #[must_use]
+    pub fn offered_tools(&self) -> Vec<String> {
+        self.backend.offered_tools()
+    }
+
     #[cfg(test)]
     #[must_use]
     pub fn with_backend(mut self, mut backend: Box<dyn AgentBackend>) -> Self {

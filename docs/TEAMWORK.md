@@ -101,6 +101,12 @@ incode --team-mcp --team-channel <path>
 
 Four tools: `team_ask`, `team_tell`, `team_answer`, `team_read`.
 
+> **Since 2026-09-25** these four are also Toolbox tools (`toolbox::team`, over the same
+> `team_mcp::Server`), so a bridged claude and the API route reach the channel through
+> incode's own gate, where the three that speak are `record` tools: refused read-only
+> and refused when the memory engine cannot decide. The separate `--team-mcp` server
+> is now handed only to codex, which still runs its own tools (`ARCHITECTURE.md` §5a).
+
 ### Identity comes from the environment, never the caller
 
 A tool that took `from` as an argument would let an agent file its words under

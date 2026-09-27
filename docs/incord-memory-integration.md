@@ -10,7 +10,29 @@ Every claim cites `file:line`. Paths under `src/` are incord-code unless prefixe
 for this audit, or by the engine contract stated in the task, is marked
 **UNVERIFIED**.
 
-## Build status (phases 2–4, 2026-09-25)
+## Final status (2026-09-26, HEAD `b39a99e`)
+
+This table is the current state. The phase tables under it are the build record,
+and sections 0–9 are the audit as it was written before any of it was built; where
+they disagree with this table, this table is right.
+
+| # | Feature | Status | Where |
+|---|---|---|---|
+| 1 | `pre-tool` guard | **DONE** for every call that goes through incode's Toolbox: the claude route (over the tool bridge) and the API route, including the `Agent` tool's sub-agents, the desktop tools, `Screenshot`, `RenderPdf`, `ConvertDocument` and an ACP client's MCP tools. **Not** for codex or agy, which still run their own tools. Order: schema → guards → permission mode → operator hooks → `pre-tool` → checkpoint → dispatch. | `src/hooks/engine.rs`, `Toolbox::run_call` |
+| 1 | Failure policy | An engine that fails, times out or is missing where one was named: **record, change and run** tools are refused (fail closed); **observe and session** tools run, traced (fail open). One table decides it (`toolbox::reach_of`, `d80b02a`), replacing the earlier Write/Edit/Bash rule. | `src/toolbox/mod.rs` |
+| 2 | `AskUserQuestion` | **DONE** as a Toolbox tool of that exact name. Exit 2 is the owner's answer from the app (a non-error result); otherwise the terminal's one-key menu; under ACP or unattended the model is told it went unanswered, with its options. **Open (app side):** a question card; the app answers every agent request but `session/request_permission` with `-32601`. | `src/toolbox/mod.rs`, `src/ask.rs` |
+| 3 | Stop channel (`capture`) | **DONE** on every route, at the end of every turn. A `block` reply is sent to the same backend as the next prompt; at most `MAX_CONTINUATIONS` (3) per turn; never after a cancel. | `src/hooks/memory.rs` |
+| 4 | `permission-request` | **DONE** on the `ask` branch, with byte-identical `tool_input`, raced against the terminal or the ACP client's Allow/Reject card; first answer wins; with nobody there, a refusal. **Open (app side):** the card cannot be withdrawn when the hook answers first; its late answer is dropped. | `Engine::settle`, `acp_agent::permission` |
+| 5a | `session-start` / `user-prompt` | **DONE** (Option A) on every route: the blocks replace incode's native rules, recorder and auditor blocks. Oversized blocks go to `.incord/context/` with the head inline. Cost measured: about 8.2 s per turn for `user-prompt`. | `src/hooks/memory.rs`, `cli::prepare_session`, `cli::plan_turn` |
+| 5b | `code-edit` | **DONE** after every change tool that landed (once per file for a patch; the output path for `RenderPdf` and `ConvertDocument`), on its own thread. | `Toolbox::run_call` |
+| 5c | `pre-compact` | **NOT APPLICABLE.** incode never compacts; `run_on_compact` is allowlisted in `wiring.rs` with that reason. | — |
+| 5d | `session-end` | **DONE**: REPL exit, `/clear` (old id), ACP `session/close` and shutdown, the end of `-t`, and each `/run` worker. | `src/hooks/memory.rs`, `cli::run_memory` |
+| 6 | Background-work awareness | **DONE**: `capture` is not sent while a background job (the model's or `/bg`) runs. | `SessionTools`, `src/hooks/memory.rs` |
+| — | Session id | incode's own (the ACP `sessionId`, or a v4 UUID), given to every backend, the toolbox and the model. | `AgentBackend::set_memory_session` |
+| — | Transcript | `.incord/transcripts/<session>.jsonl` in the engine's shape, when an engine is present or the session is an ACP one; newest 200 kept. | `src/hooks/memory.rs` |
+| — | `/run` workers | Each worker (sequential, and each lane) is a memory session of its own. | `cli::run_memory` |
+| — | Recording a session twice | claude: its settings and hooks are off. codex: `--disable hooks` (`b39a99e`). **agy** has no switch to skip its settings, so if its hooks file is installed the engine may still hear an agy session twice. | `src/agent/codex.rs` |
+| — | Operator hooks | The operator's `hooks` (alias `desktop_hooks`) run around every Toolbox tool, before the engine. | `hooks::HookRunner` |
 
 ### Phase 8 (2026-09-26) — CLI parity and the OS sandbox
 
@@ -31,7 +53,7 @@ for this audit, or by the engine contract stated in the task, is marked
 | § | Feature | Status |
 |---|---|---|
 | 2 | Shared engine-hook runner | **DONE** — `src/hooks/engine.rs`. Piped-and-closed stdin, piped stdout/stderr, `process_tree` + `tools::bash::wait_with_timeout_or`, bounds 610 s for pre-tool / permission-request / capture. Binary: `INCORD_ENGINE_BIN` → `AdminConfig.engine_bin` → install location (see the correction under §2). Phase 4 added `session-start`, `user-prompt`, `code-edit` (bound 70 s), `capture` (610 s) and `session-end` (130 s). |
-| 3 | Pre-tool guard | **DONE** in `Toolbox::run_call`: operator guards → engine → snapshot → dispatch. Failure policy taken by the owner: fail CLOSED for `Write`/`Edit`/`Bash`, fail OPEN for the rest. |
+| 3 | Pre-tool guard | **DONE** in `Toolbox::run_call`: operator guards → engine → snapshot → dispatch. Failure policy taken by the owner: fail CLOSED for `Write`/`Edit`/`Bash`, fail OPEN for the rest. (Widened in `d80b02a`: every record, change and run tool fails closed — see the final table.) |
 | 4 | `AskUserQuestion` tool | **DONE** — Toolbox tool of that exact name. Exit 2 = the owner's answer, returned as a non-error result. Exit 0: the REPL answers with a one-key menu; under ACP and unattended the model is told it went unanswered (the owner's app has no question/elicitation request — see §4). |
 | 5 | Stop channel | **DONE (phase 4)**, on every route, from `AgentSession::turn_observed` and `task_run` (not from `ApiBackend` as §5 first proposed, so that the CLI routes get it too). `hook capture` with `last_assistant_message`, `stop_hook_active` and `transcript_path`; a `block` reply is sent to the same backend as the next prompt; cap `MAX_CONTINUATIONS` = 3 per turn; not spawned once the turn was stopped. |
 | 6 | PermissionRequest | **DONE**, on the pre-tool `ask` branch only, with a byte-identical `tool_input`, racing the REPL prompt or the ACP client's `session/request_permission`; unattended, silence is a refusal. |
@@ -65,6 +87,7 @@ claude route created `a.txt`, and the service then answered
 `code-edit`), and `GET /v1/memory/session/catchup?cwd=<workspace>` with the request.
 Codex and antigravity still load their own hooks files, so on those routes the engine
 may hear a session twice — once from incode, once from the CLI under the CLI's id.
+(Closed for codex in phase 8: it runs with `--disable hooks`. Still true for agy.)
 
 **Phase 6b (2026-09-25).** Three more kinds of call now pass the engine's pre-tool hook,
 because they are Toolbox tools: the desktop's twelve tools (previously run in
@@ -132,6 +155,10 @@ The engine's per-agent reply shapes are keyed by a flag (`engine:cli/hook_agent.
 ---
 
 ## 1. Summary
+
+> **Historical.** This table is the audit's starting point on 2026-09-24. Every
+> MISSING and PARTIAL row below has since been built or ruled not applicable; the
+> current state is the "Final status" table at the top of this document.
 
 | # | Feature | Status (incord-code's own loop) | Evidence |
 |---|---|---|---|

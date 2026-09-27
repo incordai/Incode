@@ -36,7 +36,7 @@
 //!   force for the command and everything it starts. Unprivileged; sound.
 //! - **macOS** — `sandbox-exec` with a generated Seatbelt profile. Sound; the
 //!   tool is marked deprecated by Apple but present and working.
-//! - **Windows** — see [`windows`]. Read-only is enforced with a low-integrity
+//! - **Windows** — see [`windows`]. Read-only is enforced with a write-restricted
 //!   token; workspace-write cannot be done soundly without changing the
 //!   workspace's ACL, so it is left OFF with the reason stated, rather than
 //!   pretended.

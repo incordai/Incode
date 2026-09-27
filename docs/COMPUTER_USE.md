@@ -1,5 +1,10 @@
 # Incord Code — Computer Use
 
+> **Status note, 2026-09-26.** The first line below is out of date. The Windows desktop
+> (`src/desktop/`) is built, and its twelve tools are Toolbox tools behind incode's
+> gate, executed by `incode --desktop-mcp` (`ARCHITECTURE.md` §5b, "The desktop").
+> macOS (Phase C) and Linux/Xvfb (Phase D) are still open (`ROADMAP.md` B1).
+
 **Status: DESIGN ONLY. Nothing in this document is implemented.** Every claim about the
 existing tree cites a file and was measured on 2026-09-16. Every claim about a crate's
 API is marked UNVERIFIED and must be compiled against before it is pinned.
