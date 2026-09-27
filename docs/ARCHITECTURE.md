@@ -1062,6 +1062,11 @@ the msys runtime GLOBS an unquoted argument from a Windows parent; PowerShell ge
 `-NoProfile -NonInteractive -Command <script>` with UTF-8 output and progress off (not
 `-EncodedCommand`, which makes Windows PowerShell write its errors as CLIXML).
 
+**Nothing is typed into a command.** A foreground command's stdin is the null device,
+as a background job's already was: in the REPL this process's stdin is the person's
+terminal, and a command that read from it (`read x`) held it until its timeout. Now
+`read` sees end of input at once (`a_command_that_reads_input_is_not_handed_ours`).
+
 **Git Bash cannot run under the Windows token.** Measured: every msys program started
 under the write-restricted token died at once with `CreateFileMapping <user SID>.1,
 Win32 error 5` — the msys runtime maps a per-user shared section that the user's other

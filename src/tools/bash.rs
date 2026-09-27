@@ -56,8 +56,12 @@ pub fn execute_bash_watched(
     let shell = super::shell_choice::for_sandbox(sandbox).map_err(|why| anyhow::anyhow!(why))?;
     let mut child = sandbox.wrap(&shell, command);
 
+    // Nothing is typed into a tool's command: its stdin is the null device,
+    // so one that waits for input sees end of input at once instead of
+    // holding the terminal the REPL reads from until its timeout.
     child
         .current_dir(workspace)
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
@@ -635,5 +639,75 @@ mod tests {
             !filtered.contains(marker),
             "with filtering on it must not; got: {filtered}"
         );
+    }
+
+    /// Set only in the child [`a_command_that_reads_input_is_not_handed_ours`]
+    /// starts.
+    const STDIN_CHILD: &str = "INCODE_BASH_STDIN_CHILD";
+
+    /// The child half: runs a command that reads a line, with this process's
+    /// stdin a pipe its parent holds open and never writes, and prints what
+    /// the tool said. Returns at once — passing — unless started as the
+    /// child.
+    #[test]
+    fn bash_stdin_child() {
+        if std::env::var_os(STDIN_CHILD).is_none() {
+            return;
+        }
+        let command = either(
+            "read x; echo got",
+            "[Console]::In.ReadLine() | Out-Null; echo got",
+        );
+        let input = serde_json::json!({ "command": command, "timeout": 15_000 }).to_string();
+        let said = execute_bash_watched(
+            Path::new("."),
+            &input,
+            false,
+            &no_sandbox(),
+            &|| false,
+            &mut |_| {},
+        );
+        println!("TOOL-SAID: {said:?}");
+        std::process::exit(0);
+    }
+
+    /// **A COMMAND THAT WAITS FOR INPUT IS NOT HANDED THE TERMINAL.** In the
+    /// REPL this process's stdin is the person's terminal: a foreground
+    /// command that read from it hung until its timeout. Its stdin is the null
+    /// device, so `read` sees end of input at once. The child's stdin here is
+    /// a pipe held open and never written — what a terminal nobody types into
+    /// looks like to `read`.
+    #[test]
+    fn a_command_that_reads_input_is_not_handed_ours() {
+        use std::io::Read as _;
+        let mut child = std::process::Command::new(std::env::current_exe().expect("exe"))
+            .args([
+                "--exact",
+                "tools::bash::tests::bash_stdin_child",
+                "--nocapture",
+                "--test-threads=1",
+                "-q",
+            ])
+            .env(STDIN_CHILD, "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn");
+        // Held open, never written, until the child is done.
+        let held = child.stdin.take();
+        let began = std::time::Instant::now();
+        let mut out = String::new();
+        child
+            .stdout
+            .take()
+            .expect("stdout")
+            .read_to_string(&mut out)
+            .expect("read");
+        let _ = child.wait();
+        drop(held);
+        let took = began.elapsed();
+        assert!(out.contains("TOOL-SAID: Ok(\"got"), "{out}");
+        assert!(took < Duration::from_secs(10), "took {took:?}: {out}");
     }
 }

@@ -71,7 +71,9 @@ This is fully true for claude; section 0b says what is not.
   and discovery 1.5 s together. Open: run `session-start` off the answer too.
 - **The `Bash` tool's shell on Windows.** Fixed: it was cmd.exe; it is now Git Bash
   (or `INCODE_SHELL` / `admin.json` `shell`), else PowerShell, and its description
-  names the shell (`ARCHITECTURE.md`, "Which shell"). Open: under the Windows sandbox
+  names the shell (`ARCHITECTURE.md`, "Which shell"). A foreground command's stdin
+  is now the null device, so one that waits for input no longer holds the REPL's
+  terminal until its timeout. Open: under the Windows sandbox
   token Git Bash cannot start (msys maps a per-user shared section the token may not
   write), so a read-only session — and a named workspace-write one — runs PowerShell.
   Running msys under the token would mean granting that section to the session SID.
