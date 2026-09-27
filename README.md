@@ -312,15 +312,17 @@ see only a placeholder such as `[image 1280x720 png]`.
 - **Headless browser (`incord-browser`).** Looked for in `INCODE_BROWSER` (only
   there when set), then `admin.json` `browser_bin` (only there when set), then
   `PATH` as `obscura` or `incord-browser`. Found, it adds `Screenshot`,
-  `WebFetch`'s `render_js`, and the image-only fallback for `RenderPdf`. Not
+  `WebFetch`'s `render_js`, and a printer for `RenderPdf`. Not
   found, those are not offered and nothing else changes. incode checks every
   address before the browser starts and never passes it
   `--allow-private-network`.
-- **`RenderPdf` printer.** A system Chromium-family browser — `INCODE_PDF_BROWSER`
-  (only there when set), then `PATH`, then the standard install paths — which
-  gives PDFs with real text; otherwise the headless browser's PDF, and the
-  result says it is image-only. `admin.json` `pdf_renderer`: `auto` (default),
-  `chromium` or `incord-browser`.
+- **`RenderPdf` printer.** The headless browser when its PDFs carry text —
+  measured once per session by printing a probe page and reading its text back —
+  otherwise a system Chromium-family browser (`INCODE_PDF_BROWSER`, only there
+  when set, then `PATH`, then the standard install paths). A headless browser
+  whose probe found no text still prints when it is the only printer, and the
+  result says the PDF is image-only. `admin.json` `pdf_renderer`: `auto`
+  (default), `chromium` or `incord-browser`.
 - **LibreOffice.** `INCODE_SOFFICE` (only there when set), then `PATH`, then the
   platform's install paths.
 

@@ -404,26 +404,136 @@ fn render_pdf_with_the_system_browser_has_extractable_text() {
     );
 }
 
-/// **WITHOUT A SYSTEM BROWSER, INCORD-BROWSER PRINTS — AND SAYS THE PDF IS
-/// IMAGE-ONLY.**
+/// **INCORD-BROWSER'S PDF IS WHAT ITS PROBE SAYS IT IS.** A build that prints
+/// text: no image-only note, and Read returns the page's words. A build that
+/// prints pictures: the note, and no words. Either way the probe and Read
+/// agree — the probe is what decides the note and the `auto` order.
 #[test]
-fn render_pdf_falls_back_to_the_headless_browser_and_says_image_only() {
+fn render_pdf_with_the_headless_browser_matches_its_probe() {
     let Some(bin) = browser::tests::test_browser() else {
         return;
     };
     let ws = tempfile::tempdir().expect("ws");
     std::fs::write(ws.path().join("article.html"), ARTICLE).expect("seed");
-    let tools = Toolbox::new(ws.path(), true).with_browser(Some(bin));
+    let tools = Toolbox::new(ws.path(), true).with_browser(Some(bin.clone()));
     let said = tools
         .run(
             RENDER_PDF,
             &json!({"path": "article.html", "output": "article.pdf"}),
         )
         .expect("printed");
-    assert!(said.contains("IMAGE-ONLY"), "{said}");
-    assert!(said.contains("#11"), "{said}");
+    let ability = browser::print_ability(&tools.state.browsers, &bin, true).expect("probed");
+    eprintln!("probe of {}: {ability:?}", bin.display());
+    assert!(said.contains("with incord-browser"), "{said}");
     let bytes = std::fs::read(ws.path().join("article.pdf")).expect("written");
     assert!(bytes.starts_with(b"%PDF"));
+    let read = tools
+        .run(READ, &json!({"path": "article.pdf"}))
+        .expect("read back");
+    if ability.text {
+        assert!(!said.contains("IMAGE-ONLY"), "{said}");
+        assert!(
+            read.contains("SELECTABLEWORDS"),
+            "no text in the PDF: {read}"
+        );
+    } else {
+        assert!(said.contains("IMAGE-ONLY"), "{said}");
+        assert!(!read.contains("SELECTABLEWORDS"), "{read}");
+    }
+}
+
+/// **`AUTO` WITH BOTH PRINTERS INSTALLED ALWAYS GIVES A PDF WITH TEXT**: by
+/// incord-browser when its probe found text, else by the system browser.
+#[test]
+fn render_pdf_auto_prints_text_with_the_right_printer() {
+    let Some(bin) = browser::tests::test_browser() else {
+        return;
+    };
+    let Some(edge) = pdf::find_chromium(&|name| std::env::var_os(name)) else {
+        eprintln!("SKIPPED: no system browser to print with — this test did not run");
+        return;
+    };
+    let ws = tempfile::tempdir().expect("ws");
+    std::fs::write(ws.path().join("article.html"), ARTICLE).expect("seed");
+    let printer = pdf::choose(
+        crate::admin::PdfRenderer::Auto,
+        Some(edge.clone()),
+        Some(bin.clone()),
+    );
+    let tools = Toolbox::new(ws.path(), true).with_printer(Some(bin.clone()), printer);
+    let said = tools
+        .run(
+            RENDER_PDF,
+            &json!({"path": "article.html", "output": "article.pdf"}),
+        )
+        .expect("printed");
+    let ability = browser::print_ability(&tools.state.browsers, &bin, true).expect("probed");
+    let system = edge
+        .file_stem()
+        .expect("a program name")
+        .to_string_lossy()
+        .into_owned();
+    if ability.text {
+        assert!(said.contains("with incord-browser"), "{said}");
+    } else {
+        assert!(said.contains(&format!("with {system}")), "{said}");
+    }
+    assert!(!said.contains("IMAGE-ONLY"), "{said}");
+    let read = tools
+        .run(READ, &json!({"path": "article.pdf"}))
+        .expect("read back");
+    assert!(
+        read.contains("SELECTABLEWORDS"),
+        "no text in the PDF: {read}"
+    );
+}
+
+/// The first page's `/MediaBox` width and height in points, rounded.
+fn media_box(pdf: &[u8]) -> Option<(i64, i64)> {
+    let text = String::from_utf8_lossy(pdf);
+    let at = text.find("/MediaBox")?;
+    let inside = text[at..].split_once('[')?.1.split_once(']')?.0;
+    let numbers: Vec<f64> = inside
+        .split_whitespace()
+        .filter_map(|n| n.parse().ok())
+        .collect();
+    match numbers.as_slice() {
+        [x0, y0, x1, y1] => Some(((x1 - x0).round() as i64, (y1 - y0).round() as i64)),
+        _ => None,
+    }
+}
+
+/// **A PAGE'S OWN `@page` SIZE IS HONOURED** by an incord-browser whose probe
+/// found `preferCSSPageSize` supported — as the system browser's print does —
+/// and Letter otherwise.
+#[test]
+fn render_pdf_with_the_headless_browser_honours_the_page_size_it_can() {
+    let Some(bin) = browser::tests::test_browser() else {
+        return;
+    };
+    let ws = tempfile::tempdir().expect("ws");
+    std::fs::write(
+        ws.path().join("slide.html"),
+        "<!doctype html><html><head><style>@page{size:13.333in 7.5in;margin:0}</style>\
+         </head><body><h1>Wide slide</h1></body></html>",
+    )
+    .expect("seed");
+    let tools = Toolbox::new(ws.path(), true).with_browser(Some(bin.clone()));
+    tools
+        .run(
+            RENDER_PDF,
+            &json!({"path": "slide.html", "output": "slide.pdf"}),
+        )
+        .expect("printed");
+    let ability = browser::print_ability(&tools.state.browsers, &bin, true).expect("probed");
+    let bytes = std::fs::read(ws.path().join("slide.pdf")).expect("written");
+    let size = media_box(&bytes).expect("a media box");
+    let want = if ability.css_page_size {
+        (960, 540)
+    } else {
+        (612, 792)
+    };
+    assert_eq!(size, want, "{ability:?}");
 }
 
 /// **THE GUARDS SEE THE PDF'S PATH**, and a protected one is refused before

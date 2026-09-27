@@ -2,20 +2,26 @@
 //!
 //! # Which program prints it
 //!
-//! A system headless browser that prints to PDF from the command line (the
-//! `chromium` setting below) when one is installed: its PDF carries real,
-//! selectable text. Looked for like LibreOffice is: the
+//! The owner's `incord-browser`, over DevTools `Page.printToPDF`, when its
+//! PDFs carry text. Whether they do is MEASURED, once per session, never read
+//! off a version: [`super::browser::print_ability`] prints a probe page and
+//! reads its text back the way Read reads a PDF. A build from before
+//! incordai/incord-browser#11 was fixed printed pictures of the page, with no
+//! text to select, search or extract; a build with the fix prints a text
+//! layer over the page, laid out again for the paper as a system browser
+//! does (measured: the same two Letter pages as Edge for one article, 1864
+//! characters extracted where Edge gives 1884).
+//!
+//! Otherwise a system headless browser that prints to PDF from the command
+//! line: Edge or Chrome. Looked for like LibreOffice is: the
 //! `INCODE_PDF_BROWSER` override (and ONLY there when it is set), then `PATH`,
 //! then each platform's standard install locations.
 //!
-//! Otherwise the owner's `incord-browser`, over DevTools `Page.printToPDF`.
-//! Its PDF is pictures of the page today — every glyph is drawn as an image,
-//! so the text cannot be selected or searched (incordai/incord-browser#11) —
-//! and the result says so every time.
-//!
-//! `admin.json` `pdf_renderer` picks: `"auto"` (the default: the system
-//! browser, else incord-browser), `"chromium"` or `"incord-browser"` (only
-//! that one). The owner flips it to `"incord-browser"` once #11 is fixed.
+//! `admin.json` `pdf_renderer` picks: `"auto"` (the default: incord-browser
+//! when its PDFs carry text, else the system browser, else incord-browser
+//! with a note that its PDF is image-only), `"chromium"` or
+//! `"incord-browser"` (only that one). Whenever incord-browser printed a PDF
+//! the probe found no text in, the result says so.
 //!
 //! # How it is run
 //!
@@ -32,25 +38,30 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use super::browser::{Browsers, Page};
+use super::browser::{self, Browsers, Page, PrintAbility};
 use crate::admin::PdfRenderer;
 
 /// Names the system headless browser to print with, overriding the search.
 pub const PDF_BROWSER_ENV: &str = "INCODE_PDF_BROWSER";
 /// How long one print may run before its process tree is killed.
 pub const PDF_DEADLINE: Duration = Duration::from_secs(120);
-/// What the result says whenever the image-only printer was used.
-const IMAGE_ONLY: &str = "NOTE: printed by incord-browser, whose PDF is IMAGE-ONLY today — \
-    the page is pictures, and its text cannot be selected, searched or extracted \
-    (incordai/incord-browser#11).";
+/// What the result says when incord-browser printed and its probe page came
+/// back without text.
+const IMAGE_ONLY: &str = "NOTE: printed by incord-browser, whose PDF is IMAGE-ONLY — a probe \
+    page it printed this session had no text layer, so this page is pictures and its text \
+    cannot be selected, searched or extracted. A build with incordai/incord-browser#11 fixed \
+    prints text.";
 
 /// The program a print goes to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Printer {
-    /// A system headless browser; text PDFs.
+    /// A system headless browser.
     Chromium(PathBuf),
-    /// The owner's headless browser; image-only PDFs.
+    /// The owner's headless browser, whatever its PDFs are.
     IncordBrowser(PathBuf),
+    /// `auto` with both installed: the owner's browser when its PDFs carry
+    /// text, else the system browser — decided by the session's probe.
+    Either { browser: PathBuf, chromium: PathBuf },
 }
 
 /// Which printer the setting picks from what is installed, or `None` when
@@ -61,11 +72,33 @@ pub(super) fn choose(
     browser: Option<PathBuf>,
 ) -> Option<Printer> {
     match setting {
-        PdfRenderer::Auto => chromium
-            .map(Printer::Chromium)
-            .or_else(|| browser.map(Printer::IncordBrowser)),
+        PdfRenderer::Auto => match (browser, chromium) {
+            (Some(browser), Some(chromium)) => Some(Printer::Either { browser, chromium }),
+            (Some(browser), None) => Some(Printer::IncordBrowser(browser)),
+            (None, chromium) => chromium.map(Printer::Chromium),
+        },
         PdfRenderer::Chromium => chromium.map(Printer::Chromium),
         PdfRenderer::IncordBrowser => browser.map(Printer::IncordBrowser),
+    }
+}
+
+/// Whether `auto` prints with the owner's browser, given what its probe
+/// measured: only when its PDFs carry text. A probe that failed says nothing
+/// good about the browser, so the system browser prints.
+fn owner_first(ability: &Result<PrintAbility, String>) -> bool {
+    matches!(ability, Ok(PrintAbility { text: true, .. }))
+}
+
+/// The note a print by the owner's browser carries, from its probe: none
+/// when its PDFs carry text.
+fn owner_note(ability: &Result<PrintAbility, String>) -> Option<String> {
+    match ability {
+        Ok(PrintAbility { text: true, .. }) => None,
+        Ok(_) => Some(IMAGE_ONLY.to_string()),
+        Err(why) => Some(format!(
+            "NOTE: printed by incord-browser, whose PDFs could not be checked for a text layer \
+             this session ({why}); this PDF may be image-only."
+        )),
     }
 }
 
@@ -186,32 +219,107 @@ pub(super) fn run(
     }
     let page = Page::from_input(input, resolve)?;
     let target = resolve(&named)?;
-    let (bytes, note) = match printer {
-        Printer::Chromium(bin) => (print_with_chromium(bin, &page, filter_env)?, None),
-        Printer::IncordBrowser(bin) => (
-            super::browser::print_pdf(browsers, bin, &page, filter_env)?,
-            Some(IMAGE_ONLY),
-        ),
+    let printed = match printer {
+        Printer::Chromium(bin) => with_chromium(bin, &page, filter_env)?,
+        Printer::IncordBrowser(bin) => with_owner(browsers, bin, &page, filter_env)?,
+        Printer::Either { browser, chromium } => {
+            let ability = browser::print_ability(browsers, browser, filter_env);
+            if owner_first(&ability) {
+                // The owner's browser first; the system browser when it
+                // cannot print this page, and the result says why.
+                match with_owner(browsers, browser, &page, filter_env) {
+                    Ok(printed) => printed,
+                    Err(why) => {
+                        let mut printed = with_chromium(chromium, &page, filter_env)?;
+                        printed.note = Some(format!(
+                            "NOTE: incord-browser could not print it ({why}), so {} did.",
+                            printed.by
+                        ));
+                        printed
+                    }
+                }
+            } else {
+                with_chromium(chromium, &page, filter_env)?
+            }
+        }
     };
-    if !bytes.starts_with(b"%PDF") {
-        return Err("the browser produced something that is not a PDF".to_string());
-    }
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
     }
-    std::fs::write(&target, &bytes)
+    std::fs::write(&target, &printed.bytes)
         .map_err(|e| format!("could not write {}: {e}", target.display()))?;
     let mut said = format!(
-        "Printed {} to {} ({} bytes).",
+        "Printed {} to {} ({} bytes) with {}.",
         page_name(&page),
         target.display(),
-        bytes.len()
+        printed.bytes.len(),
+        printed.by
     );
-    if let Some(note) = note {
+    if let Some(note) = printed.note {
         said.push(' ');
-        said.push_str(note);
+        said.push_str(&note);
     }
     Ok(said)
+}
+
+/// A PDF, which program printed it, and what the result must add.
+struct Printed {
+    bytes: Vec<u8>,
+    by: String,
+    note: Option<String>,
+}
+
+/// Anything that is not a PDF is refused, whoever printed it.
+fn checked(bytes: Vec<u8>) -> Result<Vec<u8>, String> {
+    if bytes.starts_with(b"%PDF") {
+        Ok(bytes)
+    } else {
+        Err("the browser produced something that is not a PDF".to_string())
+    }
+}
+
+/// A print by the system browser, named by its program.
+fn with_chromium(bin: &Path, page: &Page, filter_env: bool) -> Result<Printed, String> {
+    let bytes = checked(print_with_chromium(bin, page, filter_env)?)?;
+    let by = bin
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| bin.display().to_string());
+    Ok(Printed {
+        bytes,
+        by,
+        note: None,
+    })
+}
+
+/// A print by the owner's browser, with the page's own `@page` size when the
+/// probe found it honoured, and the note its probe calls for.
+fn with_owner(
+    browsers: &Mutex<Browsers>,
+    bin: &Path,
+    page: &Page,
+    filter_env: bool,
+) -> Result<Printed, String> {
+    let ability = browser::print_ability(browsers, bin, filter_env);
+    let css_page_size = matches!(
+        ability,
+        Ok(PrintAbility {
+            css_page_size: true,
+            ..
+        })
+    );
+    let bytes = checked(browser::print_pdf(
+        browsers,
+        bin,
+        page,
+        filter_env,
+        css_page_size,
+    )?)?;
+    Ok(Printed {
+        bytes,
+        by: "incord-browser".to_string(),
+        note: owner_note(&ability),
+    })
 }
 
 fn page_name(page: &Page) -> String {
@@ -294,12 +402,20 @@ mod tests {
     }
 
     /// **THE SWITCH PICKS THE PRINTER, AND A MISSING ONE IS NOT SUBSTITUTED.**
+    /// `auto` with both installed defers to the probe.
     #[test]
     fn the_switch_picks_the_printer() {
         let edge = Some(PathBuf::from("edge"));
         let ours = Some(PathBuf::from("obscura"));
         assert_eq!(
             choose(PdfRenderer::Auto, edge.clone(), ours.clone()),
+            Some(Printer::Either {
+                browser: "obscura".into(),
+                chromium: "edge".into()
+            })
+        );
+        assert_eq!(
+            choose(PdfRenderer::Auto, edge.clone(), None),
             Some(Printer::Chromium("edge".into()))
         );
         assert_eq!(
@@ -313,6 +429,30 @@ mod tests {
         assert_eq!(choose(PdfRenderer::IncordBrowser, edge.clone(), None), None);
         assert_eq!(choose(PdfRenderer::Chromium, None, Some("o".into())), None);
         assert_eq!(choose(PdfRenderer::Auto, None, None), None);
+    }
+
+    /// **`AUTO` PRINTS WITH THE OWNER'S BROWSER ONLY WHEN ITS PROBE FOUND
+    /// TEXT, AND THE IMAGE-ONLY NOTE GOES WITH EXACTLY THE OTHER CASES.**
+    #[test]
+    fn the_probe_decides_the_order_and_the_note() {
+        let text = Ok(PrintAbility {
+            text: true,
+            css_page_size: true,
+        });
+        let pictures = Ok(PrintAbility {
+            text: false,
+            css_page_size: false,
+        });
+        let failed: Result<PrintAbility, String> = Err("did not start".to_string());
+        assert!(owner_first(&text));
+        assert!(!owner_first(&pictures));
+        assert!(!owner_first(&failed));
+        assert_eq!(owner_note(&text), None);
+        let image_only = owner_note(&pictures).expect("a note");
+        assert!(image_only.contains("IMAGE-ONLY"), "{image_only}");
+        let unknown = owner_note(&failed).expect("a note");
+        assert!(unknown.contains("did not start"), "{unknown}");
+        assert!(unknown.contains("image-only"), "{unknown}");
     }
 
     #[test]

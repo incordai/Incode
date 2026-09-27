@@ -1,5 +1,5 @@
 //! The owner's headless browser, `incord-browser`: pages that need their
-//! script run, pictures of pages, and the image-only PDF fallback.
+//! script run, pictures of pages, and pages printed to PDF.
 //!
 //! # Found, or not offered
 //!
@@ -13,7 +13,7 @@
 //!
 //! - `obscura fetch <url> --dump html --quiet --timeout <n>` for `WebFetch`:
 //!   one child per call, bounded, its whole tree killed at the deadline.
-//! - `obscura serve` for Screenshot and the PDF fallback: started lazily, once
+//! - `obscura serve` for Screenshot and RenderPdf: started lazily, once
 //!   per session, on a loopback port picked here, and driven over DevTools
 //!   ([`super::cdp`]). It is killed, with its tree, when the session's tools
 //!   are dropped. A second instance with `--allow-file-access` is started
@@ -303,12 +303,33 @@ fn font_dirs() -> Vec<PathBuf> {
     dirs
 }
 
+/// What this browser's `Page.printToPDF` gives, measured by printing
+/// [`PROBE_PAGE`] — never assumed from a version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct PrintAbility {
+    /// Its PDF has a text layer Read extracts. Builds before
+    /// incordai/incord-browser#11 was fixed print pictures only.
+    pub(super) text: bool,
+    /// It honours `preferCSSPageSize` (a page's `@page { size }`, as the
+    /// system browser's print does) rather than refusing it with -32601.
+    pub(super) css_page_size: bool,
+}
+
+/// The word the probe page carries, looked for in its printed text.
+const PROBE_WORD: &str = "INCODEPRINTPROBE";
+/// A page carrying [`PROBE_WORD`], as a `data:` address: it needs no file
+/// access and no network, so the instance that reads the web prints it.
+const PROBE_PAGE: &str = "data:text/html,%3C!doctype%20html%3E%3Cp%3EINCODEPRINTPROBE%3C%2Fp%3E";
+
 /// The session's `serve` processes: one for the web, one allowed to read
 /// files. Each is started the first time it is needed.
 #[derive(Default)]
 pub(super) struct Browsers {
     web: Option<Served>,
     files: Option<Served>,
+    /// What printing gives, once measured this session — or why it could not
+    /// be.
+    print: Option<Result<PrintAbility, String>>,
 }
 
 impl Browsers {
@@ -488,13 +509,73 @@ pub(super) fn screenshot(
     Ok(ToolOutput::with_image(text, image))
 }
 
-/// The page, printed to PDF by the headless browser. Its output is pictures
-/// of the page, not text: the browser draws every glyph as an image today.
+/// What printing with this browser gives, measured once per session and
+/// kept: [`PROBE_PAGE`] printed with `preferCSSPageSize` (again without it if
+/// that is refused), and its text read back the way Read reads a PDF. A
+/// probe that fails is kept too — the reason — so a broken browser is not
+/// retried on every print.
+pub(super) fn print_ability(
+    browsers: &Mutex<Browsers>,
+    bin: &Path,
+    filter_env: bool,
+) -> Result<PrintAbility, String> {
+    if let Some(known) = browsers
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .print
+        .clone()
+    {
+        return known;
+    }
+    let measured = probe_print(browsers, bin, filter_env);
+    match &measured {
+        Ok(ability) => crate::trace!(
+            "tool",
+            "headless browser print probe: text layer {}, CSS page size {}",
+            ability.text,
+            ability.css_page_size
+        ),
+        Err(why) => crate::trace!("tool", "headless browser print probe failed: {why}"),
+    }
+    browsers
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .print = Some(measured.clone());
+    measured
+}
+
+fn probe_print(
+    browsers: &Mutex<Browsers>,
+    bin: &Path,
+    filter_env: bool,
+) -> Result<PrintAbility, String> {
+    let page = Page::Url(PROBE_PAGE.to_string());
+    let (bytes, css_page_size) = match print_pdf(browsers, bin, &page, filter_env, true) {
+        Ok(bytes) => (bytes, true),
+        // Refused as an unknown option (measured on a build from before
+        // incordai/incord-browser#11 was fixed: -32601).
+        Err(why) if why.contains("-32601") => {
+            (print_pdf(browsers, bin, &page, filter_env, false)?, false)
+        }
+        Err(why) => return Err(why),
+    };
+    let text = crate::tools::documents::pdf_text(bytes)?;
+    Ok(PrintAbility {
+        text: text.contains(PROBE_WORD),
+        css_page_size,
+    })
+}
+
+/// The page, printed to PDF by the headless browser: Letter, backgrounds
+/// printed, and a page's own `@page { size }` honoured when
+/// `css_page_size` — which only a browser whose [`PrintAbility`] says so is
+/// asked for.
 pub(super) fn print_pdf(
     browsers: &Mutex<Browsers>,
     bin: &Path,
     page: &Page,
     filter_env: bool,
+    css_page_size: bool,
 ) -> Result<Vec<u8>, String> {
     let port = browsers
         .lock()
@@ -511,9 +592,11 @@ pub(super) fn print_pdf(
     let opened = open(&mut cdp, page, &shot, deadline)?;
     let printed = cdp.call(
         "Page.printToPDF",
-        // Letter, the protocol's default page. `preferCSSPageSize` is refused
-        // by this browser today (measured: -32601).
-        json!({"printBackground": true}),
+        // Letter, the protocol's default page, unless the page names its own
+        // size and the browser honours it — as the system browser's print
+        // does (measured: Edge prints `@page { size: 13.333in 7.5in }` at
+        // 960x540 pt).
+        json!({"printBackground": true, "preferCSSPageSize": css_page_size}),
         Some(&opened.session),
     );
     close(&mut cdp, &opened);
@@ -818,6 +901,14 @@ pub(super) mod tests {
         );
     }
 
+    /// The probe page carries the word the probe looks for, and is a page
+    /// that needs neither the network nor this machine's files.
+    #[test]
+    fn the_probe_page_carries_the_probe_word() {
+        assert!(PROBE_PAGE.starts_with("data:text/html,"));
+        assert!(PROBE_PAGE.contains(PROBE_WORD));
+    }
+
     #[test]
     fn nothing_found_is_none() {
         let empty = tempfile::tempdir().expect("tmp");
@@ -888,5 +979,45 @@ pub(super) mod tests {
         assert!(html.contains("ScriptBuiltHeading"), "{html}");
         let markdown = crate::tools::documents::html_to_markdown(&html, Some(&url));
         assert!(markdown.contains("ScriptBuiltHeading"), "{markdown}");
+    }
+
+    /// **A TABLE BUILT BY SCRIPT READS AS A TABLE.** WebFetch reads the
+    /// rendered HTML with incode's own conversion, not the browser's
+    /// `--dump markdown`, so the table's markdown is incode's: a header row,
+    /// its `---` rule, then one line per row.
+    #[test]
+    fn a_table_built_by_script_reads_as_a_markdown_table() {
+        let Some(bin) = test_browser() else { return };
+        let site = tempfile::tempdir().expect("site");
+        std::fs::write(
+            site.path().join("t.html"),
+            "<!doctype html><html><body><div id=\"root\"></div><script>\
+             document.getElementById('root').innerHTML='<table><tr><th>Item</th><th>Qty</th>\
+             </tr><tr><td>Apples</td><td>3</td></tr><tr><td>Pears</td><td>5</td></tr></table>';\
+             </script></body></html>",
+        )
+        .expect("seed");
+        let port = serve_dir(site.path().to_path_buf());
+        let url = format!("http://127.0.0.1:{port}/t.html");
+        let html = render_html_on(&bin, &url, true, true).expect("rendered");
+        let markdown = crate::tools::documents::html_to_markdown(&html, Some(&url));
+        eprintln!("{markdown}");
+        let lines: Vec<&str> = markdown.lines().map(str::trim).collect();
+        let header = lines
+            .iter()
+            .position(|l| l.starts_with('|') && l.contains("Item") && l.contains("Qty"))
+            .unwrap_or_else(|| panic!("no header row: {markdown}"));
+        assert!(
+            lines.get(header + 1).is_some_and(|l| l.contains("---")),
+            "no rule under the header: {markdown}"
+        );
+        assert!(
+            lines.get(header + 2).is_some_and(|l| l.contains("Apples")),
+            "{markdown}"
+        );
+        assert!(
+            lines.get(header + 3).is_some_and(|l| l.contains("Pears")),
+            "rows are not consecutive: {markdown}"
+        );
     }
 }

@@ -59,12 +59,21 @@ This is fully true for claude; section 0b says what is not.
   since tree-sitter's C grammars went in (`079988b`), the crate can no longer be
   compile-checked for macOS from Windows. The macOS sandbox profile itself was
   validated live on macOS during phase 8.
-- **incord-browser (incordai/incord-browser #6–#9, #11–#14).** All eight were
-  closed upstream on 2026-09-25/26 (#10 is a pull request). incode has not been
-  re-measured against the fixed browser. In particular #11 (image-only PDFs) was
-  fixed upstream: `RenderPdf`'s fallback still describes that PDF as image-only,
-  the `pdf_renderer` default is still `auto`, and the earlier measurement that
-  the browser refuses `preferCSSPageSize` predates the fix.
+- **incord-browser: what is still open upstream.** Re-measured 2026-09-27 on
+  078786a against headless Edge; incode now uses the fixes (RenderPdf prefers
+  incord-browser when its probe finds text, and passes `preferCSSPageSize` when
+  it is honoured). Fixed: #6, #7, #9, #11, #12, #14. Still open:
+  - #8, part: an inline SVG is centred now, but SVG `<text font-family="Arial"
+    font-size="24">` still draws in the inherited serif at a smaller size, with
+    or without `--font-dir`.
+  - #13, part: `--dump markdown` tables are valid GFM, but a `caption-side:
+    bottom` set in a stylesheet (not inline) still puts the caption above.
+  - #12, second half: `--font-dir` still loads every face up front.
+  - #11, remainder: the PDF is a raster with a text layer, not vector (about
+    2.5x Edge's size for the same article).
+  - Not filed yet: with `--font-dir C:\Windows\Fonts`, `font-family: Arial;
+    font-weight: 700` draws in a condensed face (Arial Narrow–like). Seen on
+    971d3e8 too, so not a regression.
 - **App-side work (the owner's desktop app, outside this repo):** a resume list
   (it calls neither `session/list` nor `session/load`); drawing image content;
   drawing the `_meta.incord` badges; a question card for `AskUserQuestion` (the app

@@ -239,8 +239,8 @@ pub struct ApiProvider {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PdfRenderer {
-    /// The system headless browser when one is installed (text PDFs), else
-    /// incord-browser (image-only PDFs).
+    /// incord-browser when its PDFs carry text (probed once per session),
+    /// else the system headless browser, else incord-browser as it is.
     #[default]
     Auto,
     /// Only the system headless browser.

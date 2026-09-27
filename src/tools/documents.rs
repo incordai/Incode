@@ -204,6 +204,17 @@ fn pdf_to_markdown(bytes: Vec<u8>) -> Result<String, String> {
     Ok(out)
 }
 
+/// A PDF's text layer, every page joined, read exactly as Read reads it —
+/// the same reader, thread, panic guard and deadline. Empty when the PDF has
+/// no text layer. The headless browser's print check uses it, so "has text"
+/// means what Read will actually return.
+pub(crate) fn pdf_text(bytes: Vec<u8>) -> Result<String, String> {
+    let pages = pdf_pages(bytes, PDF_DEADLINE, |pdf| {
+        pdf_extract::extract_text_from_mem_by_pages(pdf).map_err(|e| e.to_string())
+    })?;
+    Ok(pages.join("\n"))
+}
+
 /// The text of every page as `extract` reads it, or why there is none.
 /// `extract` is the PDF reader; a test hands in one that panics.
 fn pdf_pages<F>(bytes: Vec<u8>, deadline: Duration, extract: F) -> Result<Vec<String>, String>
