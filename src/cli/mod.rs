@@ -231,15 +231,15 @@ pub(crate) fn prepare_session(
     // The rest of the spec set — architecture, contracts, conventions,
     // verification, assumptions. The loop reads these; a PRD on its own
     // leaves every later task guessing at names and shapes.
-    if let Some(note) = crate::spec::intake_note(&workspace) {
-        intake_notes.push(note);
-    }
-    mark("spec-note", booted_at);
-    let intake_task = (!intake_notes.is_empty()).then(|| intake_notes.join("\n\n"));
-    mark("intake-joined", booted_at);
-    if let Some(ref task) = intake_task {
-        render::print_info(task);
-    }
+    //
+    // Started here, collected once the agents are found: the note searches
+    // memory for leads on the waiting deadline, and waited in line for it —
+    // measured at 1.2 s of `session/new`, the whole of its deadline. On its
+    // own thread it overlaps the rest of startup instead.
+    let spec_prefetch = {
+        let workspace = workspace.clone();
+        std::thread::spawn(move || crate::spec::intake_note(&workspace))
+    };
 
     let permission_mode = PermissionMode::from_str_lossy(&config.permission_mode);
     // PUBLISHED FOR THE REST OF THE PROCESS, so a backend built somewhere
@@ -270,6 +270,13 @@ pub(crate) fn prepare_session(
             crate::admin::AdminConfig::default()
         }
     };
+    // The owner's reserved categories: requested here and collected once the
+    // agents are found, for the same reason as the spec note — on the
+    // waiting deadline in line it was up to 1.2 s of `session/new`.
+    let guards_prefetch = admin
+        .plugins
+        .guards
+        .then(|| std::thread::spawn(crate::guards::context_for_session));
 
     // START THE ADVISORY LOOKUPS NOW; READ THEM WHEN THE PROMPT IS BUILT.
     //
@@ -373,13 +380,9 @@ pub(crate) fn prepare_session(
     // The intake task rides the system prompt rather than one turn's
     // context: it is not finished until the brief is, which may take several
     // exchanges, and a task that fell out of context after one turn would be
-    // abandoned halfway through gathering.
-    if let Some(ref task) = intake_task {
-        system_prompt.push(format!(
-            "<intake>\nThis project cannot be worked on until its brief is \
-                 complete. That is your first job, ahead of any code.\n\n{task}\n</intake>"
-        ));
-    }
+    // abandoned halfway through gathering. Put in HERE, at this place in the
+    // prompt, once the spec note is collected (after the agents are found).
+    let intake_at = system_prompt.len();
 
     // What this project has already been observed to have solved, from the
     // recorder in the body's memory. Once at session start rather than per
@@ -419,11 +422,8 @@ pub(crate) fn prepare_session(
         system_prompt.push(block);
     }
 
-    if admin.plugins.guards {
-        if let Some(block) = timed("guards", crate::guards::context_for_session) {
-            system_prompt.push(block);
-        }
-    }
+    // The guards block goes HERE, collected with the spec note below.
+    let guards_at = system_prompt.len();
 
     // What the auditor already knows is wrong here. Same shape as the
     // recorder block and for the same reason: rediscovering a filed bug
@@ -512,12 +512,37 @@ pub(crate) fn prepare_session(
         .lead(crate::agent::registry::preferred_agent().as_deref())
         .map_err(|e| anyhow::anyhow!(e))?;
     // Everything installed and drivable. With more than one, roles can route
-    // between them and work can move when one runs out.
+    // between them and work can move when one runs out. The catalogue has
+    // just probed this machine for the same agents: probing again cost
+    // another 0.7 s of `session/new` and could only find the same ones.
     let fleet = timed("agent discovery", || {
         mark("fleet", booted_at);
-        crate::fleet::Fleet::new(crate::agent::discover())
+        crate::fleet::Fleet::new(catalogue.found().to_vec())
     });
     render::print_info(&fleet.summary_line());
+
+    // The two lookups started at the top, collected now that they have had
+    // the rest of startup to answer, and put where they always stood in the
+    // prompt: the guards block first, since it comes after the intake.
+    if let Some(prefetch) = guards_prefetch {
+        if let Some(block) = timed("guards", || prefetch.join().ok().flatten()) {
+            system_prompt.insert(guards_at, block);
+        }
+    }
+    let spec_note = timed("spec note", || spec_prefetch.join().ok().flatten());
+    intake_notes.extend(spec_note);
+    mark("spec-note", booted_at);
+    let intake_task = (!intake_notes.is_empty()).then(|| intake_notes.join("\n\n"));
+    if let Some(ref task) = intake_task {
+        render::print_info(task);
+        system_prompt.insert(
+            intake_at,
+            format!(
+                "<intake>\nThis project cannot be worked on until its brief is \
+                 complete. That is your first job, ahead of any code.\n\n{task}\n</intake>"
+            ),
+        );
+    }
 
     // The protected paths reach the agent as deny rules it enforces itself,
     // so a write to one never happens — prevention, with the sentinel in

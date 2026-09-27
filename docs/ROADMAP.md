@@ -62,13 +62,19 @@ This is fully true for claude; section 0b says what is not.
   unconfined. Open: whether to make it the default, and a size cap — the grant is
   linear in the tree (a `node_modules`-heavy workspace pays per object, once per
   session). Not yet driven end to end through a real model session.
-- **`session/new` is still 12–14 s, but no longer because of MCP.** The client's
-  MCP servers now connect in the background (their tools join from the next turn;
-  a turn meanwhile is told which are still connecting), which took the memory
-  service's 28 s out of it: 42 s before, 14.0 s after, 12.4 s with no server at
-  all. Traced: the memory engine's `session-start` hook is 8.2 s of that, the
-  spec note 1.2 s, a guards request to the service 1.2 s, and the agent catalogue
-  and discovery 1.5 s together. Open: run `session-start` off the answer too.
+- **`session/new` — 2.7 s, from 11–14 s.** The client's MCP servers connect in
+  the background (42 s → 14 s, earlier). Now the memory engine's `session-start`
+  (8.2 s) runs on a thread and the first turn collects it before `user-prompt`;
+  the spec note and the guards request (each up to the 1.2 s deadline) overlap the
+  agent catalogue; and the fleet reuses the catalogue's probe instead of probing
+  again (0.7 s). Measured live under `--acp`: 14.1 / 11.1 / 12.8 s before, 5.9 /
+  2.7 / 2.7 s after (`ARCHITECTURE.md` §4). The guards request that "failed" was
+  a timeout against the memory service's first-request latency (0.2–49 s after an
+  idle gap, seen on other routes too), not a wrong route; its trace now names the
+  cause. Open: the first turn still pays the 8.2 s (plus `user-prompt`'s own
+  8.2 s) — the engine's latency, measured here, not incode's; `rules` and the
+  auditor still wait in line when the service stalls (2.8 s in one run); `--task`
+  still waits for `session-start` in line; the REPL was not timed live.
 - **The `Bash` tool's shell on Windows.** Fixed: it was cmd.exe; it is now Git Bash
   (or `INCODE_SHELL` / `admin.json` `shell`), else PowerShell, and its description
   names the shell (`ARCHITECTURE.md`, "Which shell"). A foreground command's stdin

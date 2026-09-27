@@ -219,27 +219,37 @@ impl MemoryHooks {
     /// engine's context for it, bounded, or `None`.
     pub fn start(&mut self, source: &str) -> Option<String> {
         let engine = self.engine.as_ref()?;
-        let began = std::time::Instant::now();
-        let block = engine.session_start(self.at(), source);
-        crate::trace!(
-            "memory",
-            "session-start ({source}) for {} in {:?}: {} bytes",
-            self.session,
-            began.elapsed(),
-            block.as_ref().map_or(0, String::len)
-        );
-        let name = format!("{}-start", safe_name(&self.session));
-        // The engine's block tells the model to file things under its session,
-        // and never says which one: the model only knows its own CLI's id.
-        // Measured: handed the block alone, a model posted a session entry
-        // under an id the engine had never seen.
-        block.map(|b| {
-            format!(
-                "Your session id in Incord Memory is `{}`: use it wherever the memory \
-                 service asks for a session_id.\n\n{}",
-                self.session,
-                self.inline(&b, &name, START_INLINE)
-            )
+        start_block(engine, self.at(), source)
+    }
+
+    /// [`Self::start`] on a thread of its own: returns at once, and the
+    /// block is collected with [`PendingStart::wait`]. `None` when there is
+    /// no engine to ask.
+    ///
+    /// For opening a session without holding its answer: the engine's
+    /// session-start was measured at 8.2 s of `session/new`'s 14.
+    #[must_use]
+    pub fn start_in_background(&self, source: &str) -> Option<PendingStart> {
+        let engine = self.engine.clone()?;
+        let session = self.session.clone();
+        let cwd = self.cwd.clone();
+        let transcript = self.transcript.clone();
+        let source = source.to_string();
+        let (tx, answer) = std::sync::mpsc::channel();
+        let asked = source.clone();
+        std::thread::spawn(move || {
+            let at = Conversation {
+                session: &session,
+                cwd: &cwd,
+                transcript: transcript.as_deref().filter(|p| p.is_file()),
+            };
+            // Nobody waiting any more (the session ended) is not an error.
+            let _ = tx.send(start_block(&engine, at, &source));
+        });
+        Some(PendingStart {
+            answer,
+            source: asked,
+            began: std::time::Instant::now(),
         })
     }
 
@@ -375,27 +385,96 @@ impl MemoryHooks {
     /// `block` as the model is given it: whole when it fits in `limit` bytes,
     /// otherwise its head, with the whole written to a file the model can read.
     fn inline(&self, block: &str, name: &str, limit: usize) -> String {
-        if block.len() <= limit {
-            return block.to_string();
-        }
-        let dir = self.cwd.join(CONTEXT);
-        let path = dir.join(format!("{name}.md"));
-        let written = std::fs::create_dir_all(&dir)
-            .and_then(|()| std::fs::write(&path, block))
-            .is_ok();
-        prune(&dir);
-        let head = crate::text::head_bytes(block, limit);
-        let rest = block.len() - head.len();
-        if written {
-            let shown = Path::new(CONTEXT).join(format!("{name}.md"));
-            format!(
-                "{head}\n\n[… {rest} more bytes of this block are in `{}` — read it when \
-                 the part above is not enough.]",
-                shown.display()
-            )
-        } else {
-            format!("{head}\n\n[… {rest} more bytes of this block were cut.]")
-        }
+        inline_in(&self.cwd, block, name, limit)
+    }
+}
+
+/// A session-start the engine is still answering, on a thread of its own —
+/// see [`MemoryHooks::start_in_background`].
+pub struct PendingStart {
+    answer: std::sync::mpsc::Receiver<Option<String>>,
+    source: String,
+    began: std::time::Instant,
+}
+
+impl PendingStart {
+    /// The engine's block, waiting at most `bound` for it: `None` when it had
+    /// nothing to say, or did not answer in time (traced either way).
+    #[must_use]
+    pub fn wait(self, bound: std::time::Duration) -> Option<String> {
+        let waited = std::time::Instant::now();
+        let block = match self.answer.recv_timeout(bound) {
+            Ok(block) => block,
+            Err(why) => {
+                crate::trace!(
+                    "memory",
+                    "session-start ({}) not answered within {bound:?} ({why}); the turn goes \
+                     without its block",
+                    self.source
+                );
+                None
+            }
+        };
+        crate::trace!(
+            "memory",
+            "session-start ({}) collected {:?} after it was asked, {:?} of it spent waiting here",
+            self.source,
+            self.began.elapsed(),
+            waited.elapsed()
+        );
+        block
+    }
+}
+
+/// The engine's session-start block for `at`, as every model is handed it:
+/// headed with the session's id, and inlined within [`START_INLINE`].
+fn start_block(engine: &Engine, at: Conversation<'_>, source: &str) -> Option<String> {
+    let began = std::time::Instant::now();
+    let block = engine.session_start(at, source);
+    crate::trace!(
+        "memory",
+        "session-start ({source}) for {} in {:?}: {} bytes",
+        at.session,
+        began.elapsed(),
+        block.as_ref().map_or(0, String::len)
+    );
+    let name = format!("{}-start", safe_name(at.session));
+    // The engine's block tells the model to file things under its session,
+    // and never says which one: the model only knows its own CLI's id.
+    // Measured: handed the block alone, a model posted a session entry
+    // under an id the engine had never seen.
+    block.map(|b| {
+        format!(
+            "Your session id in Incord Memory is `{}`: use it wherever the memory \
+             service asks for a session_id.\n\n{}",
+            at.session,
+            inline_in(at.cwd, &b, &name, START_INLINE)
+        )
+    })
+}
+
+/// [`MemoryHooks::inline`], for a workspace `cwd`.
+fn inline_in(cwd: &Path, block: &str, name: &str, limit: usize) -> String {
+    if block.len() <= limit {
+        return block.to_string();
+    }
+    let dir = cwd.join(CONTEXT);
+    let path = dir.join(format!("{name}.md"));
+    let written = std::fs::create_dir_all(&dir)
+        .and_then(|()| std::fs::write(&path, block))
+        .is_ok();
+    prune(&dir);
+    let head = crate::text::head_bytes(block, limit);
+    let rest = block.len() - head.len();
+    if written {
+        let shown = Path::new(CONTEXT).join(format!("{name}.md"));
+        format!(
+            "{head}\n\n[… {rest} more bytes of this block are in `{}` — read it when \
+             the part above is not enough.]",
+            shown.display()
+        )
+    } else {
+        format!("{head}\n\n[… {rest} more bytes of this block were cut.]")
     }
 }
 

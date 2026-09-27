@@ -200,17 +200,9 @@ async fn follow(url: &str, accept: &str) -> Result<reqwest::Response, String> {
     Err(format!("more than {MAX_REDIRECTS} redirects"))
 }
 
-/// An error and every cause under it, on one line: a transport error's own
-/// text ("error sending request") names nothing until its causes are read.
+/// An error and every cause under it, on one line.
 fn chain(error: &dyn std::error::Error) -> String {
-    let mut out = error.to_string();
-    let mut cause = error.source();
-    while let Some(inner) = cause {
-        out.push_str(": ");
-        out.push_str(&inner.to_string());
-        cause = inner.source();
-    }
-    out
+    crate::runtime::http::error_chain(error)
 }
 
 /// Download `url` into `to`, returning the sha256 of what arrived, lowercase

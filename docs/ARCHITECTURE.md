@@ -427,10 +427,17 @@ agy — because it is fired from incode's session and turn code, never from a CL
   a toolbox pins it (`Toolbox::pin_session`), so `pre-tool`, `permission-request`,
   `code-edit` and the lifecycle events all name one session. The model is told it too,
   at the top of the session-start block.
-- **`session-start`** (60 + 10 s): in `prepare_session` (`startup`, or `resume` with
-  `--resume`) and on `/clear` (`clear`, new id). Its block replaces incode's own rules,
-  recorder and auditor blocks (Option A) in every backend's system context
-  (`AgentBackend::set_system_context`); with no answer those stay.
+- **`session-start`** (60 + 10 s): asked in `prepare_session` (`startup`, or `resume`
+  with `--resume`) on a thread of its own (`MemoryHooks::start_in_background`), so the
+  session opens without it — it was 8.2 s of `session/new`'s 14. The first person's line
+  collects it (`AgentSession::memory_prompt` → `settle_memory_start`, waiting at most
+  the hook's own bound), before `user-prompt` is fired, so the engine hears the start
+  first and the block rides that turn; a turn with no line (a continuation, `/run`), the
+  session's end and `/clear` collect it too. `/clear` itself (`clear`, new id) still
+  waits for the new one. Its block replaces incode's own rules, recorder and auditor
+  blocks (Option A) in every backend's system context
+  (`AgentBackend::set_system_context`); with no answer those stay. `--task` still waits
+  for it in line: its one prompt is built from the block.
 - **`user-prompt`** (60 + 10 s): in `plan_turn`, after the greeting short-circuit; its
   block replaces `rules::context_for_turn` for the turn.
 - **Oversized blocks:** over 12 KB (start) or 6 KB (turn) the head is given inline and the
@@ -557,6 +564,26 @@ workspace ─┬─► brief::check ────────► intake task, if 
                                        │
                                        └─► system prompt
 ```
+
+What waits in line, and what does not (`cli::prepare_session`): the spec note (a memory
+search on the 1.2 s waiting deadline) and the owner's guard categories
+(`/v1/memory/enforcement`, same deadline) are each started on a thread as soon as their
+inputs exist and collected after the agent catalogue, each put back at its place in the
+prompt — as the recorder and auditor lookups already were. The catalogue's own probe of the machine is reused
+for the fleet (it was probed twice, 0.7 s each). The engine's `session-start` is not
+waited for at all (below). Measured live under `--acp` (debug build, no MCP server, the
+owner's memory service): `session/new` 14.1 / 11.1 / 12.8 s before, 5.9 / 2.7 / 2.7 s
+after; the 5.9 s run had the service's `rules` answer take 2.8 s.
+
+**The enforcement request that "failed".** Traced before as `guards: could not be
+loaded: … error sending request for url (…/v1/memory/enforcement)` after 1.2 s. The route
+exists and incode's call is right (curl: `200` with the categories). With the cause chain
+now in the error (`runtime::http::error_chain`) the trace says `operation timed out`:
+the service answered after the 1.2 s deadline. Probed with an idle gap before each
+request, the service took 0.2–14 s on first requests to this and to other routes
+(`/v1/memory/rules`, `/v1/memory/settings/projects` — once all three together 49 s),
+and 10–30 ms right after. It is the service's latency, not a missing route; incode no
+longer waits for it in line.
 
 ### Every turn
 ```

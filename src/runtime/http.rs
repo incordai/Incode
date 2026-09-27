@@ -80,7 +80,7 @@ where
         let response = build(&SHARED_CLIENT)
             .send()
             .await
-            .map_err(|e| format!("request failed: {e}"))?;
+            .map_err(|e| format!("request failed: {}", error_chain(&e)))?;
         let status = response.status();
         if !status.is_success() {
             return Err(format!("the {service_name} answered {status}"));
@@ -101,13 +101,29 @@ where
         let response = build(&SHARED_CLIENT)
             .send()
             .await
-            .map_err(|e| format!("request failed: {e}"))?;
+            .map_err(|e| format!("request failed: {}", error_chain(&e)))?;
         let status = response.status();
         if !status.is_success() {
             return Err(format!("the {service_name} answered {status}"));
         }
         Ok(())
     })
+}
+
+/// An error and every cause under it, on one line.
+///
+/// A transport error's own text names nothing: the guards request that failed
+/// at session start was traced only as "error sending request for url (…)",
+/// which cannot tell a refused connection from a timeout. Its causes can.
+pub(crate) fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut out = error.to_string();
+    let mut cause = error.source();
+    while let Some(inner) = cause {
+        out.push_str(": ");
+        out.push_str(&inner.to_string());
+        cause = inner.source();
+    }
+    out
 }
 
 #[cfg(test)]
@@ -124,6 +140,20 @@ mod tests {
     async fn run_async_executes_from_multi_threaded_tokio_context() {
         let result = run_async(async { Ok::<_, String>("hello".to_string()) });
         assert_eq!(result, Ok("hello".to_string()));
+    }
+
+    /// **A FAILED REQUEST NAMES WHY**: the transport error's causes are in
+    /// the message, not just "error sending request".
+    #[test]
+    fn a_failed_request_says_its_cause() {
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.local_addr().expect("addr").port()
+        };
+        let url = format!("http://127.0.0.1:{port}/");
+        let said = request_text(move |c| c.get(&url), "test service").expect_err("closed port");
+        assert!(said.contains("error sending request"), "{said}");
+        assert!(said.to_lowercase().contains("connect"), "{said}");
     }
 
     #[tokio::test(flavor = "current_thread")]

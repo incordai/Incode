@@ -165,6 +165,13 @@ impl Catalogue {
         )
     }
 
+    /// Every local agent the machine was probed for, drivable or not: what
+    /// `discover` found when the catalogue was gathered.
+    #[must_use]
+    pub(crate) fn found(&self) -> &[DetectedAgent] {
+        &self.found
+    }
+
     /// The catalogue from its inputs, with nothing read from the machine.
     ///
     /// `env` answers a variable's trimmed, non-empty value; `fetch` answers a

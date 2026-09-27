@@ -108,6 +108,9 @@ pub struct AgentSession {
     native_context: Vec<String>,
     /// What the engine's session-start handed this session, when it answered.
     start_block: Option<String>,
+    /// The session-start still being answered, on a thread of its own: the
+    /// session opens without waiting for it, and the first turn does.
+    pending_start: Option<crate::hooks::memory::PendingStart>,
     /// The session's tool state: its background jobs — the model's and the
     /// REPL's `/bg` alike — and the model's task list, shared by every
     /// backend. A stop while a job runs is a wait, not an end.
@@ -223,6 +226,7 @@ impl AgentSession {
             base_context: system_context,
             native_context: Vec::new(),
             start_block: None,
+            pending_start: None,
             workspace: workspace_for_self,
             checkpoints: CheckpointStore::new(),
             snapshot_complete: None,
@@ -458,6 +462,8 @@ impl AgentSession {
             s.clear_session();
         }
         let next = uuid::Uuid::new_v4().to_string();
+        // The old session's start is answered before it is ended.
+        self.settle_memory_start();
         self.start_block = self.memory.restart(&next, "clear");
         self.name_memory_session();
         self.carry_context();
@@ -481,20 +487,40 @@ impl AgentSession {
         self.native_context = native;
         self.memory = memory;
         self.name_memory_session();
-        self.start_block = self.memory.start(source);
+        // Asked now and answered in the background: the session opens without
+        // it (it was 8.2 s of `session/new`), and the first turn waits for it,
+        // because its context belongs in that turn.
+        self.pending_start = self.memory.start_in_background(source);
+    }
+
+    /// Collect the session-start still being answered, if there is one, and
+    /// hand its block to every backend. Waits at most the engine's own bound
+    /// for the hook, so a block the engine gives is never dropped for being
+    /// late; a hook past that bound was killed by the engine runner anyway.
+    fn settle_memory_start(&mut self) {
+        let Some(pending) = self.pending_start.take() else {
+            return;
+        };
+        self.start_block = pending.wait(crate::hooks::engine::CONTEXT_BOUND);
         if self.start_block.is_some() {
             self.carry_context();
         }
     }
 
     /// The person's line is about to go to the model: written to the session's
-    /// transcript, and the engine's context for it returned.
+    /// transcript, and the engine's context for it returned. The first one
+    /// waits for the session-start first, so the engine hears the session open
+    /// before the line, and the block rides this turn.
     pub fn memory_prompt(&mut self, line: &str) -> Option<String> {
+        self.settle_memory_start();
         self.memory.prompt(line)
     }
 
-    /// The session is over; `reason` says why.
+    /// The session is over; `reason` says why. A session-start still being
+    /// answered is collected first, so the engine hears the start before the
+    /// end.
     pub fn end_memory(&mut self, reason: &str) {
+        self.settle_memory_start();
         self.memory.end(reason);
     }
 
@@ -684,6 +710,9 @@ impl AgentSession {
         if let Some(token) = &self.cancel {
             token.reset();
         }
+        // A turn not opened by a person's line (a continuation, `/run`) still
+        // carries the session-start block.
+        self.settle_memory_start();
         // Taken before anything runs, because the agent's writes cannot be
         // intercepted as they happen.
         self.snapshot_complete = Some(self.snapshot(workspace, instruction));
@@ -1752,7 +1781,7 @@ mod tests {
             tempfile::tempdir().expect("e"),
         );
         let seen = Arc::new(Mutex::new(Seen::default()));
-        let _s = with_memory(
+        let mut s = with_memory(
             ws.path(),
             engine.path(),
             &[(
@@ -1762,6 +1791,8 @@ mod tests {
             &seen,
             Box::new(|_| {}),
         );
+        // The block rides from the first turn: the person's line waits for it.
+        let _ = s.memory_prompt("go");
         let seen = seen.lock().expect("seen");
         assert_eq!(seen.context.len(), 2, "{:?}", seen.context);
         assert_eq!(seen.context[0], "BASE");
@@ -1796,6 +1827,52 @@ mod tests {
             seen.lock().expect("seen").context.is_empty(),
             "the backend's context was not touched"
         );
+    }
+
+    /// **A SLOW SESSION-START DOES NOT HOLD THE SESSION OPEN; THE FIRST TURN
+    /// CARRIES ITS BLOCK.** Opening the memory session returns while the
+    /// engine is still answering (`session/new` is answered from here); the
+    /// first person's line waits for the answer, so the block is in what the
+    /// model is sent from that turn on, and the engine hears session-start
+    /// before user-prompt.
+    #[test]
+    fn a_slow_session_start_is_waited_for_by_the_first_turn_not_the_opening() {
+        let (ws, engine) = (
+            tempfile::tempdir().expect("ws"),
+            tempfile::tempdir().expect("e"),
+        );
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let began = std::time::Instant::now();
+        let mut s = with_memory(
+            ws.path(),
+            engine.path(),
+            &[
+                (
+                    "session-start",
+                    Reply::exit(0).stdout(&start_context("START-SLOW")).after(3),
+                ),
+                ("user-prompt", Reply::exit(0)),
+            ],
+            &seen,
+            Box::new(|_| {}),
+        );
+        let opened = began.elapsed();
+        assert!(
+            opened < std::time::Duration::from_secs(2),
+            "opening waited for session-start: {opened:?}"
+        );
+        assert!(
+            seen.lock().expect("seen").context.is_empty(),
+            "a block arrived before the engine answered"
+        );
+        let _ = s.memory_prompt("do the work");
+        let context = seen.lock().expect("seen").context.clone();
+        assert!(
+            context.last().is_some_and(|c| c.ends_with("START-SLOW")),
+            "{context:?}"
+        );
+        assert_eq!(fake::events(engine.path(), "session-start").len(), 1);
+        assert_eq!(fake::events(engine.path(), "user-prompt").len(), 1);
     }
 
     /// **A STOP THAT SAYS CARRY ON CONTINUES THE TURN ONCE, THEN ENDS.** The
