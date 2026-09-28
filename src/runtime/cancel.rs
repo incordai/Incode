@@ -82,7 +82,7 @@ impl CancelToken {
     }
 }
 
-/// Where a stop request for a workspace's run is written, inside `.incord/`.
+/// Where a stop request for a workspace's run is written, inside `.incode/`.
 pub const STOP_FILE: &str = "run.stop";
 
 /// How often a [`StopWatch`] looks for a request. A person pressing stop

@@ -13,9 +13,9 @@
 //! A role's candidates may name the agent that should serve them:
 //!
 //! ```text
-//! INCORD_ROLE_GRUNT=other-agent:fast,some-agent:small
-//! INCORD_ROLE_PLAN=some-agent:large
-//! INCORD_ROLE_REVIEW=large              # no agent named: whichever is running
+//! INCODE_ROLE_GRUNT=other-agent:fast,some-agent:small
+//! INCODE_ROLE_PLAN=some-agent:large
+//! INCODE_ROLE_REVIEW=large              # no agent named: whichever is running
 //! ```
 //!
 //! # The rule that makes it safe to configure a fleet you do not have

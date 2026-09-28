@@ -28,7 +28,7 @@
 use crate::runtime::usage::TokenUsage;
 
 /// Environment variable naming the ceiling, in total tokens.
-pub const BUDGET_ENV: &str = "INCORD_BUDGET_TOKENS";
+pub const BUDGET_ENV: &str = "INCODE_BUDGET_TOKENS";
 
 /// A token ceiling for a run, and what has been spent against it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

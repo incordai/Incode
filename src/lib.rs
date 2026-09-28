@@ -1,4 +1,5 @@
-//! incord-code — AI coding agent CLI with agentic loop, multi-provider LLM, and 66 Incord tools.
+//! incode — AI coding agent CLI with agentic loop, multi-provider LLM, and 66 tools.
+//! The crate keeps its original name, `incord-code`.
 
 pub mod acp_agent;
 pub mod admin;
@@ -25,6 +26,7 @@ pub mod ledger;
 pub mod lessons;
 pub mod links;
 pub mod mcp_stdio;
+pub mod migrate;
 pub mod owner;
 pub mod parallel;
 pub mod permissions;

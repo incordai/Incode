@@ -30,7 +30,7 @@ use crate::permissions::PermissionMode;
 /// Splitting on whitespace is deliberate: this is an operator-set value, and a
 /// checker command is a program and some flags. Anything needing quoting or a
 /// pipe belongs in a script the operator points this at.
-pub const CHECK_COMMAND_ENV: &str = "INCORD_CHECK_CMD";
+pub const CHECK_COMMAND_ENV: &str = "INCODE_CHECK_CMD";
 
 /// How long a check may take before it is abandoned.
 ///

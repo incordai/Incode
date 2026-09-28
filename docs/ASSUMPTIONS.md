@@ -1,4 +1,4 @@
-# Incord Code — Assumptions
+# incode — Assumptions
 
 Every choice made during this intake **rather than asked**, with its reasoning. The
 owner skims one list instead of answering twenty questions, and correcting an assumption
@@ -57,7 +57,7 @@ preserved.
 
 ## C. Contracts record the code as it IS, not as it should be
 
-**Decided:** `.incord/contracts.json` freezes 26 schemas and 14 endpoints exactly as the
+**Decided:** `.incode/contracts.json` freezes 26 schemas and 14 endpoints exactly as the
 source declares them today — including names and field spellings that a redesign might
 change.
 
@@ -99,13 +99,13 @@ intake does not write source.
 **Decided:** `cargo test` is recorded in `docs/VERIFICATION.md` as the command that
 settles whether work is done.
 
-**Why:** verified, not assumed — `INCORD_VERIFY_CMD` is unset in this environment, and
-`~/.incord-code/admin.json` does not exist, so `verify::command_for` falls through both
+**Why:** verified, not assumed — `INCODE_VERIFY_CMD` is unset in this environment, and
+`~/.incode/admin.json` does not exist, so `verify::command_for` falls through both
 operator layers to `detected_command`, which returns `["cargo", "test"]` for a crate
 with a `Cargo.toml` (`src/verify.rs:241`). Detection is deliberately last in that ladder,
 so anything the owner writes down will beat it without any change to this document.
 
-**Cost to reverse:** set `INCORD_VERIFY_CMD`. Free.
+**Cost to reverse:** set `INCODE_VERIFY_CMD`. Free.
 
 ---
 
@@ -116,7 +116,7 @@ so anything the owner writes down will beat it without any change to this docume
 things to run before reporting a task finished — but they were **not** folded into the
 verify command.
 
-**Why:** folding them in means setting `INCORD_VERIFY_CMD` to a compound command, which
+**Why:** folding them in means setting `INCODE_VERIFY_CMD` to a compound command, which
 changes what "done" means for every task in the ledger at once. That is the owner's call,
 not a side effect of writing a document. Note the consequence honestly: a runner that
 only runs the check will not catch a clippy regression.
@@ -128,7 +128,7 @@ this is the assumption most likely to be worth reversing.
 
 ## G. The contract check was validated by a replica, with a control
 
-**Decided:** `.incord/contracts.json` was proven clean using a line-for-line
+**Decided:** `.incode/contracts.json` was proven clean using a line-for-line
 reimplementation of `mentions()`, `files_naming()`, `read_sources()` and `check()`, run
 alongside a control (one absent schema, one absent field on a real schema, one absent
 route) that reported 3 breaches out of 3.
@@ -200,7 +200,7 @@ Both are outside intake's remit. Neither was changed.
 **Why:** intake does not write code, and nothing in completing a brief needs a new crate.
 Recorded because "did you add anything?" should have an answer that is not "probably
 not". The only files created are the three the loop was missing:
-`.incord/contracts.json`, `docs/VERIFICATION.md`, `docs/ASSUMPTIONS.md`. The only
+`.incode/contracts.json`, `docs/VERIFICATION.md`, `docs/ASSUMPTIONS.md`. The only
 mutation outside this repo is the two brief fields in §A, backed up per §B.
 
 ---

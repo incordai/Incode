@@ -41,7 +41,7 @@ pub fn no_redirect_client() -> Result<&'static reqwest::Client, String> {
 pub static SHARED_RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .thread_name("incord-http")
+        .thread_name("incode-http")
         .build()
         .expect("incord http runtime")
 });

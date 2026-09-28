@@ -38,7 +38,7 @@
 use std::path::{Path, PathBuf};
 
 /// Where findings live, relative to the workspace.
-pub const DIR: &str = ".incord/findings";
+pub const DIR: &str = ".incode/findings";
 
 /// The smallest answer this will accept, in non-whitespace characters.
 ///

@@ -512,9 +512,9 @@ mod tests {
     /// environment, so `env_filter_enabled` had no effect on it at all.
     #[test]
     fn filtered_shell_cannot_see_an_unlisted_secret() {
-        // Deliberately NOT prefixed `INCORD_`: env_filter.rs:163 allowlists that
-        // whole prefix, so an `INCORD_*` canary would be passed through by design
-        // and the test would prove nothing.
+        // Deliberately NOT prefixed `INCODE_` or `INCORD_`: env_filter.rs
+        // allowlists both whole prefixes, so such a canary would be passed
+        // through by design and the test would prove nothing.
         let name = "ZZ_UNLISTED_TEST_VAR";
         let canary = "CANARY-MUST-NOT-REACH-THE-CHILD";
         std::env::set_var(name, canary);
@@ -570,7 +570,7 @@ mod tests {
     /// subject to the console code page and would not reliably arrive.
     #[test]
     fn oversized_non_ascii_output_is_truncated_without_panicking() {
-        let dir = std::env::temp_dir().join("incord-bash-truncation-test");
+        let dir = std::env::temp_dir().join("incode-bash-truncation-test");
         std::fs::create_dir_all(&dir).expect("test fixture directory");
         let path = dir.join("wide.txt");
         let mut content = String::from("a");

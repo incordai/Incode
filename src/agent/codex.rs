@@ -931,7 +931,7 @@ mod tests {
     fn the_desktop_overrides_reach_argv_on_both_spawn_paths() {
         let overrides = crate::desktop::mcp::codex_config_overrides(
             std::path::Path::new(r"C:\Users\someone\incode.exe"),
-            Some(std::path::Path::new(r"C:\work\.incord\desktop.jsonl")),
+            Some(std::path::Path::new(r"C:\work\.incode\desktop.jsonl")),
             crate::permissions::PermissionMode::WorkspaceWrite,
         );
 

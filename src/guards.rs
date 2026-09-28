@@ -41,7 +41,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Where the operator's own list lives, under the workspace.
-pub const GUARDS_FILE: &str = ".incord/guards.json";
+pub const GUARDS_FILE: &str = ".incode/guards.json";
 
 /// Where the body's standing guard categories are read from.
 pub const ENFORCEMENT_PATH: &str = "/v1/memory/enforcement";
@@ -71,8 +71,8 @@ pub const DEFAULT_PROTECTED: [&str; 12] = [
     // Credentials.
     ".env",
     // The record of what was finished, and the operator's settings for how.
-    ".incord/ledger.json",
-    ".incord/guards.json",
+    ".incode/ledger.json",
+    ".incode/guards.json",
     "admin.json",
 ];
 
@@ -432,7 +432,7 @@ fn matches_path(fragment: &str, path: &str) -> bool {
     }
 
     // Otherwise a file name. A path fragment with a slash in it must match the
-    // tail of the path exactly, so `.incord/ledger.json` does not match a
+    // tail of the path exactly, so `.incode/ledger.json` does not match a
     // `ledger.json` sitting somewhere else.
     if fragment.contains('/') {
         return path == fragment || path.ends_with(&format!("/{fragment}"));
@@ -640,7 +640,7 @@ impl Sentinel {
                 // Build output and dependency trees hold no protected file and
                 // are enormous. `.git` is skipped for the same reason. Dot
                 // directories in general are NOT skipped — `.github/workflows/`
-                // and `.incord/ledger.json` are two of the things being guarded.
+                // and `.incode/ledger.json` are two of the things being guarded.
                 if matches!(name.as_str(), "target" | "node_modules" | "dist" | ".git") {
                     continue;
                 }
@@ -949,7 +949,7 @@ fn glob_for(fragment: &str) -> String {
         return format!("**/{trimmed}/**");
     }
     if fragment.contains('/') {
-        // Already a path, e.g. `.incord/ledger.json` or `.github/workflows/`.
+        // Already a path, e.g. `.incode/ledger.json` or `.github/workflows/`.
         return format!("**/{trimmed}");
     }
     if fragment.starts_with('.') && !fragment.ends_with('.') {
@@ -1175,7 +1175,7 @@ mod tests {
     /// A fragment that is already a path keeps its shape.
     #[test]
     fn a_path_fragment_is_not_turned_into_a_name_match() {
-        assert_eq!(glob_for(".incord/ledger.json"), "**/.incord/ledger.json");
+        assert_eq!(glob_for(".incode/ledger.json"), "**/.incode/ledger.json");
         assert_eq!(glob_for(".github/workflows/"), "**/.github/workflows/**");
     }
 
@@ -1296,7 +1296,7 @@ mod tests {
     }
 
     /// **Dot directories are watched.** `.github/workflows/` and
-    /// `.incord/ledger.json` are two of the things being guarded, so a walker
+    /// `.incode/ledger.json` are two of the things being guarded, so a walker
     /// that skipped hidden files — as the spec walker deliberately does — would
     /// protect neither.
     #[test]
@@ -1382,7 +1382,7 @@ mod tests {
             "migrations/0004_add_users.sql",
             ".env",
             ".env.local",
-            ".incord/ledger.json",
+            ".incode/ledger.json",
         ] {
             assert!(
                 guards.refuse_write(protected).is_some(),
@@ -1494,7 +1494,7 @@ mod tests {
     #[test]
     fn a_broken_guards_file_is_an_error_not_an_empty_policy() {
         let dir = tempfile::tempdir().expect("temp dir");
-        std::fs::create_dir_all(dir.path().join(".incord")).expect("mkdir");
+        std::fs::create_dir_all(dir.path().join(".incode")).expect("mkdir");
         std::fs::write(dir.path().join(GUARDS_FILE), "{ not json").expect("write");
         assert!(Guards::load(dir.path()).is_err());
     }

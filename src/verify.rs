@@ -294,7 +294,7 @@ pub const SELF_PROGRAM: &str = "incode";
 /// `incode` and does not understand its flags, so a check resolved to
 /// `current_exe` would fail for a reason that has nothing to do with the work.
 /// This says where the real one is.
-pub const SELF_BIN_ENV: &str = "INCORD_SELF_BIN";
+pub const SELF_BIN_ENV: &str = "INCODE_SELF_BIN";
 
 /// Turn [`SELF_PROGRAM`] into a binary that can actually answer, leaving every
 /// other program name alone.
@@ -410,7 +410,7 @@ pub fn run(argv: &[String], cwd: &Path) -> Result<CommandEvidence, String> {
 pub const VERIFY_TOOL: &str = "verify";
 
 /// Environment variable naming the project's check, overriding detection.
-pub const VERIFY_COMMAND_ENV: &str = "INCORD_VERIFY_CMD";
+pub const VERIFY_COMMAND_ENV: &str = "INCODE_VERIFY_CMD";
 
 /// The check for this project, from the operator or from its manifest.
 ///

@@ -33,9 +33,9 @@ use serde_json::{json, Value};
 use crate::team::{Channel, Kind};
 
 /// Where the harness tells this server who it is speaking for.
-pub const IDENTITY_ENV: &str = "INCORD_TEAM_AS";
+pub const IDENTITY_ENV: &str = "INCODE_TEAM_AS";
 
-const SERVER_NAME: &str = "incord-team";
+const SERVER_NAME: &str = "incode-team";
 
 /// The name a client sees this server under.
 pub const CLIENT_KEY: &str = "team";
@@ -342,7 +342,7 @@ mod tests {
 
     fn temp_path(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "incord-teammcp-{name}-{}-{:?}",
+            "incode-teammcp-{name}-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));

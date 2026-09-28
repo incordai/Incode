@@ -42,7 +42,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 /// Where the channel lives inside a workspace.
-pub const FILE: &str = ".incord/team.jsonl";
+pub const FILE: &str = ".incode/team.jsonl";
 
 /// How much conversation to keep before the oldest is dropped.
 pub const MAX_BYTES: u64 = 256 * 1024;
@@ -586,7 +586,7 @@ mod tests {
 
     fn temp_channel(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "incord-team-{name}-{}-{:?}",
+            "incode-team-{name}-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));

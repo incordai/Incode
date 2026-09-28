@@ -1,4 +1,4 @@
-# Incord Code — Verification
+# incode — Verification
 
 How each acceptance criterion is proven. **The runner reads this**: every roadmap item
 below turns into the check that decides whether its task is `Done`, and `Done` is
@@ -21,8 +21,8 @@ is fixed and detection is deliberately last, so anything a human writes down win
 
 | Precedence | Source | Where |
 |---|---|---|
-| 1 | `INCORD_VERIFY_CMD` environment variable | `src/verify.rs:208` |
-| 2 | `verify_command` in `~/.incord-code/admin.json` | `src/admin.rs` |
+| 1 | `INCODE_VERIFY_CMD` environment variable | `src/verify.rs:208` |
+| 2 | `verify_command` in `~/.incode/admin.json` | `src/admin.rs` |
 | 3 | detected from the manifest → `cargo test` | `src/verify.rs:241` |
 
 **The model never chooses.** `verify`'s tool schema takes no arguments
@@ -78,7 +78,7 @@ marked four such steps `Done` for reasons unrelated to any of them.
 Those tasks are checked by their **deliverable** instead:
 
 ```
-incode --check-findings .incord/findings/r-1.2.md
+incode --check-findings .incode/findings/r-1.2.md
 ```
 
 The same law, not an exception to it. `Verified` is built from a process that
@@ -87,7 +87,7 @@ command is asked, and a research task never inherits the project's.
 
 The judge is the harness's own binary because the only thing that knows what
 a findings file must contain is the harness. `verify::run` resolves the bare
-name `incode` at run time — `INCORD_SELF_BIN`, else this process when its
+name `incode` at run time — `INCODE_SELF_BIN`, else this process when its
 file stem really is `incode`, else `PATH` — so the argv stored in the ledger
 stays portable across machines and rebuilds.
 
@@ -99,7 +99,7 @@ own. See [`RUNNER.md`](RUNNER.md) §6d.
 
 ### Verification under lanes
 
-When `INCORD_LANES > 1` the check runs on the **merged** tree, never inside a
+When `INCODE_LANES > 1` the check runs on the **merged** tree, never inside a
 lane. A lane's own tree contains one agent's work, and proving it proves only
 that the agent did not break its own lane. Two lanes can each pass alone and
 break the moment they are put together. See [`TEAMWORK.md`](TEAMWORK.md) §4.
@@ -151,7 +151,7 @@ directory — every test is a `#[cfg(test)] mod tests` beside the code it covers
 call `contracts::check` **before** minting proof, so a task whose own tests pass while a
 frozen interface has moved cannot reach `Done`.
 
-- **Input:** `.incord/contracts.json` — 26 schemas, 14 endpoints.
+- **Input:** `.incode/contracts.json` — 26 schemas, 14 endpoints.
 - **What is checked:** every declared schema name appears in some source file; every
   field of a schema appears in a file that names that schema; every endpoint's route
   (method stripped) appears in some source file. Matching ignores case and punctuation,

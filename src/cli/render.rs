@@ -255,12 +255,12 @@ const FRAMES_ROTATING: [char; 10] = [
 ///
 /// A legacy console draws an unsupported glyph as a box, and a status line whose
 /// first character is visibly broken reads as a bug in the tool. Setting
-/// `INCORD_ASCII=1` switches to characters that have worked everywhere for
+/// `INCODE_ASCII=1` switches to characters that have worked everywhere for
 /// decades.
 const FRAMES_PLAIN: [char; 4] = ['|', '/', '-', '\\'];
 
 /// The variable that forces the plain frames.
-pub const ASCII_ENV: &str = "INCORD_ASCII";
+pub const ASCII_ENV: &str = "INCODE_ASCII";
 
 /// Which frames this terminal should use.
 #[must_use]
@@ -376,7 +376,7 @@ impl LiveStatus {
         let _ = execute!(io::stdout(), Hide);
         let _ = crossterm::terminal::enable_raw_mode();
         let mouse_capture = crate::cli::footer::mouse_capture_enabled_from(
-            std::env::var("INCORD_MOUSE").as_deref().ok(),
+            std::env::var("INCODE_MOUSE").as_deref().ok(),
         );
         if std::io::stdout().is_terminal() && mouse_capture {
             let _ = execute!(io::stdout(), EnableMouseCapture);
@@ -558,7 +558,7 @@ impl LiveStatus {
         }
         self.suspend();
         let mouse_capture = crate::cli::footer::mouse_capture_enabled_from(
-            std::env::var("INCORD_MOUSE").as_deref().ok(),
+            std::env::var("INCODE_MOUSE").as_deref().ok(),
         );
         if std::io::stdout().is_terminal() && mouse_capture {
             let _ = execute!(io::stdout(), DisableMouseCapture);
@@ -588,7 +588,7 @@ impl Drop for LiveStatus {
         }
         drop(active);
         let mouse_capture = crate::cli::footer::mouse_capture_enabled_from(
-            std::env::var("INCORD_MOUSE").as_deref().ok(),
+            std::env::var("INCODE_MOUSE").as_deref().ok(),
         );
         if std::io::stdout().is_terminal() && mouse_capture {
             let _ = execute!(io::stdout(), DisableMouseCapture);
@@ -616,7 +616,7 @@ pub fn print_banner(
     // Same information, one screenful less of it.
     let mut info = vec![
         String::new(),
-        "Incord Code".to_string(),
+        "incode".to_string(),
         "  an agent harness".to_string(),
         String::new(),
         format!("  model       {model}"),
@@ -640,7 +640,7 @@ const PANEL_WIDTH: usize = 100;
 /// Print an assistant text response (with optional markdown rendering).
 pub fn print_assistant(text: &str) {
     outln!();
-    print_colored("Incord: ", Color::DarkCyan);
+    print_colored("incode: ", Color::DarkCyan);
     if crate::cli::markdown::looks_like_markdown(text) {
         outln!();
         crate::cli::markdown::render_markdown(text);

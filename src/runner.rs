@@ -473,7 +473,7 @@ impl StopReason {
                 "Stopped: {} task(s) are marked in progress with nothing running them: {}. \
                  They are NOT finished. A run that was killed or crashed mid-task leaves \
                  this behind, and nothing reclaims it — set each one back to `ready` in \
-                 `.incord/ledger.json`, or cancel it, then run again.",
+                 `.incode/ledger.json`, or cancel it, then run again.",
                 ids.len(),
                 ids.join(", ")
             ),
@@ -1150,7 +1150,7 @@ fn work_the_ledger(
     // ASKED FOR FOUR, GOT ONE, AND TOLD WHY.
     //
     // `Isolation::None` carries the reason and `why_not` returns it, and
-    // nothing asked: an operator who set INCORD_LANES=4 and got a sequential
+    // nothing asked: an operator who set INCODE_LANES=4 and got a sequential
     // run had no way to learn that the workspace is not a git repository.
     // The run looks identical to one that simply had nothing to parallelise.
     //
@@ -1616,7 +1616,7 @@ pub fn task_instruction(task: &Task) -> String {
     // modules were written to read — which is the whole point of freezing them.
     if !task.contracts.is_empty() {
         out.push_str(&format!(
-            "This task is built against these frozen interfaces: {}. Use those              exact names. They were agreed before the work was split up, and              another module has already been written to read them — a field you              rename here is a break nobody sees until integration. Read              `.incord/contracts.json` for the shapes.
+            "This task is built against these frozen interfaces: {}. Use those              exact names. They were agreed before the work was split up, and              another module has already been written to read them — a field you              rename here is a break nobody sees until integration. Read              `.incode/contracts.json` for the shapes.
 
 ",
             task.contracts.join(", ")
@@ -2269,7 +2269,7 @@ mod tests {
         };
         git(&["init"])?;
         git(&["config", "user.email", "t@example.invalid"])?;
-        git(&["config", "user.name", "incord test"])?;
+        git(&["config", "user.name", "incode test"])?;
         std::fs::write(root.join("base.txt"), "base\n").ok()?;
         git(&["add", "-A"])?;
         git(&["commit", "-m", "base"])?;

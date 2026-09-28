@@ -29,7 +29,7 @@ question that only occurs to someone once they are inside the work.
 
 ## 2. The channel
 
-`.incord/team.jsonl`, append-only, one JSON object per line.
+`.incode/team.jsonl`, append-only, one JSON object per line.
 
 ### Why a file
 
@@ -113,7 +113,7 @@ A tool that took `from` as an argument would let an agent file its words under
 another agent's name — and the harness **records** those words, so it would be
 recording a claim as a fact.
 
-`INCORD_TEAM_AS` is set by the harness on the agent's process when it spawns it
+`INCODE_TEAM_AS` is set by the harness on the agent's process when it spawns it
 for a task. The MCP server is a **child** of that agent, so it inherits the
 variable, and the role is settled before the model has said anything.
 
@@ -136,7 +136,7 @@ because the description is the part that reaches the model.
 
 ## 4. Lanes: more than one agent at once
 
-`INCORD_LANES=<n>`, default **1**, capped at 8.
+`INCODE_LANES=<n>`, default **1**, capped at 8.
 
 ### Two measured facts decide the whole design
 
@@ -308,8 +308,8 @@ conversation between tasks, so a reused one would start from nothing anyway.
 
 | Setting | Default | What it does |
 |---|---|---|
-| `INCORD_LANES` | `1` | Agents at once. Needs git. Clamped to 8. A typo falls back to 1 rather than stopping the run |
-| `INCORD_TEAM_AS` | `unrouted` | Set by the harness per task; read by the team MCP server |
+| `INCODE_LANES` | `1` | Agents at once. Needs git. Clamped to 8. A typo falls back to 1 rather than stopping the run |
+| `INCODE_TEAM_AS` | `unrouted` | Set by the harness per task; read by the team MCP server |
 | `incode --team-mcp --team-channel <p>` | — | The server itself. Launched BY an MCP client, not by hand |
 
 Worktrees are created in `<repo-parent>/worktrees/` — `tools/worktree.rs`'s

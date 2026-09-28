@@ -17,7 +17,7 @@
 //!
 //! # Shape: one JSONL file per task
 //!
-//! Append-only, one JSON object per line, at `.incord/agents/<task-id>.jsonl`.
+//! Append-only, one JSON object per line, at `.incode/agents/<task-id>.jsonl`.
 //! Line-per-event rather than one document because a run that is killed
 //! mid-task must still leave a readable record — a partially-written JSON array
 //! parses as nothing, while a partially-written JSONL file parses as every line
@@ -29,7 +29,7 @@
 //! read, and this module makes no attempt to detect secrets in it — content
 //! sniffing for credentials is false-negative-prone, and a filter that catches
 //! most secrets invites treating the output as safe to move somewhere it is not.
-//! The transcript is therefore treated exactly like the rest of `.incord/`:
+//! The transcript is therefore treated exactly like the rest of `.incode/`:
 //! local workspace state, never uploaded anywhere by this module. Anything that
 //! later ships a transcript off the machine owns that decision and the redaction
 //! it requires.
@@ -39,7 +39,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Where a run's per-agent transcripts live, relative to the workspace.
-pub const DIR: &str = ".incord/agents";
+pub const DIR: &str = ".incode/agents";
 
 /// The most of any single recorded field that reaches the file.
 ///

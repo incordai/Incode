@@ -254,7 +254,7 @@ impl SessionFactory for CliSessions {
             session,
             mode: prepared.permission_mode,
             settings: commands::Settings {
-                data_dir: prepared.incord_code_dir.clone(),
+                data_dir: prepared.incode_dir.clone(),
                 catalogue: prepared.catalogue.clone(),
                 lead: prepared.agent,
             },
@@ -262,7 +262,7 @@ impl SessionFactory for CliSessions {
             roles,
             build,
             runs: Box::new(run::CliRuns {
-                data_dir: prepared.incord_code_dir,
+                data_dir: prepared.incode_dir,
                 admin: prepared.admin,
                 catalogue: prepared.catalogue,
                 fleet: prepared.fleet,
@@ -1398,9 +1398,7 @@ fn initialize() -> acp::InitializeResponse {
                 ),
         )
         .auth_methods(Vec::new())
-        .agent_info(
-            acp::Implementation::new("incode", env!("CARGO_PKG_VERSION")).title("Incord Code"),
-        )
+        .agent_info(acp::Implementation::new("incode", env!("CARGO_PKG_VERSION")).title("incode"))
 }
 
 fn mode_state(current: PermissionMode) -> acp::SessionModeState {

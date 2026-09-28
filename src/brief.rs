@@ -882,7 +882,7 @@ pub fn parse_briefs(body: &str) -> Result<Vec<ProjectBrief>, String> {
 }
 
 /// Where the last brief this workspace saw is kept.
-pub const CACHE_FILE: &str = ".incord/brief.cache.json";
+pub const CACHE_FILE: &str = ".incode/brief.cache.json";
 
 /// Keep a copy of a complete brief, so an outage does not undo the intake.
 ///

@@ -30,7 +30,7 @@ This is fully true for claude; section 0b says what is not.
 | ACP: `usage_update`, edits as diff blocks, slash commands | `63fc212` |
 | The memory engine's `pre-tool` run in incode's Toolbox; fail closed for changes; Allow/Reject raced against `permission-request`; `AskUserQuestion` as a tool | `d7f5d41` |
 | The bridge: claude runs with its own tools, settings, hooks, CLAUDE.md and skills off; its only tools are incode's, over `incode --tool-server` | `27cf90f` |
-| The memory lifecycle fired by incode on every route (`session-start`, `user-prompt`, `code-edit`, `capture`, `session-end`); transcripts in `.incord/transcripts/`; CLAUDE.md and AGENTS.md read by incode | `4802719` |
+| The memory lifecycle fired by incode on every route (`session-start`, `user-prompt`, `code-edit`, `capture`, `session-end`); transcripts in `.incode/transcripts/`; CLAUDE.md and AGENTS.md read by incode | `4802719` |
 | Toolbox: MultiEdit, ApplyPatch, LS, NotebookEdit, background Bash with BashOutput/KillShell, WebFetch, WebSearch, TodoWrite, Diagnostics, watchman_lookup, the team verbs; one reach table; WebFetch no longer leaks the search key | `d80b02a` |
 | ripgrep-based Glob/Grep/LS, Outline (tree-sitter), documents in Read, schema check on every call; ConvertDocument when LibreOffice is found | `079988b` |
 | Pictures in tool results; the headless browser (WebFetch `render_js`, Screenshot, RenderPdf); the desktop tools behind the Toolbox gate | `70c5556` |
@@ -58,7 +58,7 @@ This is fully true for claude; section 0b says what is not.
   session end, a crashed session's ACE swept by the next): 2.3–3.2 s each way on
   an 18,673-object tree, measured and live-tested on a scratch copy
   (`ARCHITECTURE.md` §5b). Applied only when `sandbox: "workspace-write"` or
-  `INCORD_SANDBOX` names it; the permission-mode default still leaves it
+  `INCODE_SANDBOX` names it; the permission-mode default still leaves it
   unconfined. Open: whether to make it the default, and a size cap — the grant is
   linear in the tree (a `node_modules`-heavy workspace pays per object, once per
   session). Not yet driven end to end through a real model session.
@@ -86,7 +86,7 @@ This is fully true for claude; section 0b says what is not.
   The operator's own hooks and `verify_command` still run through cmd.exe: they are
   the operator's commands, written for it.
 - **Network isolation — partial.** `sandbox_network: "deny"` (or
-  `INCORD_SANDBOX_NETWORK`) is enforced on macOS (Seatbelt; loopback and Unix
+  `INCODE_SANDBOX_NETWORK`) is enforced on macOS (Seatbelt; loopback and Unix
   sockets kept) and on Linux 6.7+ (Landlock ABI v4, TCP only, loopback included);
   reported NOT enforced on older Linux kernels and on Windows (only an
   AppContainer could, and it cannot read the workspace or toolchains ungranted).
@@ -181,7 +181,7 @@ thrown away. Eight of the nine are wired; one was allowlisted honestly.
 |---|---|---|
 | `verify::detection_note` | `--admin`'s verify line | "none" read the same for *no ecosystem here* and *two, so running one's tests proves nothing about the other* — opposite problems, opposite fixes |
 | `budget::exhausted_message` | `StopReason::BudgetSpent`, via `exhausted_text` | the stop said "24000 used" — not what it was measured against, not which variable raises it |
-| `parallel::why_not` | `parallel::shortfall_note`, printed by the runner | `INCORD_LANES=4` on a non-repository gave a sequential run indistinguishable from having nothing to parallelise |
+| `parallel::why_not` | `parallel::shortfall_note`, printed by the runner | `INCODE_LANES=4` on a non-repository gave a sequential run indistinguishable from having nothing to parallelise |
 | `ledger::attempts_left` | `task_instruction` | the final attempt worked exactly like the first, reaching for the better change rather than the one it was sure of |
 | `ask::unattended_note` | `task_run`, after the turn | **`--task` never parsed the agent's `<ask>` blocks.** An agent that hit a fork, asked, and guessed produced a run reporting plain success with the question sitting in the prose |
 | `brief::may_code` | `/run`'s brief gate | read as `matches!(Gate::Ready(_))` — true today, not the rule; a variant added later would fall through silently |
@@ -283,8 +283,8 @@ limit. One live call is all that is missing.
 ### B3 — The viewer's stop button — DONE 2026-09-23
 
 The owner decided: reads, plus two writes behind a per-run token
-(`.incord/serve.token`, `Authorization: Bearer`). `POST /v1/run/stop` writes
-`.incord/run.stop`; a running `/run` watches for it and trips the same cancel
+(`.incode/serve.token`, `Authorization: Bearer`). `POST /v1/run/stop` writes
+`.incode/run.stop`; a running `/run` watches for it and trips the same cancel
 Ctrl-C does, which ends the agent and its whole process tree. `POST
 /v1/team/answer` records the person's answer to an agent's question. Every
 request also passes the Host and Origin checks.

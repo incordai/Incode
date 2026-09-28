@@ -41,7 +41,7 @@ pub struct WorktreeManager {
     repo_root: PathBuf,
     /// Directory where worktrees are stored (repo_root/../worktrees/).
     worktree_dir: PathBuf,
-    /// Branch prefix (default: "incord").
+    /// Branch prefix (default: "incode").
     branch_prefix: String,
 }
 
@@ -53,11 +53,11 @@ impl WorktreeManager {
         Self {
             repo_root,
             worktree_dir,
-            branch_prefix: "incord".to_string(),
+            branch_prefix: "incode".to_string(),
         }
     }
 
-    /// Set the branch prefix (default: "incord").
+    /// Set the branch prefix (default: "incode").
     #[must_use]
     pub fn with_branch_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.branch_prefix = prefix.into();
@@ -66,7 +66,7 @@ impl WorktreeManager {
 
     /// Create a new worktree for a task.
     ///
-    /// Creates `worktrees/<slug>-<hash>/` with branch `incord/<slug>-<hash>`.
+    /// Creates `worktrees/<slug>-<hash>/` with branch `incode/<slug>-<hash>`.
     pub fn create(&self, task_name: &str, base_ref: Option<&str>) -> Result<Worktree, String> {
         // Ensure worktree directory exists
         std::fs::create_dir_all(&self.worktree_dir)
@@ -175,7 +175,7 @@ impl WorktreeManager {
         Ok(parse_worktree_list(&stdout))
     }
 
-    /// List only worktrees managed by incord (matching our branch prefix).
+    /// List only worktrees managed by incode (matching our branch prefix).
     pub fn list_managed(&self) -> Result<Vec<Worktree>, String> {
         let all = self.list()?;
         Ok(all
@@ -484,7 +484,7 @@ mod tests {
     fn worktree_manager_creation() {
         let mgr = WorktreeManager::new(PathBuf::from("/tmp/repo"));
         assert_eq!(mgr.repo_root, PathBuf::from("/tmp/repo"));
-        assert_eq!(mgr.branch_prefix, "incord");
+        assert_eq!(mgr.branch_prefix, "incode");
     }
 
     #[test]
@@ -500,9 +500,9 @@ worktree /repos/project
 HEAD 1111111111111111111111111111111111111111
 branch refs/heads/main
 
-worktree /repos/worktrees/incord-task1-abc
+worktree /repos/worktrees/incode-task1-abc
 HEAD 2222222222222222222222222222222222222222
-branch refs/heads/incord/task1-abc
+branch refs/heads/incode/task1-abc
 
 worktree /repos/worktrees/detached-task2-def
 HEAD 3333333333333333333333333333333333333333
@@ -512,8 +512,8 @@ detached
         assert_eq!(parsed.len(), 3);
         assert_eq!(parsed[0].name, "project");
         assert_eq!(parsed[0].branch, "main");
-        assert_eq!(parsed[1].name, "incord-task1-abc");
-        assert_eq!(parsed[1].branch, "incord/task1-abc");
+        assert_eq!(parsed[1].name, "incode-task1-abc");
+        assert_eq!(parsed[1].branch, "incode/task1-abc");
         assert_eq!(parsed[2].name, "detached-task2-def");
         assert_eq!(parsed[2].branch, "(detached)");
     }

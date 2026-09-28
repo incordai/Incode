@@ -9,7 +9,7 @@ use std::path::PathBuf;
 ///
 /// Lets an operator choose without editing a flag into every invocation, which
 /// is the point of "the operator picks, the code does not".
-pub const MODEL_ENV: &str = "INCORD_MODEL";
+pub const MODEL_ENV: &str = "INCODE_MODEL";
 
 /// The model used when neither `--model` nor [`MODEL_ENV`] says otherwise.
 ///
@@ -35,7 +35,7 @@ pub fn default_model() -> String {
         .unwrap_or_else(|| FALLBACK_MODEL.to_string())
 }
 
-/// Top-level config for `incord code`.
+/// Top-level config for `incode`.
 #[derive(Debug, Clone)]
 pub struct IncordCodeConfig {
     /// Which model this session runs on.

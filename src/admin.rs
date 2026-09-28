@@ -31,14 +31,23 @@ pub const ADMIN_FILE: &str = "admin.json";
 
 /// Moves the whole data directory, which is what a test needs to read settings
 /// without touching the operator's own.
-pub const DATA_DIR_ENV: &str = "INCORD_CODE_DIR";
+pub const DATA_DIR_ENV: &str = "INCODE_DIR";
+
+/// The home directory the data directory sits under when [`DATA_DIR_ENV`] is
+/// not set: `HOME`, else `USERPROFILE`.
+#[must_use]
+pub fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
 
 /// Environment variable naming which installed agent serves this session.
 ///
 /// The value is an agent ID as [`crate::agent::registry::discover`] reports it,
 /// not a path — the harness finds the binary itself and never reads a
 /// credential.
-pub const AGENT_ENV: &str = "INCORD_AGENT";
+pub const AGENT_ENV: &str = "INCODE_AGENT";
 
 /// Where a setting came from, so a surprising value can be traced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,7 +172,7 @@ pub struct AdminConfig {
     /// Whether a sandboxed shell command may use the network: `allow` (the
     /// default, and the behaviour before this existed) or `deny` — see
     /// [`crate::sandbox`] for what each OS can enforce and what it only
-    /// reports. `INCORD_SANDBOX_NETWORK` wins over it.
+    /// reports. `INCODE_SANDBOX_NETWORK` wins over it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_network: Option<String>,
     /// The shell the `Bash` tool runs commands in on Windows, as a path or a
@@ -411,10 +420,9 @@ impl AdminConfig {
         if let Some(explicit) = std::env::var_os(DATA_DIR_ENV) {
             return PathBuf::from(explicit);
         }
-        std::env::var_os("HOME")
-            .or_else(|| std::env::var_os("USERPROFILE"))
-            .map_or_else(|| PathBuf::from("."), PathBuf::from)
-            .join(".incord-code")
+        home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(crate::migrate::GLOBAL_DIR)
     }
 
     /// Read the operator's settings from the default location.

@@ -653,7 +653,7 @@ mod tests {
     // ---- Live, opt-in: they change real ACLs, so they run only on a scratch
     // tree named by `INCODE_SANDBOX_LIVE_DIR` (with `INCODE_SANDBOX_LIVE_BIN`
     // the built incode.exe, `INCODE_SANDBOX_LIVE_OUTSIDE` a scratch directory
-    // outside the tree, and `INCORD_CODE_DIR` pointing the records at scratch
+    // outside the tree, and `INCODE_DIR` pointing the records at scratch
     // too). Run with `--ignored --test-threads=1`.
 
     struct Live {

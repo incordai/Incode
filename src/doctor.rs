@@ -264,7 +264,7 @@ fn check_guards(workspace: &Path) -> Check {
         Err(e) => Check::fail(
             "guards",
             e,
-            "Fix or delete .incord/guards.json. Until it parses, delegated work is refused rather than run unprotected.",
+            "Fix or delete .incode/guards.json. Until it parses, delegated work is refused rather than run unprotected.",
         ),
     }
 }
@@ -304,7 +304,7 @@ fn check_ledger(workspace: &Path) -> Check {
         Err(e) => Check::fail(
             "ledger",
             e,
-            "Fix or remove .incord/ledger.json. `/run` cannot start while it is unreadable.",
+            "Fix or remove .incode/ledger.json. `/run` cannot start while it is unreadable.",
         ),
     }
 }
@@ -401,8 +401,8 @@ mod tests {
     #[test]
     fn a_broken_guards_policy_is_reported_as_a_failure() {
         let dir = tempfile::tempdir().expect("temp dir");
-        std::fs::create_dir_all(dir.path().join(".incord")).expect("dir");
-        std::fs::write(dir.path().join(".incord").join("guards.json"), "{ not json")
+        std::fs::create_dir_all(dir.path().join(".incode")).expect("dir");
+        std::fs::write(dir.path().join(".incode").join("guards.json"), "{ not json")
             .expect("write");
 
         let checks = run(dir.path());

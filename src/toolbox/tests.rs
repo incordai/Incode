@@ -363,7 +363,7 @@ fn unreadable_guards_stop_writes_rather_than_permitting_them() {
     // The failure the guards module calls the worst one: protections that
     // quietly stop applying while everything keeps working.
     let dir = tempfile::tempdir().expect("tmp");
-    std::fs::create_dir_all(dir.path().join(".incord")).expect("dir");
+    std::fs::create_dir_all(dir.path().join(".incode")).expect("dir");
     std::fs::write(dir.path().join(crate::guards::GUARDS_FILE), "{ not json").expect("write");
     let refused = toolbox(dir.path())
         .run(WRITE, &json!({"path": "anything.txt", "content": "x"}))

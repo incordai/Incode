@@ -1,4 +1,4 @@
-# Incord Code — Computer Use
+# incode — Computer Use
 
 > **Status note, 2026-09-26.** The first line below is out of date. The Windows desktop
 > (`src/desktop/`) is built, and its twelve tools are Toolbox tools behind incode's
@@ -469,7 +469,7 @@ the process boundary. A read-only session could not edit a file and could type i
 a login form.
 
 **And the operator's own command can refuse too.** `desktop_hooks` in
-`~/.incord-code/admin.json` runs a pre-tool command before every action; exit code 2
+`~/.incode/admin.json` runs a pre-tool command before every action; exit code 2
 refuses it and its stdout reaches the agent. A hook is shown the REAL tool input
 rather than the redacted line the journal gets — a hook that cannot see what is about
 to be typed cannot refuse on it — and is bounded at 10 seconds, because it runs
@@ -522,7 +522,7 @@ them would be worse than shipping nothing, because they would read as protection
 The kill switch must be **out-of-band** — it cannot live on the desktop it is stopping:
 
 - **An HTTP stop on the harness's own port** (`src/serve/`, already bound and already
-  published to `.incord/serve.json`). This is the operator's real stop button.
+  published to `.incode/serve.json`). This is the operator's real stop button.
 - **Process-level termination** by the harness, which already supervises child processes
   (`src/runtime/lifecycle.rs`, `src/tools/bash_jobs.rs`). Decision 4 makes this clean: the
   desktop server is a separate process, so killing it cannot damage the session.
@@ -776,7 +776,7 @@ from one working implementation is honest, one generalised from zero is a guess.
    loops are deleted.
 
    `run_backend` takes the switch as an argument (`run_backend_with_desktop`) rather than
-   reading `INCORD_DESKTOP` at the point of use. A test that reads the environment can
+   reading `INCODE_DESKTOP` at the point of use. A test that reads the environment can
    only assert the on/off pairing, and on an unset machine — the normal case — that
    reduces to "off, and nothing was handed over", which stays true with every
    registration line deleted.
@@ -817,7 +817,7 @@ from one working implementation is honest, one generalised from zero is a guess.
 
     | piece | where |
     | --- | --- |
-    | the journal | `src/desktop/journal.rs` — append-only JSONL under `.incord/desktop.jsonl` |
+    | the journal | `src/desktop/journal.rs` — append-only JSONL under `.incode/desktop.jsonl` |
     | the writer | `Server::call_tool` (`src/desktop/mcp.rs`), the one choke point every tool passes through with its outcome known |
     | the reader | `stream()` (`src/serve/http.rs`), emitting `event: desktop` per record |
     | the seam | `--desktop-journal <path>`, passed by the same registration that names the binary |
@@ -841,7 +841,7 @@ from one working implementation is honest, one generalised from zero is a guess.
 
     **The kill switch's other half — done the same day, the same way.** `Safety::stop` is
     only reachable from inside the desktop process, so the switch existed with nothing able
-    to press it. `incode --desktop-stop -w <workspace>` writes `.incord/desktop.stop`, and
+    to press it. `incode --desktop-stop -w <workspace>` writes `.incode/desktop.stop`, and
     `call_tool` checks for it before every tool.
 
     - **Existence is the signal; nothing is parsed.** There is nothing to parse wrong — a
@@ -986,7 +986,7 @@ disappears into a framebuffer codec.
 **Server-Sent Events**: it sends the current snapshot on connect, then re-sends whenever
 the state differs, with `: tick` comments in between so an idle proxy does not decide the
 connection died. `src/serve/mod.rs` picks a free port itself and publishes it to
-`.incord/serve.json`.
+`.incode/serve.json`.
 
 Measured the same day: **there is no WebSocket support anywhere in the crate.** No
 `tokio-tungstenite`, no upgrade handling, and `Cargo.toml` takes `hyper` with only the
@@ -1037,7 +1037,7 @@ security surface even on a loopback socket". A framebuffer protocol is a bigger 
 of that same trade.
 
 **The harness's job is therefore supervision, not streaming:** launch `Xvfb` and the VNC
-bridge, health-check them, publish the viewer URL into `.incord/serve.json` beside the
+bridge, health-check them, publish the viewer URL into `.incode/serve.json` beside the
 port it already publishes, and tear both down with the session. That is process
 management, which this crate already does well (`src/runtime/lifecycle.rs`,
 `src/tools/bash_jobs.rs`).
@@ -1119,7 +1119,7 @@ retrofitted into a design shaped entirely around a single Windows desktop.
 - **A `DesktopSession` is the unit**, not a global desktop. It owns a display id, a viewer
   port, a process group and a lifetime. One per agent run.
 - **Allocation follows a pattern this crate already has.** `src/serve/mod.rs` picks a free
-  port itself and publishes it to `.incord/serve.json` rather than hardcoding one. Display
+  port itself and publishes it to `.incode/serve.json` rather than hardcoding one. Display
   ids (`:99`, `:100`, …) and viewer ports want exactly that treatment.
 - **Teardown must be guaranteed, not best-effort.** An orphaned `Xvfb` is a leak; an
   orphaned agent desktop still holding a signed-in session is a security problem. This is

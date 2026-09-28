@@ -966,11 +966,11 @@ fn home_dir() -> Option<std::path::PathBuf> {
 
 /// Where to write the agent's raw output, if the operator asked for it.
 ///
-/// `INCORD_DEBUG_STREAM=<path>` appends every line the agent sends. It is the
+/// `INCODE_DEBUG_STREAM=<path>` appends every line the agent sends. It is the
 /// only way to answer "why did this turn fail" without guessing.
 #[must_use]
 pub fn debug_stream_path() -> Option<String> {
-    std::env::var("INCORD_DEBUG_STREAM")
+    std::env::var("INCODE_DEBUG_STREAM")
         .ok()
         .filter(|p| !p.is_empty())
 }
@@ -1410,7 +1410,7 @@ impl ClaudeCodeBackend {
                 let _ = writeln!(
                     file,
                     "{}",
-                    serde_json::json!({ "type": "incord_argv", "argv": argv })
+                    serde_json::json!({ "type": "incode_argv", "argv": argv })
                 );
             }
         }
@@ -2425,7 +2425,7 @@ pub(crate) mod tests {
         let on =
             ClaudeCodeBackend::new(PathBuf::from(".")).with_desktop(crate::toolbox::DesktopSetup {
                 exe: PathBuf::from("incode"),
-                journal: PathBuf::from(".incord/desktop.jsonl"),
+                journal: PathBuf::from(".incode/desktop.jsonl"),
             });
         let names = on.tools.names();
         for tool in ["screenshot", "screen_info", "ui_tree", "click", "type_text"] {

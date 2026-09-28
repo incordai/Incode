@@ -43,7 +43,7 @@ use hyper::{Method, Request, Response, StatusCode};
 /// How often the stream re-reads the run to see if anything moved.
 pub const POLL: std::time::Duration = std::time::Duration::from_millis(700);
 
-/// Where the server writes the address it actually got, inside `.incord/`.
+/// Where the server writes the address it actually got, inside `.incode/`.
 ///
 /// # There is no default port, on purpose
 ///
@@ -109,7 +109,7 @@ type Body = BoxBody<Bytes, Infallible>;
 /// Extra browser origins allowed to read this server, comma-separated — for an
 /// interface that is not served from loopback, such as a desktop shell's own
 /// scheme (`tauri://localhost`). Loopback origins need no entry.
-pub const ORIGINS_ENV: &str = "INCORD_SERVE_ORIGINS";
+pub const ORIGINS_ENV: &str = "INCODE_SERVE_ORIGINS";
 
 /// Who may talk to this server. See the module note.
 #[derive(Debug, Clone)]
@@ -207,12 +207,12 @@ fn with_cors(mut reply: Response<Body>, origin: Option<&str>) -> Response<Body> 
     reply
 }
 
-/// Where this run's write token is kept, inside `.incord/`.
+/// Where this run's write token is kept, inside `.incode/`.
 ///
 /// Reads need no token. A write — answering an agent — needs it, sent as
 /// `Authorization: Bearer <token>`. It keeps out web pages (which also fail the
 /// origin check) and other users' programs. It does NOT keep out an agent
-/// working in this workspace, which can read `.incord/` like any file; nothing
+/// working in this workspace, which can read `.incode/` like any file; nothing
 /// a write offers is more than such an agent can already do to that directory.
 pub const TOKEN_FILE: &str = "serve.token";
 
@@ -284,7 +284,7 @@ pub fn command(
             StatusCode::UNAUTHORIZED,
             &serde_json::json!({ "error": format!(
                 "a write needs this run's token: send `Authorization: Bearer <token>` \
-                 with the token from .incord/{TOKEN_FILE}"
+                 with the token from .incode/{TOKEN_FILE}"
             ) }),
         ));
     }

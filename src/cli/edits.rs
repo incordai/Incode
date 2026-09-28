@@ -612,7 +612,7 @@ mod tests {
     /// [`Watcher::returned`] and this fails on the first assertion.
     #[test]
     fn a_refused_write_is_not_shown_as_a_change() {
-        let dir = std::env::temp_dir().join(format!("incord-edits-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("incode-edits-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("a scratch dir");
         let call = r#"{"file_path":"a.rs","old_string":"one","new_string":"two"}"#;
 

@@ -198,7 +198,7 @@ pub(crate) fn run(ctx: &RunContext<'_>, cancel: &CancelToken, watch: Watch<'_>) 
         if verify.is_empty() {
             render::print_error(
                 "No check is configured for this project, so no planned step can be proved \
-                 finished. Set one with INCORD_VERIFY_CMD or `verify_command` in admin.json.",
+                 finished. Set one with INCODE_VERIFY_CMD or `verify_command` in admin.json.",
             );
         }
         let mut planned: Vec<crate::ledger::Task> = Vec::new();

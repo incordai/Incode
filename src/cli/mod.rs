@@ -1,4 +1,4 @@
-//! CLI module — interactive REPL for `incord code`.
+//! CLI module — interactive REPL for `incode`.
 
 pub mod activity;
 pub mod agent_turn;
@@ -35,14 +35,14 @@ use slash_commands::SlashCommand;
 
 /// Time one startup step, when the operator asks to see where the time goes.
 ///
-/// Reports under `INCORD_TRACE` in the `startup` area. A startup that takes
+/// Reports under `INCODE_TRACE` in the `startup` area. A startup that takes
 /// seventeen seconds with five candidate causes is not diagnosable by reading;
 /// this makes it name itself.
 fn timed<T>(label: &str, f: impl FnOnce() -> T) -> T {
     crate::trace::timed("startup", label, f)
 }
 
-/// Cumulative elapsed at a named point in startup, under `INCORD_TRACE`.
+/// Cumulative elapsed at a named point in startup, under `INCODE_TRACE`.
 fn mark(label: &str, since: std::time::Instant) {
     crate::trace!("startup", "@{label} at {:?}", since.elapsed());
 }
@@ -51,7 +51,7 @@ fn mark(label: &str, since: std::time::Instant) {
 // CliApp
 // ---------------------------------------------------------------------------
 
-/// The main REPL application for `incord code`.
+/// The main REPL application for `incode`.
 pub struct CliApp {
     config: IncordCodeConfig,
 }
@@ -94,7 +94,7 @@ impl CliApp {
 /// became of each server is traced, never printed over the prompt.
 fn connect_ext_tools(prepared: &Prepared) {
     let (specs, said) =
-        crate::ext_tools::session_servers(&prepared.admin.tools, &prepared.incord_code_dir);
+        crate::ext_tools::session_servers(&prepared.admin.tools, &prepared.incode_dir);
     for line in said {
         render::print_info(&line);
     }
@@ -114,7 +114,7 @@ fn connect_ext_tools(prepared: &Prepared) {
 /// [`crate::acp_agent`].
 pub(crate) struct Prepared {
     pub(crate) workspace: std::path::PathBuf,
-    pub(crate) incord_code_dir: std::path::PathBuf,
+    pub(crate) incode_dir: std::path::PathBuf,
     pub(crate) admin: crate::admin::AdminConfig,
     pub(crate) permission_mode: PermissionMode,
     pub(crate) tool_cache: ToolStatusCache,
@@ -159,6 +159,12 @@ pub(crate) fn prepare_session(
     // (`-w .` included).
     let workspace = crate::tools::file_ops::workspace_root(&config.workspace)
         .map_err(|e| anyhow::anyhow!("{e:#}"))?;
+    // incode's state left in the old `.incord/` moves to `.incode/` before
+    // anything below reads it. Here rather than at process start because a
+    // protocol session names its own workspace.
+    for line in crate::migrate::project_report(&workspace) {
+        render::print_info(&line);
+    }
     // The intake gate. Nothing is blocked by it: an incomplete brief makes
     // completing the brief the session's first job, not a reason to exit.
     // The work still happens here, in this session, with the owner present
@@ -248,19 +254,19 @@ pub(crate) fn prepare_session(
     // than an argument, and why it stops at this process boundary.
     std::env::set_var(PERMISSION_MODE_ENV, permission_mode.as_str());
 
-    // Incord Code data directory (history, sessions, memory)
+    // incode's data directory (history, sessions, memory)
     // One resolver for the data directory, shared with every caller that
     // reads settings from it — two answers here means the operator edits one
     // file and the harness reads another.
-    let incord_code_dir = crate::admin::AdminConfig::default_dir();
-    let _ = std::fs::create_dir_all(&incord_code_dir);
+    let incode_dir = crate::admin::AdminConfig::default_dir();
+    let _ = std::fs::create_dir_all(&incode_dir);
 
     // The operator's standing decisions. A flag beats an env var beats this
     // file beats the built-in fallback, and every value can say which of the
     // four decided it — see `/admin`.
     let admin = match timed("admin", || {
         mark("admin", booted_at);
-        crate::admin::AdminConfig::load(&incord_code_dir)
+        crate::admin::AdminConfig::load(&incode_dir)
     }) {
         Ok(admin) => admin,
         Err(e) => {
@@ -331,7 +337,7 @@ pub(crate) fn prepare_session(
     });
 
     // Tool status cache (Feature 3: detect installed CLI tools)
-    let tool_cache_path = incord_code_dir.join("tool-status.json");
+    let tool_cache_path = incode_dir.join("tool-status.json");
     let mut tool_cache = timed("tool probe", || {
         mark("tools", booted_at);
         ToolStatusCache::load_or_create(&tool_cache_path)
@@ -416,9 +422,7 @@ pub(crate) fn prepare_session(
     // fifty-five installed skills came to 21,323 characters of names and
     // descriptions alone; carrying their text as well would spend the budget
     // on skills the work never touches. One is read when it is asked for.
-    if let Some(block) = timed("skills", || {
-        crate::skills::session_context(&incord_code_dir)
-    }) {
+    if let Some(block) = timed("skills", || crate::skills::session_context(&incode_dir)) {
         system_prompt.push(block);
     }
 
@@ -638,7 +642,7 @@ pub(crate) fn prepare_session(
 
     Ok(Prepared {
         workspace,
-        incord_code_dir,
+        incode_dir,
         admin,
         permission_mode,
         tool_cache,
@@ -662,7 +666,7 @@ impl CliApp {
     ) -> anyhow::Result<()> {
         let Prepared {
             workspace,
-            incord_code_dir,
+            incode_dir,
             admin,
             permission_mode,
             tool_cache,
@@ -706,10 +710,7 @@ impl CliApp {
             git_context.as_ref(),
         );
         // History file
-        let history_path = incord_code_dir
-            .join("history.txt")
-            .to_string_lossy()
-            .to_string();
+        let history_path = incode_dir.join("history.txt").to_string_lossy().to_string();
 
         // The agent owns the transcript, so resuming is handing it the id back
         // rather than replaying messages this harness stored.
@@ -843,7 +844,7 @@ impl CliApp {
                     SlashCommand::Run => run_ledger::run(
                         &run_ledger::RunContext {
                             workspace: &workspace,
-                            data_dir: &incord_code_dir,
+                            data_dir: &incode_dir,
                             admin: &admin,
                             catalogue: &catalogue,
                             fleet: &fleet,
@@ -869,11 +870,11 @@ impl CliApp {
                             arg.as_deref(),
                             &catalogue,
                             &agent,
-                            &incord_code_dir,
+                            &incode_dir,
                         );
                     }
                     SlashCommand::Roles(arg) => {
-                        slash_commands::handle_roles(arg.as_deref(), &incord_code_dir);
+                        slash_commands::handle_roles(arg.as_deref(), &incode_dir);
                     }
                     SlashCommand::Help => slash_commands::handle_help(),
                     SlashCommand::Status => {
@@ -905,10 +906,10 @@ impl CliApp {
                             );
                             render::print_info(&tool_cache.summary_line());
                         }
-                        slash_commands::handle_ext_tools(arg.as_deref(), &incord_code_dir);
+                        slash_commands::handle_ext_tools(arg.as_deref(), &incode_dir);
                     }
                     SlashCommand::Skills => {
-                        slash_commands::handle_skills_from_store(&incord_code_dir);
+                        slash_commands::handle_skills_from_store(&incode_dir);
                     }
                     SlashCommand::Mcp => {
                         // The model is started with only incode's own servers;
@@ -943,7 +944,7 @@ impl CliApp {
                         // Saved, then dropped so the next turn starts a fresh
                         // one.
                         if let Some(finished) = session_record.take() {
-                            crate::session::save(&incord_code_dir, &finished);
+                            crate::session::save(&incode_dir, &finished);
                             crate::trace!(
                                 "session",
                                 "cleared: {} kept, next turn opens a new record",
@@ -974,7 +975,7 @@ impl CliApp {
                             match session_record.as_mut() {
                                 Some(record) => {
                                     record.rename(wanted);
-                                    crate::session::save(&incord_code_dir, record);
+                                    crate::session::save(&incode_dir, record);
                                     render::print_info(&format!(
                                         "Named this session `{}`.",
                                         record.title
@@ -1003,7 +1004,7 @@ impl CliApp {
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map_or(0, |d| d.as_secs());
-                        let records = crate::session::for_workspace(&incord_code_dir, &workspace);
+                        let records = crate::session::for_workspace(&incode_dir, &workspace);
                         for line in crate::session::summary_lines(&records, now) {
                             render::print_info(&line);
                         }
@@ -1013,7 +1014,7 @@ impl CliApp {
                         // id is what `--resume` takes, and an operator who thinks
                         // it is gone starts fresh and re-pays the cached prefix.
                         if records.is_empty() {
-                            let others = crate::session::elsewhere(&incord_code_dir, &workspace);
+                            let others = crate::session::elsewhere(&incode_dir, &workspace);
                             for line in crate::session::elsewhere_lines(&others) {
                                 render::print_info(&line);
                             }
@@ -1029,7 +1030,7 @@ impl CliApp {
                             // is finished here rather than having the resumed
                             // id stamped over it on the next turn.
                             if let Some(finished) = session_record.take() {
-                                crate::session::save(&incord_code_dir, &finished);
+                                crate::session::save(&incode_dir, &finished);
                             }
                             session.resume(&id);
                             crate::trace!("session", "resuming {id}");
@@ -1206,7 +1207,7 @@ impl CliApp {
                 for (child, title) in session.children() {
                     record.spawned(&child, &title);
                 }
-                crate::session::save(&incord_code_dir, record);
+                crate::session::save(&incode_dir, record);
             }
         }
 
@@ -1272,10 +1273,10 @@ impl CliApp {
 /// Making it the default would widen every existing run as a side effect of an
 /// upgrade, which is not a thing to discover afterwards.
 ///
-/// Set `INCORD_DESKTOP=1` to turn it on. Empty does NOT count, for the same
-/// reason `INCORD_TRACE=` in a shell profile must not turn tracing on for
+/// Set `INCODE_DESKTOP=1` to turn it on. Empty does NOT count, for the same
+/// reason `INCODE_TRACE=` in a shell profile must not turn tracing on for
 /// everyone (see [`crate::trace`]).
-pub(crate) const DESKTOP_ENV: &str = "INCORD_DESKTOP";
+pub(crate) const DESKTOP_ENV: &str = "INCODE_DESKTOP";
 
 /// What the session's `-p` was, for the parts of this file that build a
 /// backend without holding the session.
@@ -1294,7 +1295,7 @@ pub(crate) const DESKTOP_ENV: &str = "INCORD_DESKTOP";
 /// capability decision.
 ///
 /// Unset means the default mode, which is what a session without `-p` runs as.
-pub(crate) const PERMISSION_MODE_ENV: &str = "INCORD_PERMISSION_MODE";
+pub(crate) const PERMISSION_MODE_ENV: &str = "INCODE_PERMISSION_MODE";
 
 /// The session's mode, or the default when nothing set it.
 ///
@@ -1793,7 +1794,7 @@ mod tests {
 
     /// An empty value does not count as on.
     ///
-    /// Same reasoning as `INCORD_TRACE`: `INCORD_DESKTOP=` left in a shell
+    /// Same reasoning as `INCODE_TRACE`: `INCODE_DESKTOP=` left in a shell
     /// profile must not silently grant every run a desktop.
     #[test]
     fn the_desktop_switch_ignores_an_empty_value() {
@@ -1819,7 +1820,7 @@ mod tests {
     /// this fails.
     ///
     /// Both states are driven in one process, so the assertion does not depend
-    /// on what `INCORD_DESKTOP` happens to say on the machine running it. The
+    /// on what `INCODE_DESKTOP` happens to say on the machine running it. The
     /// earlier shape of this test read the environment and asserted the pairing,
     /// which on an unset machine reduced to "off, and nothing was handed over" —
     /// true with every registration line deleted.
@@ -1940,7 +1941,7 @@ mod tests {
     fn a_windows_path_is_escaped_for_toml() {
         let overrides = crate::desktop::mcp::codex_config_overrides(
             std::path::Path::new(r"C:\Users\someone\.cargo\bin\incode.exe"),
-            Some(std::path::Path::new(r"C:\work\.incord\desktop.jsonl")),
+            Some(std::path::Path::new(r"C:\work\.incode\desktop.jsonl")),
             ORDINARY,
         );
         assert!(
@@ -1952,13 +1953,13 @@ mod tests {
         // the same TOML string syntax, and escaping only the exe would ship a
         // half-fixed bug that fails exactly where nobody looks.
         assert!(
-            overrides[1].contains(r"C:\\work\\.incord"),
+            overrides[1].contains(r"C:\\work\\.incode"),
             "the journal path must be escaped too: {}",
             overrides[1]
         );
         assert_eq!(
             overrides[1],
-            r#"mcp_servers.desktop.args=["--desktop-mcp","--desktop-journal","C:\\work\\.incord\\desktop.jsonl","-p","workspace-write"]"#
+            r#"mcp_servers.desktop.args=["--desktop-mcp","--desktop-journal","C:\\work\\.incode\\desktop.jsonl","-p","workspace-write"]"#
         );
     }
 

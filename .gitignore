@@ -14,4 +14,8 @@
 # The ledger and other per-workspace run state. It records what happened to THIS
 # checkout and means nothing in another one. Unanchored for the same reason as
 # `.backups/`: `docs/.incord/` exists too.
+#
+# `.incode/` is incode's. `.incord/` is Incord Memory's, which still writes its
+# own files there (RULE_ACK, MEMORY_FIRST_OFF, ...), so both stay ignored.
+.incode/
 .incord/

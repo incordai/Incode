@@ -51,8 +51,8 @@ pub const MAX_BYTES: u64 = 256 * 1024;
 ///
 /// Beside the transcripts (`crate::transcript::DIR`) rather than in a new
 /// top-level directory: it is the same kind of artefact — a record of what an
-/// agent did — and `.incord/` is already the harness's own space.
-pub const FILE: &str = ".incord/desktop.jsonl";
+/// agent did — and `.incode/` is already the harness's own space.
+pub const FILE: &str = ".incode/desktop.jsonl";
 
 /// The journal path for a workspace.
 #[must_use]
@@ -223,7 +223,7 @@ mod tests {
 
     fn temp_journal(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "incord-journal-{name}-{}-{:?}",
+            "incode-journal-{name}-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -406,6 +406,6 @@ mod tests {
     fn the_journal_sits_under_the_harness_directory() {
         let path = path_in(Path::new("C:/work/project"));
         assert!(path.ends_with("desktop.jsonl"), "got {}", path.display());
-        assert!(path.to_string_lossy().contains(".incord"));
+        assert!(path.to_string_lossy().contains(".incode"));
     }
 }

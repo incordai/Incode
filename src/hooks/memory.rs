@@ -22,7 +22,7 @@
 //! It reads the shape an agent CLI writes — one JSON object per line with
 //! `type` (`user`/`assistant`), `uuid`, `timestamp` and `message.content`, plus
 //! the `cwd` it files the project under. incode writes exactly that, per
-//! session, at `.incord/transcripts/<session>.jsonl` in the workspace, beside
+//! session, at `.incode/transcripts/<session>.jsonl` in the workspace, beside
 //! the rest of the workspace's run state. Only when an engine is present, or
 //! when the session is one a client may load again (`incode --acp`'s
 //! `session/load` replays it — [`MemoryHooks::keep_transcript`]): with no
@@ -33,7 +33,7 @@
 //! The engine's blocks run to tens of kilobytes, and a CLI model is handed its
 //! prompt on a command line with a hard limit — an oversized block would push
 //! the person's own instruction off the end. A block over its budget is
-//! written whole to `.incord/context/` and the model is given its head and the
+//! written whole to `.incode/context/` and the model is given its head and the
 //! path, the way an agent CLI persists an oversized hook payload. The engine
 //! already puts what matters most at the top of the block for that reason.
 
@@ -60,10 +60,10 @@ pub const START_INLINE: usize = 12_000;
 pub const TURN_INLINE: usize = 6_000;
 
 /// Where transcripts are written, under the workspace.
-pub(crate) const TRANSCRIPTS: &str = ".incord/transcripts";
+pub(crate) const TRANSCRIPTS: &str = ".incode/transcripts";
 
 /// Where an oversized block is written whole, under the workspace.
-const CONTEXT: &str = ".incord/context";
+const CONTEXT: &str = ".incode/context";
 
 /// How many files each of those two directories keeps. The newest survive.
 const KEEP: usize = 200;

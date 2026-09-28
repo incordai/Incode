@@ -1,7 +1,7 @@
 //! `Diagnostics`: run the project's own checker and hand back its errors.
 //!
 //! The checker is the one [`crate::tools::diagnostics`] already chooses —
-//! the operator's `INCORD_CHECK_CMD`, or the manifest's (`cargo check`,
+//! the operator's `INCODE_CHECK_CMD`, or the manifest's (`cargo check`,
 //! `tsc --noEmit`) — and it runs once per call. Given files, the report is
 //! cut to the lines about them; given none, it is every error and warning,
 //! bounded. Running a checker runs build scripts, so this is a tool that

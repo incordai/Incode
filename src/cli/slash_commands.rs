@@ -200,7 +200,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "/agents",
-        "List the sub-agents defined in .incord/agents and ~/.incord-code/agents",
+        "List the sub-agents defined in .incode/agents and ~/.incode/agents",
     ),
     (
         "/doctor",
@@ -297,7 +297,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "/run",
         "Work the roadmap ledger until it is empty or something needs a person",
     ),
-    ("/quit", "Exit Incord Code"),
+    ("/quit", "Exit incode"),
 ];
 
 /// The bare command word, without the `<args>` the table shows after it.
@@ -425,7 +425,7 @@ pub fn handle_act(session: &mut crate::cli::agent_turn::AgentSession) {
 }
 
 pub fn handle_help() {
-    render::print_header("Incord Code Commands");
+    render::print_header("incode Commands");
     for (cmd, desc) in COMMANDS {
         outln!("  {cmd:<20} {desc}");
     }
@@ -814,7 +814,7 @@ pub fn handle_guards(workspace: &std::path::Path) {
             let paths = guards.effective();
             if paths.is_empty() {
                 render::print_error(
-                    "Nothing is protected — every default has been switched off in .incord/guards.json.",
+                    "Nothing is protected — every default has been switched off in .incode/guards.json.",
                 );
                 return;
             }
@@ -2062,7 +2062,7 @@ mod tests {
         );
         let plan = line_for("plan");
         assert!(
-            plan.contains("model-env") && plan.contains("INCORD_ROLE_PLAN"),
+            plan.contains("model-env") && plan.contains("INCODE_ROLE_PLAN"),
             "{listing}"
         );
         let explore = line_for("explore");
@@ -2095,7 +2095,7 @@ mod tests {
 
         assert!(
             said.as_ref().is_ok_and(
-                |text| text.contains("INCORD_ROLE_EXPLORE") && text.contains("overrides")
+                |text| text.contains("INCODE_ROLE_EXPLORE") && text.contains("overrides")
             ),
             "{said:?}"
         );

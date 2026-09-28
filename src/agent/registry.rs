@@ -176,7 +176,7 @@ pub fn require_drivable() -> Result<DetectedAgent, String> {
 
 /// The agent the operator asked for, if they asked for one.
 ///
-/// Checks the environment variable first (`INCORD_AGENT`), then the operator's
+/// Checks the environment variable first (`INCODE_AGENT`), then the operator's
 /// standing choice in `admin.json`.
 #[must_use]
 pub fn preferred_agent() -> Option<String> {
@@ -196,7 +196,7 @@ pub fn preferred_agent() -> Option<String> {
 ///
 /// This used to be `found.iter().find(|a| a.is_drivable())` — the first
 /// drivable agent, with the operator's choice never consulted. The admin screen
-/// read `INCORD_AGENT` and reported it, so `--admin` said `antigravity` while
+/// read `INCODE_AGENT` and reported it, so `--admin` said `antigravity` while
 /// the run drove Claude Code and printed "via Claude Code" in its own banner.
 /// Two resolvers, one of them authoritative and the other on display.
 ///

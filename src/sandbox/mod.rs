@@ -51,7 +51,7 @@
 //!   tool is marked deprecated by Apple but present and working.
 //! - **Windows** — see [`windows`]. Read-only is enforced with a write-restricted
 //!   token. Workspace-write is enforced only when the operator NAMED it
-//!   (`sandbox: "workspace-write"` or `INCORD_SANDBOX`), because it adds one ACE
+//!   (`sandbox: "workspace-write"` or `INCODE_SANDBOX`), because it adds one ACE
 //!   for a private per-session SID to each root's ACL for the session
 //!   (`windows::acl`); left to the permission-mode default it stays off, with
 //!   the reason stated, rather than pretended.
@@ -76,11 +76,11 @@ pub mod windows;
 
 /// Names the sandbox mode, ahead of the settings and the permission-mode
 /// default — for a run that wants to pin it without editing `admin.json`.
-pub const SANDBOX_ENV: &str = "INCORD_SANDBOX";
+pub const SANDBOX_ENV: &str = "INCODE_SANDBOX";
 
 /// Names the network setting (`allow` or `deny`), ahead of `admin.json`
 /// `sandbox_network`.
-pub const SANDBOX_NETWORK_ENV: &str = "INCORD_SANDBOX_NETWORK";
+pub const SANDBOX_NETWORK_ENV: &str = "INCODE_SANDBOX_NETWORK";
 
 /// Whether a sandboxed command may use the network.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

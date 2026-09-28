@@ -180,8 +180,10 @@ pub fn is_allowed(name: &str) -> bool {
         return true;
     }
 
-    // Allow all INCORD_ prefixed vars
-    if upper.starts_with("INCORD_") {
+    // incode's own variables (`INCODE_*`), and the Incord Memory service's
+    // (`INCORD_*`, e.g. `INCORD_MEMORY_URL`), which a command run here may need
+    // to reach the memory engine the way incode itself does.
+    if upper.starts_with("INCODE_") || upper.starts_with("INCORD_") {
         return true;
     }
 
@@ -227,8 +229,10 @@ mod tests {
     }
 
     #[test]
-    fn incord_prefixed_allowed() {
-        assert!(is_allowed("INCORD_CUSTOM_VAR"));
+    fn incode_and_incord_prefixed_allowed() {
+        assert!(is_allowed("INCODE_CUSTOM_VAR"));
+        assert!(is_allowed("INCODE_TRACE"));
+        assert!(is_allowed("INCORD_MEMORY_URL"));
         assert!(is_allowed("INCORD_BINANCE_KEY"));
     }
 

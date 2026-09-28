@@ -36,7 +36,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 /// Where the frozen interfaces live, under the workspace.
-pub const CONTRACTS_FILE: &str = ".incord/contracts.json";
+pub const CONTRACTS_FILE: &str = ".incode/contracts.json";
 
 /// How many files to read before giving up on a search.
 ///
@@ -731,7 +731,7 @@ mod tests {
     /// are this module's own failure mode, one level up.
     #[test]
     fn a_broken_contracts_file_is_an_error() {
-        let dir = project(&[(".incord/contracts.json", "{ not json")]);
+        let dir = project(&[(".incode/contracts.json", "{ not json")]);
         assert!(Contracts::load(dir.path()).is_err());
     }
 

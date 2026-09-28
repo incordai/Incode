@@ -12,8 +12,8 @@
 //!
 //! # One switch, not four
 //!
-//! There were three already: `INCORD_DEBUG_FOOTER`, `INCORD_DEBUG_TIMING` and
-//! `INCORD_DEBUG_STREAM`, each with its own format and its own idea of where to
+//! There were three already: `INCODE_DEBUG_FOOTER`, `INCODE_DEBUG_TIMING` and
+//! `INCODE_DEBUG_STREAM`, each with its own format and its own idea of where to
 //! write. Three switches means knowing which one to set before you know what is
 //! wrong, which is exactly backwards. This is one: [`TRACE_ENV`], on or off, and
 //! everything that matters says what it did.
@@ -31,7 +31,7 @@ use std::time::Instant;
 
 /// Where the trace goes. A path writes there; `1`, `true` or `stderr` writes to
 /// standard error, which is the one destination that always exists.
-pub const TRACE_ENV: &str = "INCORD_TRACE";
+pub const TRACE_ENV: &str = "INCODE_TRACE";
 
 /// Not yet decided.
 const UNKNOWN: u8 = 0;
@@ -103,7 +103,7 @@ fn decide() -> bool {
         Err(e) => {
             // SAID, not swallowed. A trace that silently goes nowhere is worse
             // than no trace: the reader concludes the code never ran.
-            eprintln!("incord: cannot write the trace to {value}: {e} — using stderr instead");
+            eprintln!("incode: cannot write the trace to {value}: {e} — using stderr instead");
             TO_STDERR.store(true, Ordering::Relaxed);
             STATE.store(ON, Ordering::Relaxed);
             true
@@ -222,7 +222,7 @@ mod tests {
 
     #[test]
     fn an_empty_or_zero_value_is_off() {
-        // `INCORD_TRACE=` in a shell profile must not turn it on for everyone.
+        // `INCODE_TRACE=` in a shell profile must not turn it on for everyone.
         let _guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
         for value in ["", "0", "false", "FALSE"] {
             std::env::set_var(TRACE_ENV, value);

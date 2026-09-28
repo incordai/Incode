@@ -21,11 +21,11 @@ use std::collections::BTreeMap;
 
 /// Prefix for the environment variables that assign models to a role.
 ///
-/// `INCORD_ROLE_EXPLORE=first,second,third` assigns the explore role an ORDERED
+/// `INCODE_ROLE_EXPLORE=first,second,third` assigns the explore role an ORDERED
 /// list. An env var per role rather than a config file: there are few roles,
 /// they change rarely, and an operator switching a fleet should not have to edit
 /// JSON to do it.
-pub const ROLE_ENV_PREFIX: &str = "INCORD_ROLE_";
+pub const ROLE_ENV_PREFIX: &str = "INCODE_ROLE_";
 
 /// How many models a role may list.
 ///

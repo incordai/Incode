@@ -12,7 +12,7 @@
 //! still worked.
 //!
 //! **workspace-write is applied only when the operator NAMED it** (`sandbox:
-//! "workspace-write"` in `admin.json`, or `INCORD_SANDBOX`), through a
+//! "workspace-write"` in `admin.json`, or `INCODE_SANDBOX`), through a
 //! per-SESSION grant ([`acl`]): the first sandboxed command of the session adds
 //! ONE inheritable ACE for a private per-process SID to each root's DACL, every
 //! command runs under a write-restricted token whose restricting SIDs are that
@@ -140,7 +140,7 @@ pub(super) fn per_os() -> PerOs {
         mechanism: "a write-restricted token (workspace-write through a per-session ACE on each \
                     root)",
         cannot: "workspace-write changes each root's ACL for the session, so it is applied only \
-                 when named (`sandbox: \"workspace-write\"` or INCORD_SANDBOX) and its grant was \
+                 when named (`sandbox: \"workspace-write\"` or INCODE_SANDBOX) and its grant was \
                  made",
         network: "not enforced (a token cannot block it; only an AppContainer can, and one cannot \
                   read the workspace or the user's toolchains without granting them to it)",

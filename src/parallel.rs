@@ -45,12 +45,12 @@ use std::path::{Path, PathBuf};
 /// One means today's behaviour exactly: no worktrees, no threads, no merge.
 /// That is the default, because parallelism changes where an agent's files
 /// live and that should never happen because somebody upgraded.
-pub const LANES_ENV: &str = "INCORD_LANES";
+pub const LANES_ENV: &str = "INCODE_LANES";
 
 /// More than this and the lanes contend for the machine rather than the work.
 ///
 /// Each lane is an agent CLI, which is a process with a model behind it and a
-/// full checkout to read. The limit is here so a mistyped `INCORD_LANES=40`
+/// full checkout to read. The limit is here so a mistyped `INCODE_LANES=40`
 /// costs a clamp rather than a machine.
 pub const MAX_LANES: usize = 8;
 
@@ -142,7 +142,7 @@ pub fn requested_lanes() -> usize {
 ///
 /// The reason for a single lane was already computed, carried on
 /// `Isolation::None`, and returned by [`Isolation::why_not`] — and nothing
-/// ever asked. An operator who set `INCORD_LANES=4` on a workspace that is
+/// ever asked. An operator who set `INCODE_LANES=4` on a workspace that is
 /// not a git repository got a sequential run indistinguishable from one that
 /// simply had nothing to parallelise.
 ///
@@ -321,7 +321,7 @@ pub fn seal_lane(lane: &Lane) -> Result<bool, String> {
     }
     git(
         &lane.workspace,
-        &["commit", "-m", &format!("incord lane: {}", lane.task_id)],
+        &["commit", "-m", &format!("incode lane: {}", lane.task_id)],
     )?;
     Ok(true)
 }
@@ -353,7 +353,7 @@ pub fn merge_lane(repo_root: &Path, lane: &Lane) -> Merged {
             "merge",
             "--no-ff",
             "-m",
-            &format!("incord: merge {}", lane.task_id),
+            &format!("incode: merge {}", lane.task_id),
             &lane.branch,
         ],
     ) {
@@ -604,7 +604,7 @@ mod tests {
     ///
     /// The reason was computed, carried on `Isolation::None`, and returned by
     /// `why_not` — and nothing asked for it. An operator who set
-    /// `INCORD_LANES=4` on a workspace that is not a git repository got a
+    /// `INCODE_LANES=4` on a workspace that is not a git repository got a
     /// sequential run that looked exactly like one with nothing to
     /// parallelise, and no way to tell the difference.
     #[test]
@@ -738,7 +738,7 @@ mod tests {
         let lane = Lane {
             task_id: "t-1".to_string(),
             workspace: PathBuf::from("/tmp/lane"),
-            branch: "incord/t-1".to_string(),
+            branch: "incode/t-1".to_string(),
         };
         let conflict = Merged::Conflict {
             files: vec!["src/auth.rs".to_string()],
@@ -747,7 +747,7 @@ mod tests {
         assert!(!conflict.landed());
         let said = conflict.summary(&lane);
         assert!(said.contains("src/auth.rs"), "got: {said}");
-        assert!(said.contains("incord/t-1"), "the work's location: {said}");
+        assert!(said.contains("incode/t-1"), "the work's location: {said}");
         assert!(said.contains("nothing was discarded"), "got: {said}");
 
         assert!(Merged::Clean.landed());
@@ -773,7 +773,7 @@ mod tests {
         // Identity, or the commit below fails on a machine with no global
         // git config — which is most CI.
         git(&root, &["config", "user.email", "test@example.invalid"]).ok()?;
-        git(&root, &["config", "user.name", "incord test"]).ok()?;
+        git(&root, &["config", "user.name", "incode test"]).ok()?;
         // Windows git rewrites LF to CRLF on checkout by default, so a file
         // written here and read back through a worktree would differ by line
         // ending alone — a failure about nothing, on one platform.

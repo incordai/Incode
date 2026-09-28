@@ -1407,8 +1407,8 @@ mod tests {
     #[test]
     fn an_unreadable_guards_policy_refuses_to_delegate_at_all() {
         let dir = workspace();
-        std::fs::create_dir_all(dir.path().join(".incord")).expect("incord dir");
-        std::fs::write(dir.path().join(".incord").join("guards.json"), "{ not json")
+        std::fs::create_dir_all(dir.path().join(".incode")).expect("incode dir");
+        std::fs::write(dir.path().join(".incode").join("guards.json"), "{ not json")
             .expect("broken policy");
 
         let backend = WritingBackend {
@@ -1849,7 +1849,7 @@ mod tests {
         };
         let Some(_) = git(&["init"]) else { return };
         git(&["config", "user.email", "t@example.invalid"]);
-        git(&["config", "user.name", "incord test"]);
+        git(&["config", "user.name", "incode test"]);
         std::fs::write(dir.path().join("base.txt"), "base\n").expect("write");
         git(&["add", "-A"]);
         git(&["commit", "-m", "base"]);

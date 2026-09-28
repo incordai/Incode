@@ -173,7 +173,7 @@ impl InputThread {
 
         let worker_safety = safety.clone();
         let handle = std::thread::Builder::new()
-            .name("incord-desktop-input".to_string())
+            .name("incode-desktop-input".to_string())
             .spawn(move || worker(rx, ready_tx, worker_safety))
             .map_err(|e| DesktopError::Os(format!("could not start the input thread: {e}")))?;
 

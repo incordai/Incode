@@ -58,12 +58,14 @@ pub const MAX_FILE_BYTES: u64 = 512 * 1024;
 const MIN_SYMBOL_LEN: usize = 4;
 
 /// Directories that hold no hand-written source.
-const SKIP_DIRS: [&str; 9] = [
+const SKIP_DIRS: [&str; 10] = [
     "target",
     "node_modules",
     "dist",
     "build",
     ".git",
+    // incode's own state, and the Incord Memory engine's beside it.
+    ".incode",
     ".incord",
     "vendor",
     "__pycache__",

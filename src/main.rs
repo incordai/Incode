@@ -18,7 +18,7 @@ USAGE:
     incode [OPTIONS]
 
 OPTIONS:
-    -m, --model <NAME>        Model to use (or set INCORD_MODEL)
+    -m, --model <NAME>        Model to use (or set INCODE_MODEL)
     -w, --workspace <PATH>    Workspace root (default: current directory)
     -p, --permission-mode <M> read-only | workspace-write | danger-full-access | prompt | allow
         --no-env-filter       Pass the full environment to spawned commands
@@ -26,7 +26,7 @@ OPTIONS:
         --serve               Watch this workspace and serve what it is doing,
                               read-only, on 127.0.0.1 (see --port)
         --port <N>            Pin --serve to this port. Without it a free one is
-                              chosen and written to .incord/serve.json
+                              chosen and written to .incode/serve.json
         --desktop-mcp         Speak MCP on stdin/stdout so an agent can see and
                               use this machine's screen. Launched BY an MCP
                               client, not by hand; stdout is the protocol.
@@ -95,7 +95,21 @@ fn main() -> anyhow::Result<()> {
     // errors) but no subscriber is installed, so they currently go nowhere.
     // Installing one needs a new dependency, which is a decision to take
     // deliberately rather than as a side effect of adding this entry point.
-    let config = match parse_args(std::env::args().skip(1))? {
+    let parsed = parse_args(std::env::args().skip(1))?;
+    // Before anything reads `~/.incode/` or a project's `.incode/`: state left
+    // under the old names (`~/.incord-code/`, `.incord/`) is carried over.
+    // stderr, never stdout: several modes speak a protocol on stdout.
+    let mut migrated = Vec::new();
+    if parsed.reads_data_dir() {
+        migrated.extend(incord_code::migrate::global_report());
+    }
+    if let Some(workspace) = parsed.workspace() {
+        migrated.extend(incord_code::migrate::project_report(workspace));
+    }
+    for line in migrated {
+        eprintln!("{line}");
+    }
+    let config = match parsed {
         Parsed::Run(config) => config,
         Parsed::Exit(message) => {
             println!("{message}");
@@ -131,14 +145,14 @@ fn main() -> anyhow::Result<()> {
             // banner there is a parse error at the client.
             let input = incord_code::desktop::thread::InputThread::start()
                 .map_err(|e| anyhow::anyhow!("could not start desktop input: {e}"))?;
-            // The operator's settings, read from `~/.incord-code/admin.json`.
+            // The operator's settings, read from `~/.incode/admin.json`.
             // This process holds no workspace, so a machine-wide file is the
             // only place its configuration can come from — and a guard on the
             // desktop is a machine-wide concern anyway.
             let hooks = incord_code::admin::AdminConfig::load_default().desktop_hooks;
             if !hooks.pre_tool_use.is_empty() {
                 eprintln!(
-                    "incord-desktop: {} pre-tool hook(s) will run before every action",
+                    "incode-desktop: {} pre-tool hook(s) will run before every action",
                     hooks.pre_tool_use.len()
                 );
             }
@@ -146,7 +160,7 @@ fn main() -> anyhow::Result<()> {
                 .with_permission_mode(permission_mode)
                 .with_hooks(hooks);
             if let Some(path) = journal {
-                eprintln!("incord-desktop journalling to {}", path.display());
+                eprintln!("incode-desktop journalling to {}", path.display());
                 server = server.with_journal(path);
             }
 
@@ -154,7 +168,7 @@ fn main() -> anyhow::Result<()> {
             // that it arrived. A capability restriction nobody can observe is
             // one nobody trusts.
             eprintln!(
-                "incord-desktop MCP server ready on stdio ({})",
+                "incode-desktop MCP server ready on stdio ({})",
                 permission_mode.as_str()
             );
             incord_code::desktop::mcp::run_stdio(server)?;
@@ -189,7 +203,7 @@ fn main() -> anyhow::Result<()> {
             let speaking_as = incord_code::team_mcp::Server::identity_from_env();
             // stderr, never stdout: stdout is the protocol channel and a
             // banner there is a parse error at the client.
-            eprintln!("incord-team MCP server ready on stdio, speaking as `{speaking_as}`");
+            eprintln!("incode-team MCP server ready on stdio, speaking as `{speaking_as}`");
             let server = incord_code::team_mcp::Server::new(
                 incord_code::team::Channel::at(channel),
                 speaking_as,
@@ -297,7 +311,7 @@ enum Parsed {
     /// rather than needing to be the thing that started it.
     Serve {
         workspace: PathBuf,
-        /// `None` means "any free port", published to `.incord/serve.json`.
+        /// `None` means "any free port", published to `.incode/serve.json`.
         port: Option<u16>,
     },
     /// Speak MCP over stdin/stdout so a delegated agent can drive the desktop.
@@ -377,6 +391,38 @@ enum Parsed {
     /// (`-p`, `-m`, `--no-env-filter`). The workspace does NOT come from here:
     /// each `session/new` names its own `cwd`.
     Acp(Box<IncordCodeConfig>),
+}
+
+impl Parsed {
+    /// The project this mode works in, when it names one up front. The REPL
+    /// and `--acp` are left out: each session migrates its own workspace as
+    /// it starts (`cli::prepare_session`), and under `--acp` that is the
+    /// session's `cwd`, not this process's.
+    fn workspace(&self) -> Option<&std::path::Path> {
+        match self {
+            Self::Task { workspace, .. }
+            | Self::Serve { workspace, .. }
+            | Self::DesktopStop { workspace }
+            | Self::CheckFindings { workspace, .. } => Some(workspace),
+            _ => None,
+        }
+    }
+
+    /// Whether this mode reads incode's data directory (`~/.incode/`), and so
+    /// must find the old one's contents there. The rest never open it, and
+    /// `--check-findings` in particular runs as a subprocess of checks and of
+    /// this crate's tests — copying the operator's settings is not its job.
+    fn reads_data_dir(&self) -> bool {
+        matches!(
+            self,
+            Self::Run(_)
+                | Self::Acp(_)
+                | Self::Task { .. }
+                | Self::DesktopMcp { .. }
+                | Self::InstallTools
+                | Self::ToolServer
+        )
+    }
 }
 
 /// Parse command-line arguments into a config.
@@ -984,6 +1030,24 @@ mod tests {
         parse_args(args.iter().map(|s| (*s).to_string()))
     }
 
+    /// **THE OPERATOR'S SETTINGS ARE COPIED ONLY BY A MODE THAT READS THEM.**
+    /// `--check-findings` is run as a subprocess by checks — and by this
+    /// crate's own tests, with the real home directory — so it must never
+    /// copy `~/.incord-code`. It did, once, before this was split out.
+    #[test]
+    fn only_a_mode_that_reads_the_settings_migrates_them() {
+        let findings = parse(&["--check-findings", "f.md", "-w", "."]).expect("valid");
+        assert!(!findings.reads_data_dir());
+        assert!(findings.workspace().is_some(), "its project still migrates");
+        let stop = parse(&["--desktop-stop", "-w", "."]).expect("valid");
+        assert!(!stop.reads_data_dir());
+
+        let repl = parse(&["-w", "."]).expect("valid");
+        assert!(repl.reads_data_dir());
+        assert!(repl.workspace().is_none(), "each session migrates its own");
+        assert!(parse(&["--install-tools"]).expect("valid").reads_data_dir());
+    }
+
     /// The two things the async work actually needs from the entry point, both
     /// executed rather than described. Before this, neither held: nothing in
     /// the crate built a runtime, so `Handle::try_current()` always failed and
@@ -1021,13 +1085,13 @@ mod tests {
     #[test]
     fn the_findings_check_parses_the_argv_the_ledger_writes() {
         let task = incord_code::ledger::Task::new("r-1.1", "r-1", "look")
-            .delivering_findings(".incord/findings/r-1.1.md");
+            .delivering_findings(".incode/findings/r-1.1.md");
         let (program, args) = task.verify.split_first().expect("a check");
         assert_eq!(program, incord_code::verify::SELF_PROGRAM);
 
         match parse_args(args.iter().cloned()).expect("the flag parses") {
             Parsed::CheckFindings { path, .. } => {
-                assert_eq!(path, ".incord/findings/r-1.1.md");
+                assert_eq!(path, ".incode/findings/r-1.1.md");
             }
             other => panic!("expected a findings check, got {other:?}"),
         }

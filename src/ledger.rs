@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use crate::verify::Verified;
 
 /// Where the ledger lives, relative to the workspace.
-pub const LEDGER_DIR: &str = ".incord";
+pub const LEDGER_DIR: &str = ".incode";
 pub const LEDGER_FILE: &str = "ledger.json";
 
 /// How many times a task may be attempted before it is set aside.
@@ -1588,7 +1588,7 @@ mod tests {
     #[test]
     fn a_code_task_is_told_which_shapes_are_frozen() {
         let dir = tempfile::tempdir().expect("temp dir");
-        std::fs::create_dir_all(dir.path().join(".incord")).expect("mkdir");
+        std::fs::create_dir_all(dir.path().join(".incode")).expect("mkdir");
         std::fs::write(
             dir.path().join(crate::contracts::CONTRACTS_FILE),
             r#"{"schemas":{"User":{"id":"string"}},

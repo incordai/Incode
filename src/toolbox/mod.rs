@@ -725,7 +725,7 @@ impl Toolbox {
     fn with_desktop_client(mut self, client: desktop::DesktopClient) -> Self {
         self.desktop = Some(DesktopSetup {
             exe: PathBuf::from("not-started-in-a-test"),
-            journal: self.workspace.join(".incord").join("desktop.jsonl"),
+            journal: self.workspace.join(".incode").join("desktop.jsonl"),
         });
         *self
             .state

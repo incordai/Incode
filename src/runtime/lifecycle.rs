@@ -63,24 +63,24 @@ impl LifecycleHooks {
             .map(|cmd| run_hook("on_compact", cmd, workspace))
     }
 
-    /// Load from a JSON file (e.g. `.incord-code/lifecycle.json`).
+    /// Load from a JSON file (e.g. `.incode/lifecycle.json`).
     pub fn load_from_file(path: &Path) -> Option<Self> {
         let content = std::fs::read_to_string(path).ok()?;
         serde_json::from_str(&content).ok()
     }
 
-    /// Load from workspace `.incord-code.json` or `.incord-code/lifecycle.json`.
+    /// Load from workspace `.incode.json` or `.incode/lifecycle.json`.
     pub fn discover(workspace: &Path) -> Option<Self> {
-        // Try workspace/.incord-code/lifecycle.json
-        let lifecycle_path = workspace.join(".incord-code").join("lifecycle.json");
+        // Try workspace/.incode/lifecycle.json
+        let lifecycle_path = workspace.join(".incode").join("lifecycle.json");
         if let Some(hooks) = Self::load_from_file(&lifecycle_path) {
             if hooks.has_any() {
                 return Some(hooks);
             }
         }
 
-        // Try workspace/.incord-code.json (lifecycle section)
-        let config_path = workspace.join(".incord-code.json");
+        // Try workspace/.incode.json (lifecycle section)
+        let config_path = workspace.join(".incode.json");
         if let Ok(content) = std::fs::read_to_string(config_path) {
             if let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) {
                 if let Some(lifecycle) = config.get("lifecycle") {
@@ -194,10 +194,10 @@ mod tests {
     #[test]
     fn discover_from_lifecycle_json() {
         let dir = tempfile::tempdir().unwrap();
-        let incord_dir = dir.path().join(".incord-code");
-        std::fs::create_dir_all(&incord_dir).unwrap();
+        let incode_dir = dir.path().join(".incode");
+        std::fs::create_dir_all(&incode_dir).unwrap();
         std::fs::write(
-            incord_dir.join("lifecycle.json"),
+            incode_dir.join("lifecycle.json"),
             r#"{"on_session_start": "echo start"}"#,
         )
         .unwrap();
@@ -207,10 +207,10 @@ mod tests {
     }
 
     #[test]
-    fn load_from_incord_code_json() {
+    fn load_from_incode_json() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
-            dir.path().join(".incord-code.json"),
+            dir.path().join(".incode.json"),
             r#"{"lifecycle": {"on_session_end": "cargo fmt"}}"#,
         )
         .unwrap();

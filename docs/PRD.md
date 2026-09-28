@@ -1,4 +1,4 @@
-# Incord Code — Product Requirements
+# incode — Product Requirements
 
 **Status:** measured against the working tree on 2026-09-01.
 **Scale:** 42,536 lines of Rust across 69 files. 898 tests passing (880 library, 18
@@ -309,11 +309,11 @@ Written so each one is testable. Status is the verified state of the code today.
 | R2 | Retrieval is semantic, so a question matches by meaning not shared words | ✅ Shipped | Served by the body's own index over `/v1/memory/recall/index`, not the crate's word-overlap store |
 | R3 | Guard rules are loaded from memory and enforced, not restated by the operator | ✅ Shipped | `src/rules.rs`; the always-on rules unioned with the ones matching the turn, injected per turn. No rule engine here — the ranking is the body's |
 | R4 | A confirmed decision is never re-asked; confirmations are durable | ✅ Shipped | `owner::past_verdict` checks the decision history before raising a card. Only `approve` and `dismiss` are reused — the others answered one attempt, not the question |
-| R5 | An approved roadmap is stored as an ordered, resumable task ledger | ✅ Shipped | `src/ledger.rs`; built from open roadmap items, persisted at `.incord/ledger.json` |
+| R5 | An approved roadmap is stored as an ordered, resumable task ledger | ✅ Shipped | `src/ledger.rs`; built from open roadmap items, persisted at `.incode/ledger.json` |
 | R6 | The harness advances the ledger unprompted, and knows when to stop | ✅ Shipped | `src/runner.rs` + `/run`. It ASKS the owner instead of halting, and acts on the verdict. **Run live 2026-08-20** against an installed agent on a subscription: one task planned, delegated, verified by a command this harness ran, and closed — `worked_by: claude-code:grunt (2569feb9) on claude-haiku-4-5-20251001` |
 | R7 | A task is delegated to a subagent whose exploration never enters the parent context | ✅ Shipped, by the agent | The harness's own subagent host is gone with the loop. The installed agent spawns its own subagents and keeps their exploration out of the parent context — and its output is filtered on `parent_tool_use_id` (`agent/claude_code.rs`) so a subagent's text never lands in this conversation |
 | R8 | A subagent runs on a cheaper model than the parent | ✅ Shipped | `src/roles.rs`; `task` takes a `role`, with an ordered fallback chain |
-| R9 | Spend is tracked per run and can be capped | ✅ Shipped | `src/budget.rs`; `INCORD_BUDGET_TOKENS` stops the loop before the next request |
+| R9 | Spend is tracked per run and can be capped | ✅ Shipped | `src/budget.rs`; `INCODE_BUDGET_TOKENS` stops the loop before the next request |
 | R10 | Every edit is type-checked at the moment it is made | ✅ Shipped, by the agent | The harness no longer sees individual edits, so it cannot check them one at a time; the agent runs its own diagnostics. What the harness still does is stronger and later: it runs the project's real check itself, in its own process, and that is the only thing that closes a task |
 | R11 | A bad run can be reverted in one step | ✅ Shipped | `src/tools/checkpoint.rs` + `/undo`. The agent's writes cannot be intercepted, so the snapshot is taken BEFORE the turn over the whole tree (`cli/agent_turn.rs`), and undo restores only what actually changed. Over `MAX_SNAPSHOT_FILES` it refuses rather than offering half an undo |
 | R12 | A runaway generation can be stopped mid-stream | ✅ Shipped | The agent is a child process, so stopping it means killing it: the cancel token is checked between output lines and the child is killed (`agent/claude_code.rs`). A turn that has gone silent is not interrupted until it next speaks — stated, not implied |
@@ -629,7 +629,7 @@ The design that closes this is [`RUNNER.md`](RUNNER.md), built in
 ### Gap 4 — CLOSED 2026-08-17: cheap execution
 
 `src/roles.rs` maps a role to an ORDERED list of models, set per role via
-`INCORD_ROLE_<ROLE>`. The `task` tool takes a `role`, and the subagent gets its own
+`INCODE_ROLE_<ROLE>`. The `task` tool takes a `role`, and the subagent gets its own
 client for it — so delegation now saves money as well as context. A failing candidate
 falls through to the next, and finally to the parent's model, so one provider being
 down costs an attempt rather than the task.
@@ -638,7 +638,7 @@ A reviewer sharing the writer's lineage is warned about at startup: a model revi
 its own family agrees with itself for reasons unrelated to correctness.
 
 Spend is now bounded too. `src/budget.rs` stops the loop before the next request when
-`INCORD_BUDGET_TOKENS` is reached. **Tokens rather than currency, deliberately:**
+`INCODE_BUDGET_TOKENS` is reached. **Tokens rather than currency, deliberately:**
 `usage.rs:54-62` prices unrecognised models at a default tier, so a dollar ceiling over
 an arbitrary fleet would be a fabricated number. Tokens are measured.
 
@@ -649,8 +649,8 @@ into a constructor, a fleet in one environment variable, a ceiling in another, a
 guessed from a manifest. Each was defensible alone, and together they meant nobody
 could answer *"what is this session actually going to do?"* without reading the source.
 
-`src/admin.rs` is one file the operator owns, at `~/.incord-code/admin.json`
-(`INCORD_CODE_DIR` moves it). It carries the session model, the per-role candidate
+`src/admin.rs` is one file the operator owns, at `~/.incode/admin.json`
+(`INCODE_DIR` moves it). It carries the session model, the per-role candidate
 lists, the token ceiling, the verify command and the memory URL. Nothing in it is a
 model the code chose.
 

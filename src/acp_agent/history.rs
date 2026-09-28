@@ -2,7 +2,7 @@
 //!
 //! # What a session is on disk
 //!
-//! Two things, both incode's. The transcript, `.incord/transcripts/<id>.jsonl`
+//! Two things, both incode's. The transcript, `.incode/transcripts/<id>.jsonl`
 //! in the workspace — the person's lines and the model's replies, one JSON
 //! object per line, written by [`crate::hooks::memory::MemoryHooks`] (an ACP
 //! session always keeps it). And the session record

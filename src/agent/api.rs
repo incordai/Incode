@@ -35,11 +35,11 @@ use super::{AgentBackend, AgentError, AgentEvent, TurnOutcome};
 use crate::toolbox::{ToolOutput, Toolbox};
 
 /// Where requests go. The full URL of the messages endpoint.
-pub const API_URL_ENV: &str = "INCORD_API_URL";
+pub const API_URL_ENV: &str = "INCODE_API_URL";
 /// The credential, read from the environment and never stored by this program.
-pub const API_KEY_ENV: &str = "INCORD_API_KEY";
+pub const API_KEY_ENV: &str = "INCODE_API_KEY";
 /// Which model to ask for.
-pub const API_MODEL_ENV: &str = "INCORD_API_MODEL";
+pub const API_MODEL_ENV: &str = "INCODE_API_MODEL";
 
 /// How many times the model may call tools within ONE turn.
 ///
@@ -1670,7 +1670,7 @@ mod tests {
     #[test]
     fn no_endpoint_or_key_means_no_backend() {
         // Guessing either is worse than saying it is not configured.
-        assert!(non_empty("INCORD_A_VARIABLE_THAT_IS_NOT_SET").is_none());
+        assert!(non_empty("INCODE_A_VARIABLE_THAT_IS_NOT_SET").is_none());
     }
 
     #[test]

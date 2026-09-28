@@ -1,4 +1,4 @@
-# Incord Code — Conventions
+# incode — Conventions
 
 **Why this file exists.** Work here is routed across models. Each has a different
 default style, and without an explicit convention a codebase built across four of them

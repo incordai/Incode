@@ -44,7 +44,7 @@ use super::thread::{InputThread, MouseButton};
 /// Negotiated down to this by the live server when asked for `2025-06-18`.
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
-const SERVER_NAME: &str = "incord-desktop";
+const SERVER_NAME: &str = "incode-desktop";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Standard JSON-RPC 2.0 codes, confirmed by the live server's -32601.
@@ -1094,7 +1094,7 @@ mod tests {
             // server can only receive this way, since it holds no workspace.
             let watched = client_config(
                 std::path::Path::new("C:/bin/incode.exe"),
-                Some(std::path::Path::new("C:/work/.incord/desktop.jsonl")),
+                Some(std::path::Path::new("C:/work/.incode/desktop.jsonl")),
                 crate::permissions::PermissionMode::ReadOnly,
             );
             assert_eq!(
@@ -1102,7 +1102,7 @@ mod tests {
                 json!([
                     "--desktop-mcp",
                     "--desktop-journal",
-                    "C:/work/.incord/desktop.jsonl",
+                    "C:/work/.incode/desktop.jsonl",
                     "-p",
                     "read-only"
                 ]),
@@ -1576,7 +1576,7 @@ mod tests {
         #[test]
         fn a_refused_call_is_written_to_the_journal() {
             let path = std::env::temp_dir().join(format!(
-                "incord-mcp-journal-{}-{:?}.jsonl",
+                "incode-mcp-journal-{}-{:?}.jsonl",
                 std::process::id(),
                 std::thread::current().id()
             ));
@@ -1625,7 +1625,7 @@ mod tests {
             const SECRET: &str = "hunter2-correct-horse-battery";
 
             let path = std::env::temp_dir().join(format!(
-                "incord-mcp-secret-{}-{:?}.jsonl",
+                "incode-mcp-secret-{}-{:?}.jsonl",
                 std::process::id(),
                 std::thread::current().id()
             ));
@@ -1704,7 +1704,7 @@ mod tests {
         #[test]
         fn a_stop_file_halts_a_server_that_was_working() {
             let journal = std::env::temp_dir().join(format!(
-                "incord-stop-{}-{:?}.jsonl",
+                "incode-stop-{}-{:?}.jsonl",
                 std::process::id(),
                 std::thread::current().id()
             ));

@@ -1,4 +1,4 @@
-# Incord Code — Architecture
+# incode — Architecture
 
 **What this is for.** Every implementation task inherits this document, so an error
 here is the most expensive kind in the system: it is copied into work that has already
@@ -7,6 +7,39 @@ is built* and, more importantly, **why it is cut this way** — the boundaries a
 part that a later agent will otherwise redraw by accident.
 
 Measured against the working tree. Every claim cites a file.
+
+---
+
+## Names
+
+Two products share this machine and must never share a name.
+
+| | **incode** — this harness | **Incord Memory** — the separate memory product |
+|---|---|---|
+| Program | the command `incode` | the service/engine `incord-memory-service` |
+| Per-project folder | `.incode/` (ledger, contracts, guards, agents, transcripts, checkpoints, context, findings, serve, team, desktop files) | `.incord/` (its own files: `RULE_ACK`, `MEMORY_FIRST_OFF`, `ALLOW_ONCE`, `PROJECT.md`, `backups/` …) |
+| Machine-wide folder | `~/.incode/`, or wherever `INCODE_DIR` points | `%LOCALAPPDATA%\Incord Memory\`, and the spaceless copy at `%USERPROFILE%\.incord\` |
+| Environment | `INCODE_*` (`INCODE_DIR`, `INCODE_AGENT`, `INCODE_TRACE`, …) | `INCORD_MEMORY_URL`, `INCORD_ENGINE_BIN` — incode reads these two to find the service, and they keep its name |
+| MCP servers | `incode-desktop`, `incode-team` | its own, e.g. `incord-memory` |
+
+The repository and the crate keep the name `incord-code` (`incord_code` in Rust
+paths); only what incode writes, reads or shows is named `incode`. One incode-owned
+name is still `incord`: the `_meta.incord` key on ACP updates (§2), which an external
+client reads — renaming it is pending the owner's decision.
+
+**Migration from the old names.** incode's state used to live in the project's
+`.incord/` and in `~/.incord-code/`. At the start of a mode that reads the data
+directory (the REPL, `--acp`, `-t`, `--desktop-mcp`, `--install-tools`,
+`--tool-server`; never `--check-findings`, which checks and tests run as a
+subprocess), when `INCODE_DIR` is not set, `~/.incode` does not exist
+and `~/.incord-code` does, the old folder is **copied** to `~/.incode` through a
+staging folder renamed into place, so a half copy is never taken for the real one,
+and `~/.incord-code/MOVED_TO_INCODE.txt` records where it went; the old folder is
+never deleted. Per project, on start and at each session start, every incode-owned
+item still in `.incord/` whose target in `.incode/` does not exist is renamed into
+`.incode/`, one atomic move per item; an item whose target exists is skipped (an
+empty target folder gives way), and the memory engine's files stay in `.incord/`. `INCODE_TRACE` (area `migrate`) names
+what moved. There is no fallback to the old `INCORD_*` variable names.
 
 ---
 
@@ -36,8 +69,8 @@ There are **three** processes and they are not peers.
 **The harness uses the CLI as a model only.** It holds no subscription login: the CLI
 authenticates itself, and incode decides what is worth doing, runs the tools the model
 asks for, and checks whether the work was actually done. The one route where incode
-talks to a model directly is the optional API route (`agent::api`, `INCORD_API_URL` /
-`INCORD_API_KEY` / `INCORD_API_MODEL`): the key is read from the environment when a
+talks to a model directly is the optional API route (`agent::api`, `INCODE_API_URL` /
+`INCODE_API_KEY` / `INCODE_API_MODEL`): the key is read from the environment when a
 request is made and never stored, and incode runs the tool loop itself.
 
 Everything the harness knows that outlives a session, it asks for. It caches none of
@@ -441,7 +474,7 @@ agy — because it is fired from incode's session and turn code, never from a CL
 - **`user-prompt`** (60 + 10 s): in `plan_turn`, after the greeting short-circuit; its
   block replaces `rules::context_for_turn` for the turn.
 - **Oversized blocks:** over 12 KB (start) or 6 KB (turn) the head is given inline and the
-  whole written to `.incord/context/<session>-{start,turn}.md`, which the model can Read.
+  whole written to `.incode/context/<session>-{start,turn}.md`, which the model can Read.
 - **`capture`** (the stop, 610 s): at the end of every successful turn, with
   `last_assistant_message` and `stop_hook_active`. A `{"decision":"block","reason":R}`
   reply sends R to the same backend as the next prompt — a CLI resumes its session, the
@@ -451,7 +484,7 @@ agy — because it is fired from incode's session and turn code, never from a CL
   `clear`), the end of an ACP session's thread (`session/close` or the client going
   away — shutdown waits for it, up to the bound), and the end of `--task`.
 - **Transcript:** the engine records a conversation only from `transcript_path`, so
-  incode writes `.incord/transcripts/<session>.jsonl` in the engine's shape (`type`,
+  incode writes `.incode/transcripts/<session>.jsonl` in the engine's shape (`type`,
   `uuid`, `timestamp`, `cwd`, `message.content`; the model's text as text blocks), only
   when an engine is present. Both directories keep their newest 200 files.
 
@@ -491,7 +524,7 @@ complete its brief before writing code — including projects whose brief had be
 finished for months. An outage in a service holding a *document* was undoing the
 intake of every project on the machine.
 
-So a **complete** brief is cached to `.incord/brief.cache.json` on every successful
+So a **complete** brief is cached to `.incode/brief.cache.json` on every successful
 read, and used only when the store cannot be reached. Two things make that honest:
 
 - **A cached brief cannot go stale in a way that matters.** The only route to editing
@@ -636,14 +669,14 @@ and never the work.
 ### Which agent — the catalogue
 
 `agent::catalogue` builds one list of every agent the session could use, once at
-session start: local CLIs found on the PATH, the API configured by `INCORD_API_URL` /
-`INCORD_API_KEY` / `INCORD_API_MODEL` (id `api`), and the agents each API provider in
+session start: local CLIs found on the PATH, the API configured by `INCODE_API_URL` /
+`INCODE_API_KEY` / `INCODE_API_MODEL` (id `api`), and the agents each API provider in
 `admin.json` lists about itself. Every entry is marked usable, or not usable with the
 reason. `/agent` prints it; `/agent <id>` saves the lead (`agent`) and
 `/agent sub <id>` the sub-agents (`sub_agent`), both applying from the next `/run` and
 the next session.
 
-- **Lead**: `INCORD_AGENT`, else `admin.json` `agent`, when usable; else the first
+- **Lead**: `INCODE_AGENT`, else `admin.json` `agent`, when usable; else the first
   usable local agent; else a usable API agent.
 - **Sub-agents** (the agent that works `/run`'s tasks, sequential and in lanes): the
   saved `sub_agent` when usable; else the lead's entry in the table beside
@@ -684,24 +717,27 @@ yet") rather than routed to an endpoint nothing is known to answer.
 
 | Path | Owner | Contents |
 |---|---|---|
-| `.incord/ledger.json` | **machine** | per-task execution state |
-| `.incord/contracts.json` | human approves | frozen interfaces |
-| `.incord/guards.json` | human sets once | extra protected paths |
-| `.incord/team.jsonl` | **machine**, append-only | what agents asked each other, and who answered |
-| `.incord/desktop.jsonl` | **machine**, append-only | what an agent did to the screen, streamed to `--serve` |
-| `.incord/desktop.stop` | **human** | its existence halts the desktop; nothing parses it |
-| `.incord/serve.token` | machine, per `--serve` start | the token a write to `--serve` must carry; readable by anything in the workspace, agents included |
-| `.incord/run.stop` | **human**, via `--serve` | a stop request; a running `/run` consumes it and stops, one found at `/run` start is cleared unobeyed |
-| `.incord/findings/<task>.md` | **agent** | one research task's answer, and the thing its check reads |
-| `.incord/brief.cache.json` | machine | the last complete brief, so an unreachable memory service does not stop a run |
-| `.incord/checkpoints/<session>/` | machine | each turn's "before", so `/undo` and `/rewind <n>` survive a restart (bounded: newest 20 turns, ≤ 256 MiB; a manifest naming a path outside the session's roots is not trusted) |
-| `.incord/agents/*.md` | **human** | the project's user-defined sub-agents (`~/.incord-code/agents/*.md` for every project); see §5b, "User-defined sub-agents" |
-| `.incord/transcripts/<session>.jsonl` | machine | the session's transcript in the memory engine's shape, when an engine is present or the session is an ACP one; newest 200 kept |
-| `.incord/context/` | machine | an oversized `session-start` / `user-prompt` block, written whole; newest 200 kept |
+| `.incode/ledger.json` | **machine** | per-task execution state |
+| `.incode/contracts.json` | human approves | frozen interfaces |
+| `.incode/guards.json` | human sets once | extra protected paths |
+| `.incode/team.jsonl` | **machine**, append-only | what agents asked each other, and who answered |
+| `.incode/desktop.jsonl` | **machine**, append-only | what an agent did to the screen, streamed to `--serve` |
+| `.incode/desktop.stop` | **human** | its existence halts the desktop; nothing parses it |
+| `.incode/serve.token` | machine, per `--serve` start | the token a write to `--serve` must carry; readable by anything in the workspace, agents included |
+| `.incode/run.stop` | **human**, via `--serve` | a stop request; a running `/run` consumes it and stops, one found at `/run` start is cleared unobeyed |
+| `.incode/findings/<task>.md` | **agent** | one research task's answer, and the thing its check reads |
+| `.incode/brief.cache.json` | machine | the last complete brief, so an unreachable memory service does not stop a run |
+| `.incode/checkpoints/<session>/` | machine | each turn's "before", so `/undo` and `/rewind <n>` survive a restart (bounded: newest 20 turns, ≤ 256 MiB; a manifest naming a path outside the session's roots is not trusted) |
+| `.incode/agents/*.md` | **human** | the project's user-defined sub-agents (`~/.incode/agents/*.md` for every project); see §5b, "User-defined sub-agents" |
+| `.incode/transcripts/<session>.jsonl` | machine | the session's transcript in the memory engine's shape, when an engine is present or the session is an ACP one; newest 200 kept |
+| `.incode/context/` | machine | an oversized `session-start` / `user-prompt` block, written whole; newest 200 kept |
 | `<repo-parent>/worktrees/` | machine | one checkout per lane, removed after; the **branch is kept** |
-| `~/.incord-code/admin.json` | human sets once | model, roles, ceiling, check |
-| `~/.incord-code/sessions/<workspace>.json` | machine | session pointers (the agent's conversation id, the model), one file per workspace — not transcripts |
-| `~/.incord-code/tools/<name>/` | machine, when the owner asks | an installed external tool: `<version>/` (the unpacked release) and `installed.json` (version, asset, sha256, source); see §5b, "External tools" |
+| `~/.incode/admin.json` | human sets once | model, roles, ceiling, check |
+| `~/.incode/sessions/<workspace>.json` | machine | session pointers (the agent's conversation id, the model), one file per workspace — not transcripts |
+| `~/.incode/tools/<name>/` | machine, when the owner asks | an installed external tool: `<version>/` (the unpacked release) and `installed.json` (version, asset, sha256, source); see §5b, "External tools" |
+
+These lived in `.incord/` and `~/.incord-code/` before the rename; see "Names" at the
+top for the one-time migration, and for the memory engine's own files in `.incord/`.
 
 Finished work is also written to the **shared memory** every agent on this machine
 reads, under the subject `<project>#<agent-fingerprint>` — which turns "what has this
@@ -870,11 +906,11 @@ for a patch). The ACP kind is `acp_agent::present::tool_kind`.
 | `BashOutput` | observe | read | `MAX_JOB_READ_BYTES` 30 000 per read; `MAX_JOB_BUFFER_BYTES` 1 MiB kept per stream | new output since the last read; loss past the buffer is counted. Returns at once, so nothing is streamed |
 | `KillShell` | run | execute | — | kills the job's process tree |
 | `TodoWrite` | session | think | `MAX_TODOS` 100, `MAX_TODO_CHARS` 500 | kept per session; `--acp` sends it as the plan, with its priority, on the call's successful result |
-| `Diagnostics` | run | execute | `PROJECT_CHECK_TIMEOUT` 300 s, `MAX_PROJECT_FINDINGS` 50, `MAX_DIAGNOSTIC_FILES` 50 | `INCORD_CHECK_CMD`, else `cargo check` / `tsc --noEmit` |
+| `Diagnostics` | run | execute | `PROJECT_CHECK_TIMEOUT` 300 s, `MAX_PROJECT_FINDINGS` 50, `MAX_DIAGNOSTIC_FILES` 50 | `INCODE_CHECK_CMD`, else `cargo check` / `tsc --noEmit` |
 | `WebFetch` | observe | fetch | 20 s, 512 KiB read, 20 000 chars shown; rendered: 20 s + 10 s kill grace, 2 MiB read | private addresses refused by name and by resolution; carries no credential; an HTML answer becomes markdown through Read's HTML conversion (readability when the page reads as an article, the whole page less nav/scripts otherwise), anything else is returned as sent. Where the headless browser is found: `render_js` runs the page's script first, and a page that comes back as an app shell (script, under 200 characters of text) is rendered on its own; `render_js` is not advertised where there is no browser |
 | `Screenshot` | observe | other | `PAGE_DEADLINE` 60 s, load 30 s, settle 3 s; viewport 200–3840 x 200–2160 CSS px; the image bounds below | OFFERED ONLY when the headless browser is found. A public `url` (WebFetch's address rules) or an HTML/SVG `path` in the workspace; `width`/`height`, `scale` 1 or 2, `full_page` (clipped at `MAX_IMAGE_EDGE` px tall, said so). The answer is an image block. See "The headless browser" below |
 | `RenderPdf` | change | edit | `PDF_DEADLINE` 120 s, whole-tree kill | OFFERED ONLY when a printer is found (`pdf_renderer`, below). A public `url` or a workspace HTML/SVG `path`, to `output` (must end `.pdf`); the guards and the checkpoint see `output`; the engine's `code-edit` is told it. Printed in a private temp profile and copied into place only when it exists |
-| `screen_info`, `screenshot`, `ui_tree`, `cursor_position` | observe | other | a call 120 s; the image bounds | OFFERED ONLY when the desktop is switched on (`INCORD_DESKTOP`). Executed by the desktop child — see "The desktop" below. `screenshot` answers with an image block |
+| `screen_info`, `screenshot`, `ui_tree`, `cursor_position` | observe | other | a call 120 s; the image bounds | OFFERED ONLY when the desktop is switched on (`INCODE_DESKTOP`). Executed by the desktop child — see "The desktop" below. `screenshot` answers with an image block |
 | `click_element`, `type_text`, `paste_text`, `key`, `scroll`, `drag`, `move_mouse`, `click` | run | other | a call 120 s | the same; refused read-only, asked under prompt, refused when the engine cannot decide |
 | `WebSearch` | observe | fetch | 15 s, 512 KiB, 8 results | provider from `admin.json` `web_search` — contract in `web::search_with` |
 | `Skill` | observe | other | — | |
@@ -1024,7 +1060,7 @@ code names it.
   `enclosed_name` must agree), a `:` stream name is refused on Windows, links (symbolic
   and hard) are refused, and the archive stops at 10,000 entries or 2 GiB unpacked,
   counted as the bytes come out. Into a staging folder, then renamed to
-  `~/.incord-code/tools/<name>/<version>/`; `run[0]` must exist there or nothing is
+  `~/.incode/tools/<name>/<version>/`; `run[0]` must exist there or nothing is
   installed. `tools/<name>/installed.json` records name, version, folder, asset, sha256
   and source. Older version folders are removed (one still running on Windows stays until
   the next update).
@@ -1038,7 +1074,7 @@ code names it.
   and under `--acp` (`SessionFactory::tool_servers`, merged with the client's servers in
   the one connect call). Its tools are `mcp__<name>__<tool>`, reach **run**, fail closed.
 - **Measured live** (2026-09-27, upstream `h4ckf0r0day/obscura` v0.2.3, scratch
-  `INCORD_CODE_DIR`): `--install-tools` resolved the tag, checked
+  `INCODE_DIR`): `--install-tools` resolved the tag, checked
   `obscura-x86_64-windows.zip` (68,156,208 bytes) against GitHub's digest `781a1b8b…`,
   and unpacked `obscura.exe` + `obscura-worker.exe` in 8.8 s. The same asset with one
   byte flipped, served on loopback against the pinned digest, was refused with both
@@ -1047,7 +1083,7 @@ code names it.
 ### The desktop (phase 6b)
 
 The twelve desktop tools are toolbox tools when the desktop is switched on
-(`INCORD_DESKTOP`; `cli::desktop_setup_for` → `Toolbox::enable_desktop`, on the bridged
+(`INCODE_DESKTOP`; `cli::desktop_setup_for` → `Toolbox::enable_desktop`, on the bridged
 claude route and the API route). They are offered, schema-checked, held to the mode and
 the engine, and drawn as incode's own calls like every other tool, and no desktop server
 is handed to the CLI any more.
@@ -1068,8 +1104,8 @@ overrides.
 
 ### User-defined sub-agents (phase 8)
 
-`src/subagents.rs` loads a Markdown definition per file from `.incord/agents/` in the
-workspace and `~/.incord-code/agents/` for the operator; a project's definition wins over
+`src/subagents.rs` loads a Markdown definition per file from `.incode/agents/` in the
+workspace and `~/.incode/agents/` for the operator; a project's definition wins over
 the operator's of the same name. The front matter is `name`, `description`, optional
 `role` (one of `roles::KNOWN_ROLES`) and `model`, and an optional `tools` allow-list of
 Toolbox tool names; the body is the sub-agent's instructions. The `Agent` tool
@@ -1101,7 +1137,7 @@ at all, but neither stops a command that writes outside the workspace through a
 variable, a glob or a script it wrote first (§8, "Shell is not sandboxed"). `src/sandbox`
 hands the command to the operating system's own confinement so the write is
 PREVENTED. It is a setting — `admin.json` `sandbox: off | workspace-write | read-only`,
-or `INCORD_SANDBOX` — tied to the session's permission mode by default (plus a separate
+or `INCODE_SANDBOX` — tied to the session's permission mode by default (plus a separate
 network switch, below):
 
 | permission mode | default sandbox |
@@ -1116,7 +1152,7 @@ network switch, below):
 - **`off`** — unconfined.
 
 **The network is a separate, opt-in switch:** `admin.json` `sandbox_network: "allow" |
-"deny"`, or `INCORD_SANDBOX_NETWORK` (which wins). The default is `allow` — the behaviour
+"deny"`, or `INCODE_SANDBOX_NETWORK` (which wins). The default is `allow` — the behaviour
 before the switch existed. `deny` is independent of the filesystem mode (it applies under
 `off` too), and each OS does what it soundly can; `Sandbox::note` (traced for every
 sandboxed command) says `network denied by …` or `network deny requested but NOT
@@ -1204,7 +1240,7 @@ Per OS, all measured live except where noted:
     grant drops (sub-agents in the same process share it, refcounted per root). A drive
     root or a directory holding the user profile is refused, and the command is then NOT
     run. Applied **only when the operator named the mode** (`sandbox: "workspace-write"`
-    or `INCORD_SANDBOX`); left to the permission-mode default it stays unconfined and the
+    or `INCODE_SANDBOX`); left to the permission-mode default it stays unconfined and the
     trace says so, because it changes the operator's ACL for the session.
   - **The crash sweep.** Each grant is written down first (`<rid>.grant`: SID, temp,
     roots) and the process holds a named mutex `Global\incode-sandbox-<rid>` while it

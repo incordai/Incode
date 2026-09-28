@@ -1,7 +1,7 @@
 //! Tool status cache — detect installed CLI tools and cache results.
 //!
 //! Auto-detects common developer tools (git, cargo, node, python, docker, etc.)
-//! and caches their paths + versions. Persisted to `~/.incord-code/tool-status.json`.
+//! and caches their paths + versions. Persisted to `~/.incode/tool-status.json`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

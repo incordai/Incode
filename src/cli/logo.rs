@@ -135,13 +135,13 @@ pub fn beside(frame: usize, info: &[String]) -> Vec<String> {
 
 /// Spin the mark in place for a moment, then leave it still.
 ///
-/// Skipped entirely when output is not a terminal, and by `INCORD_NO_SPLASH`.
+/// Skipped entirely when output is not a terminal, and by `INCODE_NO_SPLASH`.
 /// A pipe has no cursor to move back over, and a transcript full of half-drawn
 /// pinwheels is worse than no pinwheel at all.
 pub fn play(info: &[String]) {
     let lines = beside(0, info);
     if !std::io::IsTerminal::is_terminal(&std::io::stdout())
-        || std::env::var_os("INCORD_NO_SPLASH").is_some()
+        || std::env::var_os("INCODE_NO_SPLASH").is_some()
     {
         for line in &lines {
             println!("{line}");
@@ -219,12 +219,12 @@ mod tests {
 
     #[test]
     fn the_info_sits_clear_of_the_mark() {
-        let info = vec!["Incord Code".to_string(), "opus".to_string()];
+        let info = vec!["incode".to_string(), "opus".to_string()];
         let out = beside(0, &info);
-        assert!(out.iter().any(|l| l.ends_with("Incord Code")), "{out:?}");
+        assert!(out.iter().any(|l| l.ends_with("incode")), "{out:?}");
         // Never overlapping: the text must start beyond the mark's own columns.
-        let line = out.iter().find(|l| l.contains("Incord Code")).expect("row");
-        let at = line.find("Incord Code").expect("found");
+        let line = out.iter().find(|l| l.contains("incode")).expect("row");
+        let at = line.find("incode").expect("found");
         assert!(
             at >= width(),
             "text at {at} overlaps a mark {} wide",

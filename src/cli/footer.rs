@@ -272,9 +272,9 @@ impl Footer {
         // works out of the box without requiring Shift.
         // When mouse capture is off, we disable alternate scroll mode (1007l) so the terminal
         // does not translate mouse wheel into Up/Down arrow keys.
-        // Operators who explicitly want wheel scrolling in alternate screen can opt in via INCORD_MOUSE=1.
+        // Operators who explicitly want wheel scrolling in alternate screen can opt in via INCODE_MOUSE=1.
         let mouse_capture =
-            mouse_capture_enabled_from(std::env::var("INCORD_MOUSE").as_deref().ok());
+            mouse_capture_enabled_from(std::env::var("INCODE_MOUSE").as_deref().ok());
         if mouse_capture {
             let _ = execute!(std::io::stdout(), EnableMouseCapture);
         }
@@ -1476,7 +1476,7 @@ mod tests {
             "\x1b[?1006l\x1b[?1002l\x1b[?1000l"
         );
 
-        // When explicitly disabled (INCORD_MOUSE=0), alternate scroll mode (1007l) is sent.
+        // When explicitly disabled (INCODE_MOUSE=0), alternate scroll mode (1007l) is sent.
         assert_eq!(mouse_enable_sequence(false), "\x1b[?1007l");
         assert_eq!(mouse_disable_sequence(false), "");
     }

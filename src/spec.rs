@@ -67,7 +67,7 @@ pub const SPEC_SET: [SpecFile; 5] = [
         approval: Approval::Owner,
     },
     SpecFile {
-        path: ".incord/contracts.json",
+        path: ".incode/contracts.json",
         holds: "the shapes that cross module boundaries: schemas with their fields, endpoints, error cases",
         consumer: "the verify step checks the code against it on every task, and each task is told which shapes it must honour",
         approval: Approval::Owner,
@@ -105,7 +105,7 @@ pub const SPEC_SET: [SpecFile; 5] = [
 /// example is worth more than a description, and this one is the exact input the
 /// checker parses.
 const CONTRACTS_SHAPE: &str = "\n\n\
-    `.incord/contracts.json` must be in this shape — it is parsed, so the shape \
+    `.incode/contracts.json` must be in this shape — it is parsed, so the shape \
     is not cosmetic:\n\
     ```json\n\
     {\n\
@@ -467,7 +467,7 @@ pub fn intake_note(workspace: &Path) -> Option<String> {
         "\nWrite them in the order listed: contracts cannot be written before the \
          architecture names the modules, and roadmap tasks cannot say what shapes \
          to build against before contracts exist.\n\n\
-         `.incord/contracts.json` is the one that pays for itself immediately, and \
+         `.incode/contracts.json` is the one that pays for itself immediately, and \
          the one nobody writes. It is checked by `verify` on every task, so a \
          module returning `user_id` where another expects `userId` fails the same \
          way a broken test does — instead of surviving to integration, where the \
@@ -553,7 +553,7 @@ mod tests {
     fn a_blank_document_is_still_missing() {
         let dir = project(&[
             ("docs/ARCHITECTURE.md", "   \n\n"),
-            (".incord/contracts.json", "{\"schemas\":{}}"),
+            (".incode/contracts.json", "{\"schemas\":{}}"),
         ]);
         let missing: Vec<&str> = missing(dir.path()).iter().map(|f| f.path).collect();
         assert!(
@@ -561,7 +561,7 @@ mod tests {
             "a blank file must not satisfy the check: {missing:?}"
         );
         assert!(
-            !missing.contains(&".incord/contracts.json"),
+            !missing.contains(&".incode/contracts.json"),
             "a real file must satisfy it: {missing:?}"
         );
     }
@@ -670,7 +670,7 @@ mod tests {
     /// instructions for work already done is noise, and noise gets skimmed.
     #[test]
     fn the_shape_is_not_repeated_once_the_file_exists() {
-        let dir = project(&[(".incord/contracts.json", r#"{"schemas":{}}"#)]);
+        let dir = project(&[(".incode/contracts.json", r#"{"schemas":{}}"#)]);
         let note = intake_note(dir.path()).expect("other documents are still missing");
         assert!(!note.contains("```json"), "got: {note}");
     }
@@ -701,7 +701,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         for allowed in [
             "docs/ARCHITECTURE.md",
-            ".incord/contracts.json",
+            ".incode/contracts.json",
             "docs/PRD.md",
             "Cargo.toml",
             "package.json",
@@ -969,7 +969,7 @@ mod tests {
 
     #[test]
     fn corrupted_json_in_contracts_is_not_considered_present() {
-        let dir = project(&[(".incord/contracts.json", "{ invalid json content ...")]);
+        let dir = project(&[(".incode/contracts.json", "{ invalid json content ...")]);
         assert!(!exists(dir.path(), &SPEC_SET[1]));
         assert!(missing(dir.path())
             .iter()

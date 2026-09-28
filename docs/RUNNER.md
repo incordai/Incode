@@ -68,7 +68,7 @@ the file holds the *state*.
 > execution record attached is not.
 
 ```
-.incord/
+.incode/
 ├── ledger.json     current state — one entry per task, rewritten in place
 ├── journal.jsonl   every transition, append-only, never rewritten
 └── runner.lock     single-runner mutex; holds pid + lease
@@ -217,7 +217,7 @@ remembering it.
 > calls the recorder, with a test asserting a verify argv is never looked up.
 
 **Where the command comes from (2026-08-17).** `verify::command_for` climbs the admin
-ladder: `INCORD_VERIFY_CMD`, then `verify_command` in the operator's settings file,
+ladder: `INCODE_VERIFY_CMD`, then `verify_command` in the operator's settings file,
 then detection from the project manifest. Detection is last on purpose — it guesses
 `cargo test` from a `Cargo.toml`, which is right for a plain crate and wrong for
 anything with a real test story, and a guess must never outrank something a human wrote
@@ -495,11 +495,11 @@ passed, because there was only ever one task.
 ### What happens now
 
 `explore`, `diagnose` and `review` are tasks again, with a different judge.
-Each gets a **deliverable** — `.incord/findings/<task-id>.md`, fixed at
+Each gets a **deliverable** — `.incode/findings/<task-id>.md`, fixed at
 planning time — and its check is the command that reads it:
 
 ```
-incode --check-findings .incord/findings/r-1.2.md
+incode --check-findings .incode/findings/r-1.2.md
 ```
 
 That command exits zero when the file exists and holds at least 200
@@ -542,7 +542,7 @@ construction. As separate tasks it has to be said:
 The check's argv starts with the literal `incode`, not an absolute path: the
 ledger outlives the binary that wrote it and may be read on another machine.
 `verify::run` resolves that one name at the moment the check runs —
-`INCORD_SELF_BIN` if the operator set it, else this process when this process
+`INCODE_SELF_BIN` if the operator set it, else this process when this process
 really is `incode` (by file stem, because `current_exe` answers for every
 process including ones that would not recognise the flag), else the bare name
 for an ordinary `PATH` lookup.

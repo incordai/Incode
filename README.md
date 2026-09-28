@@ -1,4 +1,4 @@
-# Incord Code
+# incode
 
 `incode` — an autonomous coding harness. It plans work, has a model do it, runs
 every tool the model calls through its own guards, and proves the work was done
@@ -99,7 +99,7 @@ tools — see [Limits](#limits).)
    process that exited zero. A failed check puts the task back with its failure
    note, compacted by `verify::compact_log`; after `MAX_ATTEMPTS` (2) it is
    abandoned rather than retried forever.
-5. **Parallel lanes (`src/parallel.rs`).** With `INCORD_LANES` above 1 and a git
+5. **Parallel lanes (`src/parallel.rs`).** With `INCODE_LANES` above 1 and a git
    repository, tasks run in separate git worktrees; a merge conflict is never
    resolved automatically — the branch is kept and the task goes back.
 6. **Fallback between agents (`src/agent/catalogue.rs`, `src/task_run.rs`).**
@@ -163,7 +163,7 @@ incode -t "add a health endpoint and a test for it"
 | `incode -t "<text>" --output-format stream-json` | The same, printing one JSON event per line: `init`, `text`, `thinking`, `tool_use`, `tool_result`, `usage`, `result`. stdout carries JSON only; everything else goes to stderr. |
 | `incode -t "<text>" --output-format json` | The same, printing only the final `result` object. |
 | `incode --acp` | incode as an Agent Client Protocol agent on stdin/stdout, for an editor or app. Takes `-p` (`read-only`, `workspace-write`, `danger-full-access`), `-m` and `--no-env-filter`; each `session/new` names its own workspace. |
-| `incode --serve [--port N]` | A local viewer on `127.0.0.1` for what a run in this workspace is doing. Reads, plus two writes behind a per-run token in `.incord/serve.token`: stop the running `/run`, and answer an agent's question. |
+| `incode --serve [--port N]` | A local viewer on `127.0.0.1` for what a run in this workspace is doing. Reads, plus two writes behind a per-run token in `.incode/serve.token`: stop the running `/run`, and answer an agent's question. |
 | `incode --admin` | Print the resolved settings and which layer decided each. |
 | `incode --desktop-stop` | Halt the desktop driving this workspace. |
 | `incode --install-tools` | Download, check and unpack every [external tool](#external-tools) in `admin.json`, then exit (non-zero if any was not installed). |
@@ -175,7 +175,7 @@ incode -t "add a health endpoint and a test for it"
 Options shared by the session modes:
 
 ```
-  -m, --model <NAME>        Model to use (or set INCORD_MODEL)
+  -m, --model <NAME>        Model to use (or set INCODE_MODEL)
   -w, --workspace <PATH>    Workspace root (default: current directory)
   -p, --permission-mode <M> read-only | workspace-write | danger-full-access | prompt | allow
       --no-env-filter       Pass the full environment to spawned commands
@@ -200,8 +200,8 @@ incode builds one catalogue of agents at session start:
 
 - **Local agents** found on `PATH` (`claude`, `codex`, `agy`).
 - **The API route** (id `api`): a model reached over HTTP, configured with
-  `INCORD_API_URL` (the messages endpoint), `INCORD_API_KEY` and
-  `INCORD_API_MODEL`. incode runs its own tool loop for it. Setting these adds
+  `INCODE_API_URL` (the messages endpoint), `INCODE_API_KEY` and
+  `INCODE_API_MODEL`. incode runs its own tool loop for it. Setting these adds
   an entry; it does not replace the installed agents.
 - **Provider agents** from `admin.json` `api_providers` (below). They are listed
   and marked not usable: driving them is not wired yet.
@@ -211,12 +211,12 @@ incode builds one catalogue of agents at session start:
 | `/agent` | List every agent and whether it can be used, with the reason when not. |
 | `/agent <id>` | Save the lead agent (`agent` in `admin.json`). |
 | `/agent sub <id>` | Save the agent that works `/run`'s tasks, sequential and in lanes (`sub_agent`). `/agent sub` alone clears it; unset, it follows the lead. |
-| `/roles` | Show every role, the models it resolves to, and where that came from (your choice, an `INCORD_ROLE_*` variable, or unset = the session model). |
+| `/roles` | Show every role, the models it resolves to, and where that came from (your choice, an `INCODE_ROLE_*` variable, or unset = the session model). |
 | `/roles <role> <model\|@tier>...` | Save a role's ordered candidates (at most 8). An unknown role or tier is refused and nothing is written. |
 | `/roles <role> default` | Clear a role. |
 | `/model [name]` | Show or switch the session's model. |
 
-The lead is `INCORD_AGENT`, else `admin.json` `agent`, when usable; else the
+The lead is `INCODE_AGENT`, else `admin.json` `agent`, when usable; else the
 first usable local agent; else a usable API agent. Roles are `explore`,
 `diagnose`, `plan`, `implement`, `review`, `frontend` and `grunt`. A candidate
 may name its agent as `agent:model`; a candidate naming an agent that is not
@@ -288,13 +288,13 @@ anything runs.
 | `Bash` | run | A shell command, in the foreground (output streamed live over `--acp`) or with `run_in_background` (at most 8 jobs). Runs inside the OS sandbox where one applies. The shell is `sh` on macOS and Linux; on Windows it is `INCODE_SHELL` or `admin.json` `shell` if set, else Git Bash, else PowerShell — never cmd.exe — and PowerShell wherever the Windows sandbox token applies (Git Bash cannot start under it). The tool's description names the shell in use. |
 | `BashOutput` · `KillShell` | observe · run | Read a background job's new output · stop a job and its process tree. |
 | `TodoWrite` | session | The model's task list; sent over `--acp` as the plan. |
-| `Diagnostics` | run | The project's checker: `INCORD_CHECK_CMD`, else `cargo check` or `tsc --noEmit`. |
+| `Diagnostics` | run | The project's checker: `INCODE_CHECK_CMD`, else `cargo check` or `tsc --noEmit`. |
 | `WebFetch` | observe | A web page as markdown. Private addresses are refused; no credential is sent. With the headless browser: `render_js` runs the page's script first, and an empty app shell is rendered automatically. |
 | `WebSearch` | observe | Search through the provider in `admin.json` `web_search`. |
 | `Screenshot` | observe | A picture of a public page or a workspace HTML/SVG file. Offered only when the headless browser is found. |
 | `RenderPdf` | change | A public page or a workspace HTML/SVG file printed to PDF. Offered only when a printer is found (below). |
 | `ConvertDocument` | change | An office document to PDF through LibreOffice. Offered only when LibreOffice is found. |
-| `screen_info` · `screenshot` · `ui_tree` · `cursor_position` | observe | Look at the desktop. Offered only when `INCORD_DESKTOP=1`. |
+| `screen_info` · `screenshot` · `ui_tree` · `cursor_position` | observe | Look at the desktop. Offered only when `INCODE_DESKTOP=1`. |
 | `click_element` · `type_text` · `paste_text` · `key` · `scroll` · `drag` · `move_mouse` · `click` | run | Act on the desktop. Same condition; refused in read-only. |
 | `Skill` | observe | Read one skill's text from the shared store. |
 | `Agent` | run | Hand a self-contained task to a sub-agent (a second headless run of the session's CLI, or the API route), with the session's mode, guards and cancel; at most 2 levels deep. Takes `agent: <name>` for a [user-defined sub-agent](#user-defined-sub-agents). |
@@ -375,7 +375,7 @@ installed says so once and downloads nothing. An install:
    only to https, at most 512 MiB and 15 minutes, sending no credential and a
    User-Agent of `incode` alone;
 4. refuses a download whose sha256 differs, deletes it and unpacks nothing;
-5. unpacks zip or tar.gz into `~/.incord-code/tools/<name>/<version>/`,
+5. unpacks zip or tar.gz into `~/.incode/tools/<name>/<version>/`,
    refusing any entry that would land outside it and any link, at most 10,000
    entries and 2 GiB, and records the version, asset and sha256 in
    `tools/<name>/installed.json`.
@@ -397,7 +397,7 @@ In the order a call meets them:
 1. **Known tool, valid input.** An unknown name or an input that breaks the
    tool's schema runs nothing.
 2. **Guards.** Tests, CI config, migrations, `.env` files, the ledger and the
-   paths in `.incord/guards.json` are refused as write targets, for every file a
+   paths in `.incode/guards.json` are refused as write targets, for every file a
    change touches. For an agent that still runs its own tools (`codex`, `agy`),
    a sentinel fingerprints the protected files before and after the turn —
    detection, not prevention.
@@ -427,7 +427,7 @@ In the order a call meets them:
 8. **The OS sandbox** for `Bash` (below).
 
 **Checkpoints, `/undo` and `/rewind`.** Each turn's "before" is written to
-`.incord/checkpoints/<session>/` (newest 20 turns, at most 256 MiB), so `/undo`
+`.incode/checkpoints/<session>/` (newest 20 turns, at most 256 MiB), so `/undo`
 works after a restart and `/rewind <n>` goes back n changed turns. Files a turn
 created are removed on undo; a file changed since is left alone and named.
 
@@ -436,7 +436,7 @@ created are removed on undo; a file changed since is left alone and named.
 `Bash` runs commands the model chose. The guards catch a direct route to a
 protected file; the sandbox asks the operating system to prevent writes
 through a variable, a glob or a script. Setting: `admin.json` `sandbox` or
-`INCORD_SANDBOX` — `off`, `workspace-write` or `read-only`. Unset, it follows
+`INCODE_SANDBOX` — `off`, `workspace-write` or `read-only`. Unset, it follows
 the permission mode: `read-only` for read-only, `workspace-write` for prompt and
 workspace-write, `off` for the two full-access modes.
 
@@ -474,10 +474,10 @@ incode's own, names every event:
 | `session-end` | REPL exit, `/clear` (the old id), ACP `session/close` and shutdown, and the end of `-t`. |
 
 Each `/run` worker is a memory session of its own. Oversized context blocks
-are written whole to `.incord/context/` and the model is given the head and
+are written whole to `.incode/context/` and the model is given the head and
 the path.
 
-**Transcripts** go to `.incord/transcripts/<session>.jsonl` in the workspace,
+**Transcripts** go to `.incode/transcripts/<session>.jsonl` in the workspace,
 in the engine's format, when an engine is present or the session is an ACP one
 (so `session/load` can replay it). The newest 200 are kept.
 
@@ -487,8 +487,8 @@ The engine binary is found at `INCORD_ENGINE_BIN`, then `admin.json`
 
 ## User-defined sub-agents
 
-One Markdown file per sub-agent, in `.incord/agents/*.md` (the project's) or
-`~/.incord-code/agents/*.md` (yours, for every project). A project's definition
+One Markdown file per sub-agent, in `.incode/agents/*.md` (the project's) or
+`~/.incode/agents/*.md` (yours, for every project). A project's definition
 wins over yours with the same name.
 
 ```markdown
@@ -517,7 +517,7 @@ The model runs one with the `Agent` tool: `{"agent": "reviewer", ...}`.
 Settings resolve in this order — **flag > environment > admin file > built-in** —
 and `--admin` prints which layer decided each value.
 
-`~/.incord-code/admin.json` (every key optional):
+`~/.incode/admin.json` (every key optional):
 
 ```json
 {
@@ -569,40 +569,58 @@ Environment variables:
 
 | Variable | What it sets |
 |---|---|
-| `INCORD_MODEL` | The session's model |
-| `INCORD_AGENT` | The lead agent, by id |
-| `INCORD_ROLE_<ROLE>` | That role's ordered candidates, comma-separated |
-| `INCORD_BUDGET_TOKENS` | The token ceiling for a run |
-| `INCORD_VERIFY_CMD` | The check command |
-| `INCORD_CHECK_CMD` | What `Diagnostics` runs |
-| `INCORD_LANES` | Parallel `/run` lanes (needs git; at most 8) |
-| `INCORD_SANDBOX` | The sandbox mode |
-| `INCORD_DESKTOP` | `1` offers the desktop tools |
-| `INCORD_API_URL` · `INCORD_API_KEY` · `INCORD_API_MODEL` | The API route |
+| `INCODE_MODEL` | The session's model |
+| `INCODE_AGENT` | The lead agent, by id |
+| `INCODE_ROLE_<ROLE>` | That role's ordered candidates, comma-separated |
+| `INCODE_BUDGET_TOKENS` | The token ceiling for a run |
+| `INCODE_VERIFY_CMD` | The check command |
+| `INCODE_CHECK_CMD` | What `Diagnostics` runs |
+| `INCODE_LANES` | Parallel `/run` lanes (needs git; at most 8) |
+| `INCODE_SANDBOX` | The sandbox mode |
+| `INCODE_DESKTOP` | `1` offers the desktop tools |
+| `INCODE_API_URL` · `INCODE_API_KEY` · `INCODE_API_MODEL` | The API route |
 | `INCORD_MEMORY_URL` · `INCORD_ENGINE_BIN` | The memory service · its engine binary |
 | `INCODE_BROWSER` · `INCODE_PDF_BROWSER` · `INCODE_SOFFICE` | The headless browser · the PDF printer · LibreOffice |
-| `INCORD_SERVE_ORIGINS` | Extra origins `--serve` accepts |
-| `INCORD_CODE_DIR` | Where incode keeps its settings (default `~/.incord-code`) |
-| `INCORD_TRACE` | Say what incode did, as it happens |
-| `INCORD_ASCII` · `INCORD_NO_SPLASH` · `INCORD_MOUSE` | Terminal display |
+| `INCODE_SERVE_ORIGINS` | Extra origins `--serve` accepts |
+| `INCODE_DIR` | Where incode keeps its settings (default `~/.incode`) |
+| `INCODE_TRACE` | Say what incode did, as it happens |
+| `INCODE_ASCII` · `INCODE_NO_SPLASH` · `INCODE_MOUSE` | Terminal display |
 
 ### What lives where
 
 | Path | What it holds |
 |---|---|
-| `~/.incord-code/admin.json` | Your settings |
-| `~/.incord-code/agents/*.md` | Your sub-agents, for every project |
-| `~/.incord-code/sessions/<workspace>.json` | Session pointers, so a conversation can be reopened |
-| `~/.incord-code/history.txt` | The lines you typed |
-| `~/.incord-code/tools/<name>/` | An installed external tool: `<version>/` and `installed.json` |
-| `<project>/.incord/ledger.json` | What is being worked on in *this* checkout |
-| `<project>/.incord/contracts.json` | Interfaces frozen before the work was split up |
-| `<project>/.incord/guards.json` | Extra protected paths for this project |
-| `<project>/.incord/agents/*.md` | The project's sub-agents |
-| `<project>/.incord/checkpoints/<session>/` | Each turn's "before", for `/undo` and `/rewind` |
-| `<project>/.incord/transcripts/` · `.incord/context/` | Session transcripts · oversized memory blocks |
+| `~/.incode/admin.json` | Your settings |
+| `~/.incode/agents/*.md` | Your sub-agents, for every project |
+| `~/.incode/sessions/<workspace>.json` | Session pointers, so a conversation can be reopened |
+| `~/.incode/history.txt` | The lines you typed |
+| `~/.incode/tools/<name>/` | An installed external tool: `<version>/` and `installed.json` |
+| `<project>/.incode/ledger.json` | What is being worked on in *this* checkout |
+| `<project>/.incode/contracts.json` | Interfaces frozen before the work was split up |
+| `<project>/.incode/guards.json` | Extra protected paths for this project |
+| `<project>/.incode/agents/*.md` | The project's sub-agents |
+| `<project>/.incode/checkpoints/<session>/` | Each turn's "before", for `/undo` and `/rewind` |
+| `<project>/.incode/transcripts/` · `.incode/context/` | Session transcripts · oversized memory blocks |
 
-Per-project state lives **in the project**; `~/.incord-code` is yours.
+Per-project state lives **in the project**; `~/.incode` is yours.
+
+A project's `.incord/` belongs to Incord Memory, the separate memory product
+(its `RULE_ACK`, `MEMORY_FIRST_OFF` and the rest); incode leaves it alone.
+
+**Upgrading from the old names.** incode used to keep its state in `.incord/`
+and `~/.incord-code/`. At the start of a mode that reads your settings (the
+REPL, `--acp`, `-t` and the tool servers), when `INCODE_DIR` is not set, `~/.incode` does
+not exist and `~/.incord-code` does, the old folder is **copied** to
+`~/.incode` (through a staging folder renamed into place, so a half copy is
+never taken for the real one) and `~/.incord-code/MOVED_TO_INCODE.txt` says
+where it went; the old folder is never deleted. In each project, every item of
+incode's own still in `.incord/` (the ones in the table above, plus
+`brief.cache.json`, `findings/`, `serve.json`, `serve.token`, `run.stop`,
+`team.jsonl`, `desktop.jsonl`, `desktop.stop`) is moved into `.incode/`, one
+move per item; an item whose target already exists is skipped (an empty folder
+there gives way), and the memory
+engine's files stay where they are. `INCODE_TRACE` (area `migrate`) says what
+moved. The old `INCORD_*` variables are not read any more: rename them.
 
 ## Security notes
 

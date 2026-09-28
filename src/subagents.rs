@@ -2,8 +2,8 @@
 //!
 //! # Where they come from
 //!
-//! - `.incord/agents/*.md` in the workspace — the project's own;
-//! - `~/.incord-code/agents/*.md` — the operator's, for every project.
+//! - `.incode/agents/*.md` in the workspace — the project's own;
+//! - `~/.incode/agents/*.md` — the operator's, for every project.
 //!
 //! A project's definition wins over the operator's of the same name.
 //!
@@ -38,7 +38,7 @@
 use std::path::{Path, PathBuf};
 
 /// Where a project keeps its sub-agents, under the workspace.
-pub const PROJECT_DIR: &str = ".incord/agents";
+pub const PROJECT_DIR: &str = ".incode/agents";
 
 /// The directory under the operator's data directory.
 const USER_DIR: &str = "agents";
@@ -59,9 +59,9 @@ const MAX_NAME_CHARS: usize = 64;
 /// Which directory a definition came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
-    /// The workspace's `.incord/agents`.
+    /// The workspace's `.incode/agents`.
     Project,
-    /// The operator's `~/.incord-code/agents`.
+    /// The operator's `~/.incode/agents`.
     User,
 }
 
@@ -137,7 +137,7 @@ impl Loaded {
         if self.agents.is_empty() {
             out.push_str(&format!(
                 "No sub-agents are defined. Add one as a Markdown file in {PROJECT_DIR}/ (this \
-                 project) or ~/.incord-code/{USER_DIR}/ (every project).\n"
+                 project) or ~/.incode/{USER_DIR}/ (every project).\n"
             ));
         }
         for agent in &self.agents {

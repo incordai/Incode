@@ -279,7 +279,7 @@ impl Supervisor {
         let thread_shutdown = Arc::clone(&shutdown);
 
         let handle = std::thread::Builder::new()
-            .name("incord-desktop-supervisor".to_string())
+            .name("incode-desktop-supervisor".to_string())
             .spawn(move || {
                 while !thread_shutdown.load(Ordering::SeqCst) {
                     if !alive() {

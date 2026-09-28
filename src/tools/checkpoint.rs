@@ -23,7 +23,7 @@
 //! # Kept on disk, bounded
 //!
 //! A store made with [`CheckpointStore::persisted`] writes each sealed turn to
-//! `.incord/checkpoints/<session>/<turn>/` — a manifest and the "before" of
+//! `.incode/checkpoints/<session>/<turn>/` — a manifest and the "before" of
 //! each changed file — so `/undo` and `/rewind` work after incode restarts.
 //! Every session in a workspace shares one stack, ordered by when each turn
 //! ended: a new session's first `/undo` undoes the last turn of the session
@@ -67,10 +67,21 @@ pub const MAX_CREATED_FILES: usize = 5_000;
 pub const MAX_STORED_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Directories that never hold hand-written source and are enormous.
-pub const SKIP_DIRS: [&str; 5] = ["target", "node_modules", "dist", ".git", ".incord"];
+///
+/// `.incode` is incode's own state (the checkpoints themselves live there);
+/// `.incord` is the Incord Memory engine's, which is not the project's source
+/// either.
+pub const SKIP_DIRS: [&str; 6] = [
+    "target",
+    "node_modules",
+    "dist",
+    ".git",
+    ".incode",
+    ".incord",
+];
 
 /// Where the stack is kept, under the workspace.
-pub const CHECKPOINTS_DIR: &str = ".incord/checkpoints";
+pub const CHECKPOINTS_DIR: &str = ".incode/checkpoints";
 
 /// The file naming one stored turn; written last, so a turn without one is
 /// an interrupted write and is ignored.
@@ -274,7 +285,7 @@ pub enum Recorded<'a> {
 /// Where a persisted store writes, and what it has written.
 #[derive(Debug)]
 struct Disk {
-    /// `<workspace>/.incord/checkpoints`.
+    /// `<workspace>/.incode/checkpoints`.
     root: PathBuf,
     /// This session's directory name under `root`.
     session: String,
@@ -300,7 +311,7 @@ impl CheckpointStore {
         Self::default()
     }
 
-    /// A store kept under `<workspace>/.incord/checkpoints/<session>/`, that
+    /// A store kept under `<workspace>/.incode/checkpoints/<session>/`, that
     /// starts with the turns every earlier session in the workspace kept.
     /// `roots` are the directories the session works in; a stored path
     /// outside them is not trusted, and its turn is left out.
