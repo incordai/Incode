@@ -105,6 +105,7 @@ fn main() -> anyhow::Result<()> {
     }
     if let Some(workspace) = parsed.workspace() {
         migrated.extend(incord_code::migrate::project_report(workspace));
+        migrated.extend(incord_code::folders::heal(workspace));
     }
     for line in migrated {
         eprintln!("{line}");

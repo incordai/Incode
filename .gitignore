@@ -11,11 +11,13 @@
 *.bak
 *.bak.*
 
-# The ledger and other per-workspace run state. It records what happened to THIS
-# checkout and means nothing in another one. Unanchored for the same reason as
+# Incord Memory's per-workspace files (RULE_ACK, MEMORY_FIRST_OFF, ...). It is a
+# separate product and writes them itself. Unanchored for the same reason as
 # `.backups/`: `docs/.incord/` exists too.
-#
-# `.incode/` is incode's. `.incord/` is Incord Memory's, which still writes its
-# own files there (RULE_ACK, MEMORY_FIRST_OFF, ...), so both stay ignored.
-.incode/
 .incord/
+#
+# `.incode/` is NOT ignored here. It holds the owner's approved files
+# (contracts.json, guards.json, agents/*.md), which are committed, beside this
+# machine's run state (the ledger, transcripts, checkpoints, the server token),
+# which is not. incode writes `.incode/.gitignore` to keep the second kind out;
+# ignoring the whole folder here would lose the first.

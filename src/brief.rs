@@ -214,44 +214,14 @@ impl ProjectBrief {
     /// A heading, not a field: the service's brief has no `non_goals` of its own,
     /// and a section inside the document needs nothing from anyone and is already
     /// searched when a decision touches it.
+    ///
+    /// Checked by [`crate::spec::has_section`], the one check every "this
+    /// document must say X" rule shares — the architecture's `## Layout` too.
     #[must_use]
     pub fn states_non_goals(&self) -> bool {
-        if self.prd.trim().is_empty() {
-            return false;
-        }
-        let mut in_fence = false;
-        let mut in_non_goals = false;
-        let mut non_goals_has_content = false;
-
-        for line in self.prd.lines() {
-            let trimmed = line.trim_start();
-            if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-                in_fence = !in_fence;
-                if in_non_goals {
-                    non_goals_has_content = true;
-                }
-                continue;
-            }
-            if in_fence {
-                if in_non_goals && !trimmed.is_empty() {
-                    non_goals_has_content = true;
-                }
-                continue;
-            }
-            if trimmed.starts_with('#') {
-                if in_non_goals {
-                    // Reached the next heading; stop searching
-                    break;
-                }
-                let h = trimmed.trim_start_matches('#').trim().to_lowercase();
-                if h.contains("non-goal") || h.contains("non goal") || h.contains("not building") {
-                    in_non_goals = true;
-                }
-            } else if in_non_goals && !trimmed.is_empty() {
-                non_goals_has_content = true;
-            }
-        }
-        in_non_goals && non_goals_has_content
+        crate::spec::has_section(&self.prd, |h| {
+            h.contains("non-goal") || h.contains("non goal") || h.contains("not building")
+        })
     }
 
     /// Open roadmap items that name no section of the PRD.
@@ -277,6 +247,9 @@ impl ProjectBrief {
         self.roadmap
             .iter()
             .filter(|item| item.is_open())
+            // The scaffold traces to the architecture's `## Layout`, not to a
+            // PRD section: it builds the skeleton every section needs.
+            .filter(|item| !crate::scaffold::is_scaffold(item))
             .filter(|item| !names_a_section(&item.title, &headings, &self.prd))
             .map(|item| {
                 let id = if item.id.trim().is_empty() {
@@ -385,7 +358,7 @@ pub fn from_docs(workspace: &Path) -> BriefUpdate {
             .filter(|body| !body.trim().is_empty())
     };
 
-    let roadmap: Vec<RoadmapItem> = sections
+    let mut roadmap: Vec<RoadmapItem> = sections
         .iter()
         .filter(|(heading, _)| {
             let first = first_word(heading);
@@ -402,6 +375,11 @@ pub fn from_docs(workspace: &Path) -> BriefUpdate {
             status: "todo".to_string(),
         })
         .collect();
+    // A project with no code yet builds its layout before any section of the
+    // PRD — see `crate::scaffold`.
+    if crate::scaffold::applies(workspace) {
+        crate::scaffold::put_first(&mut roadmap);
+    }
 
     BriefUpdate {
         about: field("about"),
@@ -488,7 +466,7 @@ fn sections_of(prd: &str) -> Vec<(String, String)> {
 }
 
 /// A heading's first meaningful word, with any `1.` or `0b.` numbering removed.
-fn first_word(heading: &str) -> String {
+pub(crate) fn first_word(heading: &str) -> String {
     heading
         .split_whitespace()
         .find(|word| word.chars().any(char::is_alphabetic))
@@ -891,7 +869,7 @@ pub const CACHE_FILE: &str = ".incode/brief.cache.json";
 fn remember_locally(workspace: &Path, brief: &ProjectBrief) {
     let path = workspace.join(CACHE_FILE);
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        let _ = crate::folders::create_dir_all(parent);
     }
     if let Ok(text) = serde_json::to_string_pretty(brief) {
         let _ = std::fs::write(path, text);
@@ -2031,7 +2009,12 @@ mod tests {
     /// "About" describes the project — building it is not a task.
     #[test]
     fn only_the_work_sections_become_roadmap_items() {
-        let titles: Vec<String> = from_docs(documented().path())
+        // With code, so the list is the PRD's alone — a new project's
+        // scaffold item is the next test's subject.
+        let dir = documented();
+        std::fs::create_dir_all(dir.path().join("src")).expect("src");
+        std::fs::write(dir.path().join("src").join("main.rs"), "fn main() {}").expect("code");
+        let titles: Vec<String> = from_docs(dir.path())
             .roadmap
             .expect("a documented project has work in it")
             .into_iter()
@@ -2046,6 +2029,23 @@ mod tests {
             ],
             "about/goals/synopsis are fields, and non-goals and assumptions are not work"
         );
+    }
+
+    /// **A project with no code builds its layout first.** The derived roadmap
+    /// opens with the scaffold, ahead of every PRD section; once there is
+    /// code, it does not.
+    #[test]
+    fn a_new_project_derives_the_scaffold_as_item_one() {
+        let dir = documented();
+        let roadmap = from_docs(dir.path()).roadmap.expect("a roadmap");
+        let ids: Vec<&str> = roadmap.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, [crate::scaffold::ID, "d1", "d2"]);
+        assert_eq!(roadmap[0].title, crate::scaffold::TITLE);
+
+        std::fs::create_dir_all(dir.path().join("src")).expect("src");
+        std::fs::write(dir.path().join("src").join("lib.rs"), "").expect("code");
+        let roadmap = from_docs(dir.path()).roadmap.expect("a roadmap");
+        assert_eq!(roadmap[0].id, "d1", "an existing codebase has its layout");
     }
 
     /// **A non-goal must never become a task.** It is the one section that says

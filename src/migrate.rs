@@ -22,6 +22,10 @@
 //!   already exists is skipped and left where it is — unless the target is an
 //!   empty folder, which holds nothing and gives way. Everything else in
 //!   `.incord/` is the memory engine's and is not touched.
+//! - **Per project**, right after: task transcripts (`*.jsonl`) that older
+//!   versions wrote into `.incode/agents/`, beside the sub-agent definitions
+//!   the owner writes, move to [`crate::transcript::DIR`] ([`task_transcripts`]),
+//!   file by file, never replacing one already there.
 //!
 //! Both are idempotent: a second run finds nothing to do, and a run cut short
 //! is finished by the next one.
@@ -78,6 +82,8 @@ pub struct ProjectMove {
     pub skipped: Vec<String>,
     /// Could not be moved, with the reason. Left where it was.
     pub failed: Vec<(String, String)>,
+    /// Task transcripts moved out of `.incode/agents/`, by file name.
+    pub transcripts: Vec<String>,
 }
 
 /// What the machine-wide migration did.
@@ -141,6 +147,17 @@ pub fn project_report(workspace: &Path) -> Vec<String> {
             workspace.display()
         ));
     }
+    if !done.transcripts.is_empty() {
+        said.push(format!(
+            "incode: moved {} task transcript(s) from {}/ to {}/ in {}; {}/ now holds only \
+             sub-agent definitions.",
+            done.transcripts.len(),
+            crate::subagents::PROJECT_DIR,
+            crate::transcript::DIR,
+            workspace.display(),
+            crate::subagents::PROJECT_DIR,
+        ));
+    }
     for (item, why) in &done.failed {
         said.push(format!(
             "incode: could not move {OLD_PROJECT_DIR}/{item} to {PROJECT_DIR}/{item} in {}: {why}. \
@@ -158,11 +175,68 @@ pub fn project_report(workspace: &Path) -> Vec<String> {
 /// is finished by the next. A target that already exists is never replaced.
 #[must_use]
 pub fn project(workspace: &Path) -> ProjectMove {
+    let mut done = ProjectMove::default();
+    from_old_folder(workspace, &mut done);
+    // After the old folder, so transcripts that were in `.incord/agents/`
+    // make both moves in one start.
+    task_transcripts(workspace, &mut done);
+    done
+}
+
+/// Move task transcripts out of `.incode/agents/` into
+/// [`crate::transcript::DIR`].
+///
+/// Only `*.jsonl` files: every other file in that folder is the owner's, and
+/// a definition (`*.md`) is never touched. One already at the target stays
+/// where it is, as does the old copy — nothing is replaced.
+fn task_transcripts(workspace: &Path, done: &mut ProjectMove) {
+    let from_dir = workspace.join(crate::subagents::PROJECT_DIR);
+    let to_dir = workspace.join(crate::transcript::DIR);
+    let Ok(entries) = std::fs::read_dir(&from_dir) else {
+        return;
+    };
+    let mut files: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("jsonl"))
+                && std::fs::symlink_metadata(p).is_ok_and(|m| m.is_file())
+        })
+        .collect();
+    files.sort();
+    for from in files {
+        let Some(name) = from.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+            continue;
+        };
+        let to = to_dir.join(&name);
+        if std::fs::symlink_metadata(&to).is_ok() {
+            crate::trace!(
+                "migrate",
+                "kept {} — {} exists",
+                from.display(),
+                to.display()
+            );
+            done.skipped.push(format!("agents/{name}"));
+            continue;
+        }
+        match crate::folders::create_dir_all(&to_dir).and_then(|()| move_one(&from, &to)) {
+            Ok(()) => done.transcripts.push(name),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                done.skipped.push(format!("agents/{name}"));
+            }
+            Err(e) => done.failed.push((format!("agents/{name}"), e.to_string())),
+        }
+    }
+}
+
+/// Move incode's items from `.incord/` to `.incode/` — see [`project`].
+fn from_old_folder(workspace: &Path, done: &mut ProjectMove) {
     let old = workspace.join(OLD_PROJECT_DIR);
     let new = workspace.join(PROJECT_DIR);
-    let mut done = ProjectMove::default();
     if !old.is_dir() {
-        return done;
+        return;
     }
     for item in PROJECT_ITEMS {
         let from = old.join(item);
@@ -186,7 +260,7 @@ pub fn project(workspace: &Path) -> ProjectMove {
             done.skipped.push((*item).to_string());
             continue;
         }
-        let moved = std::fs::create_dir_all(&new).and_then(|()| move_one(&from, &to));
+        let moved = crate::folders::create_dir_all(&new).and_then(|()| move_one(&from, &to));
         match moved {
             Ok(()) => {
                 crate::trace!("migrate", "moved {} -> {}", from.display(), to.display());
@@ -210,7 +284,6 @@ pub fn project(workspace: &Path) -> ProjectMove {
             }
         }
     }
-    done
 }
 
 /// A real directory (not a link to one) with nothing in it.
@@ -385,7 +458,14 @@ mod tests {
         );
         assert_eq!(read(&new.join("ledger.json")), "{\"tasks\":[]}");
         assert_eq!(read(&new.join("agents").join("reviewer.md")), "# reviewer");
-        assert_eq!(read(&new.join("agents").join("t-1.jsonl")), "{}\n");
+        // The transcript that sat beside the definition moves on again, out
+        // of the owner's folder, in the same start.
+        assert!(!new.join("agents").join("t-1.jsonl").exists());
+        assert_eq!(
+            read(&dir.path().join(crate::transcript::DIR).join("t-1.jsonl")),
+            "{}\n"
+        );
+        assert_eq!(done.transcripts, ["t-1.jsonl"]);
         assert!(new
             .join("checkpoints")
             .join("s1")
@@ -461,6 +541,52 @@ mod tests {
         assert!(done.moved.contains(&"agents".to_string()), "{done:?}");
         assert_eq!(read(&new.join("agents").join("reviewer.md")), "# reviewer");
         assert!(!dir.path().join(OLD_PROJECT_DIR).join("agents").exists());
+    }
+
+    /// **Transcripts leave the owner's folder.** A `*.jsonl` in
+    /// `.incode/agents/` is machine output an older incode put beside the
+    /// sub-agent definitions; it moves to the transcripts folder, and the
+    /// definitions — and anything else there — stay exactly where they are.
+    #[test]
+    fn task_transcripts_move_out_of_the_agents_folder() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let agents = dir.path().join(crate::subagents::PROJECT_DIR);
+        write(&agents.join("reviewer.md"), "# reviewer");
+        write(&agents.join("notes.txt"), "mine");
+        write(&agents.join("d1.2.jsonl"), "{\"kind\":\"said\"}\n");
+        write(&agents.join("t-1.JSONL"), "{}\n");
+
+        let done = project(dir.path());
+
+        let tasks = dir.path().join(crate::transcript::DIR);
+        assert_eq!(done.transcripts, ["d1.2.jsonl", "t-1.JSONL"], "{done:?}");
+        assert_eq!(read(&tasks.join("d1.2.jsonl")), "{\"kind\":\"said\"}\n");
+        assert_eq!(read(&tasks.join("t-1.JSONL")), "{}\n");
+        assert!(!agents.join("d1.2.jsonl").exists());
+        assert_eq!(read(&agents.join("reviewer.md")), "# reviewer");
+        assert_eq!(read(&agents.join("notes.txt")), "mine");
+        assert!(
+            project_report(dir.path()).is_empty(),
+            "a second start finds nothing to move"
+        );
+    }
+
+    /// A transcript already at the target is newer work under the same task
+    /// id: it is kept, and so is the old one — nothing is replaced.
+    #[test]
+    fn a_transcript_already_moved_is_never_replaced() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let agents = dir.path().join(crate::subagents::PROJECT_DIR);
+        let tasks = dir.path().join(crate::transcript::DIR);
+        write(&agents.join("d1.jsonl"), "old\n");
+        write(&tasks.join("d1.jsonl"), "new\n");
+
+        let done = project(dir.path());
+
+        assert!(done.transcripts.is_empty(), "{done:?}");
+        assert_eq!(done.skipped, ["agents/d1.jsonl"]);
+        assert_eq!(read(&tasks.join("d1.jsonl")), "new\n");
+        assert_eq!(read(&agents.join("d1.jsonl")), "old\n");
     }
 
     #[test]

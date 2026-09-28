@@ -815,7 +815,7 @@ fn store(disk: &Disk, seq: u64, checkpoint: &mut Checkpoint) -> Result<(), Strin
         .join(&disk.session)
         .join(format!("{sealed_ms:013}-{seq:04}"));
     let blobs = dir.join("blobs");
-    std::fs::create_dir_all(&blobs).map_err(|e| format!("{}: {e}", blobs.display()))?;
+    crate::folders::create_dir_all(&blobs).map_err(|e| format!("{}: {e}", blobs.display()))?;
     let mut entries = Vec::with_capacity(checkpoint.files.len());
     for (i, entry) in checkpoint.files.iter().enumerate() {
         let before = match &entry.before {

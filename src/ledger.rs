@@ -322,7 +322,7 @@ impl Ledger {
     pub fn save(&self, workspace: &Path) -> Result<(), String> {
         let path = Self::path_for(workspace);
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
+            crate::folders::create_dir_all(parent)
                 .map_err(|e| format!("could not create {}: {e}", parent.display()))?;
         }
         let text =

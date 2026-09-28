@@ -17,8 +17,9 @@
 //!
 //! # Shape: one JSONL file per task
 //!
-//! Append-only, one JSON object per line, at `.incode/agents/<task-id>.jsonl`.
-//! Line-per-event rather than one document because a run that is killed
+//! Append-only, one JSON object per line, at
+//! `.incode/transcripts/tasks/<task-id>.jsonl`. Line-per-event rather than one
+//! document because a run that is killed
 //! mid-task must still leave a readable record — a partially-written JSON array
 //! parses as nothing, while a partially-written JSONL file parses as every line
 //! that finished.
@@ -39,7 +40,15 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Where a run's per-agent transcripts live, relative to the workspace.
-pub const DIR: &str = ".incode/agents";
+///
+/// Under `transcripts/`, beside the sessions' own transcripts, and NOT in
+/// `.incode/agents/`, where they were written until 2026-09-27: that folder
+/// holds the sub-agent definitions the owner writes and commits
+/// ([`crate::subagents::PROJECT_DIR`]), and machine output beside hand-written
+/// files is how one gets committed by mistake. [`crate::migrate`] moves the old
+/// ones. A subfolder, because the session transcripts' reader lists and prunes
+/// only the files directly in `transcripts/`.
+pub const DIR: &str = ".incode/transcripts/tasks";
 
 /// The most of any single recorded field that reaches the file.
 ///
@@ -229,7 +238,7 @@ impl Transcript {
 
     fn append(&self, value: &serde_json::Value) -> bool {
         if let Some(parent) = self.path.parent() {
-            if std::fs::create_dir_all(parent).is_err() {
+            if crate::folders::create_dir_all(parent).is_err() {
                 return false;
             }
         }

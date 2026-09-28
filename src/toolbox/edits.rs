@@ -348,7 +348,7 @@ fn write_step(step: &Planned) -> Result<(), String> {
     match &step.after {
         Some(text) => {
             if let Some(parent) = step.path.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                crate::folders::create_dir_all(parent).map_err(|e| e.to_string())?;
             }
             std::fs::write(&step.path, text).map_err(|e| e.to_string())
         }

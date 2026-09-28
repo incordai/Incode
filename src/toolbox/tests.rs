@@ -292,15 +292,7 @@ fn a_write_to_a_protected_path_is_refused() {
     for f in &crate::spec::SPEC_SET {
         let full = dir.path().join(f.path);
         std::fs::create_dir_all(full.parent().unwrap()).unwrap();
-        std::fs::write(
-            full,
-            if f.path.ends_with(".json") {
-                "{}"
-            } else {
-                "ok"
-            },
-        )
-        .unwrap();
+        std::fs::write(full, crate::spec::complete_text(f)).unwrap();
     }
     std::fs::create_dir_all(dir.path().join("src")).expect("dir");
     box_.run(

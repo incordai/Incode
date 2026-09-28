@@ -18,6 +18,7 @@ tools — see [Limits](#limits).)
 - [What it does](#what-it-does)
 - [How it is built](#how-it-is-built)
 - [Requirements](#requirements) · [Install](#install) · [Quick start](#quick-start)
+- [A new project](#a-new-project)
 - [Modes](#modes)
 - [Choosing agents and models](#choosing-agents-and-models)
 - [Commands inside a session](#commands-inside-a-session)
@@ -43,8 +44,10 @@ tools — see [Limits](#limits).)
   mode, the operator's hooks, the memory engine's pre-tool check, a checkpoint,
   then the tool.
 - **Refuses to code an unspecified project.** About, Goals, Synopsis, PRD and a
-  roadmap must exist before a source file may be written. On an existing
-  codebase it reads the code first and asks only what the code cannot answer.
+  roadmap must exist before a source file may be written, and so must the spec
+  set — an architecture with its `## Layout`, the contracts, the conventions,
+  the verification commands and the assumptions. On an existing codebase it
+  reads the code first and asks only what the code cannot answer.
 - **Proves completion.** A task reaches `Done` only through a command that
   exited zero. No model's report — however confident, from whichever model —
   reaches that state.
@@ -153,6 +156,42 @@ incode                      # a session in the current directory; type /doctor
 incode -w path/to/project   # a session in another directory
 incode -t "add a health endpoint and a test for it"
 ```
+
+## A new project
+
+Open incode in an empty folder and its first job is the specification, not the
+code. It asks at most seven questions in one batch, researches the rest, and
+writes:
+
+| File | What it holds |
+|---|---|
+| `docs/PRD.md` | What is being built, with a `## Non-goals` section |
+| `docs/ARCHITECTURE.md` | The stack and the modules, with a `## Layout`: the stack's official generator command (`cargo new`, `npm create vite@<version>`, `uv init`) with its verified version, and the folder tree |
+| `.incode/contracts.json` | The shapes that cross module boundaries |
+| `docs/CONVENTIONS.md` | Naming, errors, comments, tests |
+| `docs/VERIFICATION.md` | The command that proves each roadmap item |
+| `docs/ASSUMPTIONS.md` | Every choice made without asking, with its reason |
+
+Writing source is refused until they exist. The roadmap then starts with
+**`s1 Create the layout`**: the generator is run as ordinary work, and the item
+counts as done only when its check in `docs/VERIFICATION.md` — the stack's build
+or test command — exits zero. incode carries no templates of its own; pin the
+generator you want per stack with `scaffold` in `admin.json`.
+
+The project also gets **`.incode/.gitignore`**, written the moment incode
+creates `.incode/`: it ignores this machine's state (the ledger, the cached
+brief, checkpoints, transcripts, the server's token and the rest) and leaves the
+files you approve — `contracts.json`, `guards.json`, `agents/*.md` — to be
+committed. incode only ever adds a missing line to it; your edits stay.
+
+**Where done and not-done lives.** One chain, no second tracker: each work
+section of `docs/PRD.md` — not About, Goals, Synopsis, or the non-goals,
+assumptions, risks and scope — becomes a roadmap item (`d1`, `d2`, … after
+`s1`); the
+planner splits an item into tasks in `.incode/ledger.json`, each carrying that
+item's id and reaching `Done` only through its own check; and the item itself
+is reached only when its line in `docs/VERIFICATION.md` passes and every task
+for it is done. `/roadmap` shows the board.
 
 ## Modes
 
@@ -534,6 +573,7 @@ and `--admin` prints which layer decided each value.
   },
   "budget_tokens": 2000000,
   "verify_command": ["cargo", "test"],
+  "scaffold": { "rust": "cargo new --vcs none app", "web": "npm create vite@latest" },
   "memory_url": "http://127.0.0.1:9180",
   "engine_bin": "/path/to/incord-memory-service",
   "api_providers": [{ "name": "team", "url": "https://agents.example", "key_env": "TEAM_API_KEY" }],
@@ -556,6 +596,7 @@ and `--admin` prints which layer decided each value.
 | `tiers` · `roles` | Named model lists (`@name`) · each role's ordered candidates (written by `/roles`) |
 | `budget_tokens` | The token ceiling for a run |
 | `verify_command` | The command that decides whether work is finished |
+| `scaffold` | The generator you want [a new project](#a-new-project) laid out with, per stack. A preference handed to the model when it writes `## Layout`; incode runs nothing from it itself |
 | `memory_url` · `engine_bin` | Where the memory service listens · where its engine binary is |
 | `api_providers` | Services that list API agents ([contract](#the-api-providers-contract)) |
 | `web_search` | `WebSearch`'s endpoint (`url`, the query sent as `q`) and the name of its key's variable. The key is sent only over https or to loopback |
@@ -601,8 +642,16 @@ Environment variables:
 | `<project>/.incode/agents/*.md` | The project's sub-agents |
 | `<project>/.incode/checkpoints/<session>/` | Each turn's "before", for `/undo` and `/rewind` |
 | `<project>/.incode/transcripts/` · `.incode/context/` | Session transcripts · oversized memory blocks |
+| `<project>/.incode/transcripts/tasks/<task>.jsonl` | What each `/run` agent was told and did, one file per task |
+| `<project>/.incode/.gitignore` | Which of the above is this machine's own and is not committed |
 
-Per-project state lives **in the project**; `~/.incode` is yours.
+Per-project state lives **in the project**; `~/.incode` is yours. Of the
+project's `.incode/`, commit `contracts.json`, `guards.json`, `agents/*.md` and
+`.gitignore`; the `.gitignore` incode writes keeps the rest out.
+
+Task transcripts used to be written into `.incode/agents/`, beside the
+sub-agent definitions; each start moves any `*.jsonl` found there to
+`.incode/transcripts/tasks/`, never replacing one already there.
 
 A project's `.incord/` belongs to Incord Memory, the separate memory product
 (its `RULE_ACK`, `MEMORY_FIRST_OFF` and the rest); incode leaves it alone.

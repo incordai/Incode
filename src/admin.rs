@@ -206,6 +206,16 @@ pub struct AdminConfig {
     /// The command that decides whether work is finished.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verify_command: Option<Vec<String>>,
+    /// The generator the owner wants a new project scaffolded with, per stack:
+    /// `{"rust": "cargo new --vcs none app", "web": "npm create vite@latest"}`.
+    ///
+    /// A PREFERENCE handed to the model when it writes `## Layout` for a
+    /// project with no code yet — see [`crate::scaffold`]. incode carries no
+    /// templates of its own and runs nothing from this map itself; the chosen
+    /// command is run by the scaffold roadmap item like any other work, and its
+    /// build proves it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub scaffold: BTreeMap<String, String>,
     /// Where the memory service listens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_url: Option<String>,
@@ -1240,6 +1250,12 @@ mod tests {
             roles,
             budget_tokens: Some(50_000),
             verify_command: Some(vec!["cargo".to_string(), "test".to_string()]),
+            // A pinned generator is the owner's standing preference for a new
+            // project's layout; one that does not come back was never pinned.
+            scaffold: BTreeMap::from([(
+                "rust".to_string(),
+                "cargo new --vcs none app".to_string(),
+            )]),
             memory_url: Some("http://127.0.0.1:9180".to_string()),
             // The engine the harness runs its own hooks through: a path the
             // operator chose must come back, or the default quietly replaces it.

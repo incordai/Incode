@@ -49,9 +49,9 @@ pub const MAX_BYTES: u64 = 256 * 1024;
 
 /// Where the journal lives inside a workspace.
 ///
-/// Beside the transcripts (`crate::transcript::DIR`) rather than in a new
-/// top-level directory: it is the same kind of artefact — a record of what an
-/// agent did — and `.incode/` is already the harness's own space.
+/// In `.incode/`, with the transcripts (`crate::transcript::DIR`), rather than
+/// in a new top-level directory: it is the same kind of artefact — a record of
+/// what an agent did — and `.incode/` is already the harness's own space.
 pub const FILE: &str = ".incode/desktop.jsonl";
 
 /// The journal path for a workspace.
@@ -150,7 +150,7 @@ impl Journal {
         self.trim()?;
 
         if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
+            crate::folders::create_dir_all(parent)?;
         }
         let mut file = std::fs::OpenOptions::new()
             .create(true)

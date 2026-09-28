@@ -148,7 +148,7 @@ pub fn check(workspace: &Path, path: &str) -> Result<String, String> {
 /// failure here shows up as a failed check with a message that names the path
 /// — which is a better place to discover it than a run that refused to start.
 pub fn prepare(workspace: &Path) {
-    let _ = std::fs::create_dir_all(workspace.join(DIR));
+    let _ = crate::folders::create_dir_all(&workspace.join(DIR));
 }
 
 #[cfg(test)]

@@ -40,6 +40,24 @@ item still in `.incord/` whose target in `.incode/` does not exist is renamed in
 empty target folder gives way), and the memory engine's files stay in `.incord/`. `INCODE_TRACE` (area `migrate`) names
 what moved. There is no fallback to the old `INCORD_*` variable names.
 
+**Task transcripts left `.incode/agents/` (2026-09-27).** That folder holds the
+sub-agent definitions the owner writes and commits (`subagents.rs`); per-task
+transcripts were written beside them. They are now written to
+`.incode/transcripts/tasks/` (`transcript::DIR`), and the same per-project start moves
+any `*.jsonl` still in `.incode/agents/` there, file by file, never replacing one
+already at the target (`migrate::task_transcripts`).
+
+**What in `.incode/` is committed.** `folders.rs` writes `.incode/.gitignore` the
+moment any writer of incode's creates `.incode/` (every one creates its directory
+through `folders::create_dir_all`), and a session start adds any line an older file
+lacks (`folders::heal`). It ignores the machine-local state — `ledger.json`,
+`brief.cache.json`, `checkpoints/`, `transcripts/`, `context/`, `findings/`,
+`serve.json`, `serve.token`, `run.stop`, `desktop.*`, `team.jsonl`, `lifecycle.json`,
+`agents/*.jsonl` — and leaves the owner-approved files tracked: `contracts.json`,
+`guards.json`, `agents/*.md`, and the `.gitignore` itself. The file is only ever
+appended to; a line the owner negates (`!findings/`) is their decision and is not put
+back. A test holds the list to every item incode writes under `.incode/`.
+
 ---
 
 ## 1. The one sentence
@@ -489,6 +507,37 @@ agy — because it is fired from incode's session and turn code, never from a CL
 
 ---
 
+## Layout
+
+A single Rust crate, made with `cargo new` (cargo 1.97.1 on this machine; the crate's
+floor is `rust-version = "1.88"`, edition 2021), and proven by `cargo build`. One
+library, `incord_code`, and one binary, `incode` (`src/main.rs`).
+
+```
+Cargo.toml          the crate, its binary, and every dependency with why it is here
+src/
+  lib.rs            one `pub mod` per module below
+  main.rs           the `incode` binary: argument parsing and the modes
+  *.rs              one module per law or question (§3): brief, spec, scaffold, folders,
+                    ledger, runner, verify, guards, contracts, goal, plan, migrate, …
+  acp_agent/        `incode --acp`: incode as an ACP agent an editor drives
+  agent/            installed agents driven as models, the API route, the worker
+  cli/              the terminal: REPL, rendering, slash commands, one turn
+  desktop/          `incode --desktop-mcp`: the desktop tools and their safety
+  ext_tools/        external tools from a configured release
+  hooks/            the operator's hooks and the memory engine's
+  permissions/      the permission modes
+  runtime/          errors, token counting, the cancel flag
+  sandbox/          the OS sandbox for shell commands, per platform
+  serve/            `incode --serve`: the local HTTP interface
+  toolbox/          every tool a model can call, behind one gate
+  tools/            what those tools do to a workspace
+docs/               this document and the rest of the spec set, ROADMAP.md, RUNNER.md, …
+.incode/            this project's incode state; `.gitignore` says what is committed
+```
+
+---
+
 ## 3. Module map
 
 Modules are cut by **which question they answer**, not by which layer they sit in. A
@@ -552,6 +601,9 @@ That is why the fallback is traced rather than silent.
 | `wiring.rs` | **A capability nothing calls is not a capability.** Counts production mentions of every `pub fn`; a declaration mentioned only once is dead. Ratcheted, so the number can fall and never rise. See `CONVENTIONS.md` §13. |
 | `permissions.rs` | **What the session may do reaches every place that does it.** A mode governs every tool call *and* the desktop: `-p read-only` means the agent may look at the screen and not touch it. The policy applies in `Toolbox::run_call` for every tool (§5b), and again at `desktop::mcp::call_tool` in the desktop's executor. |
 | `hooks.rs` | **The operator can put their own command in front of an action.** Pre-tool hooks run before every Toolbox tool (the desktop's in its executor) and refuse with exit code 2; post-tool hooks run only for calls that happened and cannot deny. Bounded at 10s, because a hook runs between the agent asking and the screen moving. `hooks/engine.rs` is the other half: the memory engine's own hooks, run before each Toolbox call with a piped stdin and the engine's 600 s bounds — see §2, "The engine's hooks". |
+| `spec.rs` | **No source for a project nobody has specified.** Five documents, each with a named consumer, and a document is written only when it carries what it must: `ARCHITECTURE.md` its `## Layout` (checked by `spec::has_section`, the same check the PRD's `## Non-goals` goes through), and on a project with no code, `VERIFICATION.md` a runnable check for the scaffold. Until then `Write`/`Edit` of source is refused, naming the gap. |
+| `scaffold.rs` | **A new project's layout is roadmap item one, and a command proves it.** On a project with no code, `s1 Create the layout` is put first in the roadmap — derived (`brief::from_docs`) or saved (`save_brief`) — and is traceable to `## Layout` rather than to a PRD section. Its goal check is the stack's build or test command. No templates: the stack's own generator, optionally pinned by the owner (`scaffold` in `admin.json`), passed to the model as a preference. |
+| `folders.rs` | **What in `.incode/` is shared is decided once, where it is created.** Writes `.incode/.gitignore` when `.incode/` is made and only ever adds to it. See "Names". |
 | `admin.rs` | One settings file, one precedence ladder, every value able to say which layer decided it. |
 | `research.rs` | A dependency the build links and the document never argued for is a decision nobody recorded. |
 | `identity.rs` | **The agent is the identity; the model is an attribute of the attempt.** A fallback changes what answered without changing who asked, so an identity built on the model would split one worker's history the first time a provider was busy. |
@@ -728,7 +780,9 @@ yet") rather than routed to an endpoint nothing is known to answer.
 | `.incode/brief.cache.json` | machine | the last complete brief, so an unreachable memory service does not stop a run |
 | `.incode/checkpoints/<session>/` | machine | each turn's "before", so `/undo` and `/rewind <n>` survive a restart (bounded: newest 20 turns, ≤ 256 MiB; a manifest naming a path outside the session's roots is not trusted) |
 | `.incode/agents/*.md` | **human** | the project's user-defined sub-agents (`~/.incode/agents/*.md` for every project); see §5b, "User-defined sub-agents" |
+| `.incode/.gitignore` | machine writes, **human** may edit | which of these files are this machine's and not committed; see "Names" |
 | `.incode/transcripts/<session>.jsonl` | machine | the session's transcript in the memory engine's shape, when an engine is present or the session is an ACP one; newest 200 kept |
+| `.incode/transcripts/tasks/<task>.jsonl` | machine, append-only | what each `/run` task's agent was told and did; read by `--serve` |
 | `.incode/context/` | machine | an oversized `session-start` / `user-prompt` block, written whole; newest 200 kept |
 | `<repo-parent>/worktrees/` | machine | one checkout per lane, removed after; the **branch is kept** |
 | `~/.incode/admin.json` | human sets once | model, roles, ceiling, check |

@@ -87,7 +87,7 @@ pub fn write_file(workspace: &Path, input: &str) -> Result<String> {
     };
 
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        crate::folders::create_dir_all(parent)?;
     }
     std::fs::write(&path, content)?;
 

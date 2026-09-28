@@ -210,7 +210,7 @@ pub fn stop_path_in(workspace: &std::path::Path) -> std::path::PathBuf {
 /// it is worse than no stop button at all.
 pub fn request_stop(path: &std::path::Path) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        crate::folders::create_dir_all(parent)?;
     }
     // The timestamp is for a human reading the directory later. Nothing parses
     // it — see the note above.

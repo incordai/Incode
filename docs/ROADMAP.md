@@ -152,6 +152,33 @@ This is fully true for claude; section 0b says what is not.
 
 ---
 
+## 1. Project folders and planning — 2026-09-27
+
+Adapted, in incode's own terms, from a cross-check against mattpocock/skills
+(MIT). Done/not-done stays one chain — PRD section → roadmap id → ledger tasks →
+`VERIFICATION.md` goal check — and no second tracker was added.
+
+### 1a. Project folders — DONE
+
+- **`.incode/.gitignore`** (`folders.rs`): written when any writer creates
+  `.incode/`, healed at session start, only ever appended to. Ignores the
+  machine-local state, keeps `contracts.json`, `guards.json`, `agents/*.md`
+  tracked. This repository's own `.gitignore` stopped ignoring all of `.incode/`
+  for the same reason, and commits the `.incode/.gitignore`.
+- **Task transcripts** moved from `.incode/agents/` (the owner's sub-agent
+  definitions) to `.incode/transcripts/tasks/`; old ones are migrated at start.
+- **`## Layout` required in `docs/ARCHITECTURE.md`**, checked by the same
+  `spec::has_section` the PRD's non-goals go through: the stack's official
+  generator with a verified version, and the folder tree.
+- **The scaffold is roadmap item 1** on a project with no code (`scaffold.rs`):
+  `s1 Create the layout`, proven by the stack's build or test command in
+  `VERIFICATION.md`, which the spec gate requires. No templates; the owner may pin
+  a generator per stack (`scaffold` in `admin.json`).
+- **`RUNNER.md`** no longer describes a `journal.jsonl` or a `runner.lock`; neither
+  was built.
+
+---
+
 ## A. The 51 unwired capabilities
 
 `wiring.rs` reports them; `MAX_UNWIRED` is the ratchet and may only fall.

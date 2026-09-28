@@ -223,7 +223,7 @@ impl Channel {
         // the two operations.
         self.trim()?;
         if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
+            crate::folders::create_dir_all(parent)?;
         }
         let mut file = std::fs::OpenOptions::new()
             .create(true)

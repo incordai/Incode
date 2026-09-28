@@ -165,6 +165,12 @@ pub(crate) fn prepare_session(
     for line in crate::migrate::project_report(&workspace) {
         render::print_info(&line);
     }
+    // A `.incode/` made before incode wrote its `.gitignore`, or one missing
+    // a line a newer incode ignores, is brought up to date — added to, never
+    // rewritten.
+    if let Some(line) = crate::folders::heal(&workspace) {
+        render::print_info(&line);
+    }
     // The intake gate. Nothing is blocked by it: an incomplete brief makes
     // completing the brief the session's first job, not a reason to exit.
     // The work still happens here, in this session, with the owner present

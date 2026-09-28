@@ -290,7 +290,7 @@ mod tests {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).expect("the docs dir");
         }
-        std::fs::write(&path, "# Architecture\n\nReal content.\n").expect("write it");
+        std::fs::write(&path, crate::spec::complete_text(&first)).expect("write it");
 
         let docs = documents_of(dir.path());
         let found = docs

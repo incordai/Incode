@@ -886,7 +886,15 @@ impl Toolbox {
 
     /// Record part of the project's brief.
     fn save_brief(&self, raw: &str) -> Result<String, String> {
-        let update = crate::brief::parse_save(raw)?;
+        let mut update = crate::brief::parse_save(raw)?;
+        // A project with no code builds its layout first, whoever wrote the
+        // plan — see `crate::scaffold`. Said in the result, so the model knows
+        // the roadmap it saved is not exactly the one it sent.
+        let scaffolded = crate::scaffold::applies(&self.workspace)
+            && update
+                .roadmap
+                .as_mut()
+                .is_some_and(crate::scaffold::put_first);
         // The workspace FOLDER, which is what the brief is looked up by when
         // no exact path matches — see `brief_for`. A different name here would
         // write a brief that the gate then reports as missing.
@@ -896,7 +904,18 @@ impl Toolbox {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
         let still_missing = crate::brief::save(&self.workspace, &project, &update)?;
-        Ok(crate::brief::saved_report(&still_missing))
+        let report = crate::brief::saved_report(&still_missing);
+        if scaffolded {
+            return Ok(format!(
+                "{report}\n\nThis project has no code yet, so incode put `{} {}` first in \
+                 the roadmap. Give it a check in {}: {}",
+                crate::scaffold::ID,
+                crate::scaffold::TITLE,
+                crate::goal::VERIFICATION_PATH,
+                crate::scaffold::check_line()
+            ));
+        }
+        Ok(report)
     }
 
     /// Every file a call would change, as the model named them.

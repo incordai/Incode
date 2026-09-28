@@ -69,10 +69,13 @@ the file holds the *state*.
 
 ```
 .incode/
-├── ledger.json     current state — one entry per task, rewritten in place
-├── journal.jsonl   every transition, append-only, never rewritten
-└── runner.lock     single-runner mutex; holds pid + lease
+├── ledger.json          current state — one entry per task, rewritten in place
+└── transcripts/tasks/   one append-only JSONL per task: what its agent was told and did
 ```
+
+*(Corrected 2026-09-27. An earlier draft of this section specified a `journal.jsonl`
+of every transition and a `runner.lock` single-runner mutex. Neither was built; what
+is described below is what exists.)*
 
 **`ledger.json`** is the materialised view. It is what a human reads and what a diff
 shows.
@@ -99,19 +102,22 @@ same bytes. TOML would have meant a new dependency for a formatting preference, 
 }
 ```
 
-**`journal.jsonl`** is the record of what moved and on what evidence. Append-only, so
-its diff is always pure addition and its history cannot be quietly rewritten by the
-process that failed.
+**`ledger.json` is the only execution state, and nothing rebuilds it.** It is written
+whole by `Ledger::save` (`ledger.rs`) after each transition; there is no journal of
+transitions to replay. The records that do exist are:
 
-```json
-{"ts":"2026-08-14T09:31:02Z","task":"t-014","from":"running","to":"done",
- "by":"runner","evidence":{"kind":"command","argv":["cargo","test","..."],
- "exit":0,"ms":41207,"tree":"8f3c1ad"}}
-```
+- **Each task's transcript**, `.incode/transcripts/tasks/<task>.jsonl`
+  (`transcript.rs`): a `briefed` line with what the agent was told, then one line per
+  thing it said or called, stamped with the task, role, agent and time. Append-only,
+  so a run killed mid-task still leaves every finished line readable. `--serve` reads
+  it to show who is doing what.
+- **Each finished task's note**, written to the shared memory under the agent's
+  fingerprint (`runner::WorkJournal`, the real one being `MemoryJournal`). A record,
+  never a source of truth: nothing reads it back to decide whether a task is done.
 
-**The ledger is derivable from the journal.** Replay reconstructs it. That is the
-crash-recovery story and the audit story at once: if the process dies mid-write, the
-journal is the truth and `ledger.json` is rebuilt from it.
+**Crash recovery is a stop, not a replay.** A run killed mid-task leaves that task
+`running` on disk. There is no lease to expire, so the next run does not reclaim it:
+it stops with `Stranded` (§6) and names the task, and the owner puts it back.
 
 ---
 
@@ -124,14 +130,14 @@ evidence record wearing a state's clothes.
 |---|---|
 | `pending` | in the ledger; `depends_on` not yet satisfied |
 | `ready` | eligible for pickup |
-| `running` | claimed by a runner, lease held |
+| `running` | claimed by a runner (no lease: a run killed here leaves it, and the next run stops `Stranded`) |
 | `blocked` | an owner decision is outstanding; carries the ask token |
 | `done` | verified by exit code — **terminal** |
 | `abandoned` | failed its attempt budget; will not be retried |
 | `cancelled` | the owner dismissed it |
 
 There is deliberately **no `failed` state**. A failure is an increment to `attempts`
-plus a journal entry, and the task returns to `ready`. A state nothing ever observes
+plus a note on the task, and the task returns to `ready`. A state nothing ever observes
 is not a state.
 
 `done` is terminal. If a completed task turns out to be wrong later, that is a *new*
@@ -173,7 +179,7 @@ substituted for the strong one by accident.
 | `Claim` | the subagent's final answer | **nothing** — recorded only |
 
 **`Claim` is recorded and is never load-bearing.** The subagent's report goes into the
-journal labelled as a claim, with the model that produced it, because it is useful when
+task's transcript as what the agent said, with the agent that produced it, because it is useful when
 reading back a failure. It moves nothing. This is the audit-loop lesson written down:
 the thing that went wrong was not that the coder agent was mistaken, it was that its
 say-so was wired to a status field.
@@ -200,7 +206,7 @@ impl Verified {
 }
 
 // The only fn that writes `done`, and it cannot be called without one.
-fn complete(task: &mut Task, proof: Verified, journal: &mut Journal) { … }
+pub fn complete(&mut self, id: &str, proof: &Verified) -> Result<(), String> { … }
 ```
 
 If `complete` cannot be called without a `Verified`, and `Verified` cannot be built
@@ -231,9 +237,7 @@ without reading the source.
 
 ```
 start:
-  acquire runner.lock                          → else stop(AlreadyRunning)
-  replay journal → ledger                      (crash recovery)
-  reclaim expired leases: running → ready, crashes += 1
+  ledger = load(.incode/ledger.json)           no lock, no journal to replay (§2)
   watchman_handoff(project)                    what this project already solved
   recall(rules for this repo)                  standing rules from memory (Phase 3)
   resolve any outstanding blocked ask tokens first
@@ -245,13 +249,15 @@ loop:
 
   task = ledger.next_ready()
       none, and something is blocked  → stop(NeedsOwner)
+      none, and something is running  → stop(Stranded)   left by a run that died
       none                            → stop(LedgerEmpty)
 
   if task.verify is empty   → block(task, "no verification command"); continue
 
-  claim(task)                                  lease = now + 15m, heartbeat renews
-  claim_report = delegate(task)                subagent; cheap model once Phase 6 lands
-  journal.record(Claim { claim_report })       recorded, load-bearing on nothing
+  claim(task)                                  running; no lease
+  claim_report = delegate(task)                subagent; its transcript is written as it works
+                                               (.incode/transcripts/tasks/<task>.jsonl),
+                                               load-bearing on nothing
 
   ev = run_verify(task)                        parent's own process
   match ev.exit:
@@ -263,11 +269,13 @@ loop:
          else:
              release(task, ev)                 back to ready, next iteration retries
 
-stop(reason):
-  journal.record(Stop { reason, spent, done_count, remaining })
+stop(reason):                                  ledger.json was saved at each transition;
+                                               it is the only record of where the run got to
   owner_post(reason)                           the body's channel, not a new one
-  release runner.lock
 ```
+
+A finished task is also written to the shared memory as it completes
+(`WorkJournal`, §2) — a record for the next agent, never read back to decide anything.
 
 The runner picks the next ready task in ledger order among those whose dependencies
 are met. Ordering is a scheduling decision, so it is allowed to be a heuristic — that
@@ -323,12 +331,12 @@ Nine are implemented. `GuardDenied` below is still a design note, not code.
 | `NeedsOwner` | an ask is outstanding, unanswered, or could not be put at all |
 | `Cancelled` | the existing cancel token fired (R12, already shipped) |
 | `GuardDenied` | a standing rule loaded from memory forbade the next action (Phase 3) |
-| `AlreadyRunning` | another runner holds the lock |
+There is no `AlreadyRunning`: nothing stops a second runner starting over the same
+ledger (§9, question 4).
 
 **Every stop writes a reason and posts it.** The PRD's success test is that the harness
 *"stops for a stated reason rather than drifting"* — so an unlabelled exit is a bug of
-the same class as a wrong `done`, and the journal should have no `Stop` record without
-one of the seven above.
+the same class as a wrong `done`, and every run must end on one of the reasons above.
 
 `TaskFailedTwice` halting the whole run is the PRD's literal wording and is what is
 specified here. The alternative — abandon that one task, continue with the rest, halt
@@ -678,8 +686,11 @@ transitions — which durable storage does not provide.
 3. **Permission tier for unattended running.** §9.4 of the PRD is still open, and the
    runner is not safe to start without it — the tier that makes it useful is the tier
    that permits shell commands.
-4. **Concurrency.** This design is single-runner behind a lockfile. Multiple runners
-   over one ledger needs a real claim protocol and is not attempted.
+4. **Concurrency.** The design assumed a single runner behind a lockfile; the lockfile
+   was never built, so two `/run`s over one checkout are not prevented and would each
+   rewrite `ledger.json`. Lanes (`parallel.rs`) are the supported way to run tasks at
+   once. Multiple runners over one ledger needs a real claim protocol and is not
+   attempted.
 5. **Who admits tasks to the ledger.** Written here as an owner action against an
    approved roadmap. Whether the harness may propose additions to its own queue is a
    trust question, not a scheduling one, and it is the natural next thing to get wrong.
@@ -694,11 +705,12 @@ Each of these is a test, not an impression.
 - [ ] `complete` cannot be called without a `Verified`; `Verified` cannot be built from
       a non-zero exit.
 - [ ] A subagent claiming success on a task whose verify fails leaves the task `ready`
-      with `attempts = 1`, and the claim is in the journal marked as a claim.
+      with `attempts = 1`, and the claim is in the task's transcript as what it said.
 - [ ] A verify argv is never submitted to `watchman_lookup`.
-- [ ] Killing the runner mid-task and restarting reclaims the lease, increments
-      `crashes`, and rebuilds `ledger.json` from the journal alone.
+- [ ] Killing the runner mid-task and restarting stops with `Stranded`, naming the task
+      left `running` — never `LedgerEmpty`. (There is no lease to reclaim and no
+      journal to rebuild from.)
 - [ ] The runner completes several roadmap tasks unattended and exits with one of the
-      seven named reasons — with the journal containing no `Stop` lacking a reason.
+      named reasons.
 - [ ] A proxy-auto-decided card never moves a task out of `blocked`.
       **This test cannot pass until §9.7 lands.**

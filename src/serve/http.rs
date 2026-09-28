@@ -84,7 +84,7 @@ fn publish(workspace: &std::path::Path, port: u16) -> std::io::Result<Address> {
         at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
     };
     let dir = workspace.join(crate::ledger::LEDGER_DIR);
-    std::fs::create_dir_all(&dir)?;
+    crate::folders::create_dir_all(&dir)?;
     std::fs::write(
         dir.join(ADDRESS_FILE),
         serde_json::to_string_pretty(&address).unwrap_or_default(),
@@ -226,7 +226,7 @@ fn issue_token(workspace: &std::path::Path) -> std::io::Result<String> {
     use std::io::Write;
     let token = uuid::Uuid::new_v4().simple().to_string();
     let dir = workspace.join(crate::ledger::LEDGER_DIR);
-    std::fs::create_dir_all(&dir)?;
+    crate::folders::create_dir_all(&dir)?;
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]

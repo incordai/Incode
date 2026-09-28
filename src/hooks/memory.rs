@@ -460,7 +460,7 @@ fn inline_in(cwd: &Path, block: &str, name: &str, limit: usize) -> String {
     }
     let dir = cwd.join(CONTEXT);
     let path = dir.join(format!("{name}.md"));
-    let written = std::fs::create_dir_all(&dir)
+    let written = crate::folders::create_dir_all(&dir)
         .and_then(|()| std::fs::write(&path, block))
         .is_ok();
     prune(&dir);
@@ -506,7 +506,7 @@ fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
     use std::io::Write;
     let fresh = !path.exists();
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+        crate::folders::create_dir_all(dir)?;
     }
     let mut file = std::fs::OpenOptions::new()
         .create(true)

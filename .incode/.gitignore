@@ -1,0 +1,20 @@
+# Written by incode. Each line below is this machine's own state: it means
+# nothing in another checkout, so it is not committed.
+#
+# Committed, and so not listed: contracts.json, guards.json, agents/*.md, and this file.
+#
+# Edit freely. incode only ever adds a line that is missing, and a line you
+# negate (`!findings/`) is your decision and is left alone.
+ledger.json
+brief.cache.json
+checkpoints/
+transcripts/
+context/
+findings/
+serve.json
+serve.token
+run.stop
+desktop.*
+team.jsonl
+lifecycle.json
+agents/*.jsonl

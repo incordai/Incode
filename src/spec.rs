@@ -52,6 +52,101 @@ pub struct SpecFile {
     /// **Who reads it.** A file with no consumer does not belong in this list.
     pub consumer: &'static str,
     pub approval: Approval,
+    /// Sections it must carry, each with something under it. A document
+    /// missing one is not written yet, however long it is.
+    pub sections: &'static [Section],
+}
+
+/// A section a spec document must carry, found by its heading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Section {
+    /// The heading as it should be written.
+    pub heading: &'static str,
+    /// The heading's first word, lowercase, numbering aside: `## 3. Layout`
+    /// and `## Layout of the repo` both count, `## Programming language` does
+    /// not count as `## Language`.
+    pub first_word: &'static str,
+    /// What goes under it, told to whoever writes it.
+    pub holds: &'static str,
+}
+
+/// The layout, required in `docs/ARCHITECTURE.md`.
+///
+/// **Why it is a gate and not advice:** on a new project the skeleton is the
+/// first thing built and the first thing hand-written wrong — a tree that
+/// nearly matches what the stack's generator makes. Naming the generator and
+/// its version here makes running it roadmap item one
+/// ([`crate::scaffold`]), and the tree is what every later task files its code
+/// against.
+pub const LAYOUT: Section = Section {
+    heading: "## Layout",
+    first_word: "layout",
+    holds: "the stack's OFFICIAL generator command with the version you verified \
+            (e.g. `cargo new` with its cargo version, `npm create vite@<version>`, \
+            `uv init`), and the target folder tree. On an existing codebase: the \
+            tree as it is, and the command that builds it",
+};
+
+/// The sections `docs/ARCHITECTURE.md` must carry.
+const ARCHITECTURE_SECTIONS: &[Section] = &[LAYOUT];
+
+/// Whether `doc` has a section whose heading `names_it`, with something under
+/// it before the next heading of the same or a higher level.
+///
+/// `names_it` is given the heading lowercased, without its `#` markers.
+/// Subheadings belong to the section, and what is under them counts as its
+/// content; a heading alone does not. Fenced blocks count, because a folder
+/// tree is usually written in one — and a `#` inside a fence is not a heading.
+///
+/// Shared by every "this document must say X" check: the PRD's non-goals
+/// ([`crate::brief::ProjectBrief::states_non_goals`]) and the sections of
+/// this set.
+#[must_use]
+pub fn has_section(doc: &str, names_it: impl Fn(&str) -> bool) -> bool {
+    let mut in_fence = false;
+    // The depth of the heading that opened the matching section, while in it.
+    let mut open: Option<usize> = None;
+    let mut content = false;
+    for line in doc.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            content |= open.is_some();
+            continue;
+        }
+        if in_fence {
+            content |= open.is_some() && !trimmed.is_empty();
+            continue;
+        }
+        if trimmed.starts_with('#') {
+            let depth = trimmed.chars().take_while(|c| *c == '#').count();
+            if let Some(level) = open {
+                if depth > level {
+                    continue;
+                }
+                if content {
+                    return true;
+                }
+                open = None;
+            }
+            let heading = trimmed.trim_start_matches('#').trim().to_lowercase();
+            if names_it(&heading) {
+                open = Some(depth);
+                content = false;
+            }
+        } else if open.is_some() && !trimmed.is_empty() {
+            content = true;
+        }
+    }
+    open.is_some() && content
+}
+
+/// Whether `doc` carries `section`, with something under it.
+#[must_use]
+pub fn carries(doc: &str, section: &Section) -> bool {
+    has_section(doc, |heading| {
+        crate::brief::first_word(heading) == section.first_word
+    })
 }
 
 /// The set, in the order it must be written.
@@ -65,32 +160,40 @@ pub const SPEC_SET: [SpecFile; 5] = [
         holds: "stack, module boundaries, data model, what runs where, and WHY it is cut this way",
         consumer: "every implementation task inherits it, so an error here is copied into work already done",
         approval: Approval::Owner,
+        sections: ARCHITECTURE_SECTIONS,
     },
     SpecFile {
         path: ".incode/contracts.json",
         holds: "the shapes that cross module boundaries: schemas with their fields, endpoints, error cases",
         consumer: "the verify step checks the code against it on every task, and each task is told which shapes it must honour",
         approval: Approval::Owner,
+        sections: &[],
     },
     SpecFile {
         path: "docs/CONVENTIONS.md",
         holds: "naming, error handling, comment policy, test structure — with a good and a bad example per rule",
         consumer: "every coding task, so work routed across different models reads as one codebase",
         approval: Approval::Generated,
+        sections: &[],
     },
     SpecFile {
-        path: "docs/VERIFICATION.md",
+        path: VERIFICATION_PATH,
         holds: "how each acceptance criterion is proven: the exact command, the environment it needs, what a pass looks like",
         consumer: "the runner, which turns each into the check that decides whether a task is done",
         approval: Approval::Generated,
+        sections: &[],
     },
     SpecFile {
         path: "docs/ASSUMPTIONS.md",
         holds: "every choice the harness made rather than asked, each with its reasoning",
         consumer: "the owner, who skims one list instead of answering twenty questions",
         approval: Approval::Generated,
+        sections: &[],
     },
 ];
+
+/// The verification document, which [`crate::goal`] reads goal checks from.
+const VERIFICATION_PATH: &str = crate::goal::VERIFICATION_PATH;
 
 /// The shape `contracts.json` must have, shown rather than described.
 ///
@@ -152,7 +255,21 @@ pub fn refuse_source_write(workspace: &Path, path: &str) -> Option<String> {
     if !is_source(path) {
         return None;
     }
-    let names: Vec<&str> = outstanding.iter().map(|f| f.path).collect();
+    let names: Vec<String> = outstanding
+        .iter()
+        .map(|f| {
+            let lacking: Vec<String> = lacks(workspace, f).into_iter().map(|l| l.0).collect();
+            if lacking.is_empty() {
+                f.path.to_string()
+            } else {
+                format!(
+                    "{} (written, but it lacks {})",
+                    f.path,
+                    lacking.join(" and ")
+                )
+            }
+        })
+        .collect();
     Some(format!(
         "`{path}` is source, and this project is not specified yet — {} document(s) \
          are still missing: {}.\n\n\
@@ -266,7 +383,9 @@ const EXISTING_CODEBASE: &str = "\n\nTHIS PROJECT ALREADY HAS CODE, so do not \
     - CONVENTIONS: infer them from the existing code — naming, error handling, \
     test layout. This file records the house style that exists, so work routed \
     across different models does not drift away from it.\n\
-    - VERIFICATION: find the command the project already uses to check itself.\n\n\
+    - VERIFICATION: find the command the project already uses to check itself.\n\
+    - LAYOUT (`## Layout` in ARCHITECTURE): the folder tree as it is, and the \
+    command that builds it.\n\n\
     Then ask the owner ONLY what the code cannot answer: what this is for, what \
     it is deliberately NOT doing, and what must never break. Everything else you \
     derive, and record with its reasoning in ASSUMPTIONS.";
@@ -275,6 +394,29 @@ const EXISTING_CODEBASE: &str = "\n\nTHIS PROJECT ALREADY HAS CODE, so do not \
 const NEW_PROJECT: &str = "\n\nThis project has no code yet, so the \
     specification is written before anything is built rather than derived from \
     it. Ask, research, propose — then write the documents and start.";
+
+/// What a new project's layout must be, and how it is proven.
+///
+/// The generator rather than a hand-written tree, and a command rather than a
+/// claim: see [`crate::scaffold`] for why each.
+fn new_project_layout() -> String {
+    format!(
+        "\n\nTHE LAYOUT COMES FIRST, AND IS PROVEN RATHER THAN CLAIMED:\n\
+         - `## Layout` in docs/ARCHITECTURE.md names the stack's OFFICIAL \
+         generator — `cargo new`, `npm create vite@<version>`, `uv init` — with the \
+         exact version you verified today, and the folder tree it should leave. \
+         The generator makes the skeleton; do not hand-write one, and do not \
+         write it now: that is roadmap item 1.\n\
+         - Roadmap item 1 is `{id} {title}` — incode puts it first. Give it a \
+         runnable check in docs/VERIFICATION.md, the stack's build or test \
+         command, exactly in this shape:\n  {line}\n  \
+         so the layout is done when that command exits zero, not when someone \
+         says so.",
+        id = crate::scaffold::ID,
+        title = crate::scaffold::TITLE,
+        line = crate::scaffold::check_line(),
+    )
+}
 
 /// The consequence, stated where the work is described.
 ///
@@ -417,22 +559,61 @@ pub fn missing(workspace: &Path) -> Vec<&'static SpecFile> {
     SPEC_SET.iter().filter(|f| !exists(workspace, f)).collect()
 }
 
-/// Whether one document is present and has something in it.
+/// Whether one document is present, has something in it, and carries what it
+/// must ([`SpecFile::sections`], and on a project with no code the scaffold's
+/// check).
 #[must_use]
 pub fn exists(workspace: &Path, file: &SpecFile) -> bool {
-    let path = workspace.join(file.path);
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return false;
-    };
+    written(workspace, file).is_some_and(|text| lacks_in(workspace, file, &text).is_empty())
+}
+
+/// The document's text, when it is written: present, not blank, and — for
+/// JSON — parseable. A corrupted JSON file does not satisfy the spec contract.
+fn written(workspace: &Path, file: &SpecFile) -> Option<String> {
+    let text = std::fs::read_to_string(workspace.join(file.path)).ok()?;
     if text.trim().is_empty() {
-        return false;
+        return None;
     }
-    // For JSON spec files, verify valid JSON syntax.
-    // A corrupted or invalid JSON file does not satisfy the spec contract.
     if file.path.ends_with(".json") && serde_json::from_str::<serde_json::Value>(&text).is_err() {
-        return false;
+        return None;
     }
-    true
+    Some(text)
+}
+
+/// What a WRITTEN document still lacks, as (name, what it holds); empty for
+/// one that is complete or not written at all.
+fn lacks(workspace: &Path, file: &SpecFile) -> Vec<(String, String)> {
+    written(workspace, file)
+        .map(|text| lacks_in(workspace, file, &text))
+        .unwrap_or_default()
+}
+
+fn lacks_in(workspace: &Path, file: &SpecFile, text: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = file
+        .sections
+        .iter()
+        .filter(|section| !carries(text, section))
+        .map(|section| (format!("`{}`", section.heading), section.holds.to_string()))
+        .collect();
+    // Cheapest test first: the directory walk behind `applies` runs only for a
+    // verification document that has no scaffold check.
+    if file.path == VERIFICATION_PATH
+        && !crate::scaffold::verified_in(text)
+        && crate::scaffold::applies(workspace)
+    {
+        out.push((
+            format!("the `{}` check", crate::scaffold::ID),
+            format!(
+                "this project has no code yet, so roadmap item 1 is `{} {}` and it \
+                 is proven like any other goal — by the stack's build or test \
+                 command, written as: {}",
+                crate::scaffold::ID,
+                crate::scaffold::TITLE,
+                crate::scaffold::check_line()
+            ),
+        ));
+    }
+    out
 }
 
 /// What the session should produce, or `None` when the set is complete.
@@ -452,6 +633,19 @@ pub fn intake_note(workspace: &Path) -> Option<String> {
         missing.len()
     );
     for file in &missing {
+        let lacking = lacks(workspace, file);
+        if !lacking.is_empty() {
+            // Written, and short of what it must carry. Said as the gap, not
+            // as the whole entry again: the rest is done.
+            out.push_str(&format!(
+                "\n- `{}` is written, but still lacks:\n",
+                file.path
+            ));
+            for (name, holds) in &lacking {
+                out.push_str(&format!("    - {name}: {holds}\n"));
+            }
+            continue;
+        }
         out.push_str(&format!(
             "\n- `{}` ({})\n    holds: {}\n    read by: {}\n",
             file.path,
@@ -462,6 +656,12 @@ pub fn intake_note(workspace: &Path) -> Option<String> {
             file.holds,
             file.consumer
         ));
+        for section in file.sections {
+            out.push_str(&format!(
+                "    must carry `{}`: {}\n",
+                section.heading, section.holds
+            ));
+        }
     }
     out.push_str(
         "\nWrite them in the order listed: contracts cannot be written before the \
@@ -481,11 +681,20 @@ pub fn intake_note(workspace: &Path) -> Option<String> {
     // Which conversation this is. An existing codebase already answers most of
     // what a greenfield project has to be asked, and asking an owner to
     // re-describe a system they built is how a gate becomes an interrogation.
-    out.push_str(if has_existing_code(workspace) {
-        EXISTING_CODEBASE
+    if has_existing_code(workspace) {
+        out.push_str(EXISTING_CODEBASE);
     } else {
-        NEW_PROJECT
-    });
+        out.push_str(NEW_PROJECT);
+        out.push_str(&new_project_layout());
+        // The owner's pinned generators, as a preference. Read here rather
+        // than passed in: the note is built on its own thread at startup.
+        if let Some(pins) =
+            crate::scaffold::pinned_note(&crate::admin::AdminConfig::load_default().scaffold)
+        {
+            out.push_str("\n\n");
+            out.push_str(&pins);
+        }
+    }
 
     // And what the machine was already told, whichever conversation this is. A
     // greenfield project with no code can still have been described at length in
@@ -501,9 +710,164 @@ pub fn intake_note(workspace: &Path) -> Option<String> {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// A document's text that satisfies everything [`exists`] asks of it, for a
+/// test that needs the spec set complete — including on a project with no
+/// code, where the verification document must prove the scaffold. One place,
+/// so a new requirement reaches every such fixture at once.
+#[cfg(test)]
+pub(crate) fn complete_text(file: &SpecFile) -> String {
+    if file.path.ends_with(".json") {
+        return "{}".to_string();
+    }
+    let mut out = String::from("real content that is not blank\n");
+    for section in file.sections {
+        out.push_str(&format!("\n{}\n\nfilled in\n", section.heading));
+    }
+    if file.path == VERIFICATION_PATH {
+        out.push_str(&format!(
+            "\n- **{} {}** — `cargo build`\n",
+            crate::scaffold::ID,
+            crate::scaffold::TITLE
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A workspace with every document written in full.
+    fn complete() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("temp dir");
+        for file in &SPEC_SET {
+            let full = dir.path().join(file.path);
+            std::fs::create_dir_all(full.parent().expect("parent")).expect("mkdir");
+            std::fs::write(full, complete_text(file)).expect("write");
+        }
+        dir
+    }
+
+    fn write(dir: &Path, path: &str, body: &str) {
+        let full = dir.join(path);
+        std::fs::create_dir_all(full.parent().expect("parent")).expect("mkdir");
+        std::fs::write(full, body).expect("write");
+    }
+
+    /// **`## Layout` is required, not suggested.** An architecture with
+    /// everything else in it is still unwritten without one, and both the gate
+    /// and the refusal say exactly which section is missing rather than
+    /// calling the whole document absent.
+    #[test]
+    fn an_architecture_without_a_layout_is_not_written() {
+        let dir = complete();
+        write(
+            dir.path(),
+            "docs/ARCHITECTURE.md",
+            "# Arch\n\n## Modules\nthree of them\n",
+        );
+
+        let missing: Vec<&str> = missing(dir.path()).iter().map(|f| f.path).collect();
+        assert_eq!(missing, ["docs/ARCHITECTURE.md"]);
+
+        let note = intake_note(dir.path()).expect("the gate is not open");
+        assert!(note.contains("is written, but still lacks"), "{note}");
+        assert!(note.contains("`## Layout`"), "{note}");
+        assert!(
+            note.contains("generator"),
+            "it says what goes in it: {note}"
+        );
+
+        let refusal = refuse_source_write(dir.path(), "src/main.rs").expect("refused");
+        assert!(
+            refusal.contains("docs/ARCHITECTURE.md (written, but it lacks `## Layout`)"),
+            "{refusal}"
+        );
+    }
+
+    /// The heading alone is not the section: something must be under it —
+    /// the same rule the PRD's non-goals are held to.
+    #[test]
+    fn a_layout_heading_with_nothing_under_it_does_not_count() {
+        assert!(!carries("## Layout\n\n## Modules\nx\n", &LAYOUT));
+        assert!(!carries("## Layout\n### Tree\n", &LAYOUT));
+        assert!(!carries("## Layout\n", &LAYOUT));
+    }
+
+    /// Written the way people write it: numbered, with a fenced tree, with
+    /// the tree under a subheading. A `#` in the tree is not a heading.
+    #[test]
+    fn a_layout_is_found_however_it_is_written() {
+        assert!(carries(
+            "## 4. Layout\n```\nsrc/\n# not a heading\n```\n",
+            &LAYOUT
+        ));
+        assert!(carries("## Layout\n### Tree\n- src/\n## Next\n", &LAYOUT));
+        assert!(carries(
+            "# Arch\n\n## Layout of the repo\n`cargo new x`\n",
+            &LAYOUT
+        ));
+        assert!(
+            !carries("## Tree\nThe layout is below.\n", &LAYOUT),
+            "a passing mention is not the section"
+        );
+        assert!(
+            !carries("```\n## Layout\nsrc/\n```\n", &LAYOUT),
+            "a heading inside a fence is not a heading"
+        );
+    }
+
+    /// **The layout is a goal proven by a command.** On a project with no
+    /// code, the verification document must carry a runnable check for
+    /// roadmap item `s1`; once the project has code, it is not asked for.
+    #[test]
+    fn a_new_project_must_prove_its_layout_with_a_command() {
+        let dir = complete();
+        write(
+            dir.path(),
+            "docs/VERIFICATION.md",
+            "- **d1 plays** — `node check.js`\n",
+        );
+
+        let gaps: Vec<&str> = missing(dir.path()).iter().map(|f| f.path).collect();
+        assert_eq!(gaps, ["docs/VERIFICATION.md"]);
+        let note = intake_note(dir.path()).expect("not open");
+        assert!(note.contains("the `s1` check"), "{note}");
+        assert!(note.contains("**s1 Create the layout**"), "{note}");
+
+        // Prose is not a check.
+        write(
+            dir.path(),
+            "docs/VERIFICATION.md",
+            "- **s1 Create the layout** — it looks right\n",
+        );
+        assert!(!missing(dir.path()).is_empty());
+
+        // An existing codebase has no scaffold to prove.
+        write(dir.path(), "src/main.rs", "fn main() {}");
+        assert!(missing(dir.path()).is_empty(), "{:?}", missing(dir.path()));
+    }
+
+    /// A new project is told to use the generator, not to hand-write a tree,
+    /// and shown the exact check line; an existing one is not.
+    #[test]
+    fn a_new_project_is_told_the_layout_comes_first() {
+        let fresh = tempfile::tempdir().expect("temp dir");
+        let note = intake_note(fresh.path()).expect("a note");
+        assert!(note.contains("OFFICIAL"), "{note}");
+        assert!(note.contains("generator"), "{note}");
+        assert!(
+            note.contains("Roadmap item 1 is `s1 Create the layout`"),
+            "{note}"
+        );
+        assert!(note.contains(&crate::scaffold::check_line()), "{note}");
+
+        let existing = tempfile::tempdir().expect("temp dir");
+        write(existing.path(), "src/lib.rs", "");
+        let note = intake_note(existing.path()).expect("a note");
+        assert!(!note.contains("Roadmap item 1 is"), "{note}");
+        assert!(note.contains("LAYOUT"), "{note}");
+    }
 
     fn project(files: &[(&str, &str)]) -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -596,20 +960,7 @@ mod tests {
     /// done, or it trains people to ignore it.
     #[test]
     fn a_complete_set_asks_for_nothing() {
-        let files: Vec<(&str, &str)> = SPEC_SET
-            .iter()
-            .map(|f| {
-                (
-                    f.path,
-                    if f.path.ends_with(".json") {
-                        "{}"
-                    } else {
-                        "real content that is not blank"
-                    },
-                )
-            })
-            .collect();
-        let dir = project(&files);
+        let dir = complete();
         assert!(missing(dir.path()).is_empty());
         assert!(intake_note(dir.path()).is_none());
     }
@@ -717,20 +1068,7 @@ mod tests {
     /// Once the set is written, source is writable and the gate goes quiet.
     #[test]
     fn a_specified_project_may_write_code() {
-        let files: Vec<(&str, &str)> = SPEC_SET
-            .iter()
-            .map(|f| {
-                (
-                    f.path,
-                    if f.path.ends_with(".json") {
-                        "{}"
-                    } else {
-                        "real content"
-                    },
-                )
-            })
-            .collect();
-        let dir = project(&files);
+        let dir = complete();
         assert!(refuse_source_write(dir.path(), "src/main.rs").is_none());
         assert!(intake_note(dir.path()).is_none());
     }
