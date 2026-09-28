@@ -23,9 +23,8 @@ Two products share this machine and must never share a name.
 | MCP servers | `incode-desktop`, `incode-team` | its own, e.g. `incord-memory` |
 
 The repository and the crate keep the name `incord-code` (`incord_code` in Rust
-paths); only what incode writes, reads or shows is named `incode`. One incode-owned
-name is still `incord`: the `_meta.incord` key on ACP updates (§2), which an external
-client reads — renaming it is pending the owner's decision.
+paths); only what incode writes, reads or shows is named `incode`, including the
+`_meta.incode` key on ACP updates (§2).
 
 **Migration from the old names.** incode's state used to live in the project's
 `.incord/` and in `~/.incord-code/`. At the start of a mode that reads the data
@@ -110,7 +109,7 @@ runs. The code is `src/acp_agent/`; payloads are `agent-client-protocol-schema` 
 | `session/new` | `cwd` must be absolute and an existing directory; it becomes the workspace (made canonical by `prepare_session`). The session is built on its own thread, the client's stdio MCP servers are started, and the answer carries `modes` and `configOptions`; then `available_commands_update` lists its slash commands, and a message chunk says what each MCP server offered or why it did not start |
 | `session/load` | a session kept in `cwd` (its transcript exists): built like `session/new` under the same id, its history replayed as `user_message_chunk` / `agent_message_chunk` BEFORE the answer (`modes`, `configOptions`); the model's own conversation is resumed where it can be (below) |
 | `session/list` | the transcripts in `cwd` (id, title = the first person's line, `updatedAt` = the file's time), newest first, at most 200; with no `cwd`, every workspace an ACP session record names |
-| `session/prompt` | one turn: text as `agent_message_chunk`, the model's reasoning as `agent_thought_chunk`, tool calls and results as `tool_call` / `tool_call_update` (a running command's output as `in_progress` updates first), an edit that landed as a `diff`, the task list as `plan`, the context window's fill as `usage_update`, each worker as a sub-agent; every step and the reply carry `_meta.incord`; replies with the stop reason, or a JSON-RPC error if the turn failed. Pictures in the prompt go to the agent leading the session, or the prompt is refused. A prompt that is a slash command runs that command instead; `/run` works the ledger and sends it as the plan, its lanes as sub-agents |
+| `session/prompt` | one turn: text as `agent_message_chunk`, the model's reasoning as `agent_thought_chunk`, tool calls and results as `tool_call` / `tool_call_update` (a running command's output as `in_progress` updates first), an edit that landed as a `diff`, the task list as `plan`, the context window's fill as `usage_update`, each worker as a sub-agent; every step and the reply carry `_meta.incode`; replies with the stop reason, or a JSON-RPC error if the turn failed. Pictures in the prompt go to the agent leading the session, or the prompt is refused. A prompt that is a slash command runs that command instead; `/run` works the ledger and sends it as the plan, its lanes as sub-agents |
 | `session/cancel` | trips the session's cancel token; the prompt answers `cancelled` |
 | `session/set_mode` | `read-only`, `workspace-write`, `danger-full-access`; applied from the next turn |
 | `session/set_config_option` | `agent` or `role` (both selects); answered at once with every option, applied before the next turn (or at once when the session is idle) |
@@ -205,13 +204,13 @@ session's events and every worker's into updates.
 - **Plan priority.** `TodoWrite`'s own priority, as before. The ledger has no
   priority field, so `/run`'s plan stays `medium` for every entry — none is invented.
 
-**`_meta.incord` (B2).** Every `tool_call` and `tool_call_update` — the session's
+**`_meta.incode` (B2).** Every `tool_call` and `tool_call_update` — the session's
 and every worker's — and the answer to a prompt the model served carry
-`"_meta": {"incord": {…}}` with only the fields incode knows; a field it does not
+`"_meta": {"incode": {…}}` with only the fields incode knows; a field it does not
 know is absent, never `null`, and with nothing known there is no `_meta`:
 
 ```jsonc
-"_meta": {"incord": {
+"_meta": {"incode": {
   "role": "plan",                 // the role the session's model was routed by (the picker), or the worker's
   "agent": "claude-code",         // the catalogue id serving it
   "model": "opus",                // the model ASKED for, when one was chosen

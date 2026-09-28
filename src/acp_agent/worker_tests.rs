@@ -1,5 +1,5 @@
 //! Workers as sub-agents, a command's output while it runs, the model's
-//! reasoning, pictures in a prompt and `_meta.incord` — each driven by a fake
+//! reasoning, pictures in a prompt and `_meta.incode` — each driven by a fake
 //! ACP client over a real pipe, with incode's own Toolbox doing the work.
 
 use std::time::Instant;
@@ -345,16 +345,16 @@ fn reasoning_arrives_as_a_thought_chunk() {
     client.close();
 }
 
-fn incord(update: &Value) -> &Value {
-    &update["_meta"]["incord"]
+fn details(update: &Value) -> &Value {
+    &update["_meta"]["incode"]
 }
 
-/// **`_meta.incord` CARRIES WHAT INCODE KNOWS, AND NOTHING IT DOES NOT.** A
+/// **`_meta.incode` CARRIES WHAT INCODE KNOWS, AND NOTHING IT DOES NOT.** A
 /// write the guards refused says so — who, the pattern, the path; a read the
 /// guards never look at carries no decision; the model is left out when
 /// none was chosen; the prompt's answer names the role and the agent.
 #[test]
-fn incord_meta_is_present_only_when_known() {
+fn incode_meta_is_present_only_when_known() {
     let mut client = started(Script::new(Behaviour::Protected), false);
     let ws = tempfile::tempdir().expect("ws");
     std::fs::write(ws.path().join("notes.txt"), "hello\n").expect("notes");
@@ -371,7 +371,7 @@ fn incord_meta_is_present_only_when_known() {
             .find(|u| u["sessionUpdate"] == kind && u["toolCallId"] == id)
             .unwrap_or_else(|| panic!("no {kind} {id}: {updates:#?}"))
     };
-    let asked = incord(find("tool_call", "p1"));
+    let asked = details(find("tool_call", "p1"));
     assert_eq!(asked["role"], "plan", "{asked}");
     assert_eq!(asked["agent"], "claude-code", "{asked}");
     for unknown in ["model", "lane", "guard", "watchman"] {
@@ -380,15 +380,15 @@ fn incord_meta_is_present_only_when_known() {
     let refused = find("tool_call_update", "p1");
     assert_eq!(refused["status"], "failed", "{refused}");
     assert_eq!(
-        incord(refused)["guard"],
+        details(refused)["guard"],
         json!({"by": "guards", "decision": "blocked", "rule": "tests/", "path": "tests/probe.txt"}),
         "{refused}"
     );
-    let read = incord(find("tool_call_update", "r1"));
+    let read = details(find("tool_call_update", "r1"));
     assert_eq!(read["role"], "plan", "{read}");
     assert!(read.get("guard").is_none(), "{read}");
     assert!(read.get("watchman").is_none(), "{read}");
-    let answered = &reply["result"]["_meta"]["incord"];
+    let answered = &reply["result"]["_meta"]["incode"];
     assert_eq!(answered["role"], "plan", "{reply}");
     assert_eq!(answered["agent"], "claude-code", "{reply}");
     assert!(answered.get("model").is_none(), "{reply}");

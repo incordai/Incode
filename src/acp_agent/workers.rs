@@ -10,7 +10,7 @@
 //! one; only the session's own text arrives another way (the turn's text
 //! callback, after the question block is filtered out).
 //!
-//! # Incord's details on every step (`_meta.incord`)
+//! # incode's details on every step (`_meta.incode`)
 //!
 //! Every `tool_call` and `tool_call_update` carries what incode knows about
 //! the step and nothing it does not: the role the model was routed by, the
@@ -69,10 +69,10 @@ fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// `_meta` for one step: `{"incord": {…}}` with only the fields known, or
+/// `_meta` for one step: `{"incode": {…}}` with only the fields known, or
 /// `None` when nothing is.
 fn meta(who: &Who, notes: Option<&CallNotes>) -> Option<acp::Meta> {
-    let mut incord = serde_json::Map::new();
+    let mut details = serde_json::Map::new();
     for (key, value) in [
         ("role", &who.role),
         ("agent", &who.agent),
@@ -80,7 +80,7 @@ fn meta(who: &Who, notes: Option<&CallNotes>) -> Option<acp::Meta> {
         ("lane", &who.lane),
     ] {
         if let Some(value) = value {
-            incord.insert(key.to_string(), json!(value));
+            details.insert(key.to_string(), json!(value));
         }
     }
     if let Some(notes) = notes {
@@ -104,7 +104,7 @@ fn meta(who: &Who, notes: Option<&CallNotes>) -> Option<acp::Meta> {
                     guard.insert(key.to_string(), json!(value));
                 }
             }
-            incord.insert("guard".to_string(), Value::Object(guard));
+            details.insert("guard".to_string(), Value::Object(guard));
         }
         if let Some((hit, observations)) = notes.watchman {
             let mut watchman = serde_json::Map::new();
@@ -112,14 +112,14 @@ fn meta(who: &Who, notes: Option<&CallNotes>) -> Option<acp::Meta> {
             if let Some(seen) = observations {
                 watchman.insert("observations".to_string(), json!(seen));
             }
-            incord.insert("watchman".to_string(), Value::Object(watchman));
+            details.insert("watchman".to_string(), Value::Object(watchman));
         }
     }
-    if incord.is_empty() {
+    if details.is_empty() {
         return None;
     }
     let mut outer = acp::Meta::new();
-    outer.insert("incord".to_string(), Value::Object(incord));
+    outer.insert("incode".to_string(), Value::Object(details));
     Some(outer)
 }
 

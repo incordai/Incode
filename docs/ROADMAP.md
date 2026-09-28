@@ -35,7 +35,7 @@ This is fully true for claude; section 0b says what is not.
 | ripgrep-based Glob/Grep/LS, Outline (tree-sitter), documents in Read, schema check on every call; ConvertDocument when LibreOffice is found | `079988b` |
 | Pictures in tool results; the headless browser (WebFetch `render_js`, Screenshot, RenderPdf); the desktop tools behind the Toolbox gate | `70c5556` |
 | ACP: agent and role pickers, the client's stdio MCP servers run by incode, `/run` as a live plan, `session/load` and `session/list` | `fd2ffec` |
-| ACP: sub-agent tabs, `_meta.incord`, live command output, thinking, pictures in a prompt; the `Agent` tool on the session's own CLI | `eac0322` |
+| ACP: sub-agent tabs, `_meta.incode`, live command output, thinking, pictures in a prompt; the `Agent` tool on the session's own CLI | `eac0322` |
 | User-defined sub-agents and `/agents`; `-t --output-format stream-json\|json`; checkpoints on disk with `/undo` after restart and `/rewind <n>`; the OS sandbox; operator hooks on every tool; `/run` workers as memory sessions; codex `--disable hooks`; `run_on_compact` allowlisted (A5) | `b39a99e` |
 
 ### 0b. Still open
@@ -137,7 +137,7 @@ This is fully true for claude; section 0b says what is not.
     971d3e8 too, so not a regression.
 - **App-side work (the owner's desktop app, outside this repo):** a resume list
   (it calls neither `session/list` nor `session/load`); drawing image content;
-  drawing the `_meta.incord` badges; a question card for `AskUserQuestion` (the app
+  drawing the `_meta.incode` badges; a question card for `AskUserQuestion` (the app
   answers every agent request but `session/request_permission` with `-32601`);
   withdrawing a permission card when the engine answers first (no agent-side
   cancel).
