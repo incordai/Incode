@@ -1212,6 +1212,10 @@ impl AgentBackend for ClaudeCodeBackend {
         self.tools.set_owner(owner);
     }
 
+    fn share_allowed_writes(&mut self, record: std::sync::Arc<crate::toolbox::AllowedWrites>) {
+        self.tools.share_allowed_writes(record);
+    }
+
     fn children(&self) -> Vec<(String, String)> {
         self.tools
             .children()

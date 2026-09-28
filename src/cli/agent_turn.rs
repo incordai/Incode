@@ -1130,9 +1130,12 @@ impl AgentSession {
             self.pending = asked;
         }
 
-        // Checked before the turn is reported as fine.
+        // Checked before the turn is reported as fine. A protected file a
+        // person allowed this turn is theirs, not a breach; taken either way,
+        // so an allow never outlives the turn it was given in.
+        let allowed = self.session_tools.allowed_writes().take();
         if let Some((sentinel, guards)) = &watched {
-            let breaches = sentinel.breaches_across(&roots, guards);
+            let breaches = sentinel.breaches_allowing(&roots, guards, &allowed);
             if let Some(refusal) = crate::guards::Sentinel::refusal(&breaches) {
                 // Said, not thrown: an interactive turn has no ledger to fail,
                 // and the person is right there to decide what to do.

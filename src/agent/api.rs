@@ -995,6 +995,10 @@ impl AgentBackend for ApiBackend {
         self.tools.set_owner(owner);
     }
 
+    fn share_allowed_writes(&mut self, record: std::sync::Arc<crate::toolbox::AllowedWrites>) {
+        self.tools.share_allowed_writes(record);
+    }
+
     fn share_session_tools(&mut self, state: std::sync::Arc<crate::toolbox::SessionTools>) {
         self.tools.share_session(state);
     }

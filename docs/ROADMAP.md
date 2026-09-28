@@ -204,6 +204,9 @@ Adapted, in incode's own terms, from a cross-check against mattpocock/skills
   (`guards::breach_title`), so an allow given before the write is the answer the
   sentinel finds after it. Nobody to ask, or a read-only session: refused as
   before. An allow passes the protected path only; the intake gate still stands.
+  The file allowed is recorded (`toolbox::AllowedWrites`, shared with sub-agents)
+  so the interactive turn's sentinel does not then report it as a breach — found
+  in the live test of the installed build, fixed and re-tested live.
 - **A red test step is not provable on its own.** The runner verifies every code
   step with the project's check, so tests-first relies on the test being written
   pending. A step whose check is "this new test fails for the right reason" would

@@ -226,9 +226,38 @@ pub struct SessionTools {
     client: Arc<RwLock<client_servers::ClientServers>>,
     /// Whether a process these tools start gets the filtered environment.
     filter_env: bool,
+    /// The protected files a person allowed to be written, for the turn's
+    /// sentinel to leave out. Its own `Arc`, because a sub-agent's toolbox
+    /// keeps its own session state but writes into this same record.
+    allowed: Arc<AllowedWrites>,
+}
+
+/// The protected files a person allowed to be written, by
+/// [`crate::guards::file_key`], until the turn that watches them takes them.
+#[derive(Default)]
+pub struct AllowedWrites(Mutex<Vec<String>>);
+
+impl AllowedWrites {
+    fn record(&self, key: String) {
+        let mut held = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if !held.contains(&key) {
+            held.push(key);
+        }
+    }
+
+    /// Every file recorded since the last take, emptying the record.
+    pub fn take(&self) -> Vec<String> {
+        std::mem::take(&mut *self.0.lock().unwrap_or_else(PoisonError::into_inner))
+    }
 }
 
 impl SessionTools {
+    /// The record of protected files a person allowed to be written.
+    #[must_use]
+    pub fn allowed_writes(&self) -> Arc<AllowedWrites> {
+        Arc::clone(&self.allowed)
+    }
+
     /// Fresh state; `filter_env` gives background jobs the filtered
     /// environment.
     #[must_use]
@@ -242,6 +271,7 @@ impl SessionTools {
             desktop: Mutex::new(None),
             client: Arc::default(),
             filter_env,
+            allowed: Arc::default(),
         })
     }
 
@@ -419,6 +449,10 @@ pub struct Toolbox {
     /// prompter answers is left to the engine's own card, so the owner is
     /// never shown two cards for one call.
     owner: Option<Arc<dyn crate::hooks::engine::Prompter>>,
+    /// Where an allowed protected write is recorded, when it is not this
+    /// toolbox's own session state: a sub-agent's, recording into its
+    /// parent's, whose turn is the one that watches the files.
+    allowed_into: Option<Arc<AllowedWrites>>,
     /// Tripped when the operator stops the turn: a wait on the engine or on a
     /// person ends then rather than at its ten-minute bound.
     cancel: Option<crate::runtime::cancel::CancelToken>,
@@ -488,6 +522,7 @@ impl Toolbox {
             extra_dirs: Vec::new(),
             prompter: None,
             owner: None,
+            allowed_into: None,
             cancel: None,
             mode: None,
             state: SessionTools::new(filter_env),
@@ -839,6 +874,20 @@ impl Toolbox {
         self.owner = Some(owner);
     }
 
+    /// Record allowed protected writes into `record` rather than this
+    /// toolbox's own session state.
+    pub fn share_allowed_writes(&mut self, record: Arc<AllowedWrites>) {
+        self.allowed_into = Some(record);
+    }
+
+    /// Where this toolbox records a protected write a person allowed.
+    #[must_use]
+    pub fn allowed_writes(&self) -> Arc<AllowedWrites> {
+        self.allowed_into
+            .as_ref()
+            .map_or_else(|| self.state.allowed_writes(), Arc::clone)
+    }
+
     /// The token that stops the turn, so a wait on the engine stops with it.
     pub fn set_cancel(&mut self, token: crate::runtime::cancel::CancelToken) {
         self.cancel = Some(token);
@@ -1041,6 +1090,19 @@ impl Toolbox {
             .map_or_else(|_| path.to_string(), |p| p.to_string_lossy().into_owned())
     }
 
+    /// The files this call writes that the guards protect, as the model named
+    /// them. Empty for the shell, which names no file.
+    fn protected_in(&self, name: &str, input: &Value) -> Vec<String> {
+        let Ok(guards) = &self.guards else {
+            return Vec::new();
+        };
+        self.changed_paths(name, input)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|path| guards.protecting(&self.within_root(path)).is_some())
+            .collect()
+    }
+
     /// A write the guards refused as protected, put to a person.
     ///
     /// A protected path is a question, not a wall (the owner's decision,
@@ -1074,16 +1136,11 @@ impl Toolbox {
                 crate::text::truncate(command, 200)
             )
         } else {
-            let protected: Vec<String> = match &self.guards {
-                Ok(guards) => self
-                    .changed_paths(name, input)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|path| guards.protecting(&self.within_root(path)).is_some())
-                    .map(|path| format!("`{path}`"))
-                    .collect(),
-                Err(_) => Vec::new(),
-            };
+            let protected: Vec<String> = self
+                .protected_in(name, input)
+                .into_iter()
+                .map(|path| format!("`{path}`"))
+                .collect();
             format!("writes {}, which matches", protected.join(", "))
         };
         let reason = format!(
@@ -1503,6 +1560,14 @@ impl Toolbox {
                 }
                 None => {
                     confirmed = true;
+                    // So the turn's sentinel does not report, as made behind
+                    // the person's back, the change they just allowed. A shell
+                    // command names no file, so what it writes is still reported.
+                    let record = self.allowed_writes();
+                    for path in self.protected_in(name, input) {
+                        let absolute = self.absolute(&path);
+                        record.record(crate::guards::file_key(Path::new(&absolute)));
+                    }
                     self.tell_decided(
                         call_id,
                         crate::watch::Decision {

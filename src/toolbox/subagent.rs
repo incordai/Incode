@@ -159,6 +159,7 @@ impl Toolbox {
         if let Some(owner) = &self.owner {
             child.set_owner(Arc::clone(owner));
         }
+        child.share_allowed_writes(self.allowed_writes());
         if let Some(cancel) = &self.cancel {
             child.set_cancel(cancel.clone());
         }

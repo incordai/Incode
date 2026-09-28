@@ -898,6 +898,10 @@ pub trait AgentBackend {
     /// run's owner channel. Defaulted to nothing, as [`Self::set_prompter`] is.
     fn set_owner(&mut self, _owner: std::sync::Arc<dyn crate::hooks::engine::Prompter>) {}
 
+    /// Record the protected writes a person allows into `record` — a
+    /// sub-agent's, into its parent's. Defaulted to nothing, as the rest are.
+    fn share_allowed_writes(&mut self, _record: std::sync::Arc<crate::toolbox::AllowedWrites>) {}
+
     /// The session's own tool state — its background jobs and task list —
     /// for a backend whose tools this harness runs, so every backend of one
     /// session shares them.
@@ -1047,6 +1051,10 @@ impl AgentBackend for Box<dyn AgentBackend> {
 
     fn set_owner(&mut self, owner: std::sync::Arc<dyn crate::hooks::engine::Prompter>) {
         (**self).set_owner(owner);
+    }
+
+    fn share_allowed_writes(&mut self, record: std::sync::Arc<crate::toolbox::AllowedWrites>) {
+        (**self).share_allowed_writes(record);
     }
 
     fn share_session_tools(&mut self, state: std::sync::Arc<crate::toolbox::SessionTools>) {

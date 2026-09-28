@@ -511,6 +511,21 @@ pub fn target_command(input: &str) -> Option<String> {
 // The owner's question about a protected file
 // ---------------------------------------------------------------------------
 
+/// One file, as the sentinel keys it: absolute, `.` segments dropped, forward
+/// slashes — and on Windows, where case does not tell two files apart, lower
+/// case. The toolbox names an allowed write the same way, so the two agree on
+/// which file a person said yes to.
+#[must_use]
+pub fn file_key(path: &Path) -> String {
+    let joined: std::path::PathBuf = path.components().collect();
+    let key = joined.to_string_lossy().replace(char::from(92), "/");
+    if cfg!(windows) {
+        key.to_lowercase()
+    } else {
+        key
+    }
+}
+
 /// The project a protected-file question is filed under: the workspace's
 /// folder name, or the whole path when it has none.
 #[must_use]
@@ -685,7 +700,7 @@ impl Sentinel {
                 else {
                     continue;
                 };
-                let absolute = path.to_string_lossy().replace(char::from(92), "/");
+                let absolute = file_key(&path);
                 if !fragments.iter().any(|f| matches_path(f, &shown)) {
                     continue;
                 }
@@ -722,10 +737,26 @@ impl Sentinel {
     /// What changed across every root this sentinel was taken over.
     #[must_use]
     pub fn breaches_across(&self, roots: &[std::path::PathBuf], guards: &Guards) -> Vec<Breach> {
+        self.breaches_allowing(roots, guards, &[])
+    }
+
+    /// [`Self::breaches_across`], less the files a person allowed to be
+    /// written while the agent worked, named by [`file_key`]. A change they
+    /// said yes to is not a change made behind their back.
+    #[must_use]
+    pub fn breaches_allowing(
+        &self,
+        roots: &[std::path::PathBuf],
+        guards: &Guards,
+        allowed: &[String],
+    ) -> Vec<Breach> {
         let now = Self::over_roots(roots, guards);
         let mut out = Vec::new();
 
         for (path, (shown, before)) in &self.marks {
+            if allowed.contains(path) {
+                continue;
+            }
             match now.marks.get(path) {
                 Some((_, after)) if after == before => {}
                 Some(_) => out.push(Breach::Modified(shown.clone())),
@@ -733,7 +764,7 @@ impl Sentinel {
             }
         }
         for (path, (shown, _)) in &now.marks {
-            if !self.marks.contains_key(path) {
+            if !self.marks.contains_key(path) && !allowed.contains(path) {
                 out.push(Breach::Created(shown.clone()));
             }
         }

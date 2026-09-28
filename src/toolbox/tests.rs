@@ -1338,3 +1338,52 @@ fn a_shell_write_to_a_protected_path_is_asked_about() {
     assert!(dir.path().join("tests/it.rs").exists(), "the command ran");
     assert_eq!(no.asked.load(Ordering::SeqCst), 1);
 }
+
+/// **A WRITE A PERSON ALLOWED IS NOT REPORTED AS A BREACH.** Found live: the
+/// allowed test landed, and the turn's sentinel then said the attempt had
+/// changed a protected file behind the person's back. The same write with
+/// the record left out is still reported — so the sentinel is not blinded,
+/// only told what was allowed.
+#[test]
+fn the_turns_sentinel_leaves_out_a_write_a_person_allowed() {
+    let dir = tempfile::tempdir().expect("tmp");
+    specified(dir.path());
+    std::fs::create_dir_all(dir.path().join("tests")).expect("dir");
+    std::fs::write(dir.path().join("tests/old.rs"), "the old check").expect("seed");
+    let guards = crate::guards::Guards::load(dir.path()).expect("guards");
+    let roots = [dir.path().to_path_buf()];
+    let before = crate::guards::Sentinel::over_roots(&roots, &guards);
+
+    let mut box_ = toolbox(dir.path());
+    box_.set_prompter(answering(Verdict::Allow));
+    box_.run(WRITE, &json!({"path": "./tests/it.rs", "content": "x"}))
+        .expect("allowed");
+    // Changed with no one asked: this one must still be reported.
+    std::fs::write(dir.path().join("tests/old.rs"), "rewritten").expect("tamper");
+
+    let allowed = box_.allowed_writes().take();
+    assert_eq!(allowed.len(), 1, "{allowed:?}");
+    let left = before.breaches_allowing(&roots, &guards, &allowed);
+    let named: Vec<&str> = left.iter().map(crate::guards::Breach::path).collect();
+    assert_eq!(named, ["tests/old.rs"], "{left:?}");
+    assert_eq!(
+        before.breaches_allowing(&roots, &guards, &[]).len(),
+        2,
+        "without the record both are reported"
+    );
+    assert!(
+        box_.allowed_writes().take().is_empty(),
+        "the take empties it"
+    );
+}
+
+/// A refused write is not recorded as allowed.
+#[test]
+fn a_refused_protected_write_is_not_recorded_as_allowed() {
+    let dir = tempfile::tempdir().expect("tmp");
+    specified(dir.path());
+    let mut box_ = toolbox(dir.path());
+    box_.set_prompter(answering(Verdict::Deny("no".to_string())));
+    let _ = box_.run(WRITE, &json!({"path": "tests/it.rs", "content": "x"}));
+    assert!(box_.allowed_writes().take().is_empty());
+}
