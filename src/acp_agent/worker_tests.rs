@@ -353,17 +353,40 @@ fn details(update: &Value) -> &Value {
 /// write the guards refused says so — who, the pattern, the path; a read the
 /// guards never look at carries no decision; the model is left out when
 /// none was chosen; the prompt's answer names the role and the agent.
+///
+/// The protected write is put to the client first, naming the file, and the
+/// client rejects it — so the refusal is still the guards'.
 #[test]
 fn incode_meta_is_present_only_when_known() {
     let mut client = started(Script::new(Behaviour::Protected), false);
     let ws = tempfile::tempdir().expect("ws");
     std::fs::write(ws.path().join("notes.txt"), "hello\n").expect("notes");
     let session = client.open_session(ws.path());
-    let (seen, reply) = prompt(
-        &mut client,
-        &session,
-        json!([{"type": "text", "text": "write the probe"}]),
+    let id = client.request(
+        "session/prompt",
+        json!({"sessionId": session, "prompt": [{"type": "text", "text": "write the probe"}]}),
     );
+    let mut seen = Vec::new();
+    let asked = loop {
+        let message = client.next();
+        if message["method"] == "session/request_permission" {
+            break message;
+        }
+        seen.push(message);
+    };
+    assert!(
+        asked["params"]["toolCall"]["title"]
+            .as_str()
+            .is_some_and(|t| t.contains("tests/probe.txt")),
+        "{asked}"
+    );
+    client.send_raw(
+        &json!({"jsonrpc": "2.0", "id": asked["id"],
+                "result": {"outcome": {"outcome": "selected", "optionId": "reject"}}})
+        .to_string(),
+    );
+    let (rest, reply) = client.until_response(id);
+    seen.extend(rest);
     let updates = updates_of(&seen);
     let find = |kind: &str, id: &str| -> &Value {
         updates

@@ -196,15 +196,14 @@ Adapted, in incode's own terms, from a cross-check against mattpocock/skills
 
 ### 1c. Still open
 
-- **On incode's own toolbox a test write is refused, not put to the owner.**
-  `Toolbox::refused` (`toolbox/mod.rs`, the guards check in `run_call`) returns the
-  refusal at once; only the Sentinel path for an agent that brings its own tools
-  asks the owner (`agent::worker::settle_breach`). claude is bridged, so its
-  test-first step fails unless `.incode/guards.json` allows the path
-  (`allow_writes_to`). Asking the owner at the toolbox gate, as `settle_breach`
-  does, would make tests-first work there; it changes the gate, so it is left for
-  the owner to decide. The planner prompt used to say such a write is "PAUSED"; it
-  now says it is stopped until the owner allows it.
+- ~~**On incode's own toolbox a test write is refused, not put to the owner.**~~
+  DONE 2026-09-27, the owner's decision: a protected write is put to a person
+  (`Toolbox::ask_protected`) — the one at the session, else during `/run` the
+  owner's channel (`owner::OwnerPrompter`, set from `run_ledger` when
+  `plugins.owner` is on), under the sentinel's card title
+  (`guards::breach_title`), so an allow given before the write is the answer the
+  sentinel finds after it. Nobody to ask, or a read-only session: refused as
+  before. An allow passes the protected path only; the intake gate still stands.
 - **A red test step is not provable on its own.** The runner verifies every code
   step with the project's check, so tests-first relies on the test being written
   pending. A step whose check is "this new test fails for the right reason" would

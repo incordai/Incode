@@ -991,6 +991,10 @@ impl AgentBackend for ApiBackend {
         self.tools.set_prompter(prompter);
     }
 
+    fn set_owner(&mut self, owner: std::sync::Arc<dyn crate::hooks::engine::Prompter>) {
+        self.tools.set_owner(owner);
+    }
+
     fn share_session_tools(&mut self, state: std::sync::Arc<crate::toolbox::SessionTools>) {
         self.tools.share_session(state);
     }

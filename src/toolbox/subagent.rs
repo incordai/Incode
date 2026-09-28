@@ -156,6 +156,9 @@ impl Toolbox {
         if let Some(prompter) = &self.prompter {
             child.set_prompter(Arc::clone(prompter));
         }
+        if let Some(owner) = &self.owner {
+            child.set_owner(Arc::clone(owner));
+        }
         if let Some(cancel) = &self.cancel {
             child.set_cancel(cancel.clone());
         }

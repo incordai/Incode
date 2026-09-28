@@ -625,15 +625,11 @@ impl<B: AgentBackend> AgentBackendWorker<B> {
     /// whether the work is right: the attempt still has to face the check, and
     /// no verdict reachable from here can produce a [`crate::verify::Verified`].
     fn settle_breach(&mut self, task: &Task, refusal: &str) -> Result<String, String> {
-        let project = self.workspace.file_name().map_or_else(
-            || self.workspace.display().to_string(),
-            |n| n.to_string_lossy().into_owned(),
-        );
-        // The title is what `owner::past_verdict` matches on, so it names the
-        // RULE and not the attempt — an owner who has already said "this project
-        // writes its own tests" should not be asked again on the next task. The
-        // detail carries which files moved, which is what changes each time.
-        let title = format!("Protected file changed in {project}");
+        let project = crate::guards::breach_project(&self.workspace);
+        // The title names the RULE, so an answer is reused (see
+        // `guards::breach_title`). The detail carries which files moved, which
+        // is what changes each time.
+        let title = crate::guards::breach_title(&project);
         crate::trace!("guard", "{}: asking the owner — {title}", task.id);
 
         match self.owner.decide(&title, refusal, &project) {

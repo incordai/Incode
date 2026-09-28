@@ -508,6 +508,33 @@ pub fn target_command(input: &str) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
+// The owner's question about a protected file
+// ---------------------------------------------------------------------------
+
+/// The project a protected-file question is filed under: the workspace's
+/// folder name, or the whole path when it has none.
+#[must_use]
+pub fn breach_project(workspace: &Path) -> String {
+    workspace.file_name().map_or_else(
+        || workspace.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    )
+}
+
+/// The title of the owner's card about a protected file in `project`.
+///
+/// It names the RULE and not the attempt, because it is what
+/// `owner::past_verdict` matches on: an owner who has already said "this
+/// project writes its own tests" is not asked again. One title for both
+/// askers — the toolbox before a write, the [`Sentinel`] after a change — so
+/// an answer to either is the answer to both, and a run whose toolbox was
+/// allowed a test is not stopped by its sentinel for the same file.
+#[must_use]
+pub fn breach_title(project: &str) -> String {
+    format!("Protected file changed in {project}")
+}
+
+// ---------------------------------------------------------------------------
 // The sentinel — enforcement for an agent this harness does not dispatch for
 // ---------------------------------------------------------------------------
 

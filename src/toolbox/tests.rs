@@ -1184,3 +1184,157 @@ fn an_extra_directory_is_writable_under_the_same_guards() {
         .is_err());
     assert!(!outside.exists());
 }
+
+// -----------------------------------------------------------------------
+// A protected write is a question, not a wall (the owner's decision,
+// 2026-09-27). Each test below fails if `run_call` stops asking — remove the
+// `ask_protected` call and the write is refused unasked.
+// -----------------------------------------------------------------------
+
+/// The spec set, complete, so the intake gate has nothing to say.
+fn specified(root: &Path) {
+    for f in &crate::spec::SPEC_SET {
+        let full = root.join(f.path);
+        std::fs::create_dir_all(full.parent().expect("parent")).expect("dir");
+        std::fs::write(full, crate::spec::complete_text(f)).expect("spec");
+    }
+}
+
+fn answering(confirm: Verdict) -> Arc<Person> {
+    Arc::new(Person {
+        confirm: Some(confirm),
+        ..Person::default()
+    })
+}
+
+/// **THE TEST A STEP WRITES FIRST LANDS WHEN A PERSON ALLOWS IT.**
+#[test]
+fn a_protected_write_is_put_to_the_person_and_an_allow_lands_it() {
+    let dir = tempfile::tempdir().expect("tmp");
+    specified(dir.path());
+    let yes = answering(Verdict::Allow);
+    let mut box_ = toolbox(dir.path());
+    box_.set_prompter(yes.clone());
+    box_.run(
+        WRITE,
+        &json!({"path": "tests/it.rs", "content": "assert!(true);"}),
+    )
+    .expect("the person allowed it");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("tests/it.rs")).expect("read"),
+        "assert!(true);"
+    );
+    assert_eq!(yes.asked.load(Ordering::SeqCst), 1, "asked once");
+}
+
+/// A person's no is a refusal, and the model is told it was put to a person.
+#[test]
+fn a_protected_write_the_person_refuses_is_not_made() {
+    let dir = tempfile::tempdir().expect("tmp");
+    specified(dir.path());
+    let no = answering(Verdict::Deny("not this one".to_string()));
+    let mut box_ = toolbox(dir.path());
+    box_.set_prompter(no.clone());
+    let refused = box_
+        .run(WRITE, &json!({"path": "tests/it.rs", "content": "x"}))
+        .expect_err("refused by the person");
+    assert!(refused.contains("not this one"), "{refused}");
+    assert!(refused.contains("put to a person"), "{refused}");
+    assert!(!dir.path().join("tests/it.rs").exists());
+    assert_eq!(no.asked.load(Ordering::SeqCst), 1);
+}
+
+/// With nobody at the session, a run's owner channel is asked instead.
+#[test]
+fn the_owner_is_asked_when_nobody_is_at_the_session() {
+    let dir = tempfile::tempdir().expect("tmp");
+    specified(dir.path());
+    let owner = answering(Verdict::Allow);
+    let mut box_ = toolbox(dir.path());
+    box_.set_owner(owner.clone());
+    box_.run(WRITE, &json!({"path": "tests/it.rs", "content": "x"}))
+        .expect("the owner allowed it");
+    assert!(dir.path().join("tests/it.rs").exists());
+    assert_eq!(owner.asked.load(Ordering::SeqCst), 1);
+}
+
+/// The person at the session comes first; the owner is not also asked.
+#[test]
+fn the_person_at_the_session_is_asked_before_the_owner() {
+    let dir = tempfile::tempdir().expect("tmp");
+    specified(dir.path());
+    let (person, owner) = (answering(Verdict::Allow), answering(Verdict::Allow));
+    let mut box_ = toolbox(dir.path());
+    box_.set_prompter(person.clone());
+    box_.set_owner(owner.clone());
+    box_.run(WRITE, &json!({"path": "tests/it.rs", "content": "x"}))
+        .expect("allowed");
+    assert_eq!(person.asked.load(Ordering::SeqCst), 1);
+    assert_eq!(owner.asked.load(Ordering::SeqCst), 0, "asked twice");
+}
+
+/// **AN ALLOW IS FOR THE PROTECTED PATH ONLY.** The intake gate is not a
+/// person's to wave through, and it still stands after the allow.
+#[test]
+fn an_allowed_protected_write_still_faces_the_intake_gate() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let yes = answering(Verdict::Allow);
+    let mut box_ = toolbox(dir.path());
+    box_.set_prompter(yes.clone());
+    let refused = box_
+        .run(WRITE, &json!({"path": "tests/it.rs", "content": "x"}))
+        .expect_err("the project is not specified yet");
+    assert!(refused.contains("not specified yet"), "{refused}");
+    assert!(!dir.path().join("tests/it.rs").exists());
+    assert_eq!(yes.asked.load(Ordering::SeqCst), 1);
+}
+
+/// A read-only session refuses every change, so there is nothing to ask.
+#[test]
+fn a_read_only_session_does_not_ask_about_a_protected_write() {
+    use crate::permissions::PermissionMode;
+    let dir = tempfile::tempdir().expect("tmp");
+    specified(dir.path());
+    let yes = answering(Verdict::Allow);
+    let mut box_ = toolbox(dir.path());
+    box_.set_permission_mode(PermissionMode::ReadOnly);
+    box_.set_prompter(yes.clone());
+    box_.run(WRITE, &json!({"path": "tests/it.rs", "content": "x"}))
+        .expect_err("read-only");
+    assert!(!dir.path().join("tests/it.rs").exists());
+    assert_eq!(yes.asked.load(Ordering::SeqCst), 0);
+}
+
+/// A session that asks before every change asks about a protected write
+/// once, not once for the path and again for the mode.
+#[test]
+fn a_prompt_session_asks_about_a_protected_write_once() {
+    use crate::permissions::PermissionMode;
+    let dir = tempfile::tempdir().expect("tmp");
+    specified(dir.path());
+    let yes = answering(Verdict::Allow);
+    let mut box_ = toolbox(dir.path());
+    box_.set_permission_mode(PermissionMode::Prompt);
+    box_.set_prompter(yes.clone());
+    box_.run(WRITE, &json!({"path": "tests/it.rs", "content": "x"}))
+        .expect("allowed");
+    assert_eq!(yes.asked.load(Ordering::SeqCst), 1);
+}
+
+/// A shell command that writes to a protected path is asked about too, and
+/// a refusal runs nothing.
+#[test]
+fn a_shell_write_to_a_protected_path_is_asked_about() {
+    let dir = tempfile::tempdir().expect("tmp");
+    std::fs::create_dir_all(dir.path().join("tests")).expect("dir");
+    std::fs::write(dir.path().join("tests/it.rs"), "the check").expect("seed");
+    let no = answering(Verdict::Deny("keep it".to_string()));
+    let mut box_ = toolbox(dir.path());
+    box_.set_prompter(no.clone());
+    let refused = box_
+        .run(BASH, &json!({"command": "rm tests/it.rs"}))
+        .expect_err("refused by the person");
+    assert!(refused.contains("keep it"), "{refused}");
+    assert!(dir.path().join("tests/it.rs").exists(), "the command ran");
+    assert_eq!(no.asked.load(Ordering::SeqCst), 1);
+}

@@ -414,6 +414,11 @@ pub struct Toolbox {
     /// Who can be asked when the engine wants a person — the terminal, or the
     /// ACP client. `None` when nobody is there.
     prompter: Option<Arc<dyn crate::hooks::engine::Prompter>>,
+    /// Who is asked about a protected write when nobody is at the session —
+    /// the owner's channel of a run. Only that question: everything else the
+    /// prompter answers is left to the engine's own card, so the owner is
+    /// never shown two cards for one call.
+    owner: Option<Arc<dyn crate::hooks::engine::Prompter>>,
     /// Tripped when the operator stops the turn: a wait on the engine or on a
     /// person ends then rather than at its ten-minute bound.
     cancel: Option<crate::runtime::cancel::CancelToken>,
@@ -482,6 +487,7 @@ impl Toolbox {
             session_pinned: false,
             extra_dirs: Vec::new(),
             prompter: None,
+            owner: None,
             cancel: None,
             mode: None,
             state: SessionTools::new(filter_env),
@@ -828,6 +834,11 @@ impl Toolbox {
         self.prompter = Some(prompter);
     }
 
+    /// Who is asked about a protected write when nobody is at the session.
+    pub fn set_owner(&mut self, owner: Arc<dyn crate::hooks::engine::Prompter>) {
+        self.owner = Some(owner);
+    }
+
     /// The token that stops the turn, so a wait on the engine stops with it.
     pub fn set_cancel(&mut self, token: crate::runtime::cancel::CancelToken) {
         self.cancel = Some(token);
@@ -949,7 +960,12 @@ impl Toolbox {
     }
 
     /// Why this call is refused by the operator's guards, if it is.
-    fn refused(&self, name: &str, input: &Value) -> Option<Refusal> {
+    ///
+    /// `protected_allowed` is a person's answer to [`Self::ask_protected`]:
+    /// the protected paths are then passed, and every other refusal — the
+    /// guards unreadable, a patch that did not parse, the intake gate — still
+    /// stands, because none of those is a person's to wave through.
+    fn refused(&self, name: &str, input: &Value, protected_allowed: bool) -> Option<Refusal> {
         if !Self::guarded(name) {
             return None;
         }
@@ -963,6 +979,9 @@ impl Toolbox {
             }
         };
         if name == BASH {
+            if protected_allowed {
+                return None;
+            }
             let command = input.get("command").and_then(Value::as_str).unwrap_or("");
             return guards.refuse_command(command).map(|why| Refusal {
                 why,
@@ -974,39 +993,121 @@ impl Toolbox {
             Ok(paths) => paths,
             Err(why) => return Some(Refusal::said(why)),
         };
-        paths.iter().find_map(|path| self.refuse_path(guards, path))
+        paths
+            .iter()
+            .find_map(|path| self.refuse_path(guards, path, protected_allowed))
     }
 
     /// Why a write to `path` is refused by the guards, if it is.
-    fn refuse_path(&self, guards: &crate::guards::Guards, path: &str) -> Option<Refusal> {
-        let root = self.root_for_path(path);
+    fn refuse_path(
+        &self,
+        guards: &crate::guards::Guards,
+        path: &str,
+        protected_allowed: bool,
+    ) -> Option<Refusal> {
         let named = Some(path.to_string());
-        if root != self.workspace.as_path() {
-            // An added directory: the operator's protected paths apply inside
-            // it as they do in the workspace, matched against the path WITHIN
-            // it, so a parent directory's name cannot decide. The intake gate
-            // does not: it is about this workspace's own specification.
-            let inside = Path::new(path)
-                .strip_prefix(root)
-                .map_or_else(|_| path.to_string(), |p| p.to_string_lossy().into_owned());
-            return guards.refuse_write(&inside).map(|why| Refusal {
-                why,
-                rule: guards.protecting(&inside),
-                path: named,
-            });
+        if !protected_allowed {
+            let inside = self.within_root(path);
+            if let Some(why) = guards.refuse_write(&inside) {
+                return Some(Refusal {
+                    why,
+                    rule: guards.protecting(&inside),
+                    path: named,
+                });
+            }
         }
-        if let Some(why) = guards.refuse_write(path) {
-            return Some(Refusal {
-                why,
-                rule: guards.protecting(path),
-                path: named,
-            });
+        // The intake gate is about this workspace's own specification, so
+        // it does not reach into an added directory.
+        if self.root_for_path(path) != self.workspace.as_path() {
+            return None;
         }
         crate::spec::refuse_source_write(&self.workspace, path).map(|why| Refusal {
             why,
             rule: None,
             path: named,
         })
+    }
+
+    /// `path` as the guards match it. In an added directory the operator's
+    /// protected paths apply as they do in the workspace, matched against the
+    /// path WITHIN it, so a parent directory's name cannot decide.
+    fn within_root(&self, path: &str) -> String {
+        let root = self.root_for_path(path);
+        if root == self.workspace.as_path() {
+            return path.to_string();
+        }
+        Path::new(path)
+            .strip_prefix(root)
+            .map_or_else(|_| path.to_string(), |p| p.to_string_lossy().into_owned())
+    }
+
+    /// A write the guards refused as protected, put to a person.
+    ///
+    /// A protected path is a question, not a wall (the owner's decision,
+    /// 2026-09-27): the check that proves the work lives there, and writing
+    /// the test first is exactly what the planner asks for. So the person at
+    /// the session is asked — the terminal, or the ACP client — and where
+    /// nobody is, the owner's channel a run was given ([`Self::set_owner`]).
+    ///
+    /// `None` when nobody can be asked, when the session is read-only (which
+    /// refuses every change whatever the answer), and when the refusal is not
+    /// about a protected path at all. Then the refusal stands as it was.
+    fn ask_protected(
+        &self,
+        call_id: &str,
+        name: &str,
+        input: &Value,
+        refusal: &Refusal,
+    ) -> Option<crate::hooks::engine::Verdict> {
+        let rule = refusal.rule.as_deref()?;
+        if matches!(
+            self.mode,
+            Some(crate::permissions::PermissionMode::ReadOnly)
+        ) {
+            return None;
+        }
+        let asker = self.prompter.as_ref().or(self.owner.as_ref())?;
+        let what = if name == BASH {
+            let command = input.get("command").and_then(Value::as_str).unwrap_or("");
+            format!(
+                "runs `{}`, which writes to",
+                crate::text::truncate(command, 200)
+            )
+        } else {
+            let protected: Vec<String> = match &self.guards {
+                Ok(guards) => self
+                    .changed_paths(name, input)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|path| guards.protecting(&self.within_root(path)).is_some())
+                    .map(|path| format!("`{path}`"))
+                    .collect(),
+                Err(_) => Vec::new(),
+            };
+            format!("writes {}, which matches", protected.join(", "))
+        };
+        let reason = format!(
+            "{name} {what} the protected path `{rule}`. Allow lets this one call write it; \
+             the work still has to pass its check. Refuse keeps it as it is."
+        );
+        let shown = self.event_input(name, input);
+        let ask = crate::hooks::engine::Ask {
+            call_id,
+            tool_name: name,
+            tool_input: &shown,
+            reason: &reason,
+        };
+        let stopped = || {
+            self.cancel
+                .as_ref()
+                .is_some_and(crate::runtime::cancel::CancelToken::is_cancelled)
+        };
+        let answer = asker.confirm(&ask, &stopped);
+        crate::trace!(
+            "tool",
+            "{name}: protected `{rule}` put to a person: {answer:?}"
+        );
+        answer
     }
 
     /// Every tool this session offers, as the model is told about them: the
@@ -1368,25 +1469,62 @@ impl Toolbox {
         // BEFORE the call, not after. The sentinel that watches the tree can
         // only report a write that already happened; a protected path has to be
         // refused while refusing it still means something.
-        if let Some(refusal) = self.refused(name, input) {
-            crate::trace!("tool", "{name} REFUSED by guards: {}", refusal.why);
-            self.tell_decided(
-                call_id,
-                crate::watch::Decision {
-                    by: crate::watch::Decider::Guards,
-                    allowed: false,
-                    rule: refusal.rule,
-                    path: refusal.path,
-                    reason: None,
-                },
-            );
-            return Err(refusal.why);
+        // Set when a person allowed a protected write, so a session that asks
+        // before every change does not ask the same person the same thing twice.
+        let mut confirmed = false;
+        if let Some(refusal) = self.refused(name, input, false) {
+            let (rule, path) = (refusal.rule.clone(), refusal.path.clone());
+            let standing = match self.ask_protected(call_id, name, input, &refusal) {
+                Some(crate::hooks::engine::Verdict::Allow) => self.refused(name, input, true),
+                Some(crate::hooks::engine::Verdict::Deny(why)) => Some(Refusal {
+                    why: format!(
+                        "{why}\n\nThe write to the protected path `{}` was put to a person and \
+                         not allowed. Fix the code so the existing check passes.",
+                        rule.as_deref().unwrap_or_default()
+                    ),
+                    ..refusal
+                }),
+                None => Some(refusal),
+            };
+            match standing {
+                Some(refusal) => {
+                    crate::trace!("tool", "{name} REFUSED by guards: {}", refusal.why);
+                    self.tell_decided(
+                        call_id,
+                        crate::watch::Decision {
+                            by: crate::watch::Decider::Guards,
+                            allowed: false,
+                            rule: refusal.rule,
+                            path: refusal.path,
+                            reason: None,
+                        },
+                    );
+                    return Err(refusal.why);
+                }
+                None => {
+                    confirmed = true;
+                    self.tell_decided(
+                        call_id,
+                        crate::watch::Decision {
+                            by: crate::watch::Decider::Guards,
+                            allowed: true,
+                            rule,
+                            path,
+                            reason: Some("a person allowed this protected write".to_string()),
+                        },
+                    );
+                }
+            }
         }
         // The session's mode, before the engine: it is decided here, costs
-        // nothing, and a call it refuses need not cost an engine process.
-        if let Err(refusal) = self.mode_allows(call_id, name, input, reach) {
-            crate::trace!("tool", "{name} REFUSED by the permission mode: {refusal}");
-            return Err(refusal);
+        // nothing, and a call it refuses need not cost an engine process. A
+        // call a person already allowed is not asked about again: it is never
+        // read-only here, since `ask_protected` does not ask then.
+        if !confirmed {
+            if let Err(refusal) = self.mode_allows(call_id, name, input, reach) {
+                crate::trace!("tool", "{name} REFUSED by the permission mode: {refusal}");
+                return Err(refusal);
+            }
         }
         // The operator's own pre-tool commands: after the free checks, before
         // the engine, so a call they deny never costs an engine process.

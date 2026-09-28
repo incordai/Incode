@@ -894,6 +894,10 @@ pub trait AgentBackend {
     /// itself ([`crate::toolbox::Toolbox`]) has a moment at which to ask.
     fn set_prompter(&mut self, _prompter: std::sync::Arc<dyn crate::hooks::engine::Prompter>) {}
 
+    /// Who to ask about a protected write when nobody is at the session — a
+    /// run's owner channel. Defaulted to nothing, as [`Self::set_prompter`] is.
+    fn set_owner(&mut self, _owner: std::sync::Arc<dyn crate::hooks::engine::Prompter>) {}
+
     /// The session's own tool state — its background jobs and task list —
     /// for a backend whose tools this harness runs, so every backend of one
     /// session shares them.
@@ -1039,6 +1043,10 @@ impl AgentBackend for Box<dyn AgentBackend> {
 
     fn set_prompter(&mut self, prompter: std::sync::Arc<dyn crate::hooks::engine::Prompter>) {
         (**self).set_prompter(prompter);
+    }
+
+    fn set_owner(&mut self, owner: std::sync::Arc<dyn crate::hooks::engine::Prompter>) {
+        (**self).set_owner(owner);
     }
 
     fn share_session_tools(&mut self, state: std::sync::Arc<crate::toolbox::SessionTools>) {

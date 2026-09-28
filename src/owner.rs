@@ -355,12 +355,166 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// The owner as the one a run's toolbox asks
+// ---------------------------------------------------------------------------
+
+/// An owner channel as the one a run's toolbox asks about a protected write.
+///
+/// A run has nobody at a terminal, so a test its toolbox would refuse is put
+/// to the owner's channel instead, under [`crate::guards::breach_title`] — the
+/// card the sentinel raises for a protected file that changed. So an answer to
+/// one is reused for the other, and an owner who allowed the test is not asked
+/// again when the sentinel finds it written.
+///
+/// Anything but an approval is a refusal: a channel that is down, a question
+/// still pending, a hold. It blocks for the channel's own bound, and cannot be
+/// stopped sooner.
+pub struct OwnerPrompter {
+    channel: std::sync::Mutex<Box<dyn crate::runner::OwnerChannel + Send>>,
+    project: String,
+}
+
+impl OwnerPrompter {
+    #[must_use]
+    pub fn new(
+        channel: Box<dyn crate::runner::OwnerChannel + Send>,
+        workspace: &std::path::Path,
+    ) -> Self {
+        Self {
+            channel: std::sync::Mutex::new(channel),
+            project: crate::guards::breach_project(workspace),
+        }
+    }
+}
+
+impl crate::hooks::engine::Prompter for OwnerPrompter {
+    fn confirm(
+        &self,
+        ask: &crate::hooks::engine::Ask<'_>,
+        _settled: &dyn Fn() -> bool,
+    ) -> Option<crate::hooks::engine::Verdict> {
+        use crate::hooks::engine::Verdict as Answer;
+        let title = crate::guards::breach_title(&self.project);
+        let mut channel = self
+            .channel
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Some(match channel.decide(&title, ask.reason, &self.project) {
+            Ok(Verdict::Approved { .. }) => Answer::Allow,
+            Ok(Verdict::Change { note, by, .. }) => Answer::Deny(format!(
+                "NOT RUN — the owner ({by}) asked for this instead: {note}"
+            )),
+            Ok(other) => Answer::Deny(format!(
+                "NOT RUN — the owner did not allow this write ({}).",
+                other.summary()
+            )),
+            Err(e) => Answer::Deny(format!(
+                "NOT RUN — the owner could not be asked ({e}), so this stands refused."
+            )),
+        })
+    }
+
+    fn choose(&self, _questions: &[crate::ask::Question]) -> Option<Vec<crate::ask::Answer>> {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A channel that answers as scripted and records every title it was
+    /// asked under, where the test can still read it once boxed.
+    struct Channel {
+        answer: Result<Verdict, String>,
+        titles: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl crate::runner::OwnerChannel for Channel {
+        fn decide(&mut self, title: &str, _: &str, project: &str) -> Result<Verdict, String> {
+            self.titles
+                .lock()
+                .expect("titles")
+                .push(format!("{title} | {project}"));
+            self.answer.clone()
+        }
+    }
+
+    fn answer_to(
+        answer: Result<Verdict, String>,
+    ) -> (Option<crate::hooks::engine::Verdict>, Vec<String>) {
+        use crate::hooks::engine::Prompter;
+        let titles = std::sync::Arc::default();
+        let owner = OwnerPrompter::new(
+            Box::new(Channel {
+                answer,
+                titles: std::sync::Arc::clone(&titles),
+            }),
+            std::path::Path::new("work").join("demo").as_path(),
+        );
+        let input = serde_json::json!({ "path": "tests/it.rs" });
+        let ask = crate::hooks::engine::Ask {
+            call_id: "",
+            tool_name: "Write",
+            tool_input: &input,
+            reason: "writes `tests/it.rs`",
+        };
+        let said = owner.confirm(&ask, &|| false);
+        let titles = titles.lock().expect("titles").clone();
+        (said, titles)
+    }
+
+    /// **A run's protected write is asked under the SENTINEL's title**, so an
+    /// approval given here is the one the sentinel finds afterwards and the
+    /// owner is not asked twice about one test. Change the title in
+    /// `OwnerPrompter::confirm` and this fails.
+    #[test]
+    fn a_protected_write_is_asked_under_the_sentinel_title() {
+        let (said, titles) = answer_to(Ok(Verdict::Approved {
+            by: "owner".to_string(),
+            reason: String::new(),
+        }));
+        assert_eq!(said, Some(crate::hooks::engine::Verdict::Allow));
+        assert_eq!(
+            titles,
+            vec![format!("{} | demo", crate::guards::breach_title("demo"))]
+        );
+    }
+
+    /// **Only an approval is a yes.** A pending card, a hold and a channel
+    /// that is down all leave the write refused.
+    #[test]
+    fn anything_but_an_approval_refuses_the_write() {
+        for answer in [
+            Ok(Verdict::Pending),
+            Ok(Verdict::Held {
+                by: "owner".to_string(),
+                reason: "later".to_string(),
+            }),
+            Err("the store is unreachable".to_string()),
+        ] {
+            let (said, _) = answer_to(answer.clone());
+            assert!(
+                matches!(said, Some(crate::hooks::engine::Verdict::Deny(_))),
+                "{answer:?} was read as {said:?}"
+            );
+        }
+        let (said, _) = answer_to(Ok(Verdict::Change {
+            note: "extend the existing test".to_string(),
+            by: "owner".to_string(),
+            reason: String::new(),
+        }));
+        match said {
+            Some(crate::hooks::engine::Verdict::Deny(why)) => {
+                assert!(why.contains("extend the existing test"), "{why}");
+            }
+            other => panic!("a change must refuse with its note, got {other:?}"),
+        }
+    }
 
     fn ticket() -> Ticket {
         Ticket {

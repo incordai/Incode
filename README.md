@@ -202,9 +202,11 @@ the code fights the change, and a wide refactor goes expand → migrate in batch
 → contract. For a behaviour change the test is its own first step, written
 pending so the check still passes, and the next step makes the change, turns the
 test on, and is done only when the check passes with it running. Test files stay
-protected, so both steps need you: an agent that brings its own tools asks you;
-on incode's own tools the write is refused unless `.incode/guards.json` lists the
-path under `allow_writes_to` — allowing it is you agreeing what "done" means.
+protected, so both steps need you: a write to one is put to you as Allow or
+Reject — at the terminal, in your ACP client, and during `/run` as a card in the
+owner's app when `plugins.owner` is on. With nobody to ask it is refused, unless
+`.incode/guards.json` lists the path under `allow_writes_to` — allowing it is you
+agreeing what "done" means.
 
 ## Modes
 

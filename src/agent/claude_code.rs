@@ -1208,6 +1208,10 @@ impl AgentBackend for ClaudeCodeBackend {
         self.tools.set_prompter(prompter);
     }
 
+    fn set_owner(&mut self, owner: std::sync::Arc<dyn crate::hooks::engine::Prompter>) {
+        self.tools.set_owner(owner);
+    }
+
     fn children(&self) -> Vec<(String, String)> {
         self.tools
             .children()

@@ -237,6 +237,20 @@ pub(crate) fn run(ctx: &RunContext<'_>, cancel: &CancelToken, watch: Watch<'_>) 
     for other in &mut standby {
         other.set_memory_session(&worker_session);
     }
+    // A protected write — the test a step writes first — is put to the owner
+    // rather than refused, on the same switch as the worker's own channel.
+    // Nobody is at a terminal during a run, so this is the only one to ask.
+    if ctx.admin.plugins.owner {
+        let owner: std::sync::Arc<dyn crate::hooks::engine::Prompter> =
+            std::sync::Arc::new(crate::owner::OwnerPrompter::new(
+                Box::new(crate::runner::MemoryOwner::default()),
+                workspace,
+            ));
+        backend.set_owner(std::sync::Arc::clone(&owner));
+        for other in &mut standby {
+            other.set_owner(std::sync::Arc::clone(&owner));
+        }
+    }
     // The role table applies here too: the CLI takes `--model` per
     // invocation, so cheap work runs cheap.
     let worker =
