@@ -52,6 +52,8 @@ impl Drop for Raw {
 /// One key press, or `None` when the wait should end.
 enum Key {
     Char(char),
+    /// Enter: the recommended option, when the question has one.
+    Enter,
     Escape,
     Interrupt,
 }
@@ -74,6 +76,7 @@ fn next_key(stop: &dyn Fn() -> bool) -> Option<Key> {
                     }
                     match key.code {
                         KeyCode::Esc => return Some(Key::Escape),
+                        KeyCode::Enter => return Some(Key::Enter),
                         KeyCode::Char(c) => return Some(Key::Char(c)),
                         _ => {}
                     }
@@ -120,7 +123,9 @@ impl Prompter for Terminal {
                         "NOT RUN — the person at the terminal refused this call.".to_string(),
                     ));
                 }
-                Some(Key::Char(_)) => {}
+                // Enter is not an answer here: allowing a tool call takes an
+                // explicit `y`.
+                Some(Key::Char(_) | Key::Enter) => {}
             }
         }
     }
@@ -135,26 +140,34 @@ impl Prompter for Terminal {
             let menu = question.render();
             let options: Vec<&str> = menu.lines().collect();
             let shown = options[..options.len().saturating_sub(1)].join("\n");
+            let default = question
+                .recommended()
+                .map(|c| format!(" Enter takes the recommended one: {}.", c.label))
+                .unwrap_or_default();
             lease.say(&format!(
-                "\n{shown}\nPress a letter or a number. To say something else, pick the last one. \
-                 Esc leaves it unanswered.\n"
+                "\n{shown}\nPress a letter or a number.{default} To say something else, pick the \
+                 last one. Esc leaves it unanswered.\n"
             ));
             loop {
-                match next_key(&|| false) {
+                // Enter is the empty answer, which is the recommendation —
+                // and, with none, nothing, so the prompt keeps waiting.
+                let typed = match next_key(&|| false) {
                     None | Some(Key::Escape | Key::Interrupt) => {
                         lease.say("Left unanswered.\n");
                         return None;
                     }
-                    Some(Key::Char(c)) => match question.answer_for(&c.to_string()) {
-                        Answer::Said(_) => {}
-                        picked => {
-                            if let Answer::Chose(label) = &picked {
-                                lease.say(&format!("{label}\n"));
-                            }
-                            answers.push(picked);
-                            break;
+                    Some(Key::Enter) => String::new(),
+                    Some(Key::Char(c)) => c.to_string(),
+                };
+                match question.answer_for(&typed) {
+                    Answer::Said(_) => {}
+                    picked => {
+                        if let Answer::Chose(label) = &picked {
+                            lease.say(&format!("{label}\n"));
                         }
-                    },
+                        answers.push(picked);
+                        break;
+                    }
                 }
             }
         }

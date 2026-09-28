@@ -132,14 +132,16 @@ fn find_tag_ignore_case(haystack: &str, needle: &str) -> Option<usize> {
     if haystack.len() < needle.len() {
         return None;
     }
+    // Compared as BYTES. Slicing the `str` `needle.len()` bytes on from a
+    // character boundary panics whenever a multi-byte character straddles the
+    // end — found when a reply with an em dash after its `</plan>` crashed the
+    // parse. A byte window cannot split anything, and an ASCII tag can only
+    // match ASCII bytes.
+    let (hay, want) = (haystack.as_bytes(), needle.as_bytes());
     haystack.char_indices().find_map(|(i, _)| {
-        if haystack[i..].len() >= needle.len()
-            && haystack[i..][..needle.len()].eq_ignore_ascii_case(needle)
-        {
-            Some(i)
-        } else {
-            None
-        }
+        hay.get(i..i + want.len())
+            .filter(|window| window.eq_ignore_ascii_case(want))
+            .map(|_| i)
     })
 }
 
@@ -386,12 +388,34 @@ pub fn prompt_block(roles: &crate::roles::RoleTable) -> Option<String> {
          Mark it when the second step EDITS what the first created, or needs to read \
          it. Do not mark it merely because you wrote them in that order — two steps \
          that touch different files are independent, and saying otherwise makes the \
-         work take twice as long for nothing.\n\nSOME FILES ARE THE PROJECT'S OWN CHECK — its tests, specs, \
-         CI config and migrations. An attempt that writes one is PAUSED for the \
-         owner to approve, because a test rewritten by the thing it judges is not \
-         a test that was passed. Plan such a step only when the check itself is \
-         the work, and say so in the step; do not tack \"and add a test\" onto a \
-         step whose job is the fix.\n\nA role decides WHO does the work. It decides \
+         work take twice as long for nothing.\n\n\
+         HOW TO CUT THE STEPS:\n\
+         - Each step is a THIN VERTICAL SLICE — a tracer bullet through every layer \
+         it needs, leaving something the check can prove on its own. \"add the \
+         table\", \"add the endpoint\", \"add the page\" is three steps nobody can \
+         verify until the last; \"a user can sign up, end to end\" is one that can.\n\
+         - PREFACTOR FIRST. When a change is hard because of how the code is shaped, \
+         the first step reshapes it WITHOUT changing behaviour, and the change comes \
+         after it.\n\
+         - A WIDE REFACTOR is three phases, never one sweep: EXPAND (add the new \
+         shape beside the old), MIGRATE the callers in batches, one step per batch, \
+         then CONTRACT (remove the old) once nothing uses it. Every step leaves the \
+         check green.\n\n\
+         SOME FILES ARE THE PROJECT'S OWN CHECK — its tests, specs, CI config and \
+         migrations. Nothing lands in one until the owner allows it: an attempt that \
+         writes one is stopped for the owner, because a test rewritten by the thing \
+         it judges is not a test that was passed.\n\n\
+         TESTS FIRST, FOR A BEHAVIOUR CHANGE. The test is its own step and comes \
+         FIRST; the change is the next step, `[after N]`:\n\n\
+         <plan>\nimplement: add a test that the status row survives a repaint, marked \
+         pending the stack's own way (`#[ignore]`, `it.todo`) so the check still passes\n\
+         implement: make the repaint keep the status row, and turn that test on [after 1]\n\
+         </plan>\n\n\
+         The owner allowing the first step is the owner agreeing what \"done\" means, \
+         before anything is built. The second step needs the same when it turns the \
+         test on, and it is done only when the check passes with the test running. Never tack \"and add a test\" onto the step that makes the change; a \
+         refactor that keeps behaviour needs no new test.\n\n\
+         A role decides WHO does the work. It decides \
          nothing about whether the work is done: that is settled by running the \
          check, never by a model — including you — judging its own or another's \
          output.\n</planning>"
@@ -746,7 +770,7 @@ mod tests {
              copies its shape: {example}"
         );
         assert!(
-            block.contains("PAUSED for the owner"),
+            block.contains("until the owner allows it"),
             "and the planner must be TOLD the constraint, not left to discover it \
              by having an attempt fail: {block}"
         );
@@ -991,6 +1015,69 @@ mod tests {
             assert!(!steps[0].after.is_empty(), "ordering was lost on: {line}");
             assert_eq!(steps[0].instruction, "do it", "on: {line}");
         }
+    }
+
+    /// **A reply with an em dash near a tag parses instead of panicking.**
+    /// The tag search sliced the text a tag's length on from each character,
+    /// and a multi-byte character across that end took down the planning
+    /// turn. Models write em dashes constantly, before and after the block.
+    #[test]
+    fn multi_byte_text_around_the_block_does_not_panic() {
+        let reply = "Plan — here:\n<plan>\nimplement: add it — carefully\n</plan>\nDone — é.";
+        let steps = parse(reply);
+        assert_eq!(steps.len(), 1, "{steps:?}");
+        assert_eq!(steps[0].instruction, "add it — carefully");
+        assert!(parse("— — — no block at all — —").is_empty());
+    }
+
+    /// **Tests first, as their own step, and the change waits for it.** The
+    /// example the planner copies is read with the real parser: two steps, the
+    /// first writes the test, the second says `[after 1]`. The test is written
+    /// pending, because the step is verified by the project's check like any
+    /// other and a red test would fail it; the change turns it on.
+    #[test]
+    fn the_prompt_teaches_tests_first_as_their_own_step() {
+        let roles = crate::roles::RoleTable::default().with_role("implement", "some-model");
+        let block = prompt_block(&roles).expect("a planner block");
+        let at = block.find("TESTS FIRST").expect("the rule is stated");
+        let steps = parse(&block[at..]);
+
+        assert_eq!(steps.len(), 2, "{steps:?}");
+        assert!(steps[0].instruction.contains("test"), "{steps:?}");
+        assert!(steps[0].instruction.contains("pending"), "{steps:?}");
+        assert!(steps[0].after.is_empty(), "the test waits for nothing");
+        assert_eq!(steps[1].after, [1], "the change waits for the test");
+        assert!(
+            steps[1].instruction.contains("turn that test on"),
+            "{steps:?}"
+        );
+        for step in &steps {
+            assert!(
+                !step.instruction.contains("and add a test"),
+                "a test folded into the change is the shape this replaces: {step:?}"
+            );
+        }
+        assert!(block.contains("until the owner allows it"), "{block}");
+    }
+
+    /// The three ways a plan is cut, each stated where the planner reads it.
+    #[test]
+    fn the_prompt_teaches_slices_prefactoring_and_expand_migrate_contract() {
+        let roles = crate::roles::RoleTable::default().with_role("implement", "some-model");
+        let block = prompt_block(&roles).expect("a planner block");
+        for rule in [
+            "THIN VERTICAL SLICE",
+            "PREFACTOR FIRST",
+            "EXPAND",
+            "MIGRATE the callers in batches",
+            "CONTRACT",
+        ] {
+            assert!(block.contains(rule), "`{rule}` is not taught:\n{block}");
+        }
+        assert!(
+            block.contains(&format!("At most {MAX_STEPS} steps")),
+            "the cap still rides with it"
+        );
     }
 
     /// The planner is told the syntax, or no model will ever emit it.

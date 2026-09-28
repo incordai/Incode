@@ -53,7 +53,13 @@ pub struct Choice {
     pub label: String,
     /// The one line that makes it decidable. May be empty.
     pub detail: String,
+    /// The agent's own recommendation — at most one per question — and the
+    /// answer an empty reply (Enter) takes.
+    pub recommended: bool,
 }
+
+/// How the agent marks the option it recommends, at the end of the line.
+pub const RECOMMENDED: &str = "(recommended)";
 
 /// A question with options.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,17 +89,34 @@ impl Question {
         for (index, choice) in self.all_options().iter().enumerate() {
             let letter = letter_for(index);
             let number = index + 1;
+            let mark = if choice.recommended {
+                format!(" {RECOMMENDED}")
+            } else {
+                String::new()
+            };
             if choice.detail.is_empty() {
-                out.push_str(&format!("  {letter}) {number}. {}\n", choice.label));
+                out.push_str(&format!("  {letter}) {number}. {}{mark}\n", choice.label));
             } else {
                 out.push_str(&format!(
-                    "  {letter}) {number}. {} — {}\n",
+                    "  {letter}) {number}. {} — {}{mark}\n",
                     choice.label, choice.detail
                 ));
             }
         }
         out.push_str("\nAnswer with the letter or the number — or just say what you want.");
+        if let Some(default) = self.recommended() {
+            out.push_str(&format!(
+                " Enter alone takes the recommended one: {}.",
+                default.label
+            ));
+        }
         out
+    }
+
+    /// The option the agent recommends, if it marked one.
+    #[must_use]
+    pub fn recommended(&self) -> Option<&Choice> {
+        self.options.iter().find(|c| c.recommended)
     }
 
     /// The agent's options, plus the one it can never offer.
@@ -108,6 +131,7 @@ impl Question {
         all.push(Choice {
             label: DISCUSS.to_string(),
             detail: "none of these — say more about it first".to_string(),
+            recommended: false,
         });
         all
     }
@@ -123,6 +147,13 @@ impl Question {
     /// as the decision it was.
     #[must_use]
     pub fn answer_for(&self, input: &str) -> Answer {
+        // Nothing typed is the default: the recommendation, when there is
+        // one. Without one, an empty answer is still just what was said.
+        if input.trim().is_empty() {
+            if let Some(default) = self.recommended() {
+                return Answer::Chose(default.label.clone());
+            }
+        }
         let options = self.all_options();
         let cleaned = input
             .trim()
@@ -290,7 +321,43 @@ fn parse_one(body: &str) -> Option<Question> {
         // rather than shown as an empty menu.
         return None;
     }
-    Some(Question { prompt, options })
+    Some(Question {
+        prompt,
+        options: one_recommendation(options),
+    })
+}
+
+/// At most one recommendation per question: the first one marked.
+///
+/// Two "recommended" options are no recommendation, and an empty answer
+/// would have to pick between them — so the later marks are dropped rather
+/// than the whole default.
+fn one_recommendation(mut options: Vec<Choice>) -> Vec<Choice> {
+    let mut seen = false;
+    for choice in &mut options {
+        if choice.recommended && std::mem::replace(&mut seen, true) {
+            choice.recommended = false;
+        }
+    }
+    options
+}
+
+/// `text` without a trailing `(recommended)` mark, and whether it had one.
+/// Any case, and any bracket the mark came in.
+fn strip_recommended(text: &str) -> (String, bool) {
+    let trimmed = text.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    for mark in [
+        "(recommended)",
+        "[recommended]",
+        "— recommended",
+        "- recommended",
+    ] {
+        if let Some(cut) = lower.strip_suffix(mark) {
+            return (trimmed[..cut.len()].trim().to_string(), true);
+        }
+    }
+    (trimmed.to_string(), false)
 }
 
 /// The text of an option line, if this line is one.
@@ -313,18 +380,22 @@ fn option_text(line: &str) -> Option<&str> {
 
 /// A label and the line that makes it decidable.
 fn split_choice(text: &str) -> Choice {
+    // The mark comes off first, so it can end either the label or the detail.
+    let (text, recommended) = strip_recommended(text);
     // An em dash, a hyphen or a colon — whichever the agent reached for.
     for separator in [" — ", " - ", ": "] {
         if let Some((label, detail)) = text.split_once(separator) {
             return Choice {
                 label: label.trim().to_string(),
                 detail: detail.trim().to_string(),
+                recommended,
             };
         }
     }
     Choice {
         label: text.trim().to_string(),
         detail: String::new(),
+        recommended,
     }
 }
 
@@ -467,10 +538,12 @@ pub fn prompt_block() -> String {
          {OPEN}\n\
          Which database should this use?\n\
          1. Postgres — relational, and the document implies joins\n\
-         2. SQLite — one file, nothing to operate\n\
+         2. SQLite — one file, nothing to operate {RECOMMENDED}\n\
          {CLOSE}\n\n\
-         Up to {MAX_OPTIONS} options, each with the one line that makes it decidable. The \
-         answer comes back as your next turn.\n\n\
+         Up to {MAX_OPTIONS} options, each with the one line that makes it decidable. End \
+         the line of the one you would choose with `{RECOMMENDED}` — one per question: it is \
+         what an empty answer takes, so the owner can agree with a keystroke. The answer \
+         comes back as your next turn.\n\n\
          Ask ONLY when the answer changes what you build and you cannot choose responsibly \
          yourself. Routine judgement calls are yours to make — an agent that asks about \
          everything is worse than one that asks about nothing, because the owner stops \
@@ -576,14 +649,27 @@ pub fn from_tool_input(input: &serde_json::Value) -> Result<Vec<Question>, Strin
                 .and_then(serde_json::Value::as_array)
                 .into_iter()
                 .flatten()
-                .map(|o| Choice {
-                    label: text(o, "label"),
-                    detail: text(o, "description"),
+                .map(|o| {
+                    // Either the explicit flag or the mark on the label — the
+                    // second is how the convention is usually written.
+                    let (label, marked) = strip_recommended(&text(o, "label"));
+                    let flagged = o
+                        .get("recommended")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                    Choice {
+                        label,
+                        detail: text(o, "description"),
+                        recommended: marked || flagged,
+                    }
                 })
                 .filter(|c| !c.label.is_empty())
                 .take(MAX_OPTIONS)
                 .collect();
-            (!prompt.is_empty() && !options.is_empty()).then_some(Question { prompt, options })
+            (!prompt.is_empty() && !options.is_empty()).then(|| Question {
+                prompt,
+                options: one_recommendation(options),
+            })
         })
         .collect();
     if questions.is_empty() {
@@ -611,7 +697,11 @@ pub fn unattended_note(questions: &[Question]) -> Option<String> {
     for question in questions {
         out.push_str(&format!("\n  {}\n", question.prompt));
         for choice in &question.options {
-            out.push_str(&format!("    - {}\n", choice.label));
+            if choice.recommended {
+                out.push_str(&format!("    - {} {RECOMMENDED}\n", choice.label));
+            } else {
+                out.push_str(&format!("    - {}\n", choice.label));
+            }
         }
     }
     out.push_str("\nRun this again interactively to answer it.");
@@ -746,10 +836,12 @@ Which?
                 Choice {
                     label: "Postgres".to_string(),
                     detail: "relational, and the document implies joins".to_string(),
+                    recommended: false,
                 },
                 Choice {
                     label: "SQLite".to_string(),
                     detail: "one file, nothing to operate".to_string(),
+                    recommended: true,
                 },
             ],
         }
@@ -971,5 +1063,99 @@ Second?
 {CLOSE}"
         );
         assert_eq!(parse(&text).len(), 2);
+    }
+
+    /// **The recommendation is the default.** Marked on its line, it is
+    /// shown as recommended, the mark does not leak into the label, and an
+    /// empty answer — Enter — takes it.
+    #[test]
+    fn a_recommended_option_is_shown_and_taken_by_an_empty_answer() {
+        let text = format!(
+            "{OPEN}\nWhich language?\n1. Rust — one binary\n2. Python — quickest to write (Recommended)\n{CLOSE}"
+        );
+        let asked = parse(&text);
+        let question = &asked[0];
+        assert!(!question.options[0].recommended);
+        assert!(question.options[1].recommended);
+        assert_eq!(question.options[1].label, "Python");
+        assert_eq!(question.options[1].detail, "quickest to write");
+
+        let menu = question.render();
+        assert!(
+            menu.contains("Python — quickest to write (recommended)"),
+            "{menu}"
+        );
+        assert!(
+            menu.contains("Enter alone takes the recommended one: Python"),
+            "{menu}"
+        );
+        assert_eq!(question.answer_for(""), Answer::Chose("Python".to_string()));
+        assert_eq!(question.answer_for("a"), Answer::Chose("Rust".to_string()));
+    }
+
+    /// No recommendation, no default: an empty answer chooses nothing.
+    #[test]
+    fn without_a_recommendation_an_empty_answer_chooses_nothing() {
+        let plain = Question {
+            prompt: "Which?".to_string(),
+            options: vec![Choice {
+                label: "A".to_string(),
+                detail: String::new(),
+                recommended: false,
+            }],
+        };
+        assert_eq!(plain.answer_for("  "), Answer::Said(String::new()));
+        assert!(!plain.render().contains("Enter"), "{}", plain.render());
+    }
+
+    /// Two recommendations are none: the first mark is kept, the rest dropped,
+    /// so an empty answer never has to pick between them.
+    #[test]
+    fn only_the_first_recommendation_counts() {
+        let text = format!("{OPEN}\nWhich?\n1. A (recommended)\n2. B [recommended]\n{CLOSE}");
+        let question = &parse(&text)[0];
+        let marked: Vec<&str> = question
+            .options
+            .iter()
+            .filter(|c| c.recommended)
+            .map(|c| c.label.as_str())
+            .collect();
+        assert_eq!(marked, ["A"]);
+        assert_eq!(question.options[1].label, "B", "the mark still comes off");
+    }
+
+    /// The tool route reads both spellings: the flag, and the mark on the
+    /// label that the convention usually writes.
+    #[test]
+    fn a_tool_call_carries_its_recommendation() {
+        let flagged = from_tool_input(&serde_json::json!({"questions": [{
+            "question": "Which?", "header": "h",
+            "options": [
+                {"label": "A", "description": "a"},
+                {"label": "B", "description": "b", "recommended": true}
+            ]
+        }]}))
+        .expect("a question");
+        assert!(flagged[0].options[1].recommended);
+
+        let marked = from_tool_input(&serde_json::json!({"questions": [{
+            "question": "Which?", "header": "h",
+            "options": [
+                {"label": "A (Recommended)", "description": "a"},
+                {"label": "B", "description": "b"}
+            ]
+        }]}))
+        .expect("a question");
+        assert_eq!(marked[0].options[0].label, "A");
+        assert!(marked[0].options[0].recommended);
+    }
+
+    /// A run with nobody at the prompt still says which answer was
+    /// recommended, so the report shows what the agent would have chosen.
+    #[test]
+    fn the_unattended_report_names_the_recommendation() {
+        let note = unattended_note(&[question()]).expect("a note");
+        assert!(note.contains("SQLite (recommended)"), "{note}");
+        assert!(!note.contains("Postgres (recommended)"), "{note}");
     }
 }

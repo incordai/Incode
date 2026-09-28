@@ -534,7 +534,42 @@ src/
   tools/            what those tools do to a workspace
 docs/               this document and the rest of the spec set, ROADMAP.md, RUNNER.md, …
 .incode/            this project's incode state; `.gitignore` says what is committed
+defaults/agents/    the sub-agent definitions incode ships and seeds into ~/.incode/agents/
 ```
+
+## Language
+
+One word for each thing, in the code, the docs and every prompt.
+
+- **Owner** — the person whose decisions the harness acts on; asked through the owner
+  channel (`owner.rs`). _Avoid_: user, operator (for the decider).
+- **Brief** — a project's about, goals, synopsis, PRD and roadmap, held by the memory
+  service (`brief.rs`). _Avoid_: spec (that is the spec set).
+- **Spec set** — the five documents a project needs before source may be written
+  (`spec::SPEC_SET`). _Avoid_: docs, paperwork.
+- **Roadmap item** — one entry of the brief's roadmap, with an id (`s1`, `d1`, …).
+  _Avoid_: milestone, epic, feature.
+- **Scaffold** — roadmap item `s1`, "Create the layout", on a project with no code
+  (`scaffold.rs`). _Avoid_: template, boilerplate.
+- **Goal check** — the command in `docs/VERIFICATION.md` that proves a roadmap item
+  (`goal.rs`). _Avoid_: acceptance test.
+- **Step** — one line of a plan, `role: what to do`, before the ledger holds it
+  (`plan.rs`). _Avoid_: task (until it is in the ledger).
+- **Task** — one unit of work in the ledger, with a role, a check and a state
+  (`ledger.rs`). _Avoid_: job, ticket.
+- **Ledger** — `.incode/ledger.json`, the execution state of this checkout.
+  _Avoid_: queue, journal.
+- **Check** — the command whose exit code decides whether a task is done
+  (`verify.rs`). _Avoid_: validation, CI.
+- **Role** — the kind of work (`explore`, `implement`, `review`, …) that picks the
+  model. _Avoid_: tier (a tier is a named list of models).
+- **Agent** — an installed CLI or API endpoint used as the model. **Sub-agent** — an
+  owner-written definition in `agents/*.md`. _Avoid_: bot, assistant.
+- **Lane** — a git worktree one task runs in (`parallel.rs`). _Avoid_: worker, branch.
+- **Guard** — a protected path the agent may not change unasked (`guards.rs`).
+  _Avoid_: lock, permission.
+- **Transcript** — the append-only record of a session or a task's agent.
+  _Avoid_: log, history.
 
 ---
 
@@ -601,8 +636,10 @@ That is why the fallback is traced rather than silent.
 | `wiring.rs` | **A capability nothing calls is not a capability.** Counts production mentions of every `pub fn`; a declaration mentioned only once is dead. Ratcheted, so the number can fall and never rise. See `CONVENTIONS.md` §13. |
 | `permissions.rs` | **What the session may do reaches every place that does it.** A mode governs every tool call *and* the desktop: `-p read-only` means the agent may look at the screen and not touch it. The policy applies in `Toolbox::run_call` for every tool (§5b), and again at `desktop::mcp::call_tool` in the desktop's executor. |
 | `hooks.rs` | **The operator can put their own command in front of an action.** Pre-tool hooks run before every Toolbox tool (the desktop's in its executor) and refuse with exit code 2; post-tool hooks run only for calls that happened and cannot deny. Bounded at 10s, because a hook runs between the agent asking and the screen moving. `hooks/engine.rs` is the other half: the memory engine's own hooks, run before each Toolbox call with a piped stdin and the engine's 600 s bounds — see §2, "The engine's hooks". |
-| `spec.rs` | **No source for a project nobody has specified.** Five documents, each with a named consumer, and a document is written only when it carries what it must: `ARCHITECTURE.md` its `## Layout` (checked by `spec::has_section`, the same check the PRD's `## Non-goals` goes through), and on a project with no code, `VERIFICATION.md` a runnable check for the scaffold. Until then `Write`/`Edit` of source is refused, naming the gap. |
+| `spec.rs` | **No source for a project nobody has specified.** Five documents, each with a named consumer, and a document is written only when it carries what it must: `ARCHITECTURE.md` its `## Layout` and its `## Language` — each term, its definition, `_Avoid_:` its synonyms — (checked by `spec::has_section`, the same check the PRD's `## Non-goals` goes through), and on a project with no code, `VERIFICATION.md` a runnable check for the scaffold. Until then `Write`/`Edit` of source is refused, naming the gap. |
 | `scaffold.rs` | **A new project's layout is roadmap item one, and a command proves it.** On a project with no code, `s1 Create the layout` is put first in the roadmap — derived (`brief::from_docs`) or saved (`save_brief`) — and is traceable to `## Layout` rather than to a PRD section. Its goal check is the stack's build or test command. No templates: the stack's own generator, optionally pinned by the owner (`scaffold` in `admin.json`), passed to the model as a preference. |
+| `plan.rs` | **The expensive model decides the shape once.** At most twelve steps, `role: what to do`, `[after N]` for what must wait. Each step a thin vertical slice its check can prove; prefactoring first; a wide refactor as expand → migrate in batches → contract; and for a behaviour change the test as its own first step, written pending so the check stays green, with the change `[after]` it turning the test on. Test paths stay guarded and both steps need the owner: an agent that brings its own tools is put to the owner (`agent::worker::settle_breach`); on incode's own toolbox the write is refused (`Toolbox::refused`) unless `.incode/guards.json` allows the path (`allow_writes_to`) — see `ROADMAP.md` 1c. |
+| `ask.rs` | **A question arrives with an answer to agree to.** An option line ending `(recommended)` — or `recommended: true` in `AskUserQuestion` — is the default: shown as recommended, taken by an empty answer (Enter, `cli/prompt.rs`), at most one per question. The intake asks at most seven, in one batch, each with its recommendation; unanswered, they stand as recorded assumptions. Decisions live in `ASSUMPTIONS.md` and memory, never ADR files. |
 | `folders.rs` | **What in `.incode/` is shared is decided once, where it is created.** Writes `.incode/.gitignore` when `.incode/` is made and only ever adds to it. See "Names". |
 | `admin.rs` | One settings file, one precedence ladder, every value able to say which layer decided it. |
 | `research.rs` | A dependency the build links and the document never argued for is a decision nobody recorded. |
@@ -1169,6 +1206,17 @@ narrowed to what the PARENT may use, never wider, and checked at `Toolbox::run_c
 gate (`restrict_tools`/`allows`). The defined agents are named in the `Agent` tool's
 schema and listed by `/agents` (REPL and ACP). Each file is bounded, and a bad one is
 reported (by `/agents` and the trace), never a crash.
+
+**Two reviewers ship as files, not as prompts in the code** (`subagents::SHIPPED`, the
+text in `defaults/agents/`): `standards-reviewer` (the change against the repository's
+own written standards, its `## Layout` and `## Language`, and common smells) and
+`spec-reviewer` (the change against the PRD and its non-goals, `contracts.json` and
+`VERIFICATION.md`). Both are `role: review` with `tools: [Read, Grep, Glob, Outline,
+LS]` and answer with findings, `path:line`, or `No findings.` — never a verdict: they are
+not a gate, and nothing they say reaches `Done`. At the start of a mode that reads the
+data directory, `subagents::seed_report` writes each into `~/.incode/agents/` when its
+file is absent and it has not been seeded there before (`.seeded` records which were);
+an existing file is never overwritten and a deleted one is not brought back.
 
 ### Headless JSON output (phase 8)
 

@@ -1270,7 +1270,8 @@ fn catalogue() -> Vec<Value> {
                                             "type": "object",
                                             "properties": {
                                                 "label": {"type": "string", "description": "The choice, in a few words."},
-                                                "description": {"type": "string", "description": "What choosing it means."}
+                                                "description": {"type": "string", "description": "What choosing it means."},
+                                                "recommended": {"type": "boolean", "description": "True on the ONE option you would choose. It is shown as the default, and taken when the owner answers with nothing."}
                                             },
                                             "required": ["label", "description"]
                                         }

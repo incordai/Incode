@@ -198,6 +198,100 @@ fn load_from(project: &Path, user: &Path) -> Loaded {
     loaded
 }
 
+/// The definitions incode ships, as files the operator owns once they are
+/// seeded: the text lives in `defaults/agents/` in this repository and is
+/// written to `~/.incode/agents/`, where it is edited like any other.
+///
+/// Both are `review` agents with read-only tools, and both produce findings
+/// only — neither can mark work done, because nothing a model says can
+/// (`crate::verify`).
+pub const SHIPPED: &[(&str, &str)] = &[
+    (
+        "standards-reviewer.md",
+        include_str!("../defaults/agents/standards-reviewer.md"),
+    ),
+    (
+        "spec-reviewer.md",
+        include_str!("../defaults/agents/spec-reviewer.md"),
+    ),
+];
+
+/// Which shipped definitions have been seeded into a folder already, one file
+/// name per line. Read so that a definition the operator deleted stays deleted.
+const SEEDED_FILE: &str = ".seeded";
+
+/// Seed the operator's agents folder with [`SHIPPED`], and return the names
+/// written.
+///
+/// A definition is written only when its file is absent AND it has never been
+/// seeded there before: an existing file — the operator's own, or an edited
+/// copy — is never overwritten, and one the operator deleted is not brought
+/// back. Failures are traced and skipped; a missing reviewer costs an agent,
+/// never the session.
+fn seed(user_dir: &Path) -> Vec<String> {
+    let marker = user_dir.join(SEEDED_FILE);
+    let mut seeded: Vec<String> = std::fs::read_to_string(&marker)
+        .unwrap_or_default()
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    let before = seeded.len();
+    let mut written = Vec::new();
+    for (file, text) in SHIPPED {
+        if seeded.iter().any(|s| s == file) {
+            continue;
+        }
+        let target = user_dir.join(file);
+        if std::fs::symlink_metadata(&target).is_err() {
+            if let Err(e) = write_new(&target, text) {
+                crate::trace!("agents", "{} not seeded: {e}", target.display());
+                continue;
+            }
+            written.push(file.trim_end_matches(".md").to_string());
+        }
+        // Recorded either way: a file already there is the operator's, and
+        // is theirs to keep, rename or delete from now on.
+        seeded.push((*file).to_string());
+    }
+    if seeded.len() != before {
+        if let Err(e) = std::fs::write(&marker, format!("{}\n", seeded.join("\n"))) {
+            crate::trace!("agents", "{} not written: {e}", marker.display());
+        }
+    }
+    written
+}
+
+/// [`seed`] into the operator's own folder, as the line an operator is shown
+/// when something was added.
+#[must_use]
+pub fn seed_report() -> Option<String> {
+    let dir = crate::admin::AdminConfig::default_dir().join(USER_DIR);
+    let written = seed(&dir);
+    (!written.is_empty()).then(|| {
+        format!(
+            "incode: added the sub-agent definition(s) {} to {} — edit or delete them \
+             freely; incode never writes them again.",
+            written.join(", "),
+            dir.display()
+        )
+    })
+}
+
+/// Create `path` with `text`, refusing to replace a file that appeared since
+/// it was looked at.
+fn write_new(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?
+        .write_all(text.as_bytes())
+}
+
 /// The definitions in one directory, sorted by file name; problems are added
 /// to `problems`.
 fn read_dir(dir: &Path, scope: Scope, problems: &mut Vec<String>) -> Vec<AgentDef> {
@@ -431,6 +525,87 @@ mod tests {
     const REVIEWER: &str = "---\nname: reviewer\ndescription: Reads a change and reports \
         problems.\nrole: review\nmodel: opus\ntools: [Read, Grep, \"Glob\"]\n---\nYou review \
         changes.\n";
+
+    /// **The shipped reviewers load, review, and can only look.** Seeded
+    /// into an empty folder, both parse with the real loader, carry the
+    /// `review` role, are offered only tools that observe, and are told to
+    /// produce findings — never a verdict.
+    #[test]
+    fn the_shipped_reviewers_are_read_only_reviewers() {
+        let dir = tempfile::tempdir().expect("dir");
+        let user = dir.path().join("u");
+        assert_eq!(seed(&user), ["standards-reviewer", "spec-reviewer"]);
+
+        let loaded = load_from(&dir.path().join("p"), &user);
+        assert!(loaded.problems.is_empty(), "{:?}", loaded.problems);
+        assert_eq!(loaded.agents.len(), 2);
+        for agent in &loaded.agents {
+            assert_eq!(agent.role.as_deref(), Some("review"), "{}", agent.name);
+            let mut tools = agent.tools.clone().expect("an allow-list");
+            tools.sort();
+            assert_eq!(tools, ["Glob", "Grep", "LS", "Outline", "Read"]);
+            for tool in &tools {
+                assert_eq!(
+                    crate::toolbox::reach_of(tool),
+                    Some(crate::toolbox::Reach::Observe),
+                    "{} may only look: {tool}",
+                    agent.name
+                );
+            }
+            let prose = agent
+                .prompt
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(prose.contains("No findings."), "{}", agent.name);
+            assert!(
+                prose.contains("do not say the change is done"),
+                "{} must be told it is not the judge",
+                agent.name
+            );
+        }
+        let spec = loaded.find("spec-reviewer").expect("seeded");
+        assert!(spec.prompt.contains(".incode/contracts.json"));
+        assert!(spec.prompt.contains("Non-goals"));
+        let standards = loaded.find("standards-reviewer").expect("seeded");
+        assert!(standards.prompt.contains("docs/CONVENTIONS.md"));
+        assert!(standards.prompt.contains("## Language"));
+    }
+
+    /// **Seeded once, then the operator's.** An edit is never overwritten and
+    /// a deletion is not undone on the next start.
+    #[test]
+    fn seeding_never_overwrites_and_never_brings_one_back() {
+        let dir = tempfile::tempdir().expect("dir");
+        let user = dir.path().join("u");
+        assert_eq!(seed(&user).len(), 2);
+        std::fs::write(user.join("standards-reviewer.md"), "edited").expect("edit");
+        std::fs::remove_file(user.join("spec-reviewer.md")).expect("delete");
+
+        assert!(seed(&user).is_empty(), "a second start writes nothing");
+        assert_eq!(
+            std::fs::read_to_string(user.join("standards-reviewer.md")).expect("read"),
+            "edited"
+        );
+        assert!(
+            !user.join("spec-reviewer.md").exists(),
+            "deleted stays deleted"
+        );
+    }
+
+    /// A file of the same name that was there first is the operator's own.
+    #[test]
+    fn an_existing_file_of_the_same_name_is_kept() {
+        let dir = tempfile::tempdir().expect("dir");
+        let user = dir.path().join("u");
+        write(&user, "spec-reviewer.md", "mine");
+
+        assert_eq!(seed(&user), ["standards-reviewer"]);
+        assert_eq!(
+            std::fs::read_to_string(user.join("spec-reviewer.md")).expect("read"),
+            "mine"
+        );
+    }
 
     /// **A DEFINITION IS READ WHOLE**: every field and the body.
     #[test]

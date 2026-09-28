@@ -1261,10 +1261,12 @@ mod tests {
                 crate::ask::Choice {
                     label: "First".to_string(),
                     detail: String::new(),
+                    recommended: false,
                 },
                 crate::ask::Choice {
                     label: "Second".to_string(),
                     detail: String::new(),
+                    recommended: false,
                 },
             ],
         }

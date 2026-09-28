@@ -87,8 +87,23 @@ pub const LAYOUT: Section = Section {
             tree as it is, and the command that builds it",
 };
 
+/// The project's vocabulary, required in `docs/ARCHITECTURE.md`.
+///
+/// **Why a glossary is a gate:** work routed across several models drifts in
+/// its WORDS before it drifts in its code — one task's "job" is another's
+/// "task" and a third's "run", and three names for one thing become three
+/// types. One term per thing, with the synonyms to avoid written down, is
+/// what every task inherits with the architecture.
+pub const LANGUAGE: Section = Section {
+    heading: "## Language",
+    first_word: "language",
+    holds: "the project's terms, one entry each: the term, its one-line definition, \
+            and `_Avoid_:` the synonyms not to use for it — so the code, the docs \
+            and every model use one word for one thing",
+};
+
 /// The sections `docs/ARCHITECTURE.md` must carry.
-const ARCHITECTURE_SECTIONS: &[Section] = &[LAYOUT];
+const ARCHITECTURE_SECTIONS: &[Section] = &[LAYOUT, LANGUAGE];
 
 /// Whether `doc` has a section whose heading `names_it`, with something under
 /// it before the next heading of the same or a higher level.
@@ -407,6 +422,9 @@ fn new_project_layout() -> String {
          exact version you verified today, and the folder tree it should leave. \
          The generator makes the skeleton; do not hand-write one, and do not \
          write it now: that is roadmap item 1.\n\
+         - Generate INTO THIS WORKSPACE'S ROOT (`cargo init`, `npm create vite@<version> .`, \
+         `uv init` here), not into a new subfolder: every check runs from the \
+         root, so a project nested one level down fails its own build check.\n\
          - Roadmap item 1 is `{id} {title}` — incode puts it first. Give it a \
          runnable check in docs/VERIFICATION.md, the stack's build or test \
          command, exactly in this shape:\n  {line}\n  \
@@ -671,7 +689,10 @@ pub fn intake_note(workspace: &Path) -> Option<String> {
          the one nobody writes. It is checked by `verify` on every task, so a \
          module returning `user_id` where another expects `userId` fails the same \
          way a broken test does — instead of surviving to integration, where the \
-         fix touches both sides and whoever wrote the second one has long finished.",
+         fix touches both sides and whoever wrote the second one has long finished.\n\n\
+         Decisions go in `docs/ASSUMPTIONS.md` and the shared memory, not in ADR \
+         files (`docs/adr/`, `docs/decisions/`): a second home for decisions is a \
+         second copy, and the copy nobody updates is the one the next task reads.",
     );
 
     if missing.iter().any(|f| f.path.contains("contracts")) {
@@ -780,9 +801,49 @@ mod tests {
 
         let refusal = refuse_source_write(dir.path(), "src/main.rs").expect("refused");
         assert!(
-            refusal.contains("docs/ARCHITECTURE.md (written, but it lacks `## Layout`)"),
+            refusal.contains("docs/ARCHITECTURE.md (written, but it lacks `## Layout`"),
             "{refusal}"
         );
+    }
+
+    /// **`## Language` is required the same way.** An architecture with its
+    /// layout and no glossary is still unwritten, and the gap is named; a
+    /// glossary in the `term — definition — _Avoid_:` shape completes it.
+    #[test]
+    fn an_architecture_without_a_language_is_not_written() {
+        let dir = complete();
+        let layout_only = "# Arch\n\n## Layout\n`cargo new app`\n";
+        write(dir.path(), "docs/ARCHITECTURE.md", layout_only);
+
+        let refusal = refuse_source_write(dir.path(), "src/main.rs").expect("refused");
+        assert!(
+            refusal.contains("docs/ARCHITECTURE.md (written, but it lacks `## Language`)"),
+            "{refusal}"
+        );
+        let note = intake_note(dir.path()).expect("not open");
+        assert!(note.contains("`## Language`"), "{note}");
+        assert!(note.contains("_Avoid_"), "the shape is told: {note}");
+        assert!(!note.contains("`## Layout`:"), "the layout is done: {note}");
+
+        write(
+            dir.path(),
+            "docs/ARCHITECTURE.md",
+            &format!(
+                "{layout_only}\n## Language\n\n- **Stamp** — the printed date line. \
+                 _Avoid_: timestamp, date string\n"
+            ),
+        );
+        assert!(missing(dir.path()).is_empty(), "{:?}", missing(dir.path()));
+    }
+
+    /// Decisions have one home. The note says so, where the documents are
+    /// described, so an agent does not start a `docs/adr/` beside it.
+    #[test]
+    fn decisions_go_to_assumptions_not_to_adr_files() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let note = intake_note(dir.path()).expect("a note");
+        assert!(note.contains("not in ADR"), "{note}");
+        assert!(note.contains("docs/ASSUMPTIONS.md"), "{note}");
     }
 
     /// The heading alone is not the section: something must be under it —
@@ -861,6 +922,9 @@ mod tests {
             "{note}"
         );
         assert!(note.contains(&crate::scaffold::check_line()), "{note}");
+        // Found live: a generator that made `datecli/` left the root's
+        // `cargo build` check with nothing to build.
+        assert!(note.contains("INTO THIS WORKSPACE'S ROOT"), "{note}");
 
         let existing = tempfile::tempdir().expect("temp dir");
         write(existing.path(), "src/lib.rs", "");

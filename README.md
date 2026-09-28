@@ -160,20 +160,23 @@ incode -t "add a health endpoint and a test for it"
 ## A new project
 
 Open incode in an empty folder and its first job is the specification, not the
-code. It asks at most seven questions in one batch, researches the rest, and
-writes:
+code. It asks at most seven questions in one batch, each with its recommended
+answer marked — Enter takes it, so you type only where you disagree, and with
+nobody at the prompt the recommendations stand as recorded assumptions. It
+researches the rest, and writes:
 
 | File | What it holds |
 |---|---|
 | `docs/PRD.md` | What is being built, with a `## Non-goals` section |
-| `docs/ARCHITECTURE.md` | The stack and the modules, with a `## Layout`: the stack's official generator command (`cargo new`, `npm create vite@<version>`, `uv init`) with its verified version, and the folder tree |
+| `docs/ARCHITECTURE.md` | The stack and the modules, with a `## Layout`: the stack's official generator command (`cargo new`, `npm create vite@<version>`, `uv init`) with its verified version, and the folder tree; and a `## Language`: each term, its definition, and `_Avoid_:` the synonyms not to use |
 | `.incode/contracts.json` | The shapes that cross module boundaries |
 | `docs/CONVENTIONS.md` | Naming, errors, comments, tests |
 | `docs/VERIFICATION.md` | The command that proves each roadmap item |
-| `docs/ASSUMPTIONS.md` | Every choice made without asking, with its reason |
+| `docs/ASSUMPTIONS.md` | Every choice made without asking, with its reason — and the only place decisions are written; no ADR files |
 
 Writing source is refused until they exist. The roadmap then starts with
-**`s1 Create the layout`**: the generator is run as ordinary work, and the item
+**`s1 Create the layout`**: the generator is run in the project's root as
+ordinary work (every check runs from the root), and the item
 counts as done only when its check in `docs/VERIFICATION.md` — the stack's build
 or test command — exits zero. incode carries no templates of its own; pin the
 generator you want per stack with `scaffold` in `admin.json`.
@@ -192,6 +195,16 @@ planner splits an item into tasks in `.incode/ledger.json`, each carrying that
 item's id and reaching `Done` only through its own check; and the item itself
 is reached only when its line in `docs/VERIFICATION.md` passes and every task
 for it is done. `/roadmap` shows the board.
+
+**How an item is planned.** The planner cuts it into at most twelve steps, each
+a thin vertical slice its check can prove on its own; reshaping comes first when
+the code fights the change, and a wide refactor goes expand → migrate in batches
+→ contract. For a behaviour change the test is its own first step, written
+pending so the check still passes, and the next step makes the change, turns the
+test on, and is done only when the check passes with it running. Test files stay
+protected, so both steps need you: an agent that brings its own tools asks you;
+on incode's own tools the write is refused unless `.incode/guards.json` lists the
+path under `allow_writes_to` — allowing it is you agreeing what "done" means.
 
 ## Modes
 
@@ -550,6 +563,16 @@ You review changes. Report each problem with its file and line.
   file is listed by `/agents` with the reason and never stops a session.
 
 The model runs one with the `Agent` tool: `{"agent": "reviewer", ...}`.
+
+**Two come with incode**, written into `~/.incode/agents/` the first time
+incode starts: `standards-reviewer` (a change against the repository's own
+docs — conventions, `## Layout`, `## Language` — and common smells) and
+`spec-reviewer` (a change against the PRD and its non-goals, the contracts and
+`VERIFICATION.md`). Both are `review` agents limited to `Read`, `Grep`, `Glob`,
+`Outline` and `LS`, and both answer with findings only — neither decides that
+work is done. They are ordinary files: edit them, or delete them; incode never
+writes one again once it has been seeded (`~/.incode/agents/.seeded` records
+which were).
 
 ## Configuration
 

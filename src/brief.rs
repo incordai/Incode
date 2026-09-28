@@ -285,6 +285,11 @@ pub fn intake_method() -> String {
          - Ask AT MOST {MAX_INTAKE_QUESTIONS} questions, in ONE batch, and only \
          about things you genuinely cannot decide: what this is for, who uses it, \
          what must not break.\n\
+         - Every question carries YOUR RECOMMENDED ANSWER, as options with the one \
+         you would choose marked `{rec}` (or `recommended: true` in \
+         AskUserQuestion). The owner can agree with one keystroke, and correct \
+         only what is wrong. If nobody answers — a run with no one at the prompt \
+         — your recommendations stand: record each as an assumption and carry on.\n\
          - Decide everything else yourself, and record each decision with its \
          reasoning under an `## Assumptions` heading in the PRD — \"Postgres, \
          because the document implies relational data and no scale requirement \
@@ -294,7 +299,8 @@ pub fn intake_method() -> String {
          choice is free or self-hostable, and state what you considered instead. \
          Never state a version, a licence or a running cost you have not verified.\n\
          - Include a `## Non-goals` section. It is the section everyone omits and \
-         the only thing that stops an agent adding work nobody asked for."
+         the only thing that stops an agent adding work nobody asked for.",
+        rec = crate::ask::RECOMMENDED,
     )
 }
 
@@ -2798,6 +2804,22 @@ No auth in v1.
             method.contains("with its reasoning"),
             "an assumption without its reasoning cannot be corrected: {method}"
         );
+    }
+
+    /// **Every question arrives with an answer to agree to.** Still one batch
+    /// and still capped; the recommendation is marked the way the question
+    /// parser reads it, and it is what stands when nobody is there to answer.
+    #[test]
+    fn every_intake_question_carries_a_recommended_answer() {
+        let method = intake_method();
+        assert!(method.contains("RECOMMENDED ANSWER"), "{method}");
+        assert!(
+            method.contains(crate::ask::RECOMMENDED),
+            "the mark must be the one `ask::parse` reads: {method}"
+        );
+        assert!(method.contains("recommended: true"), "{method}");
+        assert!(method.contains("your recommendations stand"), "{method}");
+        assert!(method.contains("ONE batch"), "{method}");
     }
 
     /// The research standards and the non-goals section ride the same task, so a

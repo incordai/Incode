@@ -102,6 +102,9 @@ fn main() -> anyhow::Result<()> {
     let mut migrated = Vec::new();
     if parsed.reads_data_dir() {
         migrated.extend(incord_code::migrate::global_report());
+        // The reviewers incode ships, written once into the operator's own
+        // agents folder and theirs from then on.
+        migrated.extend(incord_code::subagents::seed_report());
     }
     if let Some(workspace) = parsed.workspace() {
         migrated.extend(incord_code::migrate::project_report(workspace));

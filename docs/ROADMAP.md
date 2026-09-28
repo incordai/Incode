@@ -177,6 +177,39 @@ Adapted, in incode's own terms, from a cross-check against mattpocock/skills
 - **`RUNNER.md`** no longer describes a `journal.jsonl` or a `runner.lock`; neither
   was built.
 
+### 1b. Planning and intake — DONE
+
+- **Planner** (`plan.rs`): thin vertical slices, prefactoring first, expand →
+  migrate in batches → contract; `[after N]` and the twelve-step cap unchanged.
+- **Tests first, within the guards**: for a behaviour change the test is its own
+  first step, written pending so the project's check stays green (a step is
+  verified by that check, and a red test would fail it); the change is `[after]`
+  it and turns the test on. Both steps touch a protected path and need the owner.
+  No TDD role; the guard is unchanged.
+- **Intake questions carry a recommended answer** (`(recommended)` or
+  `recommended: true`), still one batch of at most seven; Enter takes it, and
+  unanswered it stands as an assumption.
+- **`## Language` required in `ARCHITECTURE.md`**, checked like `## Layout`. No ADR
+  files: decisions stay in `ASSUMPTIONS.md` and memory.
+- **Two reviewers** (`standards-reviewer`, `spec-reviewer`) ship as files and are
+  seeded into `~/.incode/agents/`, findings only.
+
+### 1c. Still open
+
+- **On incode's own toolbox a test write is refused, not put to the owner.**
+  `Toolbox::refused` (`toolbox/mod.rs`, the guards check in `run_call`) returns the
+  refusal at once; only the Sentinel path for an agent that brings its own tools
+  asks the owner (`agent::worker::settle_breach`). claude is bridged, so its
+  test-first step fails unless `.incode/guards.json` allows the path
+  (`allow_writes_to`). Asking the owner at the toolbox gate, as `settle_breach`
+  does, would make tests-first work there; it changes the gate, so it is left for
+  the owner to decide. The planner prompt used to say such a write is "PAUSED"; it
+  now says it is stopped until the owner allows it.
+- **A red test step is not provable on its own.** The runner verifies every code
+  step with the project's check, so tests-first relies on the test being written
+  pending. A step whose check is "this new test fails for the right reason" would
+  need a verification the `Verified` law does not allow today.
+
 ---
 
 ## A. The 51 unwired capabilities
