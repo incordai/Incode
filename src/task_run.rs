@@ -354,6 +354,28 @@ struct Task<'a> {
 }
 
 /// The instruction, through each usable agent in turn until one runs it.
+/// One candidate's backend, whose edit session ends when the attempt does.
+struct EndsEdits(Box<dyn AgentBackend>);
+
+impl std::ops::Deref for EndsEdits {
+    type Target = Box<dyn AgentBackend>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for EndsEdits {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for EndsEdits {
+    fn drop(&mut self) {
+        self.0.end_code_edits();
+    }
+}
+
 fn drive(
     task: &Task<'_>,
     memory: &mut crate::hooks::memory::MemoryHooks,
@@ -415,7 +437,7 @@ fn drive(
             Candidate::Api(_) => crate::agent::registry::API_ROUTE.to_string(),
             Candidate::Cli(agent) => agent.id.clone(),
         };
-        let (mut backend, route): (Box<dyn AgentBackend>, String) = match candidate {
+        let (backend, route): (Box<dyn AgentBackend>, String) = match candidate {
             Candidate::Api(settings) => (
                 Box::new(
                     crate::agent::api::ApiBackend::new(
@@ -445,6 +467,10 @@ fn drive(
                 )
             }
         };
+        // However this candidate's attempt ends — an answer, a failure, the
+        // next candidate — the engine's edit check hears that its conversation
+        // is over: what it claimed, read and announced is let go.
+        let mut backend = EndsEdits(backend);
         // Its calls are filed under this run's session, as its stop is.
         backend.set_memory_session(memory.session());
         // The run's one set of session tools, holding the external tools'

@@ -35,6 +35,9 @@ use super::{Toolbox, ToolOutput, APPLY_PATCH, EDIT, MULTI_EDIT, NOTEBOOK_EDIT, W
 pub const MARK_PATH: &str = "/v1/memory/code/edits/mark";
 /// The route a read is recorded on.
 pub const READ_PATH: &str = "/v1/memory/code/edits/read";
+/// The route a session's end is told on: its claims released, its reads and
+/// marks dropped.
+pub const END_PATH: &str = "/v1/memory/code/edits/end";
 
 /// The agent the operator started, as the engine names it; a sub-agent is
 /// `incode/sub-1`, its own sub-agent `incode/sub-1/sub-1`.
@@ -53,6 +56,7 @@ const CALL_BOUND: Duration = Duration::from_secs(15);
 pub enum Route {
     Mark,
     Read,
+    End,
 }
 
 /// Why a call to the engine brought no answer to act on. Either way it means
@@ -116,6 +120,7 @@ impl EditLedger for EngineLedger {
             match route {
                 Route::Mark => MARK_PATH,
                 Route::Read => READ_PATH,
+                Route::End => END_PATH,
             }
         );
         let body = body.clone();
@@ -417,6 +422,34 @@ impl Toolbox {
             body["tool_use_id"] = json!(call_id);
         }
         body
+    }
+
+    /// Tell the engine that `edits`' conversation in this session is over —
+    /// a sub-agent that finished, or this agent's session ending: its claims
+    /// are released and its reads and marks dropped, rather than holding the
+    /// next agent off until their TTL runs out. Nothing to say without a
+    /// session; an engine that does not answer leaves the TTL to do it.
+    pub(super) fn end_code_session(&self, edits: &CodeEdits) {
+        if self.session.is_empty() {
+            return;
+        }
+        let body = json!({
+            "cwd": self.workspace.to_string_lossy(),
+            "session_id": edits.session_of(&self.session),
+        });
+        match edits.ledger.post(Route::End, &body) {
+            Ok(said) => crate::trace!("edits", "session {} ended: {said}", body["session_id"]),
+            Err(why) => crate::trace!("edits", "session {} not ended: {why}", body["session_id"]),
+        }
+    }
+
+    /// This agent's session is over (the REPL or `--acp` session closing or
+    /// cleared, a `--task` run or a `/run` worker ending): let go of what it
+    /// claimed, read and announced. Nothing without the edit check.
+    pub fn end_code_edits(&self) {
+        if let Some(edits) = &self.code_edits {
+            self.end_code_session(edits);
+        }
     }
 
     /// Record, after a Read that succeeded, what it showed. Waited on, and

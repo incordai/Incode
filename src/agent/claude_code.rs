@@ -1271,6 +1271,10 @@ impl AgentBackend for ClaudeCodeBackend {
         self.tools.pin_session(session);
     }
 
+    fn end_code_edits(&mut self) {
+        self.tools.end_code_edits();
+    }
+
     fn set_system_context(&mut self, blocks: Vec<String>) {
         self.system_context = blocks
             .into_iter()

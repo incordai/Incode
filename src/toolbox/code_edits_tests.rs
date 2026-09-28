@@ -336,6 +336,32 @@ fn a_sub_agent_announces_under_its_own_name_and_session() {
     }
 }
 
+/// **A SESSION THAT ENDS IS TOLD TO THE ENGINE**, as the conversation it was:
+/// the operator's agent under the session itself, a sub-agent under its own
+/// `session/sub-N` — and nothing is sent with no session or no edit check.
+#[test]
+fn an_ended_session_is_told_under_its_own_name() {
+    let ws = workspace();
+    let ledger = Recorder::new(|_, _| Ok(json!({ "claims_released": 0, "reads_dropped": 0, "marks_withdrawn": 0 })));
+    let root = CodeEdits::new(ledger.clone());
+    let child = root.child();
+
+    toolbox_as(ws.path(), root.clone()).end_code_edits();
+    toolbox_as(ws.path(), child.clone()).end_code_edits();
+
+    let calls = ledger.calls();
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert!(calls.iter().all(|(r, b)| *r == Route::End && b["cwd"] == ws.path().to_string_lossy().as_ref()), "{calls:?}");
+    assert_eq!(calls[0].1["session_id"], "session-1");
+    let scope = child.agent_id().trim_start_matches(ROOT_AGENT).to_string();
+    assert_eq!(calls[1].1["session_id"], format!("session-1{scope}"));
+
+    // No session: nobody to end. No edit check: nothing to say.
+    Toolbox::new(ws.path(), true).with_code_edits(Some(root)).end_code_edits();
+    Toolbox::new(ws.path(), true).end_code_edits();
+    assert_eq!(ledger.calls().len(), 2);
+}
+
 #[test]
 fn changed_ranges_are_whole_lines_of_the_file_as_it_stands() {
     let before = "a\nb\nc\nd\n";

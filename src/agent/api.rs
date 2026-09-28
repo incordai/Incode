@@ -1034,6 +1034,10 @@ impl AgentBackend for ApiBackend {
         self.tools.pin_session(session);
     }
 
+    fn end_code_edits(&mut self) {
+        self.tools.end_code_edits();
+    }
+
     /// The standing instructions for the following requests, as the one block
     /// the constructor makes of them.
     fn set_system_context(&mut self, blocks: Vec<String>) {

@@ -457,6 +457,9 @@ impl AgentSession {
     /// the end names the OLD id, and the new session's context replaces the
     /// old one's in what every backend carries.
     pub fn clear(&mut self) {
+        // What the old conversation claimed, read and announced is let go
+        // while every backend still names it.
+        self.end_code_edits();
         self.backend.clear_session();
         for s in &mut self.standby {
             s.clear_session();
@@ -521,7 +524,18 @@ impl AgentSession {
     /// end.
     pub fn end_memory(&mut self, reason: &str) {
         self.settle_memory_start();
+        self.end_code_edits();
         self.memory.end(reason);
+    }
+
+    /// The engine's edit check hears the session end from every backend that
+    /// announced writes in it (each ends the same session; a second end finds
+    /// nothing left).
+    fn end_code_edits(&mut self) {
+        self.backend.end_code_edits();
+        for s in &mut self.standby {
+            s.end_code_edits();
+        }
     }
 
     /// Tell every backend the session's id for the engine.

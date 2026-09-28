@@ -931,6 +931,13 @@ pub trait AgentBackend {
     /// itself sends the engine anything per call.
     fn set_memory_session(&mut self, _session: &str) {}
 
+    /// The session is over: tell the engine's edit check, so what this agent
+    /// claimed, read and announced is let go now rather than at its TTL.
+    ///
+    /// Defaulted to nothing: only a backend whose file tools this harness
+    /// runs itself announced anything.
+    fn end_code_edits(&mut self) {}
+
     /// Replace the harness context this backend carries into its turns.
     ///
     /// Defaulted to nothing for a backend that carries none.
@@ -1079,6 +1086,10 @@ impl AgentBackend for Box<dyn AgentBackend> {
 
     fn set_memory_session(&mut self, session: &str) {
         (**self).set_memory_session(session);
+    }
+
+    fn end_code_edits(&mut self) {
+        (**self).end_code_edits();
     }
 
     fn set_system_context(&mut self, blocks: Vec<String>) {

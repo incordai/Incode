@@ -131,6 +131,7 @@ impl Toolbox {
             role,
             definition: definition.as_ref(),
             tools: self.child_tools(definition.as_ref()),
+            edits: self.code_edits.as_ref().map(super::CodeEdits::child),
         };
         let (mut child, agent) = match crate::agent::api::Settings::from_env() {
             Some(settings) => (self.api_child(settings, &spec), "api"),
@@ -197,6 +198,11 @@ impl Toolbox {
         });
         if let Some(tap) = tap.as_mut() {
             tap.ended(self.end_of(&outcome, &said));
+        }
+        // Its work is over however it ended: what it claimed, read and
+        // announced is let go now, not when a lease runs out.
+        if let Some(edits) = &spec.edits {
+            self.end_code_session(edits);
         }
         let outcome = outcome.map_err(|e| format!("the subagent could not finish: {e}"))?;
 
@@ -300,7 +306,7 @@ impl Toolbox {
         )
         .at_depth(self.depth + 1)
         .with_engine(self.engine.clone())
-        .with_code_edits(self.code_edits.as_ref().map(super::CodeEdits::child))
+        .with_code_edits(spec.edits.clone())
         .with_operator_hooks(self.hooks.clone())
         .with_sandbox(self.sandbox)
         .with_tool_allowlist(spec.tools.clone());
@@ -322,7 +328,7 @@ impl Toolbox {
             .streaming(true)
             .with_system_context(Self::child_system(spec.definition))
             .with_engine(self.engine.clone())
-            .with_code_edits(self.code_edits.as_ref().map(super::CodeEdits::child))
+            .with_code_edits(spec.edits.clone())
             .with_operator_hooks(self.hooks.clone())
             .with_sandbox(self.sandbox)
             .with_tool_allowlist(spec.tools.clone())
@@ -362,6 +368,8 @@ struct Child<'a> {
     definition: Option<&'a crate::subagents::AgentDef>,
     /// The only tools it may use; `None` is every tool.
     tools: Option<Vec<String>>,
+    /// Its side of the engine's edit check: a name and a session of its own.
+    edits: Option<super::CodeEdits>,
 }
 
 #[cfg(test)]
@@ -393,6 +401,7 @@ mod tests {
             role: "review",
             definition: Some(&def),
             tools: parent.child_tools(Some(&def)),
+            edits: None,
         };
         let child = parent.cli_child("claude", &spec);
         assert!(

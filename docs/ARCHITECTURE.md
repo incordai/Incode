@@ -497,6 +497,12 @@ engine who changed which definition, not any CLI's edit events.
   under its parent's id its write would count as its parent's read. `tool_use_id` is the
   call id. No answer from the engine ends the call's announcements (it would wait on the
   same silence per file), and a stopped turn makes none.
+- **When a session ends:** `POST /v1/memory/code/edits/end {cwd, session_id}` releases
+  its claims and drops its reads and marks at once rather than at their TTL — for a
+  sub-agent's own session when it finishes, however it finished (`subagent.rs`); for
+  the session when the REPL or `--acp` session ends or `/clear` starts a new one
+  (`AgentSession::end_memory`, `clear`, through `AgentBackend::end_code_edits`); and
+  for each `--task` candidate when its attempt ends (`task_run.rs` `EndsEdits`).
 - **Where:** `CodeEdits::locate()` — only when the memory URL is this machine (the engine
   resolves paths on its own disk). Opt-in like the engine; a test's toolbox has none.
   Unanswered — no engine, a folder that is not one of its projects, a file its index does
