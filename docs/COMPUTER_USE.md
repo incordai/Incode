@@ -26,7 +26,7 @@ API is marked UNVERIFIED and must be compiled against before it is pinned.
 8. **Windows first**, because that is where development happens.
 9. **macOS is in v1**, sequenced after Windows works.
 10. **The harness registers MCP itself.** An agent platform cannot depend on a human
-    having configured `~/.claude-a` by hand, so the adapters in section 2 are a
+    having configured an agent's settings folder by hand, so the adapters in section 2 are a
     requirement, not an enhancement.
 
 Decisions 2 and 3 are the expensive ones and they pull against each other: decision 3
@@ -705,7 +705,7 @@ decisions 5-10. Nothing from that round is still open.)*
    means v1 contains one install step that cannot be automated and one platform CI cannot
    cover. That is accepted, not overlooked.
 10. **The harness registers MCP itself** (section 2). On an agent platform, depending on a
-    human having hand-configured `~/.claude-a` is not a deployment model. This promotes
+    human having hand-configured an agent's settings folder is not a deployment model. This promotes
     the backend adapters from "worth doing anyway" to a blocking requirement, and it is
     why they move earlier in the build order.
 
@@ -754,7 +754,7 @@ from one working implementation is honest, one generalised from zero is a guess.
    watchman handoff was verified inside the child's argv.
 
    **Decision 10 makes this blocking rather than optional.** A platform where the
-   capability only works if a human edited `~/.claude-a` is not a platform. Step 9 is what
+   capability only works if a human edited an agent's settings folder is not a platform. Step 9 is what
    turns "computer use exists" into "every agent has computer use".
 
    **Done, 2026-09-16, for the two backends that have a per-spawn flag.** The seam is

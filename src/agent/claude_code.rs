@@ -1535,11 +1535,11 @@ pub(crate) mod tests {
         // The exact situation that broke every turn for a day: the default
         // profile's session had expired while another profile was still good,
         // and the agent fell back to the default because nothing said otherwise.
-        let home = home_with(&[(".claude", Some(-4.0)), (".claude-a", Some(2.0))]);
+        let home = home_with(&[(".claude", Some(-4.0)), (".claude-work", Some(2.0))]);
         let chosen = pick_usable(profiles_in(home.path())).expect("one is live");
         assert!(
-            chosen.dir.ends_with(".claude-a"),
-            "chose {:?}, but only .claude-a can work",
+            chosen.dir.ends_with(".claude-work"),
+            "chose {:?}, but only .claude-work can work",
             chosen.dir
         );
     }
@@ -1548,11 +1548,11 @@ pub(crate) mod tests {
     fn the_longest_lived_session_wins() {
         let home = home_with(&[
             (".claude", Some(1.0)),
-            (".claude-a", Some(9.0)),
-            (".claude-b", Some(4.0)),
+            (".claude-work", Some(9.0)),
+            (".claude-other", Some(4.0)),
         ]);
         let chosen = pick_usable(profiles_in(home.path())).expect("live");
-        assert!(chosen.dir.ends_with(".claude-a"), "{:?}", chosen.dir);
+        assert!(chosen.dir.ends_with(".claude-work"), "{:?}", chosen.dir);
     }
 
     #[test]
@@ -1560,7 +1560,7 @@ pub(crate) mod tests {
         // Picking an expired profile would produce the same unexplained failure
         // this replaces. Choosing nothing lets the turn fail with the message
         // that actually names the problem.
-        let home = home_with(&[(".claude", Some(-1.0)), (".claude-a", Some(-9.0))]);
+        let home = home_with(&[(".claude", Some(-1.0)), (".claude-work", Some(-9.0))]);
         assert_eq!(pick_usable(profiles_in(home.path())), None);
     }
 
@@ -1575,17 +1575,17 @@ pub(crate) mod tests {
     #[test]
     fn only_directories_count_as_profiles() {
         // The home also holds `.claude.json` and a long tail of its backups.
-        let home = home_with(&[(".claude-a", Some(3.0))]);
+        let home = home_with(&[(".claude-work", Some(3.0))]);
         std::fs::write(home.path().join(".claude.json"), "{}").expect("write");
         std::fs::write(home.path().join(".claude.json.backup"), "{}").expect("write");
         let found = profiles_in(home.path());
         assert_eq!(found.len(), 1, "found {found:?}");
-        assert!(found[0].dir.ends_with(".claude-a"));
+        assert!(found[0].dir.ends_with(".claude-work"));
     }
 
     #[test]
     fn a_directory_with_no_session_recorded_is_skipped() {
-        let home = home_with(&[(".claude", None), (".claude-a", Some(3.0))]);
+        let home = home_with(&[(".claude", None), (".claude-work", Some(3.0))]);
         let found = profiles_in(home.path());
         assert_eq!(found.len(), 1, "found {found:?}");
     }
