@@ -300,6 +300,7 @@ impl Toolbox {
         )
         .at_depth(self.depth + 1)
         .with_engine(self.engine.clone())
+        .with_code_edits(self.code_edits.as_ref().map(super::CodeEdits::child))
         .with_operator_hooks(self.hooks.clone())
         .with_sandbox(self.sandbox)
         .with_tool_allowlist(spec.tools.clone());
@@ -321,6 +322,7 @@ impl Toolbox {
             .streaming(true)
             .with_system_context(Self::child_system(spec.definition))
             .with_engine(self.engine.clone())
+            .with_code_edits(self.code_edits.as_ref().map(super::CodeEdits::child))
             .with_operator_hooks(self.hooks.clone())
             .with_sandbox(self.sandbox)
             .with_tool_allowlist(spec.tools.clone())

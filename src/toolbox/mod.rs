@@ -55,6 +55,7 @@ mod browser;
 mod cdp;
 mod checks;
 mod client_servers;
+mod code_edits;
 mod convert;
 mod desktop;
 mod edits;
@@ -71,6 +72,7 @@ mod todo;
 mod validate;
 
 pub(crate) use client_servers::{OnConnected, ServerSpec, Transport};
+pub use code_edits::{CodeEdits, EditLedger, EngineLedger, LedgerError, Route as EditRoute};
 pub use desktop::DesktopSetup;
 pub use image::{Image, ImageFormat, ToolOutput, MAX_IMAGES_PER_RESULT, MAX_IMAGE_EDGE};
 pub(crate) use todo::{parse_todos, Priority, TodoStatus};
@@ -432,6 +434,10 @@ pub struct Toolbox {
     /// The memory engine, asked before every call once the operator's guards
     /// have passed it. `None` when none is named or installed.
     engine: Option<crate::hooks::engine::Engine>,
+    /// The engine's edit check around every file this toolbox writes and
+    /// reads, and the agent it is announced as ([`code_edits`]). `None` when
+    /// no engine on this machine is named, and in every toolbox a test builds.
+    code_edits: Option<CodeEdits>,
     /// The conversation these calls belong to, as the engine is told it.
     session: String,
     /// Set once the session's own id was given ([`Self::pin_session`]): from
@@ -517,6 +523,7 @@ impl Toolbox {
             children: Mutex::new(Vec::new()),
             checkpoints: None,
             engine: None,
+            code_edits: None,
             session: String::new(),
             session_pinned: false,
             extra_dirs: Vec::new(),
@@ -791,6 +798,15 @@ impl Toolbox {
     #[must_use]
     pub fn with_engine(mut self, engine: Option<crate::hooks::engine::Engine>) -> Self {
         self.engine = engine;
+        self
+    }
+
+    /// Announce every file write to the engine's edit check, and record every
+    /// read, as `edits`' agent — see [`code_edits`]. Opt-in like the engine,
+    /// for the same reason.
+    #[must_use]
+    pub fn with_code_edits(mut self, edits: Option<CodeEdits>) -> Self {
+        self.code_edits = edits;
         self
     }
 
@@ -1614,6 +1630,29 @@ impl Toolbox {
                 return Ok(ToolOutput::from(said));
             }
         };
+        // The edit check, last: every gate above refuses a call for reasons
+        // of its own, and a write announced to the engine and then refused
+        // by one of them would leave a mark for a write that never came.
+        let announced = if reach == Reach::Change {
+            match self.announce_writes(call_id, name, input) {
+                Ok(announced) => announced,
+                Err(refusal) => {
+                    self.tell_decided(
+                        call_id,
+                        crate::watch::Decision {
+                            by: crate::watch::Decider::Engine,
+                            allowed: false,
+                            rule: None,
+                            path: None,
+                            reason: Some(crate::text::truncate(&refusal, MAX_DECISION_REASON_CHARS)),
+                        },
+                    );
+                    return Err(refusal);
+                }
+            }
+        } else {
+            code_edits::Announced::default()
+        };
         // With no engine, the guards had the last word on a call they look
         // at, and it was yes.
         if self.engine.is_none() && Self::guarded(name) && self.guards.is_ok() {
@@ -1629,6 +1668,12 @@ impl Toolbox {
             );
         }
         let outcome = self.dispatch(call_id, name, input, reach);
+        // Confirmed or cancelled as it came out; a read recorded once it was
+        // shown, so the next write's check knows what this session saw.
+        let outcome = self.settle_writes(call_id, announced, outcome);
+        if name == READ && outcome.is_ok() {
+            self.record_read(input);
+        }
         // A write that LANDED is news to the engine — it files the path under
         // the session and queues the file to be read again. Only a write that
         // happened: a refused or failed one changed nothing. Not waited on.

@@ -466,6 +466,44 @@ make passes this gate.
   thread of its own (not waited on, still bounded). A refused or failed write fires
   nothing.
 
+### The engine's edit check, from incode's executor
+
+`toolbox::code_edits`, over HTTP to the engine's `/v1/memory/code/edits/{mark,read}`
+(the engine's `per-project-code-index.md` §4.9). It is this executor that tells the
+engine who changed which definition, not any CLI's edit events.
+
+- **Before a write** (`Write`, `Edit`, `MultiEdit`, `ApplyPatch`, `NotebookEdit`), after
+  every other gate: per file, `mark` `phase: pending` with the byte ranges of the file as
+  it stands that the write replaces — the changed lines of what the tool would produce,
+  worked out the way it does (lines only inserted are announced as the line before and
+  the line after, since a doc comment added above a function is that function's change);
+  the whole file when it is new, deleted, a notebook, or the result cannot be worked out.
+  A write that changes nothing is not announced. The engine checks every definition
+  those ranges touch against this session's last read; **a refusal is the call's result**
+  (`NOT WRITTEN — …`, told to the watch as the engine's decision), nothing is written, and
+  a patch's files already announced are cancelled.
+- **After it:** `confirmed` when it landed — the engine reindexes the file at once and
+  credits the change to this agent, session and call — or `cancelled` when it failed and
+  left the file as it was (a failed call that changed a file, a patch whose put-back
+  failed, is confirmed). The engine's warnings and any `lost_update_suspected` are added to
+  the result as `[edit check]` lines.
+- **After a `Read`:** `read`, for the lines it showed (the whole file names no range).
+  Waited on, bounded at 15 s like every call here: the next write is checked against it.
+  Known limit: the engine records the definitions as they are when the call arrives, so a
+  write landing between the tool's read and that is taken as seen.
+- **Who:** `agent_id` is `incode` for the operator's agent and `incode/sub-N` for each
+  sub-agent (numbered once per process, nested: `incode/sub-1/sub-2`); `session_id` is the
+  pinned session, and for a sub-agent `<session>/sub-N` — it is another conversation, and
+  under its parent's id its write would count as its parent's read. `tool_use_id` is the
+  call id. No answer from the engine ends the call's announcements (it would wait on the
+  same silence per file), and a stopped turn makes none.
+- **Where:** `CodeEdits::locate()` — only when the memory URL is this machine (the engine
+  resolves paths on its own disk). Opt-in like the engine; a test's toolbox has none.
+  Unanswered — no engine, a folder that is not one of its projects, a file its index does
+  not cover — the call runs unchecked, as before; the `pre-tool` gate has already refused
+  every change when the engine cannot decide. Not covered: shell commands (the engine has
+  no command window yet), and codex and agy, which write with their own tools.
+
 ### The engine's session lifecycle, fired by incode
 
 `hooks::memory::MemoryHooks`, one per incode session, owned by `AgentSession` (REPL and

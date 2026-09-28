@@ -596,6 +596,14 @@ impl ApiBackend {
         self
     }
 
+    /// Announce each file write to the engine's edit check, and record each
+    /// read — see `toolbox::code_edits`. Given where the engine is.
+    #[must_use]
+    pub fn with_code_edits(mut self, edits: Option<crate::toolbox::CodeEdits>) -> Self {
+        self.tools = self.tools.with_code_edits(edits);
+        self
+    }
+
     /// Offer the model the desktop tools — see `toolbox::desktop`.
     #[must_use]
     pub fn with_desktop(mut self, setup: Option<crate::toolbox::DesktopSetup>) -> Self {

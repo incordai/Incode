@@ -600,6 +600,14 @@ impl ClaudeCodeBackend {
         self
     }
 
+    /// Announce each file write this model makes to the engine's edit check,
+    /// and record each read — see `toolbox::code_edits`.
+    #[must_use]
+    pub fn with_code_edits(mut self, edits: Option<crate::toolbox::CodeEdits>) -> Self {
+        self.tools = self.tools.with_code_edits(edits);
+        self
+    }
+
     /// Continue an existing agent session on the next turn.
     pub fn set_session_id(&mut self, session_id: &str) {
         self.session_id = Some(session_id.to_string());

@@ -1407,6 +1407,7 @@ pub(crate) fn route_backend(
             // The memory engine's guard, asked before each of the harness's own
             // tools runs, and the operator's own commands around each.
             .with_engine(crate::hooks::engine::Engine::locate())
+            .with_code_edits(crate::toolbox::CodeEdits::locate())
             .with_operator_hooks(crate::hooks::HookRunner::from_settings())
             .with_sandbox(sandbox_for(permission_mode_from_env()))
             .with_desktop(desktop_setup_for(
@@ -1496,6 +1497,7 @@ fn run_backend_with_desktop(
                     // the API route, and the operator's own commands run
                     // around each.
                     .with_engine(crate::hooks::engine::Engine::locate())
+                    .with_code_edits(crate::toolbox::CodeEdits::locate())
                     .with_operator_hooks(crate::hooks::HookRunner::from_settings())
                     .with_sandbox(sandbox_for(mode));
 

@@ -428,6 +428,7 @@ fn drive(
                     // wants confirmed is the owner's app's to answer, or
                     // refused.
                     .with_engine(crate::hooks::engine::Engine::locate())
+                    .with_code_edits(crate::toolbox::CodeEdits::locate())
                     .with_operator_hooks(crate::hooks::HookRunner::from_settings())
                     .with_sandbox(
                         crate::admin::AdminConfig::load_default()
