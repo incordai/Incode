@@ -695,6 +695,9 @@ impl<B: AgentBackend> TaskWorker for AgentBackendWorker<B> {
 
     fn release(&mut self) {
         self.heard_up_to = None;
+        // The run is over: its claims and reads go now, not at their TTL.
+        // Before the clear, while the backend still names the run's session.
+        self.backend.end_code_edits();
         self.backend.clear_session();
         // Cleared too, so a worker reused for a later run does not think it is
         // still mid-conversation on a task whose session it has just dropped —
@@ -1540,6 +1543,10 @@ mod tests {
             self.session = None;
             self.log.push("clear".to_string());
         }
+
+        fn end_code_edits(&mut self) {
+            self.log.push("end".to_string());
+        }
     }
 
     /// Says a fixed thing, and remembers every prompt it was sent.
@@ -1948,6 +1955,21 @@ mod tests {
             vec!["clear", "turn", "clear", "turn"],
             "the second task resumed the first task's conversation"
         );
+    }
+
+    /// The run's end tells the engine its session is over — its claims and
+    /// reads go then, not at their TTL — and does so while the backend still
+    /// names that session, before the conversation is dropped. A task starting
+    /// mid-run ends nothing.
+    #[test]
+    fn a_released_worker_ends_its_code_edits_before_it_drops_the_conversation() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut worker =
+            AgentBackendWorker::in_workspace(ConversationSpy::default(), dir.path().to_path_buf());
+        let _ = worker.work(&Task::new("t-1", "r-1", "the first piece of work"));
+        let _ = worker.work(&Task::new("t-2", "r-1", "the second piece of work"));
+        worker.release();
+        assert_eq!(worker.backend.log, vec!["clear", "turn", "clear", "turn", "end", "clear"]);
     }
 
     /// **A RETRY IS THE SAME TASK, AND KEEPS ITS CONVERSATION.**
