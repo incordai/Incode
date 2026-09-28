@@ -477,6 +477,18 @@ fn live_an_unseen_change_is_refused_by_the_engine() {
     println!("the parent is refused: {refused}");
     assert!(refused.contains(&child_edits.agent_id()), "{refused}");
     assert!(std::fs::read_to_string(repo.join(file)).unwrap().contains("copied()"));
+
+    // The code tools answer from the same engine's code index for this
+    // checkout (the script points INCORD_MEMORY_URL at it).
+    let found = a.run_call("k-1", "find_symbol", &json!({ "symbol": "apply_voucher" })).expect("find_symbol").text;
+    println!("find_symbol: {found}");
+    assert!(found.contains("src/cart.rs"), "{found}");
+    let outline = a.run_call("k-2", "code_skeleton", &json!({ "path": file })).expect("code_skeleton").text;
+    println!("code_skeleton: {outline}");
+    assert!(outline.contains("cart_total") && outline.contains("apply_voucher"), "{outline}");
+    let blast = a.run_call("k-3", "git_blast_radius", &json!({})).expect("git_blast_radius").text;
+    println!("git_blast_radius: {blast}");
+    assert!(blast.contains("apply_voucher") || blast.contains("cart_total"), "{blast}");
 }
 
 #[test]

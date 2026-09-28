@@ -2196,8 +2196,15 @@ impl Toolbox {
             AGENT => self.run_subagent(input),
             ASK_USER_QUESTION => self.ask_here(input),
             crate::brief::SAVE_TOOL => self.save_brief(&raw),
-            other => crate::knowledge::handle_tool(other, input)
-                .or_else(|| crate::web::handle_tool(other, input, render))
+            other => crate::knowledge::handle_tool(
+                other,
+                input,
+                &crate::knowledge::CodeContext {
+                    cwd: &self.workspace,
+                    resolve: &|path| self.resolve(path),
+                },
+            )
+            .or_else(|| crate::web::handle_tool(other, input, render))
                 .or_else(|| self.team.handle(other, input))
                 .unwrap_or_else(|| Err(format!("there is no tool called `{other}`"))),
         }

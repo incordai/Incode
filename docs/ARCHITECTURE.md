@@ -1045,7 +1045,8 @@ for a patch). The ACP kind is `acp_agent::present::tool_kind`.
 | `Agent` | run | other | depth 2 | on the model endpoint when one is configured; otherwise on the agent CLI this toolbox's model runs in (`Toolbox::run_subagents_on`, set by the claude backend): a second headless run of it as a model only, its own toolbox one level down, the session's mode, guards, engine, person to ask, cancel and memory session id, its role routing its model (the operator's candidates, then the CLI's own ladder). Neither: refused. A worker — see "What a tool and a worker do while they run" |
 | `AskUserQuestion` | session | other | — | |
 | `verify` | run | other | 600 s | |
-| `recall_index`, `recall_get`, `memory_search`, `find_symbol`, `code_skeleton`, `git_blast_radius` | observe | other | 8 s | the memory service |
+| `recall_index`, `recall_get`, `memory_search` | observe | other | 8 s | the memory service |
+| `find_symbol`, `code_skeleton`, `git_blast_radius` | observe | other | 8 s | the engine's code index for this checkout (`code_find_symbol`, `code_outline` — the path made relative to the root `code_index_status` names — and `git_blast_radius`, over `/v1/memory/mcp` with the workspace as `cwd`) |
 | `watchman_lookup` | observe | search | 8 s, 20 000 chars | `POST /v1/memory/watchman/lookup`; project named by `recorder::task_for` |
 | `remember`, `forget_memory`, `save_brief` | record | other | 8 s | |
 | `team_ask`, `team_tell`, `team_answer` | record | other | — | speaks as the harness's identity for the task |

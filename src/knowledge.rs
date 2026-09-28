@@ -31,14 +31,9 @@ pub const SEARCH_PATH: &str = "/v1/memory/search";
 /// Where one stored message is corrected or removed.
 pub const MESSAGE_PATH: &str = "/v1/memory/messages";
 
-/// Where a name is looked up in the store's index of this machine's code.
-pub const SYMBOL_PATH: &str = "/v1/memory/graph/find-symbol";
-
-/// Where a signatures-only AST view of a file is fetched.
-pub const SKELETON_PATH: &str = "/v1/memory/graph/code-skeleton";
-
-/// Where the transitive blast radius of git changes is calculated.
-pub const BLAST_RADIUS_PATH: &str = "/v1/memory/graph/git-blast-radius";
+/// Where the engine serves its tools — the code index's among them, which the
+/// three code tools below ask for the checkout the session works in.
+pub const MCP_PATH: &str = "/v1/memory/mcp";
 
 /// The tools this module advertises.
 pub const REMEMBER_TOOL: &str = "remember";
@@ -350,9 +345,10 @@ pub fn tool_definitions() -> Vec<serde_json::Value> {
         serde_json::json!({
             "name": SYMBOL_TOOL,
             "description": "Find where a type, function or constant is DEFINED — its file and \
-                line range — from the index the store keeps of this machine's code. Use it \
-                instead of searching when you know the name: it answers with the definition \
-                rather than with every place the word appears.",
+                line range — from the code index of the checkout this session works in. Use \
+                it instead of searching when you know the name: it answers with the \
+                definition rather than with every place the word appears. `Type::method` \
+                narrows to one type's.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -363,53 +359,67 @@ pub fn tool_definitions() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": SKELETON_TOOL,
-            "description": "Signatures-only view of a file with implementation bodies stripped (~10x cheaper than reading the file). Returns function, method, struct, enum, and class definitions with line spans, signatures, and doc comments.",
+            "description": "Every definition in one file as signatures without bodies, in \
+                source order, with line spans (~10x cheaper than reading the file).",
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Absolute or repo-relative path of the code file to skeletonize."}
+                    "path": {"type": "string", "description": "The file, absolute or relative to the workspace."}
                 },
                 "required": ["path"]
             }
         }),
         serde_json::json!({
             "name": BLAST_RADIUS_TOOL,
-            "description": "Calculate blast radius of uncommitted edits or a git diff. Automatically maps changed lines to enclosing code definitions, traces transitive callers (depth 1-5), and identifies impacted test suites to run.",
+            "description": "The blast radius of the uncommitted changes in this checkout: \
+                the definitions they touch, how far each reaches through its callers \
+                (depth 1-5), and the tests among those callers — the ones to run.",
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "depth": {"type": "integer", "description": "Transitive caller walk depth, 1-5 (default 2)."},
-                    "limit": {"type": "integer", "description": "Max callers per name per level (default 25, max 200)."},
-                    "repo_path": {"type": "string", "description": "Path to the repository/project root."}
+                    "depth": {"type": "integer", "description": "Caller walk depth, 1-5 (default 2)."},
+                    "repo_path": {"type": "string", "description": "Another checkout to measure instead of this session's."}
                 }
             }
         }),
     ]
 }
 
+/// What the code tools need of the session: the folder the engine resolves the
+/// checkout from, and how a path the model named is resolved — the way the
+/// file tools resolve it, inside the workspace.
+pub struct CodeContext<'a> {
+    pub cwd: &'a std::path::Path,
+    pub resolve: &'a dyn Fn(&str) -> Result<std::path::PathBuf, String>,
+}
+
 /// Run one of this module's tools. `None` when the name is not one of them.
-pub fn handle_tool(name: &str, input: &serde_json::Value) -> Option<Result<String, String>> {
+pub fn handle_tool(
+    name: &str,
+    input: &serde_json::Value,
+    code: &CodeContext<'_>,
+) -> Option<Result<String, String>> {
     match name {
         REMEMBER_TOOL => Some(run_remember(input)),
         SEARCH_TOOL => Some(run_search(input)),
         FORGET_TOOL => Some(run_forget(input)),
-        SYMBOL_TOOL => Some(run_symbol(input)),
-        SKELETON_TOOL => Some(run_skeleton(input)),
-        BLAST_RADIUS_TOOL => Some(run_blast_radius(input)),
+        SYMBOL_TOOL => Some(run_symbol(input, code)),
+        SKELETON_TOOL => Some(run_skeleton(input, code)),
+        BLAST_RADIUS_TOOL => Some(run_blast_radius(input, code)),
         _ => None,
     }
 }
 
-/// Ask the store where a name is defined.
+/// Ask the checkout's code index where a name is defined (`code_find_symbol`).
 ///
 /// # Why this instead of a language server
 ///
 /// Going to a definition is most of what a language server is wanted for here,
-/// and the store already indexes it across every project on this machine — so
-/// this is one request rather than a server per language, each with its own
-/// lifecycle to manage. What it does NOT give is hover types, completions or
+/// and the engine already indexes every checkout it knows — so this is one
+/// request rather than a server per language, each with its own lifecycle to
+/// manage. What it does NOT give is hover types, completions or
 /// rename-across-project; if those are ever needed, they need the real thing.
-fn run_symbol(input: &serde_json::Value) -> Result<String, String> {
+fn run_symbol(input: &serde_json::Value, code: &CodeContext<'_>) -> Result<String, String> {
     let symbol = input
         .get("symbol")
         .and_then(|s| s.as_str())
@@ -418,56 +428,10 @@ fn run_symbol(input: &serde_json::Value) -> Result<String, String> {
     if symbol.is_empty() {
         return Err("say which name to look up".to_string());
     }
-    let url = format!(
-        "{}{SYMBOL_PATH}",
-        crate::brief::memory_url().trim_end_matches('/')
-    );
-    let body = serde_json::json!({ "symbol": symbol }).to_string();
-    parse_symbol(&post(&url, body)?, symbol)
-}
-
-/// Read the store's answer into something a model can act on.
-///
-/// Split out so the rendering is testable without the store running — the shape
-/// was taken from a live call, and a parser tested only against itself passes
-/// while the field names drift.
-pub fn parse_symbol(body: &str, symbol: &str) -> Result<String, String> {
-    let value: serde_json::Value = serde_json::from_str(body)
-        .map_err(|e| format!("the symbol index's answer did not parse: {e}"))?;
-    let found = value
-        .get("definitions")
-        .and_then(|d| d.as_array())
-        .map(Vec::as_slice)
-        .unwrap_or_default();
-    if found.is_empty() {
-        // Said plainly rather than as an empty list: "not indexed" and "does not
-        // exist" are different, and a model told nothing will assume the second.
-        return Ok(format!(
-            "`{symbol}` is not in the symbol index. It may still exist — search for it."
-        ));
-    }
-    let mut out = format!("`{symbol}` is defined in:\n");
-    for one in found {
-        let field = |key: &str| {
-            one.get(key)
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("")
-        };
-        let line = |key: &str| {
-            one.get(key)
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0)
-        };
-        out.push_str(&format!(
-            "  {}:{}-{}  {} {}\n",
-            field("path"),
-            line("start_line"),
-            line("end_line"),
-            field("kind"),
-            field("symbol"),
-        ));
-    }
-    Ok(out)
+    engine_tool(
+        "code_find_symbol",
+        serde_json::json!({ "name": symbol, "cwd": code.cwd }),
+    )
 }
 
 fn run_remember(input: &serde_json::Value) -> Result<String, String> {
@@ -527,118 +491,114 @@ fn run_forget(input: &serde_json::Value) -> Result<String, String> {
     }
 }
 
-fn run_skeleton(input: &serde_json::Value) -> Result<String, String> {
+/// One file's definitions as signatures (`code_outline`). The engine takes the
+/// file relative to the checkout's root, which need not be the workspace — so
+/// the path is resolved the way the file tools resolve it and made relative to
+/// the root the engine reports for this session's checkout.
+fn run_skeleton(input: &serde_json::Value, code: &CodeContext<'_>) -> Result<String, String> {
     let path = input
         .get("path")
         .and_then(|p| p.as_str())
         .unwrap_or("")
         .trim();
     if path.is_empty() {
-        return Err("say which file path to skeletonize".to_string());
+        return Err("say which file to outline".to_string());
     }
-    let url = format!(
-        "{}{SKELETON_PATH}",
-        crate::brief::memory_url().trim_end_matches('/')
-    );
-    let body = serde_json::json!({ "path": path }).to_string();
-    parse_code_skeleton(&post(&url, body)?)
+    let file = (code.resolve)(path)?;
+    let status = engine_tool("code_index_status", serde_json::json!({ "cwd": code.cwd }))?;
+    let root = serde_json::from_str::<serde_json::Value>(&status)
+        .ok()
+        .and_then(|v| v.get("root").and_then(|r| r.as_str()).map(std::path::PathBuf::from))
+        .ok_or_else(|| format!("the code index named no checkout root: {status}"))?;
+    let rel = relative_to(&file, &root)
+        .ok_or_else(|| format!("`{path}` is not inside the checkout at {}", root.display()))?;
+    engine_tool(
+        "code_outline",
+        serde_json::json!({ "file": rel, "cwd": code.cwd }),
+    )
 }
 
-fn run_blast_radius(input: &serde_json::Value) -> Result<String, String> {
-    let depth = input.get("depth").and_then(|d| d.as_u64()).unwrap_or(2);
-    let limit = input.get("limit").and_then(|l| l.as_u64()).unwrap_or(25);
-    let repo_path = input
+/// The blast radius of the checkout's uncommitted changes (`git_blast_radius`
+/// on the code index).
+fn run_blast_radius(input: &serde_json::Value, code: &CodeContext<'_>) -> Result<String, String> {
+    let depth = input
+        .get("depth")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(2)
+        .clamp(1, 5);
+    let cwd = match input
         .get("repo_path")
         .and_then(|r| r.as_str())
-        .unwrap_or("")
-        .trim();
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+    {
+        Some(repo) => (code.resolve)(repo)?,
+        None => code.cwd.to_path_buf(),
+    };
+    engine_tool(
+        "git_blast_radius",
+        serde_json::json!({ "cwd": cwd, "depth": depth }),
+    )
+}
+
+/// `file` relative to `root`, `/`-separated, both compared where they really
+/// are (a file not written yet by its folder); `None` when it is not under it.
+fn relative_to(file: &std::path::Path, root: &std::path::Path) -> Option<String> {
+    let real = |p: &std::path::Path| {
+        std::fs::canonicalize(p).ok().or_else(|| {
+            let parent = std::fs::canonicalize(p.parent()?).ok()?;
+            Some(parent.join(p.file_name()?))
+        })
+    };
+    let rel = real(file)?
+        .strip_prefix(real(root)?)
+        .ok()?
+        .to_string_lossy()
+        .replace('\\', "/");
+    (!rel.is_empty()).then_some(rel)
+}
+
+/// Call one of the engine's tools and return what it said.
+fn engine_tool(name: &str, arguments: serde_json::Value) -> Result<String, String> {
     let url = format!(
-        "{}{BLAST_RADIUS_PATH}",
+        "{}{MCP_PATH}",
         crate::brief::memory_url().trim_end_matches('/')
     );
-    let mut payload = serde_json::json!({
-        "depth": depth,
-        "limit": limit,
+    let body = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": name, "arguments": arguments },
     });
-    if !repo_path.is_empty() {
-        payload["repo_path"] = serde_json::json!(repo_path);
-    }
-    parse_blast_radius(&post(&url, payload.to_string())?)
+    parse_tool_reply(&post(&url, body.to_string())?)
 }
 
-/// Read the code skeleton store answer.
-pub fn parse_code_skeleton(body: &str) -> Result<String, String> {
+/// The text of an engine tool's answer, or its error.
+///
+/// Split out so the reading is testable without the engine running: a
+/// JSON-RPC error and a tool result flagged `isError` are both failures, and
+/// only the text of a successful result is the answer.
+pub fn parse_tool_reply(body: &str) -> Result<String, String> {
     let value: serde_json::Value = serde_json::from_str(body)
-        .map_err(|e| format!("the code skeleton answer did not parse: {e}"))?;
-    if let Some(formatted) = value.get("formatted").and_then(|f| f.as_str()) {
-        if !formatted.trim().is_empty() {
-            return Ok(formatted.to_string());
-        }
+        .map_err(|e| format!("the engine's answer did not parse: {e}"))?;
+    if let Some(error) = value.get("error") {
+        return Err(error
+            .get("message")
+            .and_then(|m| m.as_str())
+            .map_or_else(|| error.to_string(), str::to_string));
     }
-    let path = value.get("path").and_then(|p| p.as_str()).unwrap_or("");
-    let items = value
-        .get("items")
-        .and_then(|i| i.as_array())
-        .map(Vec::as_slice)
-        .unwrap_or_default();
-    if items.is_empty() {
-        return Ok(format!("no code skeleton definitions found for `{path}`"));
+    let result = value
+        .get("result")
+        .ok_or("the engine's answer carried no result")?;
+    let text = result
+        .get("content")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("text"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .to_string();
+    if result.get("isError").and_then(serde_json::Value::as_bool) == Some(true) {
+        return Err(text);
     }
-    let mut out = format!("# Skeleton — {path} ({} definitions)\n\n", items.len());
-    for item in items {
-        let symbol = item.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
-        let kind = item.get("kind").and_then(|k| k.as_str()).unwrap_or("");
-        let start = item.get("start_line").and_then(|l| l.as_u64()).unwrap_or(0);
-        let end = item.get("end_line").and_then(|l| l.as_u64()).unwrap_or(0);
-        let sig = item.get("signature").and_then(|s| s.as_str()).unwrap_or("");
-        let doc = item.get("doc").and_then(|d| d.as_str()).unwrap_or("");
-        out.push_str(&format!("- L{start}-L{end} [{kind}] {symbol}: `{sig}`\n"));
-        if !doc.trim().is_empty() {
-            out.push_str(&format!("  /// {}\n", doc.trim()));
-        }
-    }
-    Ok(out)
-}
-
-/// Read the git blast radius answer into a concise summary.
-pub fn parse_blast_radius(body: &str) -> Result<String, String> {
-    let value: serde_json::Value = serde_json::from_str(body)
-        .map_err(|e| format!("the blast radius answer did not parse: {e}"))?;
-    let status = value.get("status").and_then(|s| s.as_str()).unwrap_or("");
-    let message = value.get("message").and_then(|m| m.as_str()).unwrap_or("");
-    let affected_symbols = value
-        .get("affected_symbols")
-        .and_then(|a| a.as_u64())
-        .unwrap_or(0);
-    let changed_files = value
-        .get("changed_files")
-        .and_then(|c| c.as_u64())
-        .unwrap_or(0);
-    let impacted_tests = value
-        .get("impacted_tests")
-        .and_then(|t| t.as_array())
-        .map(Vec::as_slice)
-        .unwrap_or_default();
-
-    if status == "clean" || (changed_files == 0 && affected_symbols == 0) {
-        if !message.is_empty() {
-            return Ok(format!("Blast radius clean: {message}"));
-        }
-        return Ok("Blast radius clean: no uncommitted changes or affected symbols.".to_string());
-    }
-
-    let mut out = format!(
-        "Blast radius: {changed_files} file(s) changed, {affected_symbols} symbol(s) affected.\n"
-    );
-    if !impacted_tests.is_empty() {
-        out.push_str("Impacted tests to verify:\n");
-        for t in impacted_tests {
-            if let Some(name) = t.as_str() {
-                out.push_str(&format!("  - {name}\n"));
-            }
-        }
-    }
-    Ok(out)
+    Ok(text)
 }
 
 /// The subject filter for searching finished work by a specific worker in Incord Memory.
@@ -922,113 +882,64 @@ mod tests {
 
     /// The store's own answer, taken from a live call rather than written from
     /// the parser — a shape invented here would pass while the real fields drift.
-    const LIVE_SYMBOL: &str = r#"{
-      "definitions": [
-        {"end_line": 119, "kind": "struct_item", "node_id": "file-x",
-         "path": "src/toolbox.rs", "start_line": 85, "symbol": "Toolbox"}
-      ],
-      "symbol": "Toolbox", "total": 1
-    }"#;
+    #[test]
+    fn a_tool_reply_is_its_text_and_an_error_is_an_error() {
+        // The engine's tool answer, as the MCP endpoint sends it.
+        let ok = r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"function · run_turn · src/agent.rs:10-40"}],"isError":false}}"#;
+        assert_eq!(parse_tool_reply(ok).unwrap(), "function · run_turn · src/agent.rs:10-40");
+
+        let flagged = r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"not_in_project"}],"isError":true}}"#;
+        assert_eq!(parse_tool_reply(flagged).unwrap_err(), "not_in_project");
+
+        let rpc = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"unknown tool"}}"#;
+        assert_eq!(parse_tool_reply(rpc).unwrap_err(), "unknown tool");
+
+        // An answer that is not JSON is an error, not an empty result.
+        assert!(parse_tool_reply("<html>down</html>").is_err());
+    }
 
     #[test]
-    fn a_definition_says_the_file_and_the_lines() {
-        // The whole value over searching: a place to go, not a list of mentions.
-        let out = parse_symbol(LIVE_SYMBOL, "Toolbox").expect("the live shape parses");
-        assert!(out.contains("src/toolbox.rs"), "{out}");
-        assert!(out.contains("85"), "the line it starts on: {out}");
-        assert!(out.contains("119"), "and where it ends: {out}");
-        assert!(
-            out.contains("struct_item"),
-            "and what kind of thing it is: {out}"
+    fn a_file_is_named_relative_to_the_checkout_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("crates").join("a").join("src")).unwrap();
+        std::fs::write(root.join("crates/a/src/lib.rs"), "").unwrap();
+        assert_eq!(
+            relative_to(&root.join("crates").join("a").join("src").join("lib.rs"), root).as_deref(),
+            Some("crates/a/src/lib.rs")
         );
+        // Not written yet: placed by its folder.
+        assert_eq!(
+            relative_to(&root.join("crates").join("a").join("src").join("new.rs"), root).as_deref(),
+            Some("crates/a/src/new.rs")
+        );
+        // Outside the root, or the root itself: nothing to name.
+        let other = tempfile::tempdir().unwrap();
+        std::fs::write(other.path().join("x.rs"), "").unwrap();
+        assert_eq!(relative_to(&other.path().join("x.rs"), root), None);
+        assert_eq!(relative_to(root, root), None);
     }
 
     #[test]
-    fn a_name_that_is_not_indexed_is_not_reported_as_missing() {
-        // "not indexed" and "does not exist" are different claims, and a model
-        // told the first will act on the second unless the difference is said.
-        let out = parse_symbol(r#"{"definitions": [], "total": 0}"#, "Ghost").expect("parses");
-        assert!(out.contains("not in the symbol index"), "{out}");
-        assert!(out.contains("It may still exist"), "{out}");
-    }
-
-    #[test]
-    fn an_answer_that_is_not_json_is_an_error_not_an_empty_result() {
-        assert!(parse_symbol("<html>down</html>", "Toolbox").is_err());
-    }
-
-    #[test]
-    fn the_symbol_tool_is_advertised_with_the_rest() {
+    fn the_code_tools_are_advertised_and_wired() {
         let names: Vec<String> = tool_definitions()
             .iter()
             .filter_map(|d| d["name"].as_str().map(str::to_string))
             .collect();
-        assert!(names.iter().any(|n| n == SYMBOL_TOOL), "{names:?}");
-        assert!(
-            handle_tool(SYMBOL_TOOL, &serde_json::json!({})).is_some(),
-            "advertised but not wired"
-        );
-    }
-
-    #[test]
-    fn code_skeleton_and_blast_radius_tools_are_advertised_and_wired() {
-        let names: Vec<String> = tool_definitions()
-            .iter()
-            .filter_map(|d| d["name"].as_str().map(str::to_string))
-            .collect();
-        assert!(names.iter().any(|n| n == SKELETON_TOOL), "{names:?}");
-        assert!(names.iter().any(|n| n == BLAST_RADIUS_TOOL), "{names:?}");
-        assert!(
-            handle_tool(SKELETON_TOOL, &serde_json::json!({})).is_some(),
-            "skeleton advertised but not wired"
-        );
-        assert!(
-            handle_tool(BLAST_RADIUS_TOOL, &serde_json::json!({})).is_some(),
-            "blast radius advertised but not wired"
-        );
-    }
-
-    #[test]
-    fn parse_code_skeleton_formats_definitions_and_preserves_doc() {
-        let json = r#"{
-            "path": "src/identity.rs",
-            "items": [
-                {
-                    "symbol": "AgentId",
-                    "kind": "struct_item",
-                    "start_line": 31,
-                    "end_line": 38,
-                    "signature": "pub struct AgentId",
-                    "doc": "/// One worker, as the harness understands it."
-                }
-            ]
-        }"#;
-        let out = parse_code_skeleton(json).expect("parses skeleton");
-        assert!(out.contains("Skeleton — src/identity.rs"));
-        assert!(out.contains("L31-L38 [struct_item] AgentId: `pub struct AgentId`"));
-        assert!(out.contains("/// One worker, as the harness understands it."));
-
-        let formatted_json = r##"{"formatted": "# Pre-rendered markdown skeleton\n"}"##;
-        let out_formatted = parse_code_skeleton(formatted_json).expect("parses formatted");
-        assert_eq!(out_formatted, "# Pre-rendered markdown skeleton\n");
-    }
-
-    #[test]
-    fn parse_blast_radius_formats_changed_files_and_impacted_tests() {
-        let clean_json = r#"{"status":"clean","affected_symbols":0,"changed_files":0,"impacted_tests":[],"message":"No changes."}"#;
-        let clean_out = parse_blast_radius(clean_json).expect("parses clean blast radius");
-        assert!(clean_out.contains("Blast radius clean: No changes."));
-
-        let dirty_json = r#"{
-            "status": "dirty",
-            "affected_symbols": 3,
-            "changed_files": 1,
-            "impacted_tests": ["tests::test_agent_isolation", "tests::test_ledger_verify"]
-        }"#;
-        let dirty_out = parse_blast_radius(dirty_json).expect("parses dirty blast radius");
-        assert!(dirty_out.contains("1 file(s) changed, 3 symbol(s) affected"));
-        assert!(dirty_out.contains("tests::test_agent_isolation"));
-        assert!(dirty_out.contains("tests::test_ledger_verify"));
+        // Every call below is answered here, before any engine is asked: a test
+        // must never reach the engine this machine runs.
+        let refuse = |_: &str| Err("outside the workspace".to_string());
+        let code = CodeContext { cwd: std::path::Path::new("."), resolve: &refuse };
+        for (tool, input, said) in [
+            (SYMBOL_TOOL, serde_json::json!({}), "say which name to look up"),
+            (SKELETON_TOOL, serde_json::json!({}), "say which file to outline"),
+            (SKELETON_TOOL, serde_json::json!({ "path": "../x.rs" }), "outside the workspace"),
+            (BLAST_RADIUS_TOOL, serde_json::json!({ "repo_path": "../other" }), "outside the workspace"),
+        ] {
+            assert!(names.iter().any(|n| n == tool), "{tool} not advertised: {names:?}");
+            let answer = handle_tool(tool, &input, &code).expect("advertised but not wired");
+            assert_eq!(answer.unwrap_err(), said, "{tool} {input}");
+        }
     }
 
     #[test]
