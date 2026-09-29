@@ -410,23 +410,17 @@ fn drive(
     // One catalogue for both routes: the chosen agent first, then every usable
     // local agent, then a usable API. Setting the API variables no longer
     // replaces the installed agents — it adds one more place to send the work.
-    let chain = crate::agent::catalogue::Catalogue::gather(
-        &crate::admin::AdminConfig::load_default().api_providers,
-    )
-    .usable_chain(crate::agent::registry::preferred_agent().as_deref())?;
+    let chain =
+        crate::agent::catalogue::Catalogue::gather(&crate::admin::AdminConfig::load_default())
+            .usable_chain(crate::agent::registry::preferred_agent().as_deref())?;
     let candidates: Vec<Candidate> = chain
         .into_iter()
-        .map(|agent| {
-            let api = if agent.id == crate::agent::registry::API_ROUTE {
-                crate::agent::api::Settings::from_env()
-            } else {
-                None
-            };
-            match api {
+        .map(
+            |agent| match crate::agent::models::settings_for(&agent.id) {
                 Some(settings) => Candidate::Api(settings),
                 None => Candidate::Cli(agent),
-            }
-        })
+            },
+        )
         .collect();
 
     let total_candidates = candidates.len();
@@ -434,31 +428,34 @@ fn drive(
 
     for (idx, candidate) in candidates.into_iter().enumerate() {
         let agent_id = match &candidate {
-            Candidate::Api(_) => crate::agent::registry::API_ROUTE.to_string(),
+            Candidate::Api(settings) => settings.route.clone(),
             Candidate::Cli(agent) => agent.id.clone(),
         };
         let (backend, route): (Box<dyn AgentBackend>, String) = match candidate {
-            Candidate::Api(settings) => (
-                Box::new(
-                    crate::agent::api::ApiBackend::new(
-                        settings,
-                        workspace,
-                        &system.join("\n\n"),
-                        true,
-                    )
-                    // Nobody is at an unattended run: a call the engine
-                    // wants confirmed is the owner's app's to answer, or
-                    // refused.
-                    .with_engine(crate::hooks::engine::Engine::locate())
-                    .with_code_edits(crate::toolbox::CodeEdits::locate())
-                    .with_operator_hooks(crate::hooks::HookRunner::from_settings())
-                    .with_sandbox(
-                        crate::admin::AdminConfig::load_default()
-                            .sandbox_policy(crate::permissions::PermissionMode::WorkspaceWrite),
+            Candidate::Api(settings) => {
+                let named = format!("{} over its API", settings.route);
+                (
+                    Box::new(
+                        crate::agent::api::ApiBackend::new(
+                            settings,
+                            workspace,
+                            &system.join("\n\n"),
+                            true,
+                        )
+                        // Nobody is at an unattended run: a call the engine
+                        // wants confirmed is the owner's app's to answer, or
+                        // refused.
+                        .with_engine(crate::hooks::engine::Engine::locate())
+                        .with_code_edits(crate::toolbox::CodeEdits::locate())
+                        .with_operator_hooks(crate::hooks::HookRunner::from_settings())
+                        .with_sandbox(
+                            crate::admin::AdminConfig::load_default()
+                                .sandbox_policy(crate::permissions::PermissionMode::WorkspaceWrite),
+                        ),
                     ),
-                ),
-                "a model over the configured API".to_string(),
-            ),
+                    named,
+                )
+            }
             Candidate::Cli(agent) => {
                 let named = agent.display_name.clone();
                 (

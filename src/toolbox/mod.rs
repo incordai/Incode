@@ -489,6 +489,11 @@ pub struct Toolbox {
     /// `Agent` tool starts its sub-agent there when no model endpoint is
     /// configured. See [`subagent`].
     cli_agent: Option<String>,
+    /// The API route this toolbox's model is driven over, when it is: the
+    /// `Agent` tool starts its sub-agent there, so a model chosen by name
+    /// hands work to the same service rather than to whatever the
+    /// environment happens to configure.
+    api_route: Option<crate::agent::api::Settings>,
     /// The only tools this toolbox offers and runs, when a sub-agent's
     /// definition named them ([`crate::subagents`]). `None` is every tool.
     allowed: Option<Vec<String>>,
@@ -540,6 +545,7 @@ impl Toolbox {
             desktop: None,
             watch: None,
             cli_agent: None,
+            api_route: None,
             allowed: None,
             hooks: None,
             sandbox: crate::sandbox::SandboxPolicy::OFF,
@@ -883,6 +889,11 @@ impl Toolbox {
     /// Who is asked when the engine wants a person to confirm a call.
     pub fn set_prompter(&mut self, prompter: Arc<dyn crate::hooks::engine::Prompter>) {
         self.prompter = Some(prompter);
+    }
+
+    /// The API route this toolbox's model is driven over, for its sub-agents.
+    pub fn set_api_route(&mut self, route: crate::agent::api::Settings) {
+        self.api_route = Some(route);
     }
 
     /// Who is asked about a protected write when nobody is at the session.
@@ -1644,7 +1655,10 @@ impl Toolbox {
                             allowed: false,
                             rule: None,
                             path: None,
-                            reason: Some(crate::text::truncate(&refusal, MAX_DECISION_REASON_CHARS)),
+                            reason: Some(crate::text::truncate(
+                                &refusal,
+                                MAX_DECISION_REASON_CHARS,
+                            )),
                         },
                     );
                     return Err(refusal);
@@ -2205,8 +2219,8 @@ impl Toolbox {
                 },
             )
             .or_else(|| crate::web::handle_tool(other, input, render))
-                .or_else(|| self.team.handle(other, input))
-                .unwrap_or_else(|| Err(format!("there is no tool called `{other}`"))),
+            .or_else(|| self.team.handle(other, input))
+            .unwrap_or_else(|| Err(format!("there is no tool called `{other}`"))),
         }
     }
 }

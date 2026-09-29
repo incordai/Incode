@@ -839,9 +839,26 @@ and never written to disk or printed.
   reply that breaks the rules above lists the provider as ONE entry, not usable, with
   the reason.
 
-Provider agents are listed but not driven yet: the contract does not say where an
-agent's turns go, so each is marked not usable ("driving provider agents is not wired
-yet") rather than routed to an endpoint nothing is known to answer.
+- **Turns**: `POST {url}/v1/chat/completions` in the chat-completions format, with the
+  key as a bearer and `model` set to the agent's `id` (`agent::models::provider_settings`).
+
+### API models, and the two wire formats
+
+admin.json `api_models` names each service reached with a key — `name`, `format`,
+`url`, `key_env`, `model`, `sub_model`, `auth` — and `agent::models` is the one place an
+id (`api`, a model's `name`, or `<provider>/<agent>`) becomes the `Settings` a backend
+is built from; the catalogue lists an id as usable by the same functions, so the two
+cannot disagree. Every key is sent only over `https` or to loopback
+(`catalogue::key_may_travel_to`), checked again in `ApiBackend::run_turn`.
+
+The turn loop keeps its conversation in the messages shape. A `format: "openai"` route
+is reached through `agent::openai`, which translates the request on the way out
+(system first, tools as functions, tool results as `tool` messages, their pictures in a
+following user message) and the reply — whole or streamed — back into the messages
+shape, so one parser and one loop serve both. The key travels in the one header `auth`
+names (`x-api-key` or `bearer`, default by format); the messages format also sends
+`anthropic-version: 2023-06-01`. A route's `sub_model` is what its sub-agents run on;
+`/models` reads the service's own `…/models` list, every page.
 
 ---
 

@@ -253,12 +253,16 @@ Details: `docs/ARCHITECTURE.md` §2.
 incode builds one catalogue of agents at session start:
 
 - **Local agents** found on `PATH` (`claude`, `codex`, `agy`).
-- **The API route** (id `api`): a model reached over HTTP, configured with
-  `INCODE_API_URL` (the messages endpoint), `INCODE_API_KEY` and
-  `INCODE_API_MODEL`. incode runs its own tool loop for it. Setting these adds
-  an entry; it does not replace the installed agents.
-- **Provider agents** from `admin.json` `api_providers` (below). They are listed
-  and marked not usable: driving them is not wired yet.
+- **API models** from `admin.json` `api_models` (below), each chosen by its
+  `name`: Anthropic, Z.ai, OpenRouter or any other service, with a key. incode
+  runs its own tool loop for them — its tools, guards and prompts.
+- **The environment's API route** (id `api`): `INCODE_API_URL` (the full
+  endpoint), `INCODE_API_KEY`, and optionally `INCODE_API_MODEL`,
+  `INCODE_API_SUB_MODEL`, `INCODE_API_FORMAT` and `INCODE_API_AUTH`. Setting
+  these adds an entry; it does not replace the installed agents.
+- **Provider agents** from `admin.json` `api_providers` (below), as
+  `<provider>/<agent>`. Driven at the provider's `/v1/chat/completions`, asking
+  for the agent's id as the model.
 
 | Command | What it does |
 |---|---|
@@ -268,13 +272,50 @@ incode builds one catalogue of agents at session start:
 | `/roles` | Show every role, the models it resolves to, and where that came from (your choice, an `INCODE_ROLE_*` variable, or unset = the session model). |
 | `/roles <role> <model\|@tier>...` | Save a role's ordered candidates (at most 8). An unknown role or tier is refused and nothing is written. |
 | `/roles <role> default` | Clear a role. |
-| `/model [name]` | Show or switch the session's model. |
+| `/model [name]` | Show or switch the session's model — on an API model, any model its service offers. |
+| `/models` | List the models the current API model's service offers (its own `…/models` list, every page). |
 
 The lead is `INCODE_AGENT`, else `admin.json` `agent`, when usable; else the
 first usable local agent; else a usable API agent. Roles are `explore`,
 `diagnose`, `plan`, `implement`, `review`, `frontend` and `grunt`. A candidate
 may name its agent as `agent:model`; a candidate naming an agent that is not
 installed is skipped. Changes apply from the next `/run` and the next session.
+
+### API models
+
+Each entry is one service, chosen by `name` with `/agent <name>`. Nothing about
+a vendor is built into incode: these are ordinary entries you write.
+
+```json
+"api_models": [
+  { "name": "anthropic", "format": "anthropic",
+    "url": "https://api.anthropic.com/v1/messages", "key_env": "ANTHROPIC_API_KEY",
+    "model": "claude-opus-5-5", "sub_model": "claude-haiku-4-5" },
+  { "name": "zai", "format": "anthropic", "auth": "bearer",
+    "url": "https://api.z.ai/api/anthropic/v1/messages", "key_env": "ZAI_API_KEY",
+    "model": "glm-5.3", "sub_model": "glm-5.3-flash" },
+  { "name": "openrouter", "format": "openai",
+    "url": "https://openrouter.ai/api/v1/chat/completions", "key_env": "OPENROUTER_API_KEY",
+    "model": "<a model id from /models>" }
+]
+```
+
+- `format`: `anthropic` (`…/v1/messages`, `x-api-key`, `anthropic-version`)
+  or `openai` (`…/chat/completions`, `Authorization: Bearer`). The conversation
+  is the same either way; incode translates at the edge.
+- `auth`: which header carries the key, `x-api-key` or `bearer`. Unset, the
+  format's own. Z.ai's Anthropic endpoint reads a bearer token.
+- `model` is the lead's model; `sub_model` the one its sub-agents run on (the
+  `Agent` tool). A sub-agent definition or an `INCODE_ROLE_*` model still wins.
+- `key_env` is the **name** of the variable holding the key, never the key. The
+  url must be `https`, or plain `http` to this machine; the key goes nowhere
+  else.
+- **Z.ai GLM Coding Plan (the subscription):** the plan's own endpoints,
+  `https://api.z.ai/api/anthropic/v1/messages` (as above) or, in the `openai`
+  format, `https://api.z.ai/api/coding/paas/v4/chat/completions`, with the key
+  from the plan's dashboard. Pay-as-you-go is
+  `https://api.z.ai/api/paas/v4/chat/completions` (`openai`).
+- `/model <id>` switches to any model the service offers; `/models` lists them.
 
 ### The API providers contract
 
@@ -291,6 +332,10 @@ installed is skipped. Changes apply from the next `/run` and the next session.
   `id` is required and unique; `name` and `model` are optional.
 - Each agent's catalogue id is `<provider name>/<id>`. A provider that cannot
   be asked shows as one entry saying why.
+- **A turn** for an agent goes to `POST {url}/v1/chat/completions` in the
+  chat-completions format, with `Authorization: Bearer <key>` and `model` set
+  to the agent's `id`, streamed. Tools are `function`s; the reply's
+  `tool_calls` are run by incode and answered with `tool` messages.
 
 ## Commands inside a session
 
@@ -602,6 +647,9 @@ and `--admin` prints which layer decided each value.
   "memory_url": "http://127.0.0.1:9180",
   "engine_bin": "/path/to/incord-memory-service",
   "api_providers": [{ "name": "team", "url": "https://agents.example", "key_env": "TEAM_API_KEY" }],
+  "api_models": [{ "name": "zai", "format": "anthropic", "auth": "bearer",
+                   "url": "https://api.z.ai/api/anthropic/v1/messages", "key_env": "ZAI_API_KEY",
+                   "model": "glm-5.3", "sub_model": "glm-5.3-flash" }],
   "web_search": { "url": "https://search.example/api", "key_env": "SEARCH_KEY" },
   "tools": [{ "name": "browser", "release": "<owner>/<repo>", "version": "latest",
               "asset": "<prefix>-{arch}-{os}.{ext}", "run": ["<program>", "mcp"],
@@ -624,6 +672,7 @@ and `--admin` prints which layer decided each value.
 | `scaffold` | The generator you want [a new project](#a-new-project) laid out with, per stack. A preference handed to the model when it writes `## Layout`; incode runs nothing from it itself |
 | `memory_url` · `engine_bin` | Where the memory service listens · where its engine binary is |
 | `api_providers` | Services that list API agents ([contract](#the-api-providers-contract)) |
+| `api_models` | [Models reached with a key](#api-models): `name`, `format`, `url`, `key_env`, `model`, `sub_model`, `auth` |
 | `web_search` | `WebSearch`'s endpoint (`url`, the query sent as `q`) and the name of its key's variable. The key is sent only over https or to loopback |
 | `tools` | [External tools](#external-tools): each one's release, version, asset, `run` and `provides` |
 | `browser_bin` · `pdf_renderer` | For development, a headless browser executable that wins over the installed one · which program `RenderPdf` uses |
@@ -644,7 +693,8 @@ Environment variables:
 | `INCODE_LANES` | Parallel `/run` lanes (needs git; at most 8) |
 | `INCODE_SANDBOX` | The sandbox mode |
 | `INCODE_DESKTOP` | `1` offers the desktop tools |
-| `INCODE_API_URL` · `INCODE_API_KEY` · `INCODE_API_MODEL` | The API route |
+| `INCODE_API_URL` · `INCODE_API_KEY` · `INCODE_API_MODEL` · `INCODE_API_SUB_MODEL` | The environment's API route: endpoint, key, model, sub-agents' model |
+| `INCODE_API_FORMAT` · `INCODE_API_AUTH` | Its format (`anthropic` · `openai`) and key header (`x-api-key` · `bearer`) |
 | `INCORD_MEMORY_URL` · `INCORD_ENGINE_BIN` | The memory service · its engine binary |
 | `INCODE_BROWSER` · `INCODE_PDF_BROWSER` · `INCODE_SOFFICE` | The headless browser · the PDF printer · LibreOffice |
 | `INCODE_SERVE_ORIGINS` | Extra origins `--serve` accepts |
@@ -727,7 +777,9 @@ moved. The old `INCORD_*` variables are not read any more: rename them.
   not spoken.
 - The Windows sandbox does not confine workspace-write, and no OS restricts
   the network.
-- Provider agents from `api_providers` are listed but not driven.
+- On an API model, the session's permission mode and `--add-dir` are not yet
+  applied to its toolbox, a 429 or 529 is not retried, and replies are capped at
+  8,192 tokens.
 
 The full list is in `docs/ROADMAP.md`.
 

@@ -40,6 +40,94 @@ pub const API_URL_ENV: &str = "INCODE_API_URL";
 pub const API_KEY_ENV: &str = "INCODE_API_KEY";
 /// Which model to ask for.
 pub const API_MODEL_ENV: &str = "INCODE_API_MODEL";
+/// The model sub-agents run on over the environment's route. Unset, they
+/// inherit [`API_MODEL_ENV`].
+pub const API_SUB_MODEL_ENV: &str = "INCODE_API_SUB_MODEL";
+/// Which wire format the endpoint speaks: `anthropic` (the default) or
+/// `openai`. See [`WireFormat`].
+pub const API_FORMAT_ENV: &str = "INCODE_API_FORMAT";
+
+/// The version header the messages format requires on every request. Fixed
+/// by that format's own documentation, not chosen here.
+const MESSAGES_VERSION: &str = "2023-06-01";
+
+/// Which request and reply shape an endpoint speaks.
+///
+/// The turn loop keeps its conversation in the messages shape either way; a
+/// chat-completions endpoint is reached through [`super::openai`], which
+/// translates at the edge. Named for the two shapes, not for the companies
+/// that published them: many services speak each.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WireFormat {
+    /// `POST .../v1/messages`: `tool_use` blocks, `x-api-key`, and the
+    /// `anthropic-version` header.
+    #[default]
+    Anthropic,
+    /// `POST .../chat/completions`: `tool_calls`, `Authorization: Bearer`.
+    Openai,
+}
+
+impl WireFormat {
+    /// The format a setting names, or `None` for a word that names neither.
+    #[must_use]
+    pub fn parse(word: &str) -> Option<Self> {
+        match word.trim().to_ascii_lowercase().as_str() {
+            "anthropic" | "messages" => Some(Self::Anthropic),
+            "openai" | "chat" | "chat-completions" => Some(Self::Openai),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::Openai => "openai",
+        }
+    }
+
+    /// The header this format's own documentation puts the key in.
+    #[must_use]
+    pub const fn default_auth(self) -> KeyHeader {
+        match self {
+            Self::Anthropic => KeyHeader::XApiKey,
+            Self::Openai => KeyHeader::Bearer,
+        }
+    }
+}
+
+/// Which header carries the key.
+///
+/// A setting rather than a property of the format: a service that speaks the
+/// messages format for tools built around a token reads `Authorization:
+/// Bearer` instead of `x-api-key` — Z.ai's endpoint for Claude Code is one.
+/// Only one is sent, so a service is never handed its key in a header it did
+/// not ask for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum KeyHeader {
+    /// `x-api-key: <key>`.
+    XApiKey,
+    /// `Authorization: Bearer <key>`.
+    Bearer,
+}
+
+impl KeyHeader {
+    /// The header a setting names, or `None` for a word that names neither.
+    #[must_use]
+    pub fn parse(word: &str) -> Option<Self> {
+        match word.trim().to_ascii_lowercase().as_str() {
+            "x-api-key" => Some(Self::XApiKey),
+            "bearer" | "authorization" => Some(Self::Bearer),
+            _ => None,
+        }
+    }
+}
+
+/// Which header carries the key on the environment's route: `x-api-key` or
+/// `bearer`. Unset, the format's own ([`WireFormat::default_auth`]).
+pub const API_AUTH_ENV: &str = "INCODE_API_AUTH";
 
 /// How many times the model may call tools within ONE turn.
 ///
@@ -63,6 +151,32 @@ pub struct Settings {
     pub endpoint: String,
     pub key: String,
     pub model: String,
+    pub format: WireFormat,
+    pub auth: KeyHeader,
+    /// The model this route's sub-agents run on, when it names one: the
+    /// same service's cheaper model for delegated work. Blank, a sub-agent
+    /// inherits `model`.
+    pub sub_model: String,
+    /// The catalogue id this route is chosen by: [`API_ROUTE`] for the one
+    /// the environment configures, a model's or a provider agent's own id
+    /// otherwise — see [`super::models`].
+    ///
+    /// [`API_ROUTE`]: crate::agent::registry::API_ROUTE
+    pub route: String,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            endpoint: String::new(),
+            key: String::new(),
+            model: String::new(),
+            format: WireFormat::default(),
+            auth: WireFormat::default().default_auth(),
+            sub_model: String::new(),
+            route: crate::agent::registry::API_ROUTE.to_string(),
+        }
+    }
 }
 
 impl Settings {
@@ -86,10 +200,25 @@ impl Settings {
     pub(crate) fn from_lookup(get: &dyn Fn(&str) -> Option<String>) -> Option<Self> {
         let endpoint = get(API_URL_ENV)?;
         let key = get(API_KEY_ENV)?;
+        // A format that names neither is not quietly read as the default: a
+        // request in the wrong shape fails with a message about the request,
+        // not about the setting that caused it.
+        let format = match get(API_FORMAT_ENV) {
+            Some(word) => WireFormat::parse(&word)?,
+            None => WireFormat::default(),
+        };
+        let auth = match get(API_AUTH_ENV) {
+            Some(word) => KeyHeader::parse(&word)?,
+            None => format.default_auth(),
+        };
         Some(Self {
             endpoint,
             key,
             model: get(API_MODEL_ENV).unwrap_or_default(),
+            format,
+            auth,
+            sub_model: get(API_SUB_MODEL_ENV).unwrap_or_default(),
+            ..Self::default()
         })
     }
 }
@@ -569,6 +698,7 @@ impl ApiBackend {
         let session = new_session_id();
         let mut tools = Toolbox::new(workspace, filter_env);
         tools.set_session(&session);
+        tools.set_api_route(settings.clone());
         Self {
             settings,
             system: system.to_string(),
@@ -776,15 +906,38 @@ impl ApiBackend {
 }
 
 /// The real transport.
+#[derive(Clone)]
 struct Http {
     endpoint: String,
     key: String,
+    format: WireFormat,
+    auth: KeyHeader,
+}
+
+impl Http {
+    /// A request as the route sends it: the body in its format's shape, and
+    /// the key in the ONE header the route names.
+    fn authorised(&self, client: &reqwest::Client, payload: &Value) -> reqwest::RequestBuilder {
+        let request = client
+            .post(&self.endpoint)
+            .header("content-type", "application/json");
+        let request = match self.auth {
+            KeyHeader::XApiKey => request.header("x-api-key", &self.key),
+            KeyHeader::Bearer => request.bearer_auth(&self.key),
+        };
+        match self.format {
+            WireFormat::Anthropic => request
+                .header("anthropic-version", MESSAGES_VERSION)
+                .json(payload),
+            WireFormat::Openai => request.json(&super::openai::request(payload)),
+        }
+    }
 }
 
 impl Transport for Http {
     fn send(&self, body: &Value) -> Result<String, String> {
-        let endpoint = self.endpoint.clone();
-        let key = self.key.clone();
+        let http = self.clone();
+        let format = self.format;
         let payload = body.clone();
         // On its own thread with its own runtime, matching every other outbound
         // call in this crate: the harness is not async and starting a runtime
@@ -799,14 +952,8 @@ impl Transport for Http {
                     .timeout(REQUEST_TIMEOUT)
                     .build()
                     .map_err(|e| format!("client: {e}"))?;
-                let response = client
-                    .post(&endpoint)
-                    .header("content-type", "application/json")
-                    // Both spellings, because which one an endpoint wants is a
-                    // property of the endpoint and the operator picks that.
-                    .header("authorization", format!("Bearer {key}"))
-                    .header("x-api-key", &key)
-                    .json(&payload)
+                let response = http
+                    .authorised(&client, &payload)
                     .send()
                     .await
                     .map_err(|e| format!("request failed: {e}"))?;
@@ -820,7 +967,10 @@ impl Transport for Http {
                     // status alone is the category without the reason.
                     return Err(format!("the model service answered {status}: {text}"));
                 }
-                Ok(text)
+                match format {
+                    WireFormat::Anthropic => Ok(text),
+                    WireFormat::Openai => super::openai::reply(&text),
+                }
             })
         });
         handle
@@ -833,8 +983,8 @@ impl Transport for Http {
         body: &Value,
         on_text: &mut dyn FnMut(&str),
     ) -> Result<String, String> {
-        let endpoint = self.endpoint.clone();
-        let key = self.key.clone();
+        let http = self.clone();
+        let format = self.format;
         let mut payload = body.clone();
         payload["stream"] = json!(true);
 
@@ -853,12 +1003,8 @@ impl Transport for Http {
                     .timeout(REQUEST_TIMEOUT)
                     .build()
                     .map_err(|e| format!("client: {e}"))?;
-                let mut response = client
-                    .post(&endpoint)
-                    .header("content-type", "application/json")
-                    .header("authorization", format!("Bearer {key}"))
-                    .header("x-api-key", &key)
-                    .json(&payload)
+                let mut response = http
+                    .authorised(&client, &payload)
                     .send()
                     .await
                     .map_err(|e| format!("request failed: {e}"))?;
@@ -866,6 +1012,27 @@ impl Transport for Http {
                 if !status.is_success() {
                     let text = response.text().await.unwrap_or_default();
                     return Err(format!("the model service answered {status}: {text}"));
+                }
+                if format == WireFormat::Openai {
+                    let mut whole = super::openai::ChatStream::new();
+                    let mut raw = String::new();
+                    while let Some(bytes) = response
+                        .chunk()
+                        .await
+                        .map_err(|e| format!("the reply stopped early: {e}"))?
+                    {
+                        let text = String::from_utf8_lossy(&bytes);
+                        raw.push_str(&text);
+                        whole.feed(&text, &mut |fragment| {
+                            let _ = fragments.send(fragment.to_string());
+                        });
+                    }
+                    // Not a stream after all: read it as a whole reply.
+                    return if whole.saw_events() {
+                        whole.finish()
+                    } else {
+                        super::openai::reply(&raw)
+                    };
                 }
                 let mut whole = Reassembler::new();
                 // KEPT AS WELL AS REASSEMBLED. An endpoint may ignore `stream`
@@ -912,7 +1079,7 @@ impl Transport for Http {
 
 impl AgentBackend for ApiBackend {
     fn id(&self) -> &str {
-        crate::agent::registry::API_ROUTE
+        &self.settings.route
     }
 
     /// Both halves, and enforced more strongly here than on any CLI.
@@ -939,9 +1106,20 @@ impl AgentBackend for ApiBackend {
         prompt: &str,
         on_event: &mut dyn FnMut(&AgentEvent),
     ) -> Result<TurnOutcome, AgentError> {
+        // The key goes only where it cannot be read on the way: https, or
+        // plain http to this machine — the rule every other key here is held
+        // to. Checked on the way out, so no route to this backend skips it.
+        super::catalogue::key_may_travel_to(&self.settings.endpoint).map_err(|why| {
+            AgentError::new(format!(
+                "the request to {} was not sent: {why}",
+                self.settings.route
+            ))
+        })?;
         let transport = Http {
             endpoint: self.settings.endpoint.clone(),
             key: self.settings.key.clone(),
+            format: self.settings.format,
+            auth: self.settings.auth,
         };
         self.run_turn_with(&transport, prompt, on_event)
     }
@@ -1005,6 +1183,10 @@ impl AgentBackend for ApiBackend {
 
     fn share_allowed_writes(&mut self, record: std::sync::Arc<crate::toolbox::AllowedWrites>) {
         self.tools.share_allowed_writes(record);
+    }
+
+    fn api_route(&self) -> Option<&Settings> {
+        Some(&self.settings)
     }
 
     fn share_session_tools(&mut self, state: std::sync::Arc<crate::toolbox::SessionTools>) {
@@ -1085,6 +1267,10 @@ fn new_session_id() -> String {
 }
 
 #[cfg(test)]
+#[path = "api_wire_tests.rs"]
+mod wire_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1121,6 +1307,7 @@ mod tests {
                 endpoint: "http://example.invalid/messages".to_string(),
                 key: "<TEST-KEY>".to_string(),
                 model: "test-model".to_string(),
+                ..Default::default()
             },
             root,
             "be brief",

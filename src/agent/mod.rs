@@ -19,6 +19,8 @@ pub mod api;
 pub mod catalogue;
 pub mod claude_code;
 pub mod codex;
+pub mod models;
+pub mod openai;
 pub mod process_tree;
 pub mod registry;
 pub mod stderr_tail;
@@ -486,6 +488,7 @@ mod route_parity_tests {
                 endpoint: "http://localhost/x".to_string(),
                 key: String::new(),
                 model: "m".to_string(),
+                ..Default::default()
             },
             std::path::Path::new("."),
             "",
@@ -535,6 +538,7 @@ mod route_parity_tests {
                 endpoint: "http://localhost/x".to_string(),
                 key: String::new(),
                 model: "m".to_string(),
+                ..Default::default()
             },
             std::path::Path::new("."),
             block,
@@ -575,6 +579,7 @@ mod route_parity_tests {
                 endpoint: "http://localhost/x".to_string(),
                 key: String::new(),
                 model: "m".to_string(),
+                ..Default::default()
             },
             std::path::Path::new("."),
             "   ",
@@ -902,6 +907,12 @@ pub trait AgentBackend {
     /// sub-agent's, into its parent's. Defaulted to nothing, as the rest are.
     fn share_allowed_writes(&mut self, _record: std::sync::Arc<crate::toolbox::AllowedWrites>) {}
 
+    /// The API route this backend drives, when it drives one — what
+    /// `/models` asks for its service's model list. `None` for a CLI.
+    fn api_route(&self) -> Option<&crate::agent::api::Settings> {
+        None
+    }
+
     /// The session's own tool state — its background jobs and task list —
     /// for a backend whose tools this harness runs, so every backend of one
     /// session shares them.
@@ -1062,6 +1073,10 @@ impl AgentBackend for Box<dyn AgentBackend> {
 
     fn share_allowed_writes(&mut self, record: std::sync::Arc<crate::toolbox::AllowedWrites>) {
         (**self).share_allowed_writes(record);
+    }
+
+    fn api_route(&self) -> Option<&crate::agent::api::Settings> {
+        (**self).api_route()
     }
 
     fn share_session_tools(&mut self, state: std::sync::Arc<crate::toolbox::SessionTools>) {

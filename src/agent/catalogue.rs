@@ -36,9 +36,9 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use super::api::{Settings, API_KEY_ENV, API_MODEL_ENV, API_URL_ENV};
+use super::api::{Settings, API_AUTH_ENV, API_FORMAT_ENV, API_KEY_ENV, API_MODEL_ENV, API_URL_ENV};
 use super::registry::{no_drivable_reason, AgentProbe, DetectedAgent, API_ROUTE, KNOWN_AGENTS};
-use crate::admin::ApiProvider;
+use crate::admin::{ApiModel, ApiProvider};
 
 /// How long one provider has to answer with its agent list.
 ///
@@ -49,14 +49,6 @@ use crate::admin::ApiProvider;
 /// are asked one after another, so the worst case is this times the number
 /// configured.
 pub const PROVIDER_TIMEOUT: Duration = Duration::from_secs(3);
-
-/// Why an agent a provider lists cannot take work yet.
-///
-/// Said rather than pretended: the API backend in [`super::api`] speaks one
-/// messages endpoint, and the provider contract does not yet say where an
-/// agent's turns are sent. Listing these as usable would route work into a
-/// request nothing is known to answer.
-const NOT_WIRED: &str = "driving provider agents is not wired yet";
 
 /// The longest name or model shown for a provider-listed agent.
 ///
@@ -154,12 +146,14 @@ pub struct Catalogue {
 }
 
 impl Catalogue {
-    /// Probe this machine, read the API variables, and ask each provider.
+    /// Probe this machine, read the API variables and the configured models,
+    /// and ask each provider.
     #[must_use]
-    pub fn gather(providers: &[ApiProvider]) -> Self {
-        Self::assemble(
+    pub fn gather(admin: &crate::admin::AdminConfig) -> Self {
+        Self::assemble_with(
             super::registry::discover(),
-            providers,
+            &admin.api_providers,
+            &admin.api_models,
             &super::api::non_empty,
             &fetch_agents,
         )
@@ -177,14 +171,30 @@ impl Catalogue {
     /// `env` answers a variable's trimmed, non-empty value; `fetch` answers a
     /// provider's agent list for `(url, key)`. Both are seams so every outcome
     /// — each failure included — can be tested without a network.
+    #[cfg(test)]
     fn assemble(
         found: Vec<DetectedAgent>,
         providers: &[ApiProvider],
         env: &dyn Fn(&str) -> Option<String>,
         fetch: &dyn Fn(&str, &str) -> Result<String, String>,
     ) -> Self {
+        Self::assemble_with(found, providers, &[], env, fetch)
+    }
+
+    /// [`Self::assemble`], with the models configured in admin.json.
+    fn assemble_with(
+        found: Vec<DetectedAgent>,
+        providers: &[ApiProvider],
+        models: &[ApiModel],
+        env: &dyn Fn(&str) -> Option<String>,
+        fetch: &dyn Fn(&str, &str) -> Result<String, String>,
+    ) -> Self {
         let mut entries: Vec<Entry> = found.iter().map(local_entry).collect();
         entries.extend(api_route_entry(env));
+        for model in models {
+            let entry = model_entry(model, &entries, providers, env);
+            entries.push(entry);
+        }
         let mut seen: Vec<&str> = Vec::new();
         for provider in providers {
             entries.extend(provider_entries(provider, &seen, env, fetch));
@@ -417,14 +427,16 @@ fn api_route_entry(env: &dyn Fn(&str) -> Option<String>) -> Option<Entry> {
         return None;
     }
     let status = match Settings::from_lookup(env) {
-        Some(settings) => Status::Usable(DetectedAgent::over_api(&settings.model)),
+        Some(settings) => match key_may_travel_to(&settings.endpoint) {
+            Ok(()) => Status::Usable(DetectedAgent::over_api(&settings.model)),
+            Err(why) => Status::Unusable(format!("{API_URL_ENV}: {why}")),
+        },
+        None if url.is_none() => Status::Unusable(format!("{API_URL_ENV} is not set")),
+        None if key.is_none() => Status::Unusable(format!("{API_KEY_ENV} is not set")),
+        // Both are set, so what failed is a word naming a format or a header.
         None => Status::Unusable(format!(
-            "{} is not set",
-            if url.is_none() {
-                API_URL_ENV
-            } else {
-                API_KEY_ENV
-            }
+            "{API_FORMAT_ENV} must be `anthropic` or `openai`, and {API_AUTH_ENV} \
+             `x-api-key` or `bearer`"
         )),
     };
     Some(Entry {
@@ -434,6 +446,47 @@ fn api_route_entry(env: &dyn Fn(&str) -> Option<String>) -> Option<Entry> {
         detail: env(API_MODEL_ENV),
         status,
     })
+}
+
+/// One model configured in admin.json `api_models`: usable by exactly the rule
+/// its backend is built by ([`super::models::model_settings`]), or listed with
+/// why not.
+fn model_entry(
+    model: &ApiModel,
+    earlier: &[Entry],
+    providers: &[ApiProvider],
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Entry {
+    let name = model.name.trim();
+    let id = if name.is_empty() {
+        "(unnamed model)".to_string()
+    } else {
+        name.to_string()
+    };
+    // An id that is already taken would make `/agent <id>` choose whichever
+    // was listed first, so the later one is refused by name instead.
+    let clash = earlier.iter().any(|e| e.id.eq_ignore_ascii_case(name))
+        || providers
+            .iter()
+            .any(|p| p.name.trim().eq_ignore_ascii_case(name))
+        || name.contains('/');
+    let status = if clash {
+        Status::Unusable(format!(
+            "`{name}` is already an agent's or a provider's id, or holds a `/`; give it another name"
+        ))
+    } else {
+        match super::models::model_settings(model, env) {
+            Ok(settings) => Status::Usable(DetectedAgent::api_route(&settings)),
+            Err(why) => Status::Unusable(why),
+        }
+    };
+    Entry {
+        id,
+        name: format!("api model ({})", model.format.as_str()),
+        kind: Kind::Api,
+        detail: Some(model.model.trim().to_string()).filter(|m| !m.is_empty()),
+        status,
+    }
 }
 
 /// One provider's agents, or one line saying why there are none.
@@ -486,12 +539,20 @@ fn provider_entries(
     }
     listed
         .into_iter()
-        .map(|agent| Entry {
-            id: format!("{name}/{}", agent.id),
-            name: agent.name.unwrap_or_else(|| agent.id.clone()),
-            kind: Kind::Api,
-            detail: agent.model,
-            status: Status::Unusable(NOT_WIRED.to_string()),
+        .map(|agent| {
+            // Driven by the rule its backend is built by, so listing it as
+            // usable and building it cannot disagree.
+            let status = match super::models::provider_settings(provider, &agent.id, env) {
+                Ok(settings) => Status::Usable(DetectedAgent::api_route(&settings)),
+                Err(why) => Status::Unusable(why),
+            };
+            Entry {
+                id: format!("{name}/{}", agent.id),
+                name: agent.name.unwrap_or_else(|| agent.id.clone()),
+                kind: Kind::Api,
+                detail: agent.model,
+                status,
+            }
         })
         .collect()
 }
@@ -744,7 +805,7 @@ mod tests {
             ],
             &[],
             &env_of(&[
-                (API_URL_ENV, "http://endpoint.invalid/v1/messages"),
+                (API_URL_ENV, "https://endpoint.invalid/v1/messages"),
                 (API_KEY_ENV, "k"),
                 (API_MODEL_ENV, "some-model"),
             ]),
@@ -773,7 +834,10 @@ mod tests {
     /// can — the two cases the old "the API replaces everything" rule served.
     #[test]
     fn the_configured_api_leads_when_chosen_or_when_nothing_local_can() {
-        let env = env_of(&[(API_URL_ENV, "http://endpoint.invalid"), (API_KEY_ENV, "k")]);
+        let env = env_of(&[
+            (API_URL_ENV, "https://endpoint.invalid"),
+            (API_KEY_ENV, "k"),
+        ]);
         let with_local = Catalogue::assemble(
             vec![local("claude-code", Protocol::ClaudeStreamJson)],
             &[],
@@ -807,7 +871,7 @@ mod tests {
         let catalogue = Catalogue::assemble(
             Vec::new(),
             &[],
-            &env_of(&[(API_URL_ENV, "http://endpoint.invalid")]),
+            &env_of(&[(API_URL_ENV, "https://endpoint.invalid")]),
             &no_network,
         );
         assert_eq!(
@@ -908,10 +972,10 @@ mod tests {
         assert_eq!(asked.get(), 4);
     }
 
-    /// A provider's agents are listed but not driven yet, and saying so is the
-    /// point: choosing one falls back instead of routing work nowhere.
+    /// **A PROVIDER'S AGENT IS DRIVEN.** Chosen, it leads, over its provider's
+    /// chat-completions endpoint, asking for its own id as the model.
     #[test]
-    fn a_provider_agent_is_listed_but_not_usable_until_driving_it_is_wired() {
+    fn a_provider_agent_is_usable_and_leads_when_chosen() {
         let fetch = |_: &str, _: &str| Ok(r#"{"agents":[{"id":"coder"}]}"#.to_string());
         let catalogue = Catalogue::assemble(
             vec![local("claude-code", Protocol::ClaudeStreamJson)],
@@ -919,17 +983,56 @@ mod tests {
             &env_of(&[("KEY", "k")]),
             &fetch,
         );
-        assert_eq!(
-            entry(&catalogue, "team/coder").status,
-            Status::Unusable(NOT_WIRED.to_string())
+        let lead = catalogue.lead(Some("team/coder")).expect("usable");
+        assert_eq!(lead.id, "team/coder");
+        assert_eq!(lead.protocol, Protocol::HarnessApi);
+        assert_eq!(lead.version.as_deref(), Some("coder"));
+    }
+
+    /// A configured model is listed, usable when its key is set, and refused
+    /// by name when it would take another entry's id.
+    #[test]
+    fn a_configured_model_is_listed_and_a_clashing_name_is_refused() {
+        let model = |name: &str| ApiModel {
+            name: name.to_string(),
+            format: crate::agent::api::WireFormat::Openai,
+            url: "https://models.invalid/v1/chat/completions".to_string(),
+            key_env: "MODEL_KEY".to_string(),
+            model: "some-model".to_string(),
+            sub_model: String::new(),
+            auth: None,
+        };
+        let catalogue = Catalogue::assemble_with(
+            vec![local("claude-code", Protocol::ClaudeStreamJson)],
+            &[],
+            &[model("router"), model("claude-code"), model("unset")],
+            &|name| (name == "MODEL_KEY").then(|| "k".to_string()),
+            &|_, _| Err("no provider".to_string()),
         );
+        assert_eq!(catalogue.lead(Some("router")).expect("usable").id, "router");
         assert_eq!(
-            catalogue.lead(Some("team/coder")).map(|a| a.id),
-            Ok("claude-code".to_string())
+            entry(&catalogue, "router").detail.as_deref(),
+            Some("some-model")
         );
-        assert!(catalogue
-            .route_for("team/coder")
-            .is_err_and(|why| why.contains(NOT_WIRED)));
+        // The second `claude-code` is refused; the local one still leads by it.
+        assert_eq!(
+            catalogue.lead(Some("claude-code")).expect("local").protocol,
+            Protocol::ClaudeStreamJson
+        );
+        let clash = catalogue
+            .entries
+            .iter()
+            .filter(|e| e.id == "claude-code")
+            .nth(1)
+            .expect("listed");
+        assert!(matches!(&clash.status, Status::Unusable(why) if why.contains("another name")));
+        let without_key =
+            Catalogue::assemble_with(Vec::new(), &[], &[model("router")], &|_| None, &|_, _| {
+                Err("no provider".to_string())
+            });
+        assert!(without_key
+            .route_for("router")
+            .is_err_and(|why| why.contains("MODEL_KEY is not set")));
     }
 
     /// Two providers with one name would give their agents the same ids.
@@ -1038,7 +1141,10 @@ mod tests {
         let catalogue = Catalogue::assemble(
             vec![local("claude-code", Protocol::ClaudeStreamJson)],
             &[],
-            &env_of(&[(API_URL_ENV, "http://endpoint.invalid"), (API_KEY_ENV, "k")]),
+            &env_of(&[
+                (API_URL_ENV, "https://endpoint.invalid"),
+                (API_KEY_ENV, "k"),
+            ]),
             &no_network,
         );
         let table = [AgentProbe {

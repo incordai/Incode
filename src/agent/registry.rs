@@ -282,6 +282,21 @@ impl DetectedAgent {
         }
     }
 
+    /// A route over an API, by the id it is chosen by — a configured model's
+    /// name or a provider agent's `<provider>/<agent>`. Its backend is built
+    /// from [`crate::agent::models::settings_for`] with the same id.
+    #[must_use]
+    pub fn api_route(settings: &crate::agent::api::Settings) -> Self {
+        Self {
+            id: settings.route.clone(),
+            display_name: format!("{} over its API", settings.route),
+            command: String::new(),
+            path: None,
+            version: Some(settings.model.clone()).filter(|m| !m.is_empty()),
+            protocol: Protocol::HarnessApi,
+        }
+    }
+
     /// Whether the harness can route a turn to this agent today.
     #[must_use]
     pub fn is_drivable(&self) -> bool {

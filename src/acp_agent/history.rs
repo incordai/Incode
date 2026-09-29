@@ -170,7 +170,7 @@ pub(super) fn resume_or_carry(held: &mut super::Held, session_id: &acp::SessionI
         Some(record)
             if !record.agent_session.is_empty()
                 && record.agent == held.session.backend_id()
-                && record.agent != crate::agent::registry::API_ROUTE =>
+                && !crate::agent::models::is_api_route(&record.agent) =>
         {
             crate::trace!(
                 "acp",

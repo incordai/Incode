@@ -21,6 +21,8 @@ pub enum SlashCommand {
     Skills,
     Mcp,
     Model(Option<String>),
+    /// The models the current API route's service offers.
+    Models,
     Clear,
     Save(Option<String>),
     Sessions,
@@ -114,6 +116,7 @@ impl SlashCommand {
             "/skills" | "/sk" => Self::Skills,
             "/mcp" => Self::Mcp,
             "/model" | "/m" => Self::Model(arg),
+            "/models" => Self::Models,
             "/clear" => Self::Clear,
             "/save" => Self::Save(arg),
             "/sessions" | "/ls" => Self::Sessions,
@@ -233,6 +236,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
     (
         "/model [name]",
         "Show or switch the model the agent runs on",
+    ),
+    (
+        "/models",
+        "List the models the current API route's service offers",
     ),
     ("/clear", "Start a new agent session on the next turn"),
     (

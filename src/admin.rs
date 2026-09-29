@@ -140,6 +140,11 @@ pub struct AdminConfig {
     /// from the environment when it is needed and never written to this file.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub api_providers: Vec<ApiProvider>,
+    /// Models reached over an API with a key, each chosen by its own name —
+    /// see [`crate::agent::models`]. Only the NAME of the variable holding a
+    /// model's key is kept here, never the key.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub api_models: Vec<ApiModel>,
     /// The search service the `WebSearch` tool asks — see [`crate::web`] for
     /// the exact request and reply. Only the NAME of the variable holding
     /// its key is kept here, never the key. Unset, the tool says it is not
@@ -271,6 +276,35 @@ pub struct ApiProvider {
     pub url: String,
     /// The NAME of the environment variable holding the key — never the key.
     pub key_env: String,
+}
+
+/// One model reached over an API with a key.
+///
+/// Nothing about a vendor is built in: Anthropic, Z.ai, OpenRouter or a local
+/// server are each one of these, differing only in what is written here.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiModel {
+    /// The catalogue id it is chosen by (`/agent <name>`). Unique, and not a
+    /// local agent's id.
+    pub name: String,
+    /// The request shape the endpoint speaks. Unset is `anthropic`.
+    #[serde(default)]
+    pub format: crate::agent::api::WireFormat,
+    /// The FULL endpoint: `.../v1/messages` or `.../chat/completions`.
+    pub url: String,
+    /// The NAME of the environment variable holding the key — never the key.
+    pub key_env: String,
+    /// The model asked for. Blank asks for none, for an endpoint serving one.
+    #[serde(default)]
+    pub model: String,
+    /// The model this entry's sub-agents run on — the same service's
+    /// cheaper model for delegated work. Blank, they inherit `model`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sub_model: String,
+    /// Which header carries the key: `x-api-key` or `bearer`. Unset is the
+    /// format's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<crate::agent::api::KeyHeader>,
 }
 
 /// Which program `RenderPdf` prints with — see `toolbox::pdf`.
@@ -510,7 +544,7 @@ impl AdminConfig {
         // DRIVABLE, not merely present, and from the same catalogue the lead
         // is chosen from — so an API agent chosen with `/agent` is reported as
         // the choice it is rather than as an agent that is not installed.
-        let catalogue = crate::agent::catalogue::Catalogue::gather(&self.api_providers);
+        let catalogue = crate::agent::catalogue::Catalogue::gather(self);
         let (drivable, present_only) = catalogue.ids_by_usability();
         Self::describe_agent(&self.resolve_agent(), &drivable, &present_only)
     }
@@ -1219,6 +1253,16 @@ mod tests {
                 name: "team".to_string(),
                 url: "http://127.0.0.1:9".to_string(),
                 key_env: "TEAM_KEY_VARIABLE".to_string(),
+            }],
+            // A configured model too, holding its key variable's NAME only.
+            api_models: vec![ApiModel {
+                name: "router".to_string(),
+                format: crate::agent::api::WireFormat::Openai,
+                url: "https://router.invalid/v1/chat/completions".to_string(),
+                key_env: "ROUTER_KEY_VARIABLE".to_string(),
+                model: "a-model".to_string(),
+                sub_model: "a-fast-model".to_string(),
+                auth: Some(crate::agent::api::KeyHeader::Bearer),
             }],
             // The search provider too, holding its key variable's NAME only.
             web_search: Some(SearchProvider {

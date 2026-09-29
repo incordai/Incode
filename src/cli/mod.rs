@@ -516,7 +516,7 @@ pub(crate) fn prepare_session(
     // `/agent` and `/run`: the lead is the operator's choice when usable,
     // else the first usable local agent, else a usable API agent.
     let catalogue = timed("agent catalogue", || {
-        crate::agent::catalogue::Catalogue::gather(&admin.api_providers)
+        crate::agent::catalogue::Catalogue::gather(&admin)
     });
     let agent = catalogue
         .lead(crate::agent::registry::preferred_agent().as_deref())
@@ -940,6 +940,28 @@ impl CliApp {
                             None => render::print_info(&format!("Model: {display_model}")),
                         }
                     }
+                    SlashCommand::Models => match session.api_route() {
+                        Some(route) => match crate::agent::models::list_models(route) {
+                            Ok(ids) if ids.is_empty() => {
+                                render::print_info(&format!("{} lists no models.", route.route))
+                            }
+                            Ok(ids) => render::print_info(&format!(
+                                "{} offers {} model(s) — switch with /model <id>:\n  {}",
+                                route.route,
+                                ids.len(),
+                                ids.join("\n  ")
+                            )),
+                            Err(why) => render::print_error(&format!(
+                                "{}'s model list could not be read: {why}",
+                                route.route
+                            )),
+                        },
+                        None => render::print_info(
+                            "The lead is an installed agent, which names its own models; \
+                             /models lists what an API route's service offers. Choose one \
+                             with /agent.",
+                        ),
+                    },
                     SlashCommand::Clear => {
                         // THE OLD RECORD IS FINISHED, not reused. The write
                         // after each turn does `record.agent_session = id` on
@@ -1371,16 +1393,16 @@ fn sandbox_for(mode: crate::permissions::PermissionMode) -> crate::sandbox::Sand
     crate::admin::AdminConfig::load_default().sandbox_policy(mode)
 }
 
-/// The backend for one catalogue route: the configured API when the route is
-/// [`crate::agent::registry::API_ROUTE`], otherwise the installed CLI.
+/// The backend for one catalogue route: an API route when the id names one
+/// ([`crate::agent::models::settings_for`]), otherwise the installed CLI.
 ///
 /// # The bug this closes
 ///
 /// The API backend used to be chosen whenever the API variables were SET,
 /// whatever agent had been chosen — so exporting two variables replaced every
 /// installed agent, and a session that announced one agent drove another. The
-/// id decides now, and the catalogue lists that id as usable only when the
-/// same variables are present ([`crate::agent::api::Settings::from_lookup`]).
+/// id decides now, and the catalogue lists that id as usable by the same
+/// resolution ([`crate::agent::models`]).
 pub(crate) fn route_backend(
     workspace: &Path,
     agent_id: &str,
@@ -1389,12 +1411,7 @@ pub(crate) fn route_backend(
     system_prompt: &[String],
     filter_env: bool,
 ) -> Box<dyn crate::agent::AgentBackend> {
-    let api = if agent_id == crate::agent::registry::API_ROUTE {
-        crate::agent::api::Settings::from_env()
-    } else {
-        None
-    };
-    match api {
+    match crate::agent::models::settings_for(agent_id) {
         Some(settings) => Box::new(
             crate::agent::api::ApiBackend::new(
                 settings,

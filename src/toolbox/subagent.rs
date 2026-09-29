@@ -133,7 +133,13 @@ impl Toolbox {
             tools: self.child_tools(definition.as_ref()),
             edits: self.code_edits.as_ref().map(super::CodeEdits::child),
         };
-        let (mut child, agent) = match crate::agent::api::Settings::from_env() {
+        // The parent's own route first: a model chosen by name hands work to
+        // the same service. Then the environment's, as before.
+        let route = self
+            .api_route
+            .clone()
+            .or_else(crate::agent::api::Settings::from_env);
+        let (mut child, agent) = match route {
             Some(settings) => (self.api_child(settings, &spec), "api"),
             None => match &self.cli_agent {
                 Some(binary) => (self.cli_child(binary, &spec), "claude-code"),
@@ -271,6 +277,13 @@ impl Toolbox {
     ) -> Box<dyn AgentBackend> {
         let role = spec.role;
         let inherited = settings.model.clone();
+        // The route's own model for delegated work, when it names one — the
+        // cheaper model of the same service (a fast GLM under a main GLM, a
+        // small Claude under a large one). The operator's role table and the
+        // definition still win over it below.
+        if !settings.sub_model.is_empty() {
+            settings.model.clone_from(&settings.sub_model);
+        }
         if !role.is_empty() {
             if let Some(chosen) = crate::roles::RoleTable::from_env().model_for(role) {
                 settings.model = crate::roles::model_name(chosen).to_string();
@@ -416,6 +429,52 @@ mod tests {
         let mut offered = child.offered_tools();
         offered.sort();
         assert_eq!(offered, ["Grep", "Read"]);
+    }
+
+    /// **A sub-agent of an API model runs on that model's `sub_model`** — the
+    /// same service's cheaper model for delegated work — over the parent's
+    /// own route; a definition that names a model still wins.
+    #[test]
+    fn an_api_sub_agent_runs_on_its_routes_sub_model() {
+        let ws = tempfile::tempdir().expect("ws");
+        let parent = Toolbox::new(ws.path(), true);
+        let settings = crate::agent::api::Settings {
+            endpoint: "https://service.invalid/v1/messages".to_string(),
+            key: "k".to_string(),
+            model: "main-model".to_string(),
+            sub_model: "fast-model".to_string(),
+            route: "service".to_string(),
+            ..Default::default()
+        };
+        let plain = Child {
+            role: "",
+            definition: None,
+            tools: None,
+            edits: None,
+        };
+        let child = parent.api_child(settings.clone(), &plain);
+        assert_eq!(child.model(), Some("fast-model"));
+        assert_eq!(child.id(), "service", "the parent's own route");
+        let def = reviewer(None);
+        let defined = Child {
+            role: "",
+            definition: Some(&def),
+            tools: None,
+            edits: None,
+        };
+        assert_eq!(
+            parent.api_child(settings.clone(), &defined).model(),
+            Some("opus")
+        );
+        // None named: the child inherits the main model, as before.
+        let inherited = crate::agent::api::Settings {
+            sub_model: String::new(),
+            ..settings
+        };
+        assert_eq!(
+            parent.api_child(inherited, &plain).model(),
+            Some("main-model")
+        );
     }
 
     /// A sub-agent never gets a tool its parent was not given: a definition's

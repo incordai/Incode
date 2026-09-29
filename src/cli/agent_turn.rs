@@ -271,7 +271,7 @@ impl AgentSession {
         let mut previous = std::mem::replace(&mut self.backend, backend);
         let now = self.backend.id().to_string();
         self.standby.retain(|standby| standby.id() != now);
-        if previous.id() != now && previous.id() != crate::agent::registry::API_ROUTE {
+        if previous.id() != now && !crate::agent::models::is_api_route(previous.id()) {
             previous.clear_session();
             self.standby.push(previous);
         }
@@ -446,6 +446,12 @@ impl AgentSession {
     #[must_use]
     pub fn model(&self) -> Option<&str> {
         self.backend.model()
+    }
+
+    /// The API route the lead is driven over, when it is.
+    #[must_use]
+    pub fn api_route(&self) -> Option<&crate::agent::api::Settings> {
+        self.backend.api_route()
     }
 
     /// Start a fresh agent session on the next turn.
