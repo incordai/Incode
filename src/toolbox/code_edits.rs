@@ -29,7 +29,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use similar::{DiffTag, TextDiff};
 
-use super::{Toolbox, ToolOutput, APPLY_PATCH, EDIT, MULTI_EDIT, NOTEBOOK_EDIT, WRITE};
+use super::{ToolOutput, Toolbox, APPLY_PATCH, EDIT, MULTI_EDIT, NOTEBOOK_EDIT, WRITE};
 
 /// The route a write is announced, confirmed and cancelled on.
 pub const MARK_PATH: &str = "/v1/memory/code/edits/mark";
@@ -133,12 +133,20 @@ impl EditLedger for EngineLedger {
                 .await
             {
                 Ok(response) => response,
-                Err(e) => return Ok(Err(LedgerError::NoAnswer(crate::runtime::http::error_chain(&e)))),
+                Err(e) => {
+                    return Ok(Err(LedgerError::NoAnswer(
+                        crate::runtime::http::error_chain(&e),
+                    )))
+                }
             };
             let status = response.status();
             let text = match response.text().await {
                 Ok(text) => text,
-                Err(e) => return Ok(Err(LedgerError::NoAnswer(format!("reading the answer failed: {e}")))),
+                Err(e) => {
+                    return Ok(Err(LedgerError::NoAnswer(format!(
+                        "reading the answer failed: {e}"
+                    ))))
+                }
             };
             if !status.is_success() {
                 // The engine's own words: "not in a project" reads very
@@ -148,8 +156,9 @@ impl EditLedger for EngineLedger {
                     crate::text::truncate(&text, 300)
                 ))));
             }
-            Ok(serde_json::from_str(&text)
-                .map_err(|e| LedgerError::Declined(format!("the engine's answer is not JSON: {e}"))))
+            Ok(serde_json::from_str(&text).map_err(|e| {
+                LedgerError::Declined(format!("the engine's answer is not JSON: {e}"))
+            }))
         });
         answered.map_err(LedgerError::NoAnswer)?
     }
@@ -189,7 +198,10 @@ impl CodeEdits {
     /// The operator's agent, announced to `ledger`.
     #[must_use]
     pub fn new(ledger: Arc<dyn EditLedger>) -> Self {
-        Self { ledger, scope: String::new() }
+        Self {
+            ledger,
+            scope: String::new(),
+        }
     }
 
     /// The operator's agent, announced to this machine's engine — `None`
@@ -283,7 +295,10 @@ impl Toolbox {
             return Ok(announced);
         };
         if self.session.is_empty() {
-            crate::trace!("edits", "{name} unchecked: no session id to announce it under");
+            crate::trace!(
+                "edits",
+                "{name} unchecked: no session id to announce it under"
+            );
             return Ok(announced);
         }
         for planned in self.plan_writes(name, input) {
@@ -296,7 +311,10 @@ impl Toolbox {
             };
             let path = path.to_string_lossy().into_owned();
             let target = Target {
-                cwd: self.root_for_path(&planned.named).to_string_lossy().into_owned(),
+                cwd: self
+                    .root_for_path(&planned.named)
+                    .to_string_lossy()
+                    .into_owned(),
                 before: fingerprint(&path),
                 path,
             };
@@ -328,7 +346,11 @@ impl Toolbox {
                     crate::trace!("edits", "{name} unchecked for {}: {why}", target.path);
                 }
                 Err(LedgerError::NoAnswer(why)) => {
-                    crate::trace!("edits", "{name} unchecked from {}: no answer: {why}", target.path);
+                    crate::trace!(
+                        "edits",
+                        "{name} unchecked from {}: no answer: {why}",
+                        target.path
+                    );
                     break;
                 }
             }
@@ -402,7 +424,11 @@ impl Toolbox {
                     crate::trace!("edits", "{phase} not recorded for {}: {why}", target.path);
                 }
                 Err(why @ LedgerError::NoAnswer(_)) => {
-                    crate::trace!("edits", "{phase} not recorded from {} on: {why}", target.path);
+                    crate::trace!(
+                        "edits",
+                        "{phase} not recorded from {} on: {why}",
+                        target.path
+                    );
                     break;
                 }
             }
@@ -498,27 +524,52 @@ impl Toolbox {
     /// out from the files as they stand — the same arithmetic the tool does,
     /// without the write.
     fn plan_writes(&self, name: &str, input: &Value) -> Vec<Planned> {
-        let path_of = || input.get("path").and_then(Value::as_str).map(str::to_string);
-        let current = |named: &str| self.resolve(named).ok().and_then(|p| std::fs::read_to_string(p).ok());
+        let path_of = || {
+            input
+                .get("path")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        };
+        let current = |named: &str| {
+            self.resolve(named)
+                .ok()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+        };
         match name {
             WRITE => {
-                let Some(named) = path_of() else { return Vec::new() };
+                let Some(named) = path_of() else {
+                    return Vec::new();
+                };
                 let content = input.get("content").and_then(Value::as_str).unwrap_or("");
-                planned(named.clone(), current(&named).as_deref(), |_| Some(content.to_string()))
+                planned(named.clone(), current(&named).as_deref(), |_| {
+                    Some(content.to_string())
+                })
             }
             EDIT => {
-                let Some(named) = path_of() else { return Vec::new() };
+                let Some(named) = path_of() else {
+                    return Vec::new();
+                };
                 // As the tool does it: the one place `old_string` matches.
                 let edit = [json!({
                     "old_string": input.get("old_string").and_then(Value::as_str).unwrap_or(""),
                     "new_string": input.get("new_string").and_then(Value::as_str).unwrap_or(""),
                 })];
-                planned(named.clone(), current(&named).as_deref(), |text| multi_edited(text, &edit))
+                planned(named.clone(), current(&named).as_deref(), |text| {
+                    multi_edited(text, &edit)
+                })
             }
             MULTI_EDIT => {
-                let Some(named) = path_of() else { return Vec::new() };
-                let edits = input.get("edits").and_then(Value::as_array).cloned().unwrap_or_default();
-                planned(named.clone(), current(&named).as_deref(), |text| multi_edited(text, &edits))
+                let Some(named) = path_of() else {
+                    return Vec::new();
+                };
+                let edits = input
+                    .get("edits")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                planned(named.clone(), current(&named).as_deref(), |text| {
+                    multi_edited(text, &edits)
+                })
             }
             APPLY_PATCH => {
                 let Some(patch) = input.get("patch").and_then(Value::as_str) else {
@@ -539,14 +590,26 @@ impl Toolbox {
                                 .and_then(|t| crate::tools::diff::apply_hunks(t, &p.hunks).ok()),
                             _ => None,
                         };
-                        let ranges = before.as_deref().zip(after.as_deref()).map(|(b, a)| changed_ranges(b, a));
+                        let ranges = before
+                            .as_deref()
+                            .zip(after.as_deref())
+                            .map(|(b, a)| changed_ranges(b, a));
                         Planned { named, ranges }
                     })
                     .filter(|p| p.ranges.as_ref().is_none_or(|r| !r.is_empty()))
-                    .map(|p| Planned { ranges: p.ranges.filter(|r| r.len() <= MAX_RANGES), ..p })
+                    .map(|p| Planned {
+                        ranges: p.ranges.filter(|r| r.len() <= MAX_RANGES),
+                        ..p
+                    })
                     .collect()
             }
-            NOTEBOOK_EDIT => path_of().map(|named| Planned { named, ranges: None }).into_iter().collect(),
+            NOTEBOOK_EDIT => path_of()
+                .map(|named| Planned {
+                    named,
+                    ranges: None,
+                })
+                .into_iter()
+                .collect(),
             _ => Vec::new(),
         }
     }
@@ -555,9 +618,16 @@ impl Toolbox {
 /// The plan for one file whose new text `after` works out from its current
 /// text: nothing when the text would not change, all of it when the file is
 /// new or the result could not be worked out.
-fn planned(named: String, before: Option<&str>, after: impl FnOnce(&str) -> Option<String>) -> Vec<Planned> {
+fn planned(
+    named: String,
+    before: Option<&str>,
+    after: impl FnOnce(&str) -> Option<String>,
+) -> Vec<Planned> {
     let Some(before) = before else {
-        return vec![Planned { named, ranges: None }];
+        return vec![Planned {
+            named,
+            ranges: None,
+        }];
     };
     let ranges = match after(before) {
         Some(after) if after == before => return Vec::new(),
@@ -575,12 +645,23 @@ fn multi_edited(text: &str, edits: &[Value]) -> Option<String> {
     for edit in edits {
         let old = edit.get("old_string").and_then(Value::as_str)?;
         let new = edit.get("new_string").and_then(Value::as_str)?;
-        let all = edit.get("replace_all").and_then(Value::as_bool).unwrap_or(false);
-        let count = if old.is_empty() { 0 } else { out.matches(old).count() };
+        let all = edit
+            .get("replace_all")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let count = if old.is_empty() {
+            0
+        } else {
+            out.matches(old).count()
+        };
         if count == 0 || (count > 1 && !all) {
             return None;
         }
-        out = if all { out.replace(old, new) } else { out.replacen(old, new, 1) };
+        out = if all {
+            out.replace(old, new)
+        } else {
+            out.replacen(old, new, 1)
+        };
     }
     Some(out)
 }
@@ -631,7 +712,12 @@ pub(super) fn shown_range(text: &str, offset: u64, limit: Option<u64>) -> Option
         at += line.len() as u64;
         starts.push(at);
     }
-    let byte = |line: u64| usize::try_from(line).ok().and_then(|l| starts.get(l).copied()).unwrap_or(at);
+    let byte = |line: u64| {
+        usize::try_from(line)
+            .ok()
+            .and_then(|l| starts.get(l).copied())
+            .unwrap_or(at)
+    };
     Some([byte(offset), byte(end)])
 }
 
@@ -639,7 +725,12 @@ pub(super) fn shown_range(text: &str, offset: u64, limit: Option<u64>) -> Option
 fn strings(said: &Value, key: &str) -> Vec<String> {
     said.get(key)
         .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
         .unwrap_or_default()
 }
 

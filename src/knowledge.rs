@@ -508,7 +508,11 @@ fn run_skeleton(input: &serde_json::Value, code: &CodeContext<'_>) -> Result<Str
     let status = engine_tool("code_index_status", serde_json::json!({ "cwd": code.cwd }))?;
     let root = serde_json::from_str::<serde_json::Value>(&status)
         .ok()
-        .and_then(|v| v.get("root").and_then(|r| r.as_str()).map(std::path::PathBuf::from))
+        .and_then(|v| {
+            v.get("root")
+                .and_then(|r| r.as_str())
+                .map(std::path::PathBuf::from)
+        })
         .ok_or_else(|| format!("the code index named no checkout root: {status}"))?;
     let rel = relative_to(&file, &root)
         .ok_or_else(|| format!("`{path}` is not inside the checkout at {}", root.display()))?;
@@ -886,7 +890,10 @@ mod tests {
     fn a_tool_reply_is_its_text_and_an_error_is_an_error() {
         // The engine's tool answer, as the MCP endpoint sends it.
         let ok = r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"function · run_turn · src/agent.rs:10-40"}],"isError":false}}"#;
-        assert_eq!(parse_tool_reply(ok).unwrap(), "function · run_turn · src/agent.rs:10-40");
+        assert_eq!(
+            parse_tool_reply(ok).unwrap(),
+            "function · run_turn · src/agent.rs:10-40"
+        );
 
         let flagged = r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"not_in_project"}],"isError":true}}"#;
         assert_eq!(parse_tool_reply(flagged).unwrap_err(), "not_in_project");
@@ -905,12 +912,20 @@ mod tests {
         std::fs::create_dir_all(root.join("crates").join("a").join("src")).unwrap();
         std::fs::write(root.join("crates/a/src/lib.rs"), "").unwrap();
         assert_eq!(
-            relative_to(&root.join("crates").join("a").join("src").join("lib.rs"), root).as_deref(),
+            relative_to(
+                &root.join("crates").join("a").join("src").join("lib.rs"),
+                root
+            )
+            .as_deref(),
             Some("crates/a/src/lib.rs")
         );
         // Not written yet: placed by its folder.
         assert_eq!(
-            relative_to(&root.join("crates").join("a").join("src").join("new.rs"), root).as_deref(),
+            relative_to(
+                &root.join("crates").join("a").join("src").join("new.rs"),
+                root
+            )
+            .as_deref(),
             Some("crates/a/src/new.rs")
         );
         // Outside the root, or the root itself: nothing to name.
@@ -929,14 +944,36 @@ mod tests {
         // Every call below is answered here, before any engine is asked: a test
         // must never reach the engine this machine runs.
         let refuse = |_: &str| Err("outside the workspace".to_string());
-        let code = CodeContext { cwd: std::path::Path::new("."), resolve: &refuse };
+        let code = CodeContext {
+            cwd: std::path::Path::new("."),
+            resolve: &refuse,
+        };
         for (tool, input, said) in [
-            (SYMBOL_TOOL, serde_json::json!({}), "say which name to look up"),
-            (SKELETON_TOOL, serde_json::json!({}), "say which file to outline"),
-            (SKELETON_TOOL, serde_json::json!({ "path": "../x.rs" }), "outside the workspace"),
-            (BLAST_RADIUS_TOOL, serde_json::json!({ "repo_path": "../other" }), "outside the workspace"),
+            (
+                SYMBOL_TOOL,
+                serde_json::json!({}),
+                "say which name to look up",
+            ),
+            (
+                SKELETON_TOOL,
+                serde_json::json!({}),
+                "say which file to outline",
+            ),
+            (
+                SKELETON_TOOL,
+                serde_json::json!({ "path": "../x.rs" }),
+                "outside the workspace",
+            ),
+            (
+                BLAST_RADIUS_TOOL,
+                serde_json::json!({ "repo_path": "../other" }),
+                "outside the workspace",
+            ),
         ] {
-            assert!(names.iter().any(|n| n == tool), "{tool} not advertised: {names:?}");
+            assert!(
+                names.iter().any(|n| n == tool),
+                "{tool} not advertised: {names:?}"
+            );
             let answer = handle_tool(tool, &input, &code).expect("advertised but not wired");
             assert_eq!(answer.unwrap_err(), said, "{tool} {input}");
         }
