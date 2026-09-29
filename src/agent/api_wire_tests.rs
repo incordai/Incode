@@ -59,6 +59,7 @@ fn http(endpoint: String, format: WireFormat, auth: KeyHeader) -> Http {
         key: "k-123".to_string(),
         format,
         auth,
+        timeout: std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
     }
 }
 
@@ -208,4 +209,88 @@ fn a_turn_to_plain_http_on_another_machine_is_refused_before_sending() {
         "router",
         "the backend answers to its own route"
     );
+}
+
+/// A route with a default model, a sub-agents' model and aliases, as a
+/// service speaking the messages format for token-based tools documents it.
+fn aliased_route() -> Settings {
+    Settings {
+        endpoint: "https://service.invalid/v1/messages".to_string(),
+        key: "k".to_string(),
+        model: "main-model".to_string(),
+        sub_model: "fast-model".to_string(),
+        aliases: std::collections::BTreeMap::from([
+            ("opus".to_string(), "main-model".to_string()),
+            ("haiku".to_string(), "fast-model".to_string()),
+        ]),
+        route: "service".to_string(),
+        ..Default::default()
+    }
+}
+
+fn backend_on(settings: Settings) -> (tempfile::TempDir, ApiBackend) {
+    let dir = tempfile::tempdir().expect("tmp");
+    let backend = ApiBackend::new(settings, dir.path(), "", true);
+    (dir, backend)
+}
+
+/// **A ROLE TABLE WRITTEN FOR EVERY AGENT DOES NOT BREAK AN API ROUTE.**
+/// The owner's `plan` candidates are CLI names and other vendors' ids; the
+/// route takes the first it serves — `opus` through its alias — and a list it
+/// serves none of leaves the default in hand instead of sending `opus` to a
+/// service that has no such model. Revert `set_models` to "take the first"
+/// and this fails.
+#[test]
+fn a_role_tables_candidates_are_taken_only_as_the_route_serves_them() {
+    let plan = [
+        "opus".to_string(),
+        "gemini-3.1-pro-high".to_string(),
+        "gpt-5.6-terra".to_string(),
+    ];
+    let (_dir, mut backend) = backend_on(aliased_route());
+    backend.set_models(&["haiku".to_string(), "sonnet".to_string()]);
+    assert_eq!(backend.model(), Some("fast-model"), "haiku's alias");
+    backend.set_models(&plan);
+    assert_eq!(backend.model(), Some("main-model"), "opus's alias");
+
+    let (_dir, mut bare) = backend_on(Settings {
+        aliases: std::collections::BTreeMap::new(),
+        ..aliased_route()
+    });
+    bare.set_models(&plan);
+    assert_eq!(
+        bare.model(),
+        Some("main-model"),
+        "nothing served: the default stands"
+    );
+    bare.set_models(&["sonnet".to_string(), "fast-model".to_string()]);
+    assert_eq!(
+        bare.model(),
+        Some("fast-model"),
+        "its own sub-agents' model is served"
+    );
+}
+
+#[test]
+fn a_qualified_candidate_is_taken_only_for_its_own_route() {
+    let route = aliased_route();
+    assert_eq!(route.serves("service:any-id").as_deref(), Some("any-id"));
+    assert_eq!(route.serves("service:haiku").as_deref(), Some("fast-model"));
+    assert_eq!(route.serves("claude-code:opus"), None, "another agent's");
+    assert_eq!(
+        route.serves("opus@lab-a").as_deref(),
+        Some("main-model"),
+        "a family tag"
+    );
+    assert_eq!(route.serves(""), None);
+}
+
+/// `/model` and `-m` take any id the service offers, through the aliases.
+#[test]
+fn a_model_named_outright_is_taken_whatever_it_is() {
+    let (_dir, mut backend) = backend_on(aliased_route());
+    backend.choose_model("some-other-model");
+    assert_eq!(backend.model(), Some("some-other-model"));
+    backend.choose_model("OPUS");
+    assert_eq!(backend.model(), Some("main-model"));
 }

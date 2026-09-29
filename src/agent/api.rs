@@ -16,7 +16,8 @@
 //! One turn is not one request. The model answers with text, or with calls it
 //! wants made; when it calls, the tools are run, the results are appended, and
 //! it is asked again. A turn ends when the model stops asking. That loop is
-//! bounded by [`MAX_STEPS`] — a model that calls a failing tool forever would
+//! bounded by the route's `max_steps` ([`DEFAULT_MAX_STEPS`] unless its entry
+//! says otherwise) — a model that calls a failing tool forever would
 //! otherwise spend an account rather than fail.
 //!
 //! # No vendor in the code
@@ -101,7 +102,7 @@ impl WireFormat {
 ///
 /// A setting rather than a property of the format: a service that speaks the
 /// messages format for tools built around a token reads `Authorization:
-/// Bearer` instead of `x-api-key` — Z.ai's endpoint for Claude Code is one.
+/// Bearer` instead of `x-api-key`; which one is the entry's `auth`.
 /// Only one is sent, so a service is never handed its key in a header it did
 /// not ask for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -129,21 +130,24 @@ impl KeyHeader {
 /// `bearer`. Unset, the format's own ([`WireFormat::default_auth`]).
 pub const API_AUTH_ENV: &str = "INCODE_API_AUTH";
 
-/// How many times the model may call tools within ONE turn.
+/// How many times the model may call tools within ONE turn, unless the
+/// route's entry says otherwise (`max_steps`).
 ///
 /// Bounded because the loop is driven by the model: one that keeps calling a
 /// tool that keeps failing would otherwise run until the account is empty. Hit
 /// the ceiling and the turn ends saying so, rather than quietly looking finished.
-const MAX_STEPS: usize = 40;
+pub const DEFAULT_MAX_STEPS: usize = 40;
 
-/// The reply-length ceiling asked for on each request.
-const MAX_TOKENS: u64 = 8_192;
+/// The reply-length ceiling asked for on each request, unless the route's
+/// entry says otherwise (`max_tokens`).
+pub const DEFAULT_MAX_TOKENS: u64 = 8_192;
 
-/// How long one request may take.
+/// How long one request may take, in seconds, unless the route's entry says
+/// otherwise (`timeout_secs`).
 ///
 /// Generous because a long reply legitimately takes minutes, but present because
 /// a hung connection must not hang the session.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+pub const DEFAULT_TIMEOUT_SECS: u64 = 300;
 
 /// Where to send a request, and as whom.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,6 +161,18 @@ pub struct Settings {
     /// same service's cheaper model for delegated work. Blank, a sub-agent
     /// inherits `model`.
     pub sub_model: String,
+    /// The names the operator's role table uses (`opus`, `haiku`, …), each
+    /// mapped to the model id THIS service knows it by. A service speaking
+    /// the messages format for token-based tools documents exactly this
+    /// mapping; without it, a role table written once for every agent would
+    /// send a name the service does not have.
+    pub aliases: std::collections::BTreeMap<String, String>,
+    /// The reply-length ceiling asked for on each request.
+    pub max_tokens: u64,
+    /// How many tool rounds one turn may take.
+    pub max_steps: usize,
+    /// How long one request may take, in seconds.
+    pub timeout_secs: u64,
     /// The catalogue id this route is chosen by: [`API_ROUTE`] for the one
     /// the environment configures, a model's or a provider agent's own id
     /// otherwise — see [`super::models`].
@@ -174,12 +190,70 @@ impl Default for Settings {
             format: WireFormat::default(),
             auth: WireFormat::default().default_auth(),
             sub_model: String::new(),
+            aliases: std::collections::BTreeMap::new(),
+            max_tokens: DEFAULT_MAX_TOKENS,
+            max_steps: DEFAULT_MAX_STEPS,
+            timeout_secs: DEFAULT_TIMEOUT_SECS,
             route: crate::agent::registry::API_ROUTE.to_string(),
         }
     }
 }
 
 impl Settings {
+    /// The model id a role-table candidate names on this route, when this
+    /// route serves it; `None` when it does not.
+    ///
+    /// Served: a candidate qualified with this route (`<route>:<id>`), an
+    /// alias, or one of the route's own models (`model`, `sub_model`, an
+    /// alias's target). A candidate qualified with another agent, or a bare
+    /// name this service has not been told of, is not — sending it would
+    /// fail the request, which is worse than keeping the model in hand.
+    #[must_use]
+    pub fn serves(&self, candidate: &str) -> Option<String> {
+        let candidate = crate::roles::model_name(candidate).trim();
+        if candidate.is_empty() {
+            return None;
+        }
+        // A qualifier is taken only when it names THIS route; a model id
+        // may itself hold a `:` (a variant tag), so an unknown prefix is
+        // read as part of the id, not as another agent.
+        if let Some((agent, model)) = candidate.split_once(':') {
+            if agent.trim().eq_ignore_ascii_case(&self.route) {
+                let model = model.trim();
+                return (!model.is_empty()).then(|| self.alias(model));
+            }
+            if crate::agent::registry::KNOWN_AGENTS
+                .iter()
+                .any(|a| a.id.eq_ignore_ascii_case(agent.trim()))
+                || crate::agent::models::is_api_route(agent.trim())
+            {
+                return None;
+            }
+        }
+        if let Some(mapped) = self
+            .aliases
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(candidate))
+            .map(|(_, id)| id.clone())
+        {
+            return Some(mapped);
+        }
+        let own = [self.model.as_str(), self.sub_model.as_str()];
+        (own.contains(&candidate) || self.aliases.values().any(|id| id == candidate))
+            .then(|| candidate.to_string())
+    }
+
+    /// A model the operator named outright, through this route's aliases:
+    /// `opus` becomes this service's id for it, anything else stands.
+    #[must_use]
+    pub fn alias(&self, name: &str) -> String {
+        let name = name.trim();
+        self.aliases
+            .iter()
+            .find(|(alias, _)| alias.eq_ignore_ascii_case(name))
+            .map_or_else(|| name.to_string(), |(_, id)| id.clone())
+    }
+
     /// Read the settings from the environment.
     ///
     /// `None` when the endpoint or the key is missing, because those cannot be
@@ -500,7 +574,7 @@ impl Reply {
 #[must_use]
 pub fn request_body(model: &str, system: &str, messages: &[Value], tools: &[Value]) -> Value {
     let mut body = json!({
-        "max_tokens": MAX_TOKENS,
+        "max_tokens": DEFAULT_MAX_TOKENS,
         "messages": messages,
         "tools": tools,
     });
@@ -809,7 +883,8 @@ impl ApiBackend {
         self.messages.push(user_prompt(prompt, &images));
 
         let definitions = self.tools.definitions();
-        for _ in 0..MAX_STEPS {
+        let max_steps = self.settings.max_steps;
+        for _ in 0..max_steps {
             // BETWEEN steps, which is the only place a turn can be stopped
             // without abandoning a request already in flight or a tool already
             // running. A turn inside a long tool call stops when that call
@@ -823,12 +898,13 @@ impl ApiBackend {
                     served_by: self.served_by.clone(),
                 });
             }
-            let body = request_body(
+            let mut body = request_body(
                 &self.settings.model,
                 &self.system,
                 &self.messages,
                 &definitions,
             );
+            body["max_tokens"] = json!(self.settings.max_tokens);
             // Streamed, so a long reply arrives rather than appearing. The
             // fragments go out as they come; the WHOLE reply is still parsed
             // below by the same parser the non-streaming path uses, so nothing
@@ -897,7 +973,7 @@ impl ApiBackend {
             stop_reason: "step_limit".to_string(),
             is_error: true,
             detail: Some(format!(
-                "the model kept asking for tools past {MAX_STEPS} rounds in one turn, so the \
+                "the model kept asking for tools past {max_steps} rounds in one turn, so the \
                  turn was stopped. Whatever it was retrying was not working."
             )),
             served_by: self.served_by.clone(),
@@ -912,6 +988,7 @@ struct Http {
     key: String,
     format: WireFormat,
     auth: KeyHeader,
+    timeout: Duration,
 }
 
 impl Http {
@@ -949,7 +1026,7 @@ impl Transport for Http {
                 .map_err(|e| format!("no runtime for the request: {e}"))?;
             runtime.block_on(async move {
                 let client = reqwest::Client::builder()
-                    .timeout(REQUEST_TIMEOUT)
+                    .timeout(http.timeout)
                     .build()
                     .map_err(|e| format!("client: {e}"))?;
                 let response = http
@@ -1000,7 +1077,7 @@ impl Transport for Http {
                 .map_err(|e| format!("no runtime for the request: {e}"))?;
             runtime.block_on(async move {
                 let client = reqwest::Client::builder()
-                    .timeout(REQUEST_TIMEOUT)
+                    .timeout(http.timeout)
                     .build()
                     .map_err(|e| format!("client: {e}"))?;
                 let mut response = http
@@ -1120,6 +1197,7 @@ impl AgentBackend for ApiBackend {
             key: self.settings.key.clone(),
             format: self.settings.format,
             auth: self.settings.auth,
+            timeout: Duration::from_secs(self.settings.timeout_secs),
         };
         self.run_turn_with(&transport, prompt, on_event)
     }
@@ -1246,12 +1324,20 @@ impl AgentBackend for ApiBackend {
     // pretend implementation would hide it.
 
     fn set_models(&mut self, candidates: &[String]) {
-        // No fallback chain: one request goes to one model, and a caller that
-        // wants a second tried must ask again. Taking the first is honest about
-        // that; pretending to hold a chain would not be.
-        if let Some(first) = candidates.first() {
-            self.settings.model.clone_from(first);
+        // No fallback chain: one request goes to one model. The FIRST
+        // candidate this route serves is taken ([`Settings::serves`]); a role
+        // table written for every agent names models this service may not
+        // have, and one that serves none leaves the model in hand rather than
+        // sending a name the request would fail on.
+        if let Some(model) = candidates.iter().find_map(|c| self.settings.serves(c)) {
+            self.settings.model = model;
         }
+    }
+
+    /// A model the operator named outright (`/model`, `-m`): any id the
+    /// service offers, through the route's aliases.
+    fn choose_model(&mut self, model: &str) {
+        self.settings.model = self.settings.alias(model);
     }
 }
 
@@ -1479,7 +1565,7 @@ mod tests {
         // A model that keeps calling a failing tool would otherwise run until
         // the account is empty.
         let dir = tempfile::tempdir().expect("tmp");
-        let forever: Vec<String> = (0..MAX_STEPS + 5)
+        let forever: Vec<String> = (0..DEFAULT_MAX_STEPS + 5)
             .map(|n| {
                 asked_for(
                     &format!("c{n}"),
@@ -1497,9 +1583,20 @@ mod tests {
         assert_eq!(outcome.stop_reason, "step_limit");
         assert_eq!(
             transport.sent.borrow().len(),
-            MAX_STEPS,
+            DEFAULT_MAX_STEPS,
             "stopped at the cap"
         );
+        // The entry's own ceiling is the one kept, and its reply ceiling is
+        // the one asked for.
+        let transport = Canned::new(&refs);
+        let mut tight = backend(dir.path());
+        tight.settings.max_steps = 3;
+        tight.settings.max_tokens = 1234;
+        tight
+            .run_turn_with(&transport, "loop", &mut |_| {})
+            .expect("a turn");
+        assert_eq!(transport.sent.borrow().len(), 3, "the entry's cap");
+        assert_eq!(transport.sent.borrow()[0]["max_tokens"], 1234);
         assert!(
             outcome.detail.is_some_and(|d| d.contains("not working")),
             "and says why"

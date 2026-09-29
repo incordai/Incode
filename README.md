@@ -290,13 +290,17 @@ a vendor is built into incode: these are ordinary entries you write.
 "api_models": [
   { "name": "anthropic", "format": "anthropic",
     "url": "https://api.anthropic.com/v1/messages", "key_env": "ANTHROPIC_API_KEY",
-    "model": "claude-opus-5-5", "sub_model": "claude-haiku-4-5" },
+    "model": "claude-opus-5-5", "sub_model": "claude-haiku-4-5",
+    "aliases": { "opus": "claude-opus-5-5", "sonnet": "claude-sonnet-5-5", "haiku": "claude-haiku-4-5" } },
   { "name": "zai", "format": "anthropic", "auth": "bearer",
     "url": "https://api.z.ai/api/anthropic/v1/messages", "key_env": "ZAI_API_KEY",
-    "model": "glm-5.3", "sub_model": "glm-5.3-flash" },
+    "model": "glm-5.3", "sub_model": "glm-5.3-flash",
+    "aliases": { "opus": "glm-5.3", "sonnet": "glm-5.3", "haiku": "glm-5.3-flash" } },
   { "name": "openrouter", "format": "openai",
     "url": "https://openrouter.ai/api/v1/chat/completions", "key_env": "OPENROUTER_API_KEY",
-    "model": "<a model id from /models>" }
+    "model": "anthropic/claude-opus-5.5", "sub_model": "anthropic/claude-haiku-4.5",
+    "aliases": { "opus": "anthropic/claude-opus-5.5", "sonnet": "anthropic/claude-sonnet-5.5",
+                 "haiku": "anthropic/claude-haiku-4.5" } }
 ]
 ```
 
@@ -305,8 +309,14 @@ a vendor is built into incode: these are ordinary entries you write.
   is the same either way; incode translates at the edge.
 - `auth`: which header carries the key, `x-api-key` or `bearer`. Unset, the
   format's own. Z.ai's Anthropic endpoint reads a bearer token.
-- `model` is the lead's model; `sub_model` the one its sub-agents run on (the
+- `model` is the default model; `sub_model` the one its sub-agents run on (the
   `Agent` tool). A sub-agent definition or an `INCODE_ROLE_*` model still wins.
+- `aliases` map the names your role table uses (`opus`, `sonnet`, `haiku`) to
+  this service's ids, so one role table serves every entry — the same mapping
+  Z.ai documents for Claude Code. A role candidate is taken only when the entry
+  serves it (an alias, its `model` or `sub_model`, or `<name>:<id>`); one it
+  serves none of leaves the default model in place rather than sending a name
+  the service does not have.
 - `key_env` is the **name** of the variable holding the key, never the key. The
   url must be `https`, or plain `http` to this machine; the key goes nowhere
   else.
@@ -315,6 +325,9 @@ a vendor is built into incode: these are ordinary entries you write.
   format, `https://api.z.ai/api/coding/paas/v4/chat/completions`, with the key
   from the plan's dashboard. Pay-as-you-go is
   `https://api.z.ai/api/paas/v4/chat/completions` (`openai`).
+- `max_tokens` (reply ceiling, default 8192), `max_steps` (tool rounds per
+  turn, default 40) and `timeout_secs` (per request, default 300) are per
+  entry too.
 - `/model <id>` switches to any model the service offers; `/models` lists them.
 
 ### The API providers contract
@@ -672,7 +685,7 @@ and `--admin` prints which layer decided each value.
 | `scaffold` | The generator you want [a new project](#a-new-project) laid out with, per stack. A preference handed to the model when it writes `## Layout`; incode runs nothing from it itself |
 | `memory_url` · `engine_bin` | Where the memory service listens · where its engine binary is |
 | `api_providers` | Services that list API agents ([contract](#the-api-providers-contract)) |
-| `api_models` | [Models reached with a key](#api-models): `name`, `format`, `url`, `key_env`, `model`, `sub_model`, `auth` |
+| `api_models` | [Models reached with a key](#api-models): `name`, `format`, `url`, `key_env`, `model`, `sub_model`, `aliases`, `auth`, `max_tokens`, `max_steps`, `timeout_secs` |
 | `web_search` | `WebSearch`'s endpoint (`url`, the query sent as `q`) and the name of its key's variable. The key is sent only over https or to loopback |
 | `tools` | [External tools](#external-tools): each one's release, version, asset, `run` and `provides` |
 | `browser_bin` · `pdf_renderer` | For development, a headless browser executable that wins over the installed one · which program `RenderPdf` uses |
@@ -778,8 +791,7 @@ moved. The old `INCORD_*` variables are not read any more: rename them.
 - The Windows sandbox does not confine workspace-write, and no OS restricts
   the network.
 - On an API model, the session's permission mode and `--add-dir` are not yet
-  applied to its toolbox, a 429 or 529 is not retried, and replies are capped at
-  8,192 tokens.
+  applied to its toolbox, and a 429 or 529 is not retried.
 
 The full list is in `docs/ROADMAP.md`.
 

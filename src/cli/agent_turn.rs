@@ -442,6 +442,11 @@ impl AgentSession {
         self.backend.set_models(candidates);
     }
 
+    /// Point the next turn at a model the operator named outright.
+    pub fn choose_model(&mut self, model: &str) {
+        self.backend.choose_model(model);
+    }
+
     /// The model the next turn will ask for.
     #[must_use]
     pub fn model(&self) -> Option<&str> {

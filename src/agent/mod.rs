@@ -776,6 +776,13 @@ pub trait AgentBackend {
     /// caller has no opinion and the agent's own default should stand.
     fn set_models(&mut self, _candidates: &[String]) {}
 
+    /// A model the operator named outright (`/model`, `-m`), rather than a
+    /// role table's candidates. Defaulted to the same rule as
+    /// [`Self::set_models`]; an API route takes any id its service offers.
+    fn choose_model(&mut self, model: &str) {
+        self.set_models(&[model.to_string()]);
+    }
+
     // The methods below exist because an interactive session needs them and not
     // every backend can honour them. Each defaults to doing nothing rather than
     // being required, so a backend implements only what it actually supports —
@@ -1041,6 +1048,10 @@ impl AgentBackend for Box<dyn AgentBackend> {
 
     fn session_id(&self) -> Option<&str> {
         (**self).session_id()
+    }
+
+    fn choose_model(&mut self, model: &str) {
+        (**self).choose_model(model);
     }
 
     fn set_models(&mut self, candidates: &[String]) {

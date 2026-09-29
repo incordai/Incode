@@ -1000,6 +1000,10 @@ mod tests {
             key_env: "MODEL_KEY".to_string(),
             model: "some-model".to_string(),
             sub_model: String::new(),
+            aliases: std::collections::BTreeMap::new(),
+            max_tokens: None,
+            max_steps: None,
+            timeout_secs: None,
             auth: None,
         };
         let catalogue = Catalogue::assemble_with(

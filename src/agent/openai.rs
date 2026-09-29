@@ -4,8 +4,8 @@
 //!
 //! The API route keeps its conversation in ONE shape — the messages format of
 //! [`super::api`] — and the turn loop, the parser and every test of them are
-//! written against it. A service that speaks chat completions (OpenRouter,
-//! Z.ai's pay-as-you-go endpoint, the owner's own API) is reached by turning
+//! written against it. A service that speaks chat completions (a router, a
+//! vendor's pay-as-you-go endpoint, the owner's own API) is reached by turning
 //! the request into its shape on the way out and its reply back on the way in.
 //! A second loop written against the second format would be free to disagree
 //! with the first about what a turn is; a translation cannot.

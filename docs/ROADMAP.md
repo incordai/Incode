@@ -55,8 +55,9 @@ This is fully true for claude; section 0b says what is not.
   https-or-loopback rule on every API key, a route's `sub_model` for its
   sub-agents, and `/models`. Not run against a live service: no key was used.
 - **The API route still lacks**: the session's permission mode and `--add-dir`
-  on its toolbox, retry on 429/529, prompt caching, and a configurable reply
-  ceiling (8,192 tokens).
+  on its toolbox, retry on 429/529, and prompt caching. The reply ceiling, tool
+  rounds and request timeout are per-entry config (`max_tokens`, `max_steps`,
+  `timeout_secs`).
 - **No SSE MCP transport.** An ACP client's HTTP MCP servers are spoken to over
   Streamable HTTP (`toolbox::mcp_http`, `mcpCapabilities.http: true`); the older SSE
   transport is not, and `initialize` says so. A server that forgets its session

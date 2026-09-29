@@ -341,7 +341,9 @@ impl RoleTable {
         self.assigned.get(role).map_or(&[], Vec::as_slice)
     }
 
-    /// The first model for a role, if any.
+    /// The first model for a role, if any. Production code takes the whole
+    /// list (`candidates_for`), since a route may serve only a later one.
+    #[cfg(test)]
     #[must_use]
     pub fn model_for(&self, role: &str) -> Option<&str> {
         self.candidates_for(role).first().map(String::as_str)

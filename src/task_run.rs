@@ -475,7 +475,7 @@ fn drive(
         backend.share_session_tools(std::sync::Arc::clone(tools));
 
         if let Some(m) = model {
-            backend.set_models(&[m.to_string()]);
+            backend.choose_model(m);
         } else {
             let admin = crate::admin::AdminConfig::load_default();
             let plan_models = admin.roles.get("plan").cloned().unwrap_or_default();

@@ -635,7 +635,7 @@ pub(crate) fn prepare_session(
     // the most specific thing the operator said, and it was previously
     // reported by `/admin` while the session ran on something else.
     match config.model_from_flag.as_deref() {
-        Some(model) => session.set_models(&[model.to_string()]),
+        Some(model) => session.choose_model(model),
         None => {
             // Role routing applies to interactive work too: the model the
             // session opens on is the one chosen for conversation.
@@ -931,7 +931,7 @@ impl CliApp {
                                 // a resumed session carries the earlier turns,
                                 // and asking a different model to continue them
                                 // is a request nothing can reason about.
-                                session.set_models(&[name.to_string()]);
+                                session.choose_model(name);
                                 display_model = format!("{} via {}", name, agent.display_name);
                                 render::print_info(&format!(
                                     "Next turn runs on {name}. The conversation starts fresh — a different model cannot continue a transcript it never had."

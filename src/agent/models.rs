@@ -4,9 +4,9 @@
 //!
 //! - [`API_ROUTE`] — the one the environment configures
 //!   ([`super::api::API_URL_ENV`] and its siblings).
-//! - A model in admin.json `api_models`, chosen by its `name`. Anthropic,
-//!   Z.ai, OpenRouter, a local server: each is one entry, differing only in
-//!   what the operator wrote.
+//! - A model in admin.json `api_models`, chosen by its `name`. Every service,
+//!   a local server included, is one entry, differing only in what the
+//!   operator wrote.
 //! - An agent of a provider in admin.json `api_providers`, chosen as
 //!   `<provider>/<agent>`. Its turns go to `{url}`[`PROVIDER_TURNS_PATH`] in
 //!   the chat-completions format, asking for the agent's id as the model —
@@ -60,6 +60,25 @@ pub fn model_settings(
         format: model.format,
         auth: model.auth.unwrap_or_else(|| model.format.default_auth()),
         sub_model: model.sub_model.trim().to_string(),
+        aliases: model
+            .aliases
+            .iter()
+            .map(|(name, id)| (name.trim().to_string(), id.trim().to_string()))
+            .filter(|(name, id)| !name.is_empty() && !id.is_empty())
+            .collect(),
+        // Zero would stop every turn before it starts, so it is read as unset.
+        max_tokens: model
+            .max_tokens
+            .filter(|n| *n > 0)
+            .unwrap_or(super::api::DEFAULT_MAX_TOKENS),
+        max_steps: model
+            .max_steps
+            .filter(|n| *n > 0)
+            .unwrap_or(super::api::DEFAULT_MAX_STEPS),
+        timeout_secs: model
+            .timeout_secs
+            .filter(|n| *n > 0)
+            .unwrap_or(super::api::DEFAULT_TIMEOUT_SECS),
         route: name.to_string(),
     })
 }
@@ -88,7 +107,9 @@ pub fn provider_settings(
         auth: WireFormat::Openai.default_auth(),
         // A provider agent is one model; its sub-agents are the same agent.
         sub_model: String::new(),
+        aliases: std::collections::BTreeMap::new(),
         route: format!("{}/{agent}", provider.name.trim()),
+        ..Settings::default()
     })
 }
 
@@ -284,6 +305,10 @@ mod tests {
             key_env: "MODEL_KEY_VARIABLE".to_string(),
             model: "some-model".to_string(),
             sub_model: String::new(),
+            aliases: std::collections::BTreeMap::new(),
+            max_tokens: None,
+            max_steps: None,
+            timeout_secs: None,
             auth: None,
         }
     }
@@ -515,5 +540,48 @@ mod tests {
             ("INCODE_API_FORMAT", "openia"),
         ]);
         assert!(settings_in("api", &AdminConfig::default(), &typo).is_none());
+    }
+}
+
+/// **NO VENDOR IN THE API ROUTE'S CODE.** Which services, models and urls
+/// exist is the operator's admin.json; one named here would have to be
+/// edited out of the source to change it. The same rule `roles.rs` holds its
+/// own source to, over every file of this route.
+#[cfg(test)]
+mod no_vendor_in_source {
+    #[test]
+    fn no_service_model_or_url_is_baked_into_the_api_route() {
+        let files = [
+            ("api.rs", include_str!("api.rs")),
+            ("models.rs", include_str!("models.rs")),
+            ("openai.rs", include_str!("openai.rs")),
+            ("catalogue.rs", include_str!("catalogue.rs")),
+        ];
+        // Assembled, so this test's own list does not match itself.
+        let names: Vec<String> = [
+            ["clau", "de-"],
+            ["gl", "m-"],
+            ["gp", "t-"],
+            ["gem", "ini"],
+            ["open", "router"],
+            ["z", ".ai"],
+            ["api.anth", "ropic.com"],
+        ]
+        .iter()
+        .map(|parts| parts.concat())
+        .collect();
+        for (file, source) in files {
+            let production = source
+                .split("\nmod tests")
+                .next()
+                .expect("a production half")
+                .to_ascii_lowercase();
+            for name in &names {
+                assert!(
+                    !production.contains(name.as_str()),
+                    "`{name}` is named in {file}; a service is configuration, not code"
+                );
+            }
+        }
     }
 }

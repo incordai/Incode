@@ -284,14 +284,21 @@ impl Toolbox {
         if !settings.sub_model.is_empty() {
             settings.model.clone_from(&settings.sub_model);
         }
+        // A role's candidates, only as this route serves them: a name the
+        // service does not have is not sent to it (`Settings::serves`).
         if !role.is_empty() {
-            if let Some(chosen) = crate::roles::RoleTable::from_env().model_for(role) {
-                settings.model = crate::roles::model_name(chosen).to_string();
+            if let Some(chosen) = crate::roles::RoleTable::from_env()
+                .candidates_for(role)
+                .iter()
+                .find_map(|c| settings.serves(c))
+            {
+                settings.model = chosen;
             }
         }
-        // A model the definition names outright wins over the role's.
+        // A model the definition names outright wins over the role's, through
+        // the route's aliases (`opus` is this service's id for it).
         if let Some(model) = spec.definition.and_then(|d| d.model.as_deref()) {
-            settings.model = model.to_string();
+            settings.model = settings.alias(model);
         }
         // WHICH WORK WENT WHERE. Routing is invisible from outside: a subagent on
         // the wrong model looks exactly like one on the right model that answered

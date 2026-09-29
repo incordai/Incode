@@ -301,6 +301,23 @@ pub struct ApiModel {
     /// cheaper model for delegated work. Blank, they inherit `model`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub sub_model: String,
+    /// The role table's names (`opus`, `sonnet`, `haiku`, …) mapped to this
+    /// service's own model ids, so one role table serves every entry. A name
+    /// this service is not given is not sent to it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub aliases: BTreeMap<String, String>,
+    /// The reply-length ceiling asked for. Unset is
+    /// [`crate::agent::api::DEFAULT_MAX_TOKENS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
+    /// How many tool rounds one turn may take. Unset is
+    /// [`crate::agent::api::DEFAULT_MAX_STEPS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_steps: Option<usize>,
+    /// How long one request may take, in seconds. Unset is
+    /// [`crate::agent::api::DEFAULT_TIMEOUT_SECS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
     /// Which header carries the key: `x-api-key` or `bearer`. Unset is the
     /// format's own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1262,6 +1279,10 @@ mod tests {
                 key_env: "ROUTER_KEY_VARIABLE".to_string(),
                 model: "a-model".to_string(),
                 sub_model: "a-fast-model".to_string(),
+                aliases: BTreeMap::from([("haiku".to_string(), "a-fast-model".to_string())]),
+                max_tokens: Some(64_000),
+                max_steps: Some(60),
+                timeout_secs: Some(600),
                 auth: Some(crate::agent::api::KeyHeader::Bearer),
             }],
             // The search provider too, holding its key variable's NAME only.
