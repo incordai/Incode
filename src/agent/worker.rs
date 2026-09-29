@@ -1969,7 +1969,10 @@ mod tests {
         let _ = worker.work(&Task::new("t-1", "r-1", "the first piece of work"));
         let _ = worker.work(&Task::new("t-2", "r-1", "the second piece of work"));
         worker.release();
-        assert_eq!(worker.backend.log, vec!["clear", "turn", "clear", "turn", "end", "clear"]);
+        assert_eq!(
+            worker.backend.log,
+            vec!["clear", "turn", "clear", "turn", "end", "clear"]
+        );
     }
 
     /// **A RETRY IS THE SAME TASK, AND KEEPS ITS CONVERSATION.**
