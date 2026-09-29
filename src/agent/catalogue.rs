@@ -1,15 +1,13 @@
 //! Every agent this session could use, in one list.
 //!
-//! # Three sources, and none of them is a list in this code
+//! # Three sources, all of them admin.json or the machine itself
 //!
 //! - **Local agents** — CLIs found on this machine by
-//!   [`super::registry::discover`]. The operator never lists them; they are
-//!   found, and the operator only picks.
-//! - **The API route** — the one API configured by [`API_URL_ENV`],
-//!   [`API_KEY_ENV`] and [`super::api::API_MODEL_ENV`]. It used to REPLACE
-//!   every local agent the moment it was set, so an operator who exported two
-//!   variables for one experiment silently lost the agents they had installed.
-//!   It is now one more entry, and leads only when chosen or when nothing local
+//!   [`super::registry::discover_in`], looking for what
+//!   [`super::registry::agent_table`] says. The operator never lists them;
+//!   they are found, and the operator only picks.
+//! - **API models** — each entry of admin.json `api_models`, chosen by its
+//!   name. One more entry each, leading only when chosen or when nothing local
 //!   can.
 //! - **Provider agents** — each service in admin.json `api_providers` is asked
 //!   which agents it serves. The request and the reply are specified once, on
@@ -26,9 +24,9 @@
 //! # The lead and the sub-agents
 //!
 //! The lead is the agent the session talks to. The sub-agent is the agent that
-//! takes the work the lead hands out. By default it is the lead's entry in the
-//! built-in table ([`super::registry::AgentProbe::default_sub_agent`]); the
-//! operator may name another. This picks an AGENT. Which MODEL a kind of work
+//! takes the work the lead hands out. By default it is the lead's
+//! `default_sub_agent` in the agent table ([`super::registry::AgentSpec`]);
+//! the operator may name another. This picks an AGENT. Which MODEL a kind of work
 //! runs on is the role table's job ([`crate::roles`]), and the two are kept
 //! separate.
 
@@ -36,11 +34,11 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use super::api::{Settings, API_AUTH_ENV, API_FORMAT_ENV, API_KEY_ENV, API_MODEL_ENV, API_URL_ENV};
-use super::registry::{no_drivable_reason, AgentProbe, DetectedAgent, API_ROUTE, KNOWN_AGENTS};
+use super::registry::{agent_table, no_drivable_reason, AgentSpec, DetectedAgent};
 use crate::admin::{ApiModel, ApiProvider};
 
-/// How long one provider has to answer with its agent list.
+/// How long one provider has to answer with its agent list, unless its entry
+/// says otherwise (`list_timeout_secs`).
 ///
 /// The list is read while the session starts, before the first prompt, so a
 /// provider that does not answer is a person waiting to type. Three seconds is
@@ -48,7 +46,14 @@ use crate::admin::{ApiModel, ApiProvider};
 /// a dead one costs a pause rather than a terminal that looks hung. Providers
 /// are asked one after another, so the worst case is this times the number
 /// configured.
-pub const PROVIDER_TIMEOUT: Duration = Duration::from_secs(3);
+pub const DEFAULT_PROVIDER_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Where a provider's agent list is read, under its `url`, unless its entry
+/// names another path (`agents_path`).
+pub const DEFAULT_AGENTS_PATH: &str = "/v1/agents";
+
+/// Answers a provider's agent list for `(endpoint, key, timeout)`.
+type Fetch<'a> = &'a dyn Fn(&str, &str, Duration) -> Result<String, String>;
 
 /// The longest name or model shown for a provider-listed agent.
 ///
@@ -143,20 +148,26 @@ pub struct Catalogue {
     /// Every local agent found, drivable or not — what an empty choice is
     /// explained from.
     found: Vec<DetectedAgent>,
+    /// The agent table the local agents were looked for by — where a lead's
+    /// default sub-agent is read.
+    table: Vec<AgentSpec>,
 }
 
 impl Catalogue {
-    /// Probe this machine, read the API variables and the configured models,
-    /// and ask each provider.
+    /// Probe this machine for the agents admin.json's table names, read the
+    /// configured models, and ask each provider.
     #[must_use]
     pub fn gather(admin: &crate::admin::AdminConfig) -> Self {
-        Self::assemble_with(
-            super::registry::discover(),
+        let table = agent_table(&admin.cli_agents);
+        let mut catalogue = Self::assemble_with(
+            super::registry::discover_in(&table),
             &admin.api_providers,
             &admin.api_models,
             &super::api::non_empty,
             &fetch_agents,
-        )
+        );
+        catalogue.table = table;
+        catalogue
     }
 
     /// Every local agent the machine was probed for, drivable or not: what
@@ -169,14 +180,15 @@ impl Catalogue {
     /// The catalogue from its inputs, with nothing read from the machine.
     ///
     /// `env` answers a variable's trimmed, non-empty value; `fetch` answers a
-    /// provider's agent list for `(url, key)`. Both are seams so every outcome
-    /// — each failure included — can be tested without a network.
+    /// provider's agent list for `(endpoint, key, timeout)`. Both are seams so
+    /// every outcome — each failure included — can be tested without a
+    /// network. The agent table is the built-in one.
     #[cfg(test)]
     fn assemble(
         found: Vec<DetectedAgent>,
         providers: &[ApiProvider],
         env: &dyn Fn(&str) -> Option<String>,
-        fetch: &dyn Fn(&str, &str) -> Result<String, String>,
+        fetch: Fetch<'_>,
     ) -> Self {
         Self::assemble_with(found, providers, &[], env, fetch)
     }
@@ -187,10 +199,9 @@ impl Catalogue {
         providers: &[ApiProvider],
         models: &[ApiModel],
         env: &dyn Fn(&str) -> Option<String>,
-        fetch: &dyn Fn(&str, &str) -> Result<String, String>,
+        fetch: Fetch<'_>,
     ) -> Self {
         let mut entries: Vec<Entry> = found.iter().map(local_entry).collect();
-        entries.extend(api_route_entry(env));
         for model in models {
             let entry = model_entry(model, &entries, providers, env);
             entries.push(entry);
@@ -200,13 +211,17 @@ impl Catalogue {
             entries.extend(provider_entries(provider, &seen, env, fetch));
             seen.push(provider.name.trim());
         }
-        Self { entries, found }
+        Self {
+            entries,
+            found,
+            table: agent_table(&[]),
+        }
     }
 
     /// A catalogue of these local agents alone, for another module's tests.
     #[cfg(test)]
     pub(crate) fn of_local(found: Vec<DetectedAgent>) -> Self {
-        Self::assemble(found, &[], &|_| None, &|_, _| {
+        Self::assemble(found, &[], &|_| None, &|_, _, _| {
             Err("no provider in this catalogue".to_string())
         })
     }
@@ -308,8 +323,7 @@ impl Catalogue {
     ///
     /// 1. The operator's choice (`chosen`, admin.json `sub_agent`) when it is
     ///    usable.
-    /// 2. Otherwise the lead's entry in the built-in table beside
-    ///    [`KNOWN_AGENTS`].
+    /// 2. Otherwise the lead's `default_sub_agent` in the agent table.
     /// 3. When that is not usable — or the lead has no entry, as an API lead
     ///    does not — the lead itself.
     ///
@@ -317,14 +331,14 @@ impl Catalogue {
     /// can say it rather than leave a choice that quietly did not apply.
     #[must_use]
     pub fn sub_agent(&self, lead: &DetectedAgent, chosen: Option<&str>) -> SubAgent {
-        self.sub_agent_by(lead, chosen, KNOWN_AGENTS)
+        self.sub_agent_by(lead, chosen, &self.table)
     }
 
     fn sub_agent_by(
         &self,
         lead: &DetectedAgent,
         chosen: Option<&str>,
-        table: &[AgentProbe],
+        table: &[AgentSpec],
     ) -> SubAgent {
         let mut passed_over: Vec<String> = Vec::new();
         if let Some(want) = chosen.map(str::trim).filter(|w| !w.is_empty()) {
@@ -342,8 +356,8 @@ impl Catalogue {
         let origin = format!("default for {}", lead.id);
         let default = table
             .iter()
-            .find(|probe| probe.id.eq_ignore_ascii_case(&lead.id))
-            .map(|probe| probe.default_sub_agent);
+            .find(|spec| spec.id.eq_ignore_ascii_case(&lead.id))
+            .map(|spec| spec.default_sub_agent.as_str());
         if let Some(default) = default {
             match self.route_for(default) {
                 Ok(agent) => {
@@ -415,39 +429,6 @@ fn local_entry(agent: &DetectedAgent) -> Entry {
     }
 }
 
-/// The API route configured by environment variables, when any of them is set.
-///
-/// Usable by exactly the rule that builds its backend
-/// ([`Settings::from_lookup`]); half-configured, it is listed with the
-/// variable that is missing rather than left out.
-fn api_route_entry(env: &dyn Fn(&str) -> Option<String>) -> Option<Entry> {
-    let url = env(API_URL_ENV);
-    let key = env(API_KEY_ENV);
-    if url.is_none() && key.is_none() {
-        return None;
-    }
-    let status = match Settings::from_lookup(env) {
-        Some(settings) => match key_may_travel_to(&settings.endpoint) {
-            Ok(()) => Status::Usable(DetectedAgent::over_api(&settings.model)),
-            Err(why) => Status::Unusable(format!("{API_URL_ENV}: {why}")),
-        },
-        None if url.is_none() => Status::Unusable(format!("{API_URL_ENV} is not set")),
-        None if key.is_none() => Status::Unusable(format!("{API_KEY_ENV} is not set")),
-        // Both are set, so what failed is a word naming a format or a header.
-        None => Status::Unusable(format!(
-            "{API_FORMAT_ENV} must be `anthropic` or `openai`, and {API_AUTH_ENV} \
-             `x-api-key` or `bearer`"
-        )),
-    };
-    Some(Entry {
-        id: API_ROUTE.to_string(),
-        name: "configured API".to_string(),
-        kind: Kind::Api,
-        detail: env(API_MODEL_ENV),
-        status,
-    })
-}
-
 /// One model configured in admin.json `api_models`: usable by exactly the rule
 /// its backend is built by ([`super::models::model_settings`]), or listed with
 /// why not.
@@ -494,7 +475,7 @@ fn provider_entries(
     provider: &ApiProvider,
     seen: &[&str],
     env: &dyn Fn(&str) -> Option<String>,
-    fetch: &dyn Fn(&str, &str) -> Result<String, String>,
+    fetch: Fetch<'_>,
 ) -> Vec<Entry> {
     let name = provider.name.trim();
     let broken = |why: String| {
@@ -530,7 +511,17 @@ fn provider_entries(
     let Some(key) = env(key_env) else {
         return broken(format!("{key_env} is not set"));
     };
-    let listed = match fetch(url, &key).and_then(|body| parse_agents(&body)) {
+    let endpoint = format!(
+        "{}{}",
+        url.trim_end_matches('/'),
+        super::models::path_or(provider.agents_path.as_deref(), DEFAULT_AGENTS_PATH)
+    );
+    // Zero would give up before asking, so it is read as unset.
+    let timeout = provider
+        .list_timeout_secs
+        .filter(|n| *n > 0)
+        .map_or(DEFAULT_PROVIDER_TIMEOUT, Duration::from_secs);
+    let listed = match fetch(&endpoint, &key, timeout).and_then(|body| parse_agents(&body)) {
         Ok(listed) => listed,
         Err(why) => return broken(format!("could not list its agents: {why}")),
     };
@@ -583,10 +574,12 @@ struct WireAgent {
 ///
 /// # The request
 ///
-/// `GET {url}/v1/agents`, where `url` is the provider's `url` from admin.json
-/// with any trailing `/` removed, carrying `Authorization: Bearer <key>`, where
-/// the key is the value of the environment variable the provider's `key_env`
-/// names. The whole request must finish within [`PROVIDER_TIMEOUT`]. The url
+/// `GET {url}{agents_path}` — `agents_path` unset is [`DEFAULT_AGENTS_PATH`] —
+/// where `url` is the provider's `url` from admin.json with any trailing `/`
+/// removed, carrying `Authorization: Bearer <key>`, where the key is the value
+/// of the environment variable the provider's `key_env` names. The whole
+/// request must finish within the provider's `list_timeout_secs`
+/// ([`DEFAULT_PROVIDER_TIMEOUT`] unset). The url
 /// must be `https`, or plain `http` to this machine only
 /// ([`key_may_travel_to`]); anything else is refused before the key is sent.
 ///
@@ -679,17 +672,12 @@ fn is_this_machine(host: &str) -> bool {
             .is_ok_and(|address| address.is_loopback())
 }
 
-/// Ask one provider for its agent list, under [`PROVIDER_TIMEOUT`].
-fn fetch_agents(url: &str, key: &str) -> Result<String, String> {
-    let endpoint = format!("{}/v1/agents", url.trim_end_matches('/'));
+/// Ask one provider's list endpoint for its agents, within `timeout`.
+fn fetch_agents(endpoint: &str, key: &str, timeout: Duration) -> Result<String, String> {
+    let endpoint = endpoint.to_string();
     let key = key.to_string();
     crate::runtime::http::request_text(
-        move |client| {
-            client
-                .get(&endpoint)
-                .bearer_auth(key)
-                .timeout(PROVIDER_TIMEOUT)
-        },
+        move |client| client.get(&endpoint).bearer_auth(key).timeout(timeout),
         "agent provider",
     )
 }
@@ -716,6 +704,7 @@ mod tests {
             name: name.to_string(),
             url: "https://provider.invalid/".to_string(),
             key_env: key_env.to_string(),
+            ..ApiProvider::default()
         }
     }
 
@@ -729,8 +718,19 @@ mod tests {
         }
     }
 
-    fn no_network(_: &str, _: &str) -> Result<String, String> {
+    fn no_network(_: &str, _: &str, _: Duration) -> Result<String, String> {
         panic!("nothing in this test may reach a provider")
+    }
+
+    /// A model in admin.json `api_models`, its key in `MODEL_KEY`.
+    fn api_model(name: &str) -> ApiModel {
+        ApiModel {
+            name: name.to_string(),
+            url: "https://endpoint.invalid/v1/messages".to_string(),
+            key_env: "MODEL_KEY".to_string(),
+            model: "some-model".to_string(),
+            ..ApiModel::default()
+        }
     }
 
     fn ids(catalogue: &Catalogue) -> Vec<&str> {
@@ -749,10 +749,11 @@ mod tests {
     #[test]
     fn a_providers_agents_appear_beside_the_local_agents() {
         let asked = Cell::new(0);
-        let fetch = |url: &str, key: &str| {
+        let fetch = |endpoint: &str, key: &str, timeout: Duration| {
             asked.set(asked.get() + 1);
-            assert_eq!(url, "https://provider.invalid/");
+            assert_eq!(endpoint, "https://provider.invalid/v1/agents");
             assert_eq!(key, "the-key-value");
+            assert_eq!(timeout, DEFAULT_PROVIDER_TIMEOUT);
             Ok(r#"{"agents":[{"id":"coder","name":"Coder","model":"model-1"},{"id":"claude-code"}]}"#
                 .to_string())
         };
@@ -793,25 +794,22 @@ mod tests {
         );
     }
 
-    /// **Setting the API variables no longer hides the local agents.** They
-    /// used to replace every installed CLI; the configured API is now one more
-    /// entry, and with no choice made a local agent still leads.
+    /// **A configured model does not hide the local agents.** The API route
+    /// once replaced every installed CLI the moment it was set; a model is one
+    /// more entry, and with no choice made a local agent still leads.
     #[test]
-    fn setting_the_api_variables_no_longer_hides_the_local_agents() {
-        let catalogue = Catalogue::assemble(
+    fn a_configured_model_does_not_hide_the_local_agents() {
+        let catalogue = Catalogue::assemble_with(
             vec![
                 local("claude-code", Protocol::ClaudeStreamJson),
                 local(CODEX, Protocol::CodexJson),
             ],
             &[],
-            &env_of(&[
-                (API_URL_ENV, "https://endpoint.invalid/v1/messages"),
-                (API_KEY_ENV, "k"),
-                (API_MODEL_ENV, "some-model"),
-            ]),
+            &[api_model("service")],
+            &env_of(&[("MODEL_KEY", "k")]),
             &no_network,
         );
-        assert_eq!(ids(&catalogue), vec!["claude-code", CODEX, API_ROUTE]);
+        assert_eq!(ids(&catalogue), vec!["claude-code", CODEX, "service"]);
         assert_eq!(
             catalogue.lead(None).map(|a| a.id),
             Ok("claude-code".to_string()),
@@ -823,62 +821,76 @@ mod tests {
             .into_iter()
             .map(|a| a.id)
             .collect();
-        assert_eq!(chain, vec!["claude-code", CODEX, API_ROUTE]);
-        assert_eq!(
-            entry(&catalogue, API_ROUTE).detail.as_deref(),
-            Some("some-model")
-        );
+        assert_eq!(chain, vec!["claude-code", CODEX, "service"]);
     }
 
-    /// The configured API leads when it is ASKED for, and when nothing local
-    /// can — the two cases the old "the API replaces everything" rule served.
+    /// A configured model leads when it is ASKED for, and when nothing local
+    /// can.
     #[test]
-    fn the_configured_api_leads_when_chosen_or_when_nothing_local_can() {
-        let env = env_of(&[
-            (API_URL_ENV, "https://endpoint.invalid"),
-            (API_KEY_ENV, "k"),
-        ]);
-        let with_local = Catalogue::assemble(
+    fn a_configured_model_leads_when_chosen_or_when_nothing_local_can() {
+        let env = env_of(&[("MODEL_KEY", "k")]);
+        let with_local = Catalogue::assemble_with(
             vec![local("claude-code", Protocol::ClaudeStreamJson)],
             &[],
+            &[api_model("service")],
             &env,
             &no_network,
         );
-        let chosen = with_local.lead(Some(API_ROUTE));
-        assert_eq!(chosen.as_ref().map(|a| a.id.as_str()), Ok(API_ROUTE));
+        let chosen = with_local.lead(Some("service"));
+        assert_eq!(chosen.as_ref().map(|a| a.id.as_str()), Ok("service"));
         assert_eq!(
             chosen.map(|a| a.protocol),
             Ok(Protocol::HarnessApi),
-            "the API route is built as the API backend"
+            "a model is built as the API backend"
         );
 
-        let only_unverified = Catalogue::assemble(
+        let only_unverified = Catalogue::assemble_with(
             vec![local("cursor", Protocol::Unverified)],
             &[],
+            &[api_model("service")],
             &env,
             &no_network,
         );
         assert_eq!(
             only_unverified.lead(None).map(|a| a.id),
-            Ok(API_ROUTE.to_string())
+            Ok("service".to_string())
         );
     }
 
-    /// Half-configured, the API route is listed with the variable that is
-    /// missing — not dropped, and not usable.
+    /// A model whose key variable is unset is listed with that reason — not
+    /// dropped, and not usable.
     #[test]
-    fn a_half_configured_api_route_names_the_missing_variable() {
-        let catalogue = Catalogue::assemble(
+    fn a_model_without_its_key_names_the_missing_variable() {
+        let catalogue = Catalogue::assemble_with(
             Vec::new(),
             &[],
-            &env_of(&[(API_URL_ENV, "https://endpoint.invalid")]),
+            &[api_model("service")],
+            &env_of(&[]),
             &no_network,
         );
         assert_eq!(
-            entry(&catalogue, API_ROUTE).status,
-            Status::Unusable(format!("{API_KEY_ENV} is not set"))
+            entry(&catalogue, "service").status,
+            Status::Unusable("MODEL_KEY is not set".to_string())
         );
         assert!(catalogue.lead(None).is_err(), "nothing usable, so no lead");
+    }
+
+    /// **A provider's list path and timeout are its entry's**, each with the
+    /// contract's value when the entry is silent.
+    #[test]
+    fn a_providers_list_path_and_timeout_come_from_its_entry() {
+        let fetch = |endpoint: &str, _: &str, timeout: Duration| {
+            assert_eq!(endpoint, "https://provider.invalid/api/agents");
+            assert_eq!(timeout, Duration::from_secs(9));
+            Ok(r#"{"agents":[{"id":"coder"}]}"#.to_string())
+        };
+        let team = ApiProvider {
+            agents_path: Some("api/agents".to_string()),
+            list_timeout_secs: Some(9),
+            ..provider("team", "KEY")
+        };
+        let catalogue = Catalogue::assemble(Vec::new(), &[team], &env_of(&[("KEY", "k")]), &fetch);
+        assert_eq!(ids(&catalogue), vec!["team/coder"]);
     }
 
     /// **Every way a provider can fail is ONE line with the reason** — never a
@@ -909,7 +921,7 @@ mod tests {
             ),
         ];
         for (name, reply, expected) in cases {
-            let fetch = |_: &str, _: &str| reply.clone();
+            let fetch = |_: &str, _: &str, _: Duration| reply.clone();
             let catalogue = Catalogue::assemble(
                 Vec::new(),
                 &[provider(name, "KEY")],
@@ -933,7 +945,7 @@ mod tests {
     #[test]
     fn a_key_is_never_sent_over_plain_http_to_another_machine() {
         let asked: Cell<usize> = Cell::new(0);
-        let fetch = |_: &str, _: &str| {
+        let fetch = |_: &str, _: &str, _: Duration| {
             asked.set(asked.get() + 1);
             Ok(r#"{"agents":[{"id":"coder"}]}"#.to_string())
         };
@@ -976,7 +988,8 @@ mod tests {
     /// chat-completions endpoint, asking for its own id as the model.
     #[test]
     fn a_provider_agent_is_usable_and_leads_when_chosen() {
-        let fetch = |_: &str, _: &str| Ok(r#"{"agents":[{"id":"coder"}]}"#.to_string());
+        let fetch =
+            |_: &str, _: &str, _: Duration| Ok(r#"{"agents":[{"id":"coder"}]}"#.to_string());
         let catalogue = Catalogue::assemble(
             vec![local("claude-code", Protocol::ClaudeStreamJson)],
             &[provider("team", "KEY")],
@@ -1005,13 +1018,14 @@ mod tests {
             max_steps: None,
             timeout_secs: None,
             auth: None,
+            api_version: None,
         };
         let catalogue = Catalogue::assemble_with(
             vec![local("claude-code", Protocol::ClaudeStreamJson)],
             &[],
             &[model("router"), model("claude-code"), model("unset")],
             &|name| (name == "MODEL_KEY").then(|| "k".to_string()),
-            &|_, _| Err("no provider".to_string()),
+            &|_, _, _| Err("no provider".to_string()),
         );
         assert_eq!(catalogue.lead(Some("router")).expect("usable").id, "router");
         assert_eq!(
@@ -1030,10 +1044,13 @@ mod tests {
             .nth(1)
             .expect("listed");
         assert!(matches!(&clash.status, Status::Unusable(why) if why.contains("another name")));
-        let without_key =
-            Catalogue::assemble_with(Vec::new(), &[], &[model("router")], &|_| None, &|_, _| {
-                Err("no provider".to_string())
-            });
+        let without_key = Catalogue::assemble_with(
+            Vec::new(),
+            &[],
+            &[model("router")],
+            &|_| None,
+            &|_, _, _| Err("no provider".to_string()),
+        );
         assert!(without_key
             .route_for("router")
             .is_err_and(|why| why.contains("MODEL_KEY is not set")));
@@ -1042,7 +1059,8 @@ mod tests {
     /// Two providers with one name would give their agents the same ids.
     #[test]
     fn a_second_provider_with_the_same_name_is_refused() {
-        let fetch = |_: &str, _: &str| Ok(r#"{"agents":[{"id":"coder"}]}"#.to_string());
+        let fetch =
+            |_: &str, _: &str, _: Duration| Ok(r#"{"agents":[{"id":"coder"}]}"#.to_string());
         let catalogue = Catalogue::assemble(
             Vec::new(),
             &[provider("team", "KEY"), provider("Team", "KEY")],
@@ -1117,14 +1135,7 @@ mod tests {
             &env_of(&[]),
             &no_network,
         );
-        let table = [AgentProbe {
-            id: "claude-code",
-            display_name: "a local agent",
-            commands: &["claude"],
-            version_args: &[],
-            protocol: Protocol::ClaudeStreamJson,
-            default_sub_agent: CODEX,
-        }];
+        let table = [spec_handing_to(CODEX)];
         let lead = local("claude-code", Protocol::ClaudeStreamJson);
         let sub = catalogue.sub_agent_by(&lead, Some("gemini"), &table);
         assert_eq!(sub.agent.id, CODEX, "the table's pairing was not used");
@@ -1142,23 +1153,14 @@ mod tests {
     /// `/agent` says so.** An API lead has no entry and gets itself too.
     #[test]
     fn when_the_default_is_not_usable_the_lead_itself_takes_the_work() {
-        let catalogue = Catalogue::assemble(
+        let catalogue = Catalogue::assemble_with(
             vec![local("claude-code", Protocol::ClaudeStreamJson)],
             &[],
-            &env_of(&[
-                (API_URL_ENV, "https://endpoint.invalid"),
-                (API_KEY_ENV, "k"),
-            ]),
+            &[api_model("service")],
+            &env_of(&[("MODEL_KEY", "k")]),
             &no_network,
         );
-        let table = [AgentProbe {
-            id: "claude-code",
-            display_name: "a local agent",
-            commands: &["claude"],
-            version_args: &[],
-            protocol: Protocol::ClaudeStreamJson,
-            default_sub_agent: ANTIGRAVITY,
-        }];
+        let table = [spec_handing_to(ANTIGRAVITY)];
         let lead = local("claude-code", Protocol::ClaudeStreamJson);
         let sub = catalogue.sub_agent_by(&lead, None, &table);
         assert_eq!(sub.agent.id, "claude-code");
@@ -1172,10 +1174,47 @@ mod tests {
         let report = catalogue.report(&lead, &sub, None);
         assert!(report.contains("the lead itself"), "{report}");
 
-        let api_lead = DetectedAgent::over_api("");
+        let api_lead = catalogue.lead(Some("service")).expect("usable");
         let api_sub = catalogue.sub_agent(&api_lead, None);
-        assert_eq!(api_sub.agent.id, API_ROUTE);
-        assert_eq!(api_sub.origin, format!("default for {API_ROUTE}"));
+        assert_eq!(api_sub.agent.id, "service");
+        assert_eq!(api_sub.origin, "default for service");
+    }
+
+    /// **The sub-agent default admin.json gives is the one used**: the
+    /// catalogue reads the table its agents were found by, not the built-in
+    /// one.
+    #[test]
+    fn a_configured_default_sub_agent_is_the_one_used() {
+        let mut catalogue = Catalogue::assemble(
+            vec![
+                local("claude-code", Protocol::ClaudeStreamJson),
+                local(CODEX, Protocol::CodexJson),
+            ],
+            &[],
+            &env_of(&[]),
+            &no_network,
+        );
+        let lead = local("claude-code", Protocol::ClaudeStreamJson);
+        // Control: the built-in table hands the work to the lead itself.
+        assert_eq!(catalogue.sub_agent(&lead, None).agent.id, "claude-code");
+        catalogue.table = agent_table(&[crate::admin::CliAgent {
+            id: "claude-code".to_string(),
+            default_sub_agent: Some(CODEX.to_string()),
+            ..crate::admin::CliAgent::default()
+        }]);
+        assert_eq!(catalogue.sub_agent(&lead, None).agent.id, CODEX);
+    }
+
+    /// A table whose `claude-code` hands its work to `sub`.
+    fn spec_handing_to(sub: &str) -> AgentSpec {
+        AgentSpec {
+            id: "claude-code".to_string(),
+            display_name: "a local agent".to_string(),
+            commands: vec!["claude".to_string()],
+            version_args: Vec::new(),
+            protocol: Protocol::ClaudeStreamJson,
+            default_sub_agent: sub.to_string(),
+        }
     }
 
     /// `/agent`'s listing: every entry with its state, the lead marked, and
@@ -1232,7 +1271,11 @@ mod tests {
             stream.write_all(reply.as_bytes()).expect("write");
             String::from_utf8_lossy(&request).to_string()
         });
-        let body = fetch_agents(&format!("http://{addr}/"), "k-123");
+        let body = fetch_agents(
+            &format!("http://{addr}/v1/agents"),
+            "k-123",
+            DEFAULT_PROVIDER_TIMEOUT,
+        );
         let request = server.join().expect("server");
         assert_eq!(body, Ok(r#"{"agents":[{"id":"coder"}]}"#.to_string()));
         assert!(request.starts_with("GET /v1/agents HTTP/1.1"), "{request}");
@@ -1259,12 +1302,12 @@ mod tests {
             }
         });
         let started = std::time::Instant::now();
-        let outcome = fetch_agents(&format!("http://{addr}"), "k");
+        let outcome = fetch_agents(&format!("http://{addr}"), "k", DEFAULT_PROVIDER_TIMEOUT);
         let took = started.elapsed();
         assert!(outcome.is_err(), "{outcome:?}");
         assert!(
-            took < PROVIDER_TIMEOUT + Duration::from_secs(5),
-            "took {took:?}, the bound is {PROVIDER_TIMEOUT:?}"
+            took < DEFAULT_PROVIDER_TIMEOUT + Duration::from_secs(5),
+            "took {took:?}, the bound is {DEFAULT_PROVIDER_TIMEOUT:?}"
         );
     }
 }

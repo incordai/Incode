@@ -1402,34 +1402,23 @@ mod tests {
         )
     }
 
-    /// **The chosen agent gets its own backend even with the API variables
-    /// set.** Their presence used to replace whatever agent had been chosen,
-    /// so the banner named one agent while another did the work. Only the API
-    /// route's own id reaches the API backend now.
+    /// **The chosen agent gets its own backend even with the old API
+    /// variables set.** Their presence once replaced whatever agent had been
+    /// chosen, so the banner named one agent while another did the work; then
+    /// they configured a route of their own. A route is an admin.json entry
+    /// now, and these variables configure nothing.
     #[test]
-    fn the_api_variables_do_not_replace_the_chosen_local_agent() {
+    fn the_old_api_variables_do_not_replace_the_chosen_local_agent() {
         let _guard = crate::brief::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let names = [
-            crate::agent::api::API_URL_ENV,
-            crate::agent::api::API_KEY_ENV,
-        ];
+        let names = ["INCODE_API_URL", "INCODE_API_KEY"];
         let before: Vec<Option<std::ffi::OsString>> = names.iter().map(std::env::var_os).collect();
         std::env::set_var(names[0], "http://127.0.0.1:9/v1/messages");
         std::env::set_var(names[1], "not-a-real-key");
 
         let dir = tempfile::tempdir().expect("temp dir");
         let local = session(dir.path()).backend_id().to_string();
-        let api = AgentSession::new(
-            dir.path().to_path_buf(),
-            crate::agent::registry::API_ROUTE,
-            String::new(),
-            &crate::guards::Guards::default(),
-            Vec::new(),
-        )
-        .backend_id()
-        .to_string();
 
         for (name, value) in names.iter().zip(before) {
             match value {
@@ -1439,9 +1428,8 @@ mod tests {
         }
         assert_eq!(
             local, "claude-code",
-            "the API variables replaced the chosen local agent"
+            "the old API variables replaced the chosen local agent"
         );
-        assert_eq!(api, crate::agent::registry::API_ROUTE);
     }
 
     /// **Context goes before the instruction.** Context placed after an

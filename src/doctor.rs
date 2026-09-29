@@ -162,6 +162,23 @@ fn check_agents() -> Check {
 }
 
 /// Can the protected-path policy be read, and what does it cover?
+/// The session check for a chosen admin.json API model that can be driven:
+/// it has no login to expire, only a key its entry's variable holds. `None`
+/// when nothing is chosen, or the choice is not such a model.
+fn api_session(
+    preferred: Option<&str>,
+    settings_for: &dyn Fn(&str) -> Option<crate::agent::api::Settings>,
+) -> Option<Check> {
+    let settings = settings_for(preferred?)?;
+    Some(Check::ok(
+        "session",
+        format!(
+            "API model `{}` configured ({})",
+            settings.route, settings.model
+        ),
+    ))
+}
+
 /// Is the agent actually logged in, and for how much longer?
 ///
 /// # Why this check exists
@@ -173,11 +190,11 @@ fn check_agents() -> Check {
 ///
 /// Only expiry timestamps are read. The tokens beside them are never touched.
 fn check_session() -> Check {
-    if let Some(settings) = crate::agent::api::Settings::from_env() {
-        return Check::ok(
-            "session",
-            format!("API endpoint configured ({})", settings.model),
-        );
+    let preferred = crate::agent::registry::preferred_agent();
+    if let Some(check) = api_session(preferred.as_deref(), &|id| {
+        crate::agent::models::settings_for(id)
+    }) {
+        return check;
     }
 
     let found = crate::agent::claude_code::profiles();
@@ -456,18 +473,22 @@ mod tests {
         assert!(out.contains("fix it like so"), "got: {out}");
     }
 
+    /// A chosen API model that can be driven is a ready session; anything
+    /// else falls through to the agent-login checks.
     #[test]
-    fn check_session_accepts_configured_api_settings() {
-        std::env::set_var(crate::agent::api::API_URL_ENV, "https://api.example.com");
-        std::env::set_var(crate::agent::api::API_KEY_ENV, "sk-dummy");
-        std::env::set_var(crate::agent::api::API_MODEL_ENV, "claude-sonnet-4");
-
-        let check = check_session();
+    fn a_chosen_api_model_is_a_ready_session() {
+        let resolve = |id: &str| {
+            (id == "service").then(|| crate::agent::api::Settings {
+                model: "some-model".to_string(),
+                route: "service".to_string(),
+                ..crate::agent::api::Settings::default()
+            })
+        };
+        let check = api_session(Some("service"), &resolve).expect("a model");
         assert_eq!(check.health, Health::Ok);
-        assert!(check.detail.contains("API endpoint configured"));
-
-        std::env::remove_var(crate::agent::api::API_URL_ENV);
-        std::env::remove_var(crate::agent::api::API_KEY_ENV);
-        std::env::remove_var(crate::agent::api::API_MODEL_ENV);
+        assert!(check.detail.contains("`service`"), "{}", check.detail);
+        assert!(check.detail.contains("some-model"), "{}", check.detail);
+        assert!(api_session(Some("claude-code"), &resolve).is_none());
+        assert!(api_session(None, &resolve).is_none());
     }
 }

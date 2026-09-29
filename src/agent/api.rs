@@ -22,10 +22,11 @@
 //!
 //! # No vendor in the code
 //!
-//! Endpoint, key and model all come from the environment. Nothing here names a
-//! provider, so pointing this at a different one is configuration rather than a
-//! change — including at a local model, which is the case that has no bill at
-//! all.
+//! Endpoint, model and every limit come from the route's entry in admin.json
+//! ([`super::models`]); the key from the variable that entry names. Nothing
+//! here names a provider, so pointing this at a different one is configuration
+//! rather than a change — including at a local model, which is the case that
+//! has no bill at all.
 
 use std::path::Path;
 use std::time::Duration;
@@ -35,22 +36,10 @@ use serde_json::{json, Value};
 use super::{AgentBackend, AgentError, AgentEvent, TurnOutcome};
 use crate::toolbox::{ToolOutput, Toolbox};
 
-/// Where requests go. The full URL of the messages endpoint.
-pub const API_URL_ENV: &str = "INCODE_API_URL";
-/// The credential, read from the environment and never stored by this program.
-pub const API_KEY_ENV: &str = "INCODE_API_KEY";
-/// Which model to ask for.
-pub const API_MODEL_ENV: &str = "INCODE_API_MODEL";
-/// The model sub-agents run on over the environment's route. Unset, they
-/// inherit [`API_MODEL_ENV`].
-pub const API_SUB_MODEL_ENV: &str = "INCODE_API_SUB_MODEL";
-/// Which wire format the endpoint speaks: `anthropic` (the default) or
-/// `openai`. See [`WireFormat`].
-pub const API_FORMAT_ENV: &str = "INCODE_API_FORMAT";
-
-/// The version header the messages format requires on every request. Fixed
-/// by that format's own documentation, not chosen here.
-const MESSAGES_VERSION: &str = "2023-06-01";
+/// The version header the messages format sends on every request, unless the
+/// route's entry names another (`api_version`). The value that format's own
+/// documentation gives.
+pub const DEFAULT_API_VERSION: &str = "2023-06-01";
 
 /// Which request and reply shape an endpoint speaks.
 ///
@@ -70,16 +59,6 @@ pub enum WireFormat {
 }
 
 impl WireFormat {
-    /// The format a setting names, or `None` for a word that names neither.
-    #[must_use]
-    pub fn parse(word: &str) -> Option<Self> {
-        match word.trim().to_ascii_lowercase().as_str() {
-            "anthropic" | "messages" => Some(Self::Anthropic),
-            "openai" | "chat" | "chat-completions" => Some(Self::Openai),
-            _ => None,
-        }
-    }
-
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -113,22 +92,6 @@ pub enum KeyHeader {
     /// `Authorization: Bearer <key>`.
     Bearer,
 }
-
-impl KeyHeader {
-    /// The header a setting names, or `None` for a word that names neither.
-    #[must_use]
-    pub fn parse(word: &str) -> Option<Self> {
-        match word.trim().to_ascii_lowercase().as_str() {
-            "x-api-key" => Some(Self::XApiKey),
-            "bearer" | "authorization" => Some(Self::Bearer),
-            _ => None,
-        }
-    }
-}
-
-/// Which header carries the key on the environment's route: `x-api-key` or
-/// `bearer`. Unset, the format's own ([`WireFormat::default_auth`]).
-pub const API_AUTH_ENV: &str = "INCODE_API_AUTH";
 
 /// How many times the model may call tools within ONE turn, unless the
 /// route's entry says otherwise (`max_steps`).
@@ -173,11 +136,10 @@ pub struct Settings {
     pub max_steps: usize,
     /// How long one request may take, in seconds.
     pub timeout_secs: u64,
-    /// The catalogue id this route is chosen by: [`API_ROUTE`] for the one
-    /// the environment configures, a model's or a provider agent's own id
-    /// otherwise — see [`super::models`].
-    ///
-    /// [`API_ROUTE`]: crate::agent::registry::API_ROUTE
+    /// The version header the messages format sends; unused by the other.
+    pub api_version: String,
+    /// The catalogue id this route is chosen by: a configured model's name,
+    /// or a provider agent's `<provider>/<agent>` — see [`super::models`].
     pub route: String,
 }
 
@@ -194,7 +156,8 @@ impl Default for Settings {
             max_tokens: DEFAULT_MAX_TOKENS,
             max_steps: DEFAULT_MAX_STEPS,
             timeout_secs: DEFAULT_TIMEOUT_SECS,
-            route: crate::agent::registry::API_ROUTE.to_string(),
+            api_version: DEFAULT_API_VERSION.to_string(),
+            route: String::new(),
         }
     }
 }
@@ -222,9 +185,11 @@ impl Settings {
                 let model = model.trim();
                 return (!model.is_empty()).then(|| self.alias(model));
             }
-            if crate::agent::registry::KNOWN_AGENTS
-                .iter()
-                .any(|a| a.id.eq_ignore_ascii_case(agent.trim()))
+            if crate::agent::registry::protocol_of(
+                &crate::agent::registry::configured_table(),
+                agent,
+            )
+            .is_some()
                 || crate::agent::models::is_api_route(agent.trim())
             {
                 return None;
@@ -252,48 +217,6 @@ impl Settings {
             .iter()
             .find(|(alias, _)| alias.eq_ignore_ascii_case(name))
             .map_or_else(|| name.to_string(), |(_, id)| id.clone())
-    }
-
-    /// Read the settings from the environment.
-    ///
-    /// `None` when the endpoint or the key is missing, because those cannot be
-    /// guessed. A missing MODEL is different: some endpoints serve exactly one,
-    /// and demanding a name there would refuse a working setup.
-    #[must_use]
-    pub fn from_env() -> Option<Self> {
-        Self::from_lookup(&non_empty)
-    }
-
-    /// The same rule as [`Self::from_env`], reading variables through `get`.
-    ///
-    /// Split out so the agent catalogue lists this route by the one rule that
-    /// decides whether it can be driven, and a test can supply the variables
-    /// without changing the process environment. `get` answers a variable's
-    /// trimmed, non-empty value, as [`non_empty`] does.
-    #[must_use]
-    pub(crate) fn from_lookup(get: &dyn Fn(&str) -> Option<String>) -> Option<Self> {
-        let endpoint = get(API_URL_ENV)?;
-        let key = get(API_KEY_ENV)?;
-        // A format that names neither is not quietly read as the default: a
-        // request in the wrong shape fails with a message about the request,
-        // not about the setting that caused it.
-        let format = match get(API_FORMAT_ENV) {
-            Some(word) => WireFormat::parse(&word)?,
-            None => WireFormat::default(),
-        };
-        let auth = match get(API_AUTH_ENV) {
-            Some(word) => KeyHeader::parse(&word)?,
-            None => format.default_auth(),
-        };
-        Some(Self {
-            endpoint,
-            key,
-            model: get(API_MODEL_ENV).unwrap_or_default(),
-            format,
-            auth,
-            sub_model: get(API_SUB_MODEL_ENV).unwrap_or_default(),
-            ..Self::default()
-        })
     }
 }
 
@@ -989,6 +912,7 @@ struct Http {
     format: WireFormat,
     auth: KeyHeader,
     timeout: Duration,
+    api_version: String,
 }
 
 impl Http {
@@ -1004,7 +928,7 @@ impl Http {
         };
         match self.format {
             WireFormat::Anthropic => request
-                .header("anthropic-version", MESSAGES_VERSION)
+                .header("anthropic-version", &self.api_version)
                 .json(payload),
             WireFormat::Openai => request.json(&super::openai::request(payload)),
         }
@@ -1198,6 +1122,7 @@ impl AgentBackend for ApiBackend {
             format: self.settings.format,
             auth: self.settings.auth,
             timeout: Duration::from_secs(self.settings.timeout_secs),
+            api_version: self.settings.api_version.clone(),
         };
         self.run_turn_with(&transport, prompt, on_event)
     }

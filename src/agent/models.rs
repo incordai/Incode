@@ -1,17 +1,18 @@
 //! Which API route an id names, and the settings a backend is built from.
 //!
-//! # Three kinds of API route, one resolution
+//! # Two kinds of API route, one resolution, one file
 //!
-//! - [`API_ROUTE`] — the one the environment configures
-//!   ([`super::api::API_URL_ENV`] and its siblings).
 //! - A model in admin.json `api_models`, chosen by its `name`. Every service,
 //!   a local server included, is one entry, differing only in what the
 //!   operator wrote.
 //! - An agent of a provider in admin.json `api_providers`, chosen as
-//!   `<provider>/<agent>`. Its turns go to `{url}`[`PROVIDER_TURNS_PATH`] in
-//!   the chat-completions format, asking for the agent's id as the model —
-//!   the provider contract's second half, beside the listing on
-//!   [`super::catalogue`].
+//!   `<provider>/<agent>`. Its turns go to `{url}{turns_path}` (unset,
+//!   [`DEFAULT_TURNS_PATH`]) in the chat-completions format, asking for the
+//!   agent's id as the model — the provider contract's second half, beside
+//!   the listing on [`super::catalogue`].
+//!
+//! Both are admin.json and nothing else: no environment variable configures
+//! a route, so what `--admin` shows is every route there is.
 //!
 //! The catalogue lists a route as usable by exactly these functions, and every
 //! place that builds a backend builds it from them, so the two cannot disagree
@@ -22,15 +23,23 @@
 //! Read from the environment variable the entry names, when it is needed, and
 //! never written anywhere. It is sent only to `https`, or to plain `http` on
 //! this machine ([`super::catalogue::key_may_travel_to`]).
-//!
-//! [`API_ROUTE`]: super::registry::API_ROUTE
 
 use super::api::{Settings, WireFormat};
-use super::registry::API_ROUTE;
 use crate::admin::{AdminConfig, ApiModel, ApiProvider};
 
-/// Where a provider agent's turns are sent, under the provider's `url`.
-pub const PROVIDER_TURNS_PATH: &str = "/v1/chat/completions";
+/// Where a provider agent's turns are sent, under the provider's `url`,
+/// unless its entry names another path (`turns_path`).
+pub const DEFAULT_TURNS_PATH: &str = "/v1/chat/completions";
+
+/// A path under a base url: `configured` when it names one, else `default`,
+/// always with one leading `/`.
+pub(crate) fn path_or(configured: Option<&str>, default: &str) -> String {
+    let path = configured
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .unwrap_or(default);
+    format!("/{}", path.trim_start_matches('/'))
+}
 
 /// The settings for one configured model, or why it cannot be driven now.
 ///
@@ -79,6 +88,13 @@ pub fn model_settings(
             .timeout_secs
             .filter(|n| *n > 0)
             .unwrap_or(super::api::DEFAULT_TIMEOUT_SECS),
+        api_version: model
+            .api_version
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .unwrap_or(super::api::DEFAULT_API_VERSION)
+            .to_string(),
         route: name.to_string(),
     })
 }
@@ -100,7 +116,11 @@ pub fn provider_settings(
     super::catalogue::key_may_travel_to(url)?;
     let key = key_from(&provider.key_env, env)?;
     Ok(Settings {
-        endpoint: format!("{}{PROVIDER_TURNS_PATH}", url.trim_end_matches('/')),
+        endpoint: format!(
+            "{}{}",
+            url.trim_end_matches('/'),
+            path_or(provider.turns_path.as_deref(), DEFAULT_TURNS_PATH)
+        ),
         key,
         model: agent.to_string(),
         format: WireFormat::Openai,
@@ -172,24 +192,23 @@ fn fetch_models_page(
             query.push(("after_id".to_string(), after.to_string()));
         }
     }
-    let (url, key, auth, format) = (
+    let (url, key, auth, format, version, timeout) = (
         url.to_string(),
         settings.key.clone(),
         settings.auth,
         settings.format,
+        settings.api_version.clone(),
+        std::time::Duration::from_secs(settings.timeout_secs),
     );
     crate::runtime::http::request_text(
         move |client| {
-            let request = client
-                .get(&url)
-                .query(&query)
-                .timeout(std::time::Duration::from_secs(15));
+            let request = client.get(&url).query(&query).timeout(timeout);
             let request = match auth {
                 super::api::KeyHeader::XApiKey => request.header("x-api-key", key),
                 super::api::KeyHeader::Bearer => request.bearer_auth(key),
             };
             match format {
-                WireFormat::Anthropic => request.header("anthropic-version", "2023-06-01"),
+                WireFormat::Anthropic => request.header("anthropic-version", version),
                 WireFormat::Openai => request,
             }
         },
@@ -233,8 +252,9 @@ fn key_from(key_env: &str, env: &dyn Fn(&str) -> Option<String>) -> Result<Strin
     env(key_env).ok_or_else(|| format!("{key_env} is not set"))
 }
 
-/// The settings for the API route `id` names, from the environment and
-/// admin.json; `None` when it names none, or one that cannot be driven now.
+/// The settings for the API route `id` names in admin.json, with its key from
+/// the environment; `None` when it names none, or one that cannot be driven
+/// now.
 #[must_use]
 pub fn settings_for(id: &str) -> Option<Settings> {
     settings_in(id, &AdminConfig::load_default(), &super::api::non_empty)
@@ -248,10 +268,6 @@ pub(crate) fn settings_in(
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Option<Settings> {
     let id = id.trim();
-    if id.eq_ignore_ascii_case(API_ROUTE) {
-        return Settings::from_lookup(env)
-            .filter(|s| super::catalogue::key_may_travel_to(&s.endpoint).is_ok());
-    }
     if let Some(model) = admin
         .api_models
         .iter()
@@ -274,9 +290,9 @@ pub(crate) fn settings_in(
 #[must_use]
 pub fn is_api_route(id: &str) -> bool {
     let id = id.trim();
-    // A local agent's id never holds a `/`; a provider agent's always does.
-    id.eq_ignore_ascii_case(API_ROUTE)
-        || id.contains('/')
+    // A local agent's id never holds a `/` (`registry::agent_table` refuses
+    // one); a provider agent's always does.
+    id.contains('/')
         || AdminConfig::load_default()
             .api_models
             .iter()
@@ -310,6 +326,7 @@ mod tests {
             max_steps: None,
             timeout_secs: None,
             auth: None,
+            api_version: None,
         }
     }
 
@@ -340,6 +357,7 @@ mod tests {
                 name: "team".to_string(),
                 url: "https://team.invalid/".to_string(),
                 key_env: "TEAM_KEY_VARIABLE".to_string(),
+                ..ApiProvider::default()
             }],
             ..AdminConfig::default()
         }
@@ -407,11 +425,6 @@ mod tests {
         let why = model_settings(&admin.api_models[0], &env).expect_err("refused");
         assert!(why.contains("https"), "{why}");
         assert!(settings_in("team/coder", &admin, &env).is_none());
-        let exposed = env_with(&[
-            ("INCODE_API_URL", "http://a.invalid/v1/messages"),
-            ("INCODE_API_KEY", "k"),
-        ]);
-        assert!(settings_in(API_ROUTE, &admin, &exposed).is_none());
         // The control: this machine is fine, as a local server is.
         admin.api_models[0].url = "http://127.0.0.1:8080/v1/messages".to_string();
         assert!(model_settings(&admin.api_models[0], &env).is_ok());
@@ -522,24 +535,59 @@ mod tests {
         assert!(!heads[0].contains("anthropic-version"), "{}", heads[0]);
     }
 
+    /// **ONE PLACE.** The variables that used to configure a route of their
+    /// own configure nothing now: a route is an admin.json entry, and only
+    /// its key comes from the environment.
     #[test]
-    fn the_environment_route_reads_its_format_and_header() {
+    fn the_environment_configures_no_route() {
         let env = env_with(&[
-            ("INCODE_API_URL", "https://x.invalid/v1/chat/completions"),
-            ("INCODE_API_KEY", "k"),
-            ("INCODE_API_FORMAT", "openai"),
-        ]);
-        let settings = settings_in("api", &AdminConfig::default(), &env).expect("resolves");
-        assert_eq!(settings.format, WireFormat::Openai);
-        assert_eq!(settings.auth, KeyHeader::Bearer);
-        assert_eq!(settings.route, API_ROUTE);
-        // A word that names no format is not quietly read as the default.
-        let typo = env_with(&[
             ("INCODE_API_URL", "https://x.invalid/v1/messages"),
             ("INCODE_API_KEY", "k"),
-            ("INCODE_API_FORMAT", "openia"),
+            ("INCODE_API_MODEL", "some-model"),
         ]);
-        assert!(settings_in("api", &AdminConfig::default(), &typo).is_none());
+        assert!(settings_in("api", &AdminConfig::default(), &env).is_none());
+        assert!(settings_in("api", &admin(), &env).is_none());
+    }
+
+    /// **The protocol's own values are the entry's to change**: the version
+    /// header, and a provider's turns path — each with the value the format
+    /// documents when the entry is silent.
+    #[test]
+    fn a_version_and_a_turns_path_come_from_the_entry_or_the_default() {
+        let env = env_with(KEYS);
+        let silent = settings_in("messages-service", &admin(), &env).expect("resolves");
+        assert_eq!(silent.api_version, super::super::api::DEFAULT_API_VERSION);
+
+        let mut admin = admin();
+        admin.api_models[0].api_version = Some(" 2099-01-01 ".to_string());
+        admin.api_providers[0].turns_path = Some("chat/v2".to_string());
+        let named = settings_in("messages-service", &admin, &env).expect("resolves");
+        assert_eq!(named.api_version, "2099-01-01");
+        let agent = settings_in("team/coder", &admin, &env).expect("resolves");
+        assert_eq!(agent.endpoint, "https://team.invalid/chat/v2");
+
+        admin.api_models[0].api_version = Some("  ".to_string());
+        let blank = settings_in("messages-service", &admin, &env).expect("resolves");
+        assert_eq!(
+            blank.api_version,
+            super::super::api::DEFAULT_API_VERSION,
+            "blank is unset"
+        );
+    }
+
+    /// The model list is asked with the route's own version, not a fixed one.
+    #[test]
+    fn the_model_list_is_asked_with_the_routes_version() {
+        let (base, server) = serve(vec![r#"{"data":[{"id":"m"}],"has_more":false}"#]);
+        let mut settings = route(format!("{base}/v1/messages"), WireFormat::Anthropic);
+        settings.api_version = "2099-01-01".to_string();
+        assert_eq!(list_models(&settings).expect("listed"), ["m"]);
+        let heads = server.join().expect("server");
+        assert!(
+            heads[0].contains("anthropic-version: 2099-01-01"),
+            "{}",
+            heads[0]
+        );
     }
 }
 

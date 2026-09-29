@@ -127,8 +127,8 @@ pub struct AdminConfig {
     pub agent: Option<String>,
     /// Which agent takes the work the lead hands out, by its catalogue id.
     ///
-    /// Unset means the lead's default from the built-in table beside
-    /// [`crate::agent::registry::KNOWN_AGENTS`], which today is the lead
+    /// Unset means the lead's `default_sub_agent` in
+    /// [`crate::agent::registry::agent_table`], which today is the lead
     /// itself. Written by `/agent sub <id>` and cleared by `/agent sub`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sub_agent: Option<String>,
@@ -145,6 +145,12 @@ pub struct AdminConfig {
     /// model's key is kept here, never the key.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub api_models: Vec<ApiModel>,
+    /// Agent CLIs: changes to the built-in ones, and more of them. Local
+    /// agents are still FOUND, never listed by hand — an entry here only
+    /// says what to look for and how to drive it. See
+    /// [`crate::agent::registry::agent_table`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cli_agents: Vec<CliAgent>,
     /// The search service the `WebSearch` tool asks — see [`crate::web`] for
     /// the exact request and reply. Only the NAME of the variable holding
     /// its key is kept here, never the key. Unset, the tool says it is not
@@ -272,10 +278,53 @@ pub struct ApiProvider {
     /// Unique among providers; prefixes each of its agents' catalogue ids as
     /// `<name>/<agent id>`, so they cannot collide with a local agent's.
     pub name: String,
-    /// The service's base URL. The agent list is read from `{url}/v1/agents`.
+    /// The service's base URL. The agent list is read from
+    /// `{url}{agents_path}`, and turns are sent to `{url}{turns_path}`.
     pub url: String,
     /// The NAME of the environment variable holding the key — never the key.
     pub key_env: String,
+    /// Where its agent list is read, under `url`. Unset is
+    /// [`crate::agent::catalogue::DEFAULT_AGENTS_PATH`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agents_path: Option<String>,
+    /// Where its agents' turns are sent, under `url`. Unset is
+    /// [`crate::agent::models::DEFAULT_TURNS_PATH`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turns_path: Option<String>,
+    /// How long it has to answer with its agent list, in seconds. Unset is
+    /// [`crate::agent::catalogue::DEFAULT_PROVIDER_TIMEOUT`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub list_timeout_secs: Option<u64>,
+}
+
+/// One agent CLI, as admin.json `cli_agents` states it: an entry whose `id`
+/// is a built-in agent's changes only the fields it sets; any other `id`
+/// adds an agent — see [`crate::agent::registry::agent_table`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CliAgent {
+    /// What the operator types to choose it.
+    pub id: String,
+    /// What it is called, for a person. Unset: the built-in's, or the id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// The program names to look for on `PATH`, tried in order. Empty keeps
+    /// the built-in's; a new agent without any is not looked for.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commands: Vec<String>,
+    /// The arguments that make it print its version. Unset: the built-in's,
+    /// or `--version`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_args: Option<Vec<String>>,
+    /// Which headless protocol it speaks — one this harness has verified:
+    /// `claude-stream-json`, `codex-json`, `agy-stream-json`, or `unverified`
+    /// (found and listed, never driven). Unset: the built-in's, or
+    /// `unverified`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<crate::agent::registry::Protocol>,
+    /// The agent that takes the work it hands out, unless `sub_agent` names
+    /// another. Unset: the built-in's, or itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_sub_agent: Option<String>,
 }
 
 /// One model reached over an API with a key.
@@ -322,6 +371,10 @@ pub struct ApiModel {
     /// format's own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<crate::agent::api::KeyHeader>,
+    /// The `anthropic-version` header the messages format sends. Unset is
+    /// [`crate::agent::api::DEFAULT_API_VERSION`]; the chat format sends none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_version: Option<String>,
 }
 
 /// Which program `RenderPdf` prints with — see `toolbox::pdf`.
@@ -1270,7 +1323,26 @@ mod tests {
                 name: "team".to_string(),
                 url: "http://127.0.0.1:9".to_string(),
                 key_env: "TEAM_KEY_VARIABLE".to_string(),
+                agents_path: Some("/agents".to_string()),
+                turns_path: Some("/chat".to_string()),
+                list_timeout_secs: Some(7),
             }],
+            // An agent CLI changed, and one added, by the protocol's name.
+            cli_agents: vec![
+                CliAgent {
+                    id: "codex".to_string(),
+                    commands: vec!["codex-nightly".to_string()],
+                    ..CliAgent::default()
+                },
+                CliAgent {
+                    id: "mine".to_string(),
+                    display_name: Some("My agent".to_string()),
+                    commands: vec!["my-agent".to_string()],
+                    version_args: Some(vec!["-V".to_string()]),
+                    protocol: Some(crate::agent::Protocol::ClaudeStreamJson),
+                    default_sub_agent: Some("codex".to_string()),
+                },
+            ],
             // A configured model too, holding its key variable's NAME only.
             api_models: vec![ApiModel {
                 name: "router".to_string(),
@@ -1284,6 +1356,7 @@ mod tests {
                 max_steps: Some(60),
                 timeout_secs: Some(600),
                 auth: Some(crate::agent::api::KeyHeader::Bearer),
+                api_version: Some("2099-01-01".to_string()),
             }],
             // The search provider too, holding its key variable's NAME only.
             web_search: Some(SearchProvider {

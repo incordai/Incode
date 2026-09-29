@@ -60,6 +60,7 @@ fn http(endpoint: String, format: WireFormat, auth: KeyHeader) -> Http {
         format,
         auth,
         timeout: std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+        api_version: DEFAULT_API_VERSION.to_string(),
     }
 }
 
@@ -107,6 +108,26 @@ fn the_messages_format_sends_its_version_and_only_its_own_key_header() {
     assert_eq!(body["system"], "be brief");
     assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
     assert_eq!(parse_reply(&raw).expect("parsed").text, "hello");
+}
+
+/// **The version header is the entry's, when it names one** (`api_version`):
+/// a service that moves to a newer version is a change to admin.json, not to
+/// this code.
+#[test]
+fn an_entrys_own_version_is_the_one_sent() {
+    let (base, server) = serve_once(MESSAGES_REPLY, false);
+    let transport = Http {
+        api_version: "2099-01-01".to_string(),
+        ..http(
+            format!("{base}/v1/messages"),
+            WireFormat::Anthropic,
+            KeyHeader::XApiKey,
+        )
+    };
+    transport.send(&prompt_body()).expect("sent");
+    let (head, _) = head_and_body(&server.join().expect("server"));
+    assert!(head.contains("anthropic-version: 2099-01-01"), "{head}");
+    assert!(!head.contains(DEFAULT_API_VERSION), "{head}");
 }
 
 /// A service speaking the messages format for token-based tools reads the key

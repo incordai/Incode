@@ -252,17 +252,20 @@ Details: `docs/ARCHITECTURE.md` §2.
 
 incode builds one catalogue of agents at session start:
 
-- **Local agents** found on `PATH` (`claude`, `codex`, `agy`).
+- **Local agents** found on `PATH` (`claude`, `codex`, `agy`, …) — what is
+  looked for, and how each is driven, can be changed in `admin.json`
+  `cli_agents` ([below](#cli-agents)).
 - **API models** from `admin.json` `api_models` (below), each chosen by its
   `name`: Anthropic, Z.ai, OpenRouter or any other service, with a key. incode
   runs its own tool loop for them — its tools, guards and prompts.
-- **The environment's API route** (id `api`): `INCODE_API_URL` (the full
-  endpoint), `INCODE_API_KEY`, and optionally `INCODE_API_MODEL`,
-  `INCODE_API_SUB_MODEL`, `INCODE_API_FORMAT` and `INCODE_API_AUTH`. Setting
-  these adds an entry; it does not replace the installed agents.
 - **Provider agents** from `admin.json` `api_providers` (below), as
-  `<provider>/<agent>`. Driven at the provider's `/v1/chat/completions`, asking
-  for the agent's id as the model.
+  `<provider>/<agent>`. Driven at the provider's `turns_path` (default
+  `/v1/chat/completions`), asking for the agent's id as the model.
+
+Every route is an `admin.json` entry; no environment variable configures one.
+Only keys come from the environment, from the variable each entry's `key_env`
+names. (The old `INCODE_API_*` variables are no longer read: move such a setup
+into one `api_models` entry.)
 
 | Command | What it does |
 |---|---|
@@ -326,9 +329,34 @@ a vendor is built into incode: these are ordinary entries you write.
   from the plan's dashboard. Pay-as-you-go is
   `https://api.z.ai/api/paas/v4/chat/completions` (`openai`).
 - `max_tokens` (reply ceiling, default 8192), `max_steps` (tool rounds per
-  turn, default 40) and `timeout_secs` (per request, default 300) are per
-  entry too.
+  turn, default 40) and `timeout_secs` (per request and per model-list page,
+  default 300) are per entry too.
+- `api_version`: the `anthropic-version` header the `anthropic` format sends.
+  Unset, `2023-06-01`, the value that format documents.
 - `/model <id>` switches to any model the service offers; `/models` lists them.
+
+### CLI agents
+
+The agents incode looks for on `PATH` are a built-in list; `cli_agents`
+changes it. An entry whose `id` is a built-in agent's changes only the fields
+it sets; any other `id` adds an agent.
+
+```json
+"cli_agents": [
+  { "id": "codex", "commands": ["codex-nightly"] },
+  { "id": "my-agent", "display_name": "My agent", "commands": ["C:/tools/my-agent.exe"],
+    "protocol": "claude-stream-json", "default_sub_agent": "my-agent" }
+]
+```
+
+- `commands`: program names tried in order, or a path to the program.
+- `protocol`: how it is driven — `claude-stream-json`, `codex-json`,
+  `agy-stream-json`, or `unverified` (listed, never driven). An added agent
+  with no protocol is `unverified`: a stream format is never guessed.
+- `version_args` (default `["--version"]`), `display_name`, and
+  `default_sub_agent` (the agent its work is handed to, default itself).
+- An `id` holding `/` or `:` is skipped: those mark provider agents and role
+  qualifiers.
 
 ### The API providers contract
 
@@ -338,15 +366,16 @@ a vendor is built into incode: these are ordinary entries you write.
 
 - `key_env` is the **name** of an environment variable. The key is read from it
   when needed and never written to disk or printed.
-- incode sends `GET {url}/v1/agents` with `Authorization: Bearer <key>`, and
-  allows 3 seconds. The url must be `https`, or plain `http` to this machine
-  only; any other url is refused before the key is sent.
+- incode sends `GET {url}{agents_path}` (default `/v1/agents`) with
+  `Authorization: Bearer <key>`, and allows `list_timeout_secs` (default 3).
+  The url must be `https`, or plain `http` to this machine only; any other url
+  is refused before the key is sent.
 - The reply is `{"agents": [{"id": "coder", "name": "Coder", "model": "model-1"}]}`.
   `id` is required and unique; `name` and `model` are optional.
 - Each agent's catalogue id is `<provider name>/<id>`. A provider that cannot
   be asked shows as one entry saying why.
-- **A turn** for an agent goes to `POST {url}/v1/chat/completions` in the
-  chat-completions format, with `Authorization: Bearer <key>` and `model` set
+- **A turn** for an agent goes to `POST {url}{turns_path}` (default
+  `/v1/chat/completions`) in the chat-completions format, with `Authorization: Bearer <key>` and `model` set
   to the agent's `id`, streamed. Tools are `function`s; the reply's
   `tool_calls` are run by incode and answered with `tool` messages.
 
@@ -684,8 +713,9 @@ and `--admin` prints which layer decided each value.
 | `verify_command` | The command that decides whether work is finished |
 | `scaffold` | The generator you want [a new project](#a-new-project) laid out with, per stack. A preference handed to the model when it writes `## Layout`; incode runs nothing from it itself |
 | `memory_url` · `engine_bin` | Where the memory service listens · where its engine binary is |
-| `api_providers` | Services that list API agents ([contract](#the-api-providers-contract)) |
-| `api_models` | [Models reached with a key](#api-models): `name`, `format`, `url`, `key_env`, `model`, `sub_model`, `aliases`, `auth`, `max_tokens`, `max_steps`, `timeout_secs` |
+| `api_providers` | Services that list API agents ([contract](#the-api-providers-contract)): `name`, `url`, `key_env`, `agents_path`, `turns_path`, `list_timeout_secs` |
+| `api_models` | [Models reached with a key](#api-models): `name`, `format`, `url`, `key_env`, `model`, `sub_model`, `aliases`, `auth`, `max_tokens`, `max_steps`, `timeout_secs`, `api_version` |
+| `cli_agents` | [Agent CLIs](#cli-agents) to look for, changed or added: `id`, `commands`, `protocol`, `version_args`, `display_name`, `default_sub_agent` |
 | `web_search` | `WebSearch`'s endpoint (`url`, the query sent as `q`) and the name of its key's variable. The key is sent only over https or to loopback |
 | `tools` | [External tools](#external-tools): each one's release, version, asset, `run` and `provides` |
 | `browser_bin` · `pdf_renderer` | For development, a headless browser executable that wins over the installed one · which program `RenderPdf` uses |
@@ -706,8 +736,7 @@ Environment variables:
 | `INCODE_LANES` | Parallel `/run` lanes (needs git; at most 8) |
 | `INCODE_SANDBOX` | The sandbox mode |
 | `INCODE_DESKTOP` | `1` offers the desktop tools |
-| `INCODE_API_URL` · `INCODE_API_KEY` · `INCODE_API_MODEL` · `INCODE_API_SUB_MODEL` | The environment's API route: endpoint, key, model, sub-agents' model |
-| `INCODE_API_FORMAT` · `INCODE_API_AUTH` | Its format (`anthropic` · `openai`) and key header (`x-api-key` · `bearer`) |
+| The variable each `key_env` names | That entry's key — the only part of an API route read from the environment |
 | `INCORD_MEMORY_URL` · `INCORD_ENGINE_BIN` | The memory service · its engine binary |
 | `INCODE_BROWSER` · `INCODE_PDF_BROWSER` · `INCODE_SOFFICE` | The headless browser · the PDF printer · LibreOffice |
 | `INCODE_SERVE_ORIGINS` | Extra origins `--serve` accepts |

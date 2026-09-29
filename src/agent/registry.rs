@@ -27,7 +27,12 @@ pub const CODEX: &str = "codex";
 /// Only protocols whose wire format has actually been verified are listed. A
 /// detected agent whose contract has not been verified is registered as
 /// present-but-not-drivable rather than driven on guessed CLI flags.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Named in admin.json `cli_agents` as `claude-stream-json`, `codex-json`,
+/// `agy-stream-json` or `unverified`. The API route's own protocol cannot be
+/// named there: it belongs to `api_models`, not to a program on `PATH`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Protocol {
     /// `-p <prompt> --output-format stream-json --verbose`, newline-delimited
     /// JSON tagged on `type`. Verified against Claude Code 2.1.229.
@@ -53,6 +58,7 @@ pub enum Protocol {
     /// Not discovered on the machine like the others — it exists because the
     /// operator configured an endpoint. The harness supplies the tools on this
     /// route, so it is drivable wherever it is configured.
+    #[serde(skip)]
     HarnessApi,
 }
 
@@ -74,7 +80,8 @@ pub struct AgentProbe {
     pub default_sub_agent: &'static str,
 }
 
-/// Agents the harness knows how to look for. Presence here is not a claim of
+/// Agents the harness knows how to look for, before the operator's admin.json
+/// `cli_agents` is applied ([`agent_table`]). Presence here is not a claim of
 /// support — `protocol` decides whether a turn can actually be routed to it.
 pub const KNOWN_AGENTS: &[AgentProbe] = &[
     AgentProbe {
@@ -142,6 +149,129 @@ pub const KNOWN_AGENTS: &[AgentProbe] = &[
     },
 ];
 
+/// One agent CLI as it is looked for and driven: an entry of
+/// [`KNOWN_AGENTS`] with the operator's admin.json `cli_agents` applied, or
+/// one that admin.json adds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSpec {
+    pub id: String,
+    pub display_name: String,
+    /// Program names tried in order, or a path to the program itself.
+    pub commands: Vec<String>,
+    pub version_args: Vec<String>,
+    pub protocol: Protocol,
+    /// See [`AgentProbe::default_sub_agent`].
+    pub default_sub_agent: String,
+}
+
+impl AgentSpec {
+    fn built_in(probe: &AgentProbe) -> Self {
+        Self {
+            id: probe.id.to_string(),
+            display_name: probe.display_name.to_string(),
+            commands: probe.commands.iter().map(|c| (*c).to_string()).collect(),
+            version_args: probe
+                .version_args
+                .iter()
+                .map(|a| (*a).to_string())
+                .collect(),
+            protocol: probe.protocol,
+            default_sub_agent: probe.default_sub_agent.to_string(),
+        }
+    }
+
+    /// An agent admin.json adds: named by its id alone until the entry says
+    /// more, never driven unless it names a verified protocol.
+    fn added(id: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            display_name: id.to_string(),
+            commands: Vec::new(),
+            version_args: vec!["--version".to_string()],
+            protocol: Protocol::Unverified,
+            default_sub_agent: id.to_string(),
+        }
+    }
+
+    /// The fields `entry` sets, over what is here.
+    fn apply(&mut self, entry: &crate::admin::CliAgent) {
+        if let Some(name) = entry.display_name.as_deref().map(str::trim) {
+            if !name.is_empty() {
+                self.display_name = name.to_string();
+            }
+        }
+        let commands: Vec<String> = entry
+            .commands
+            .iter()
+            .map(|c| c.trim().to_string())
+            .filter(|c| !c.is_empty())
+            .collect();
+        if !commands.is_empty() {
+            self.commands = commands;
+        }
+        if let Some(args) = &entry.version_args {
+            self.version_args = args.clone();
+        }
+        if let Some(protocol) = entry.protocol {
+            self.protocol = protocol;
+        }
+        if let Some(sub) = entry.default_sub_agent.as_deref().map(str::trim) {
+            if !sub.is_empty() {
+                self.default_sub_agent = sub.to_string();
+            }
+        }
+    }
+}
+
+/// The agent CLIs to look for: [`KNOWN_AGENTS`] with admin.json
+/// `cli_agents` applied.
+///
+/// An entry whose id is a built-in's (case aside) changes only the fields it
+/// sets; any other id adds an agent after the built-ins, in the order
+/// written. An id that is blank, or holds `/` or `:`, is skipped: those mark
+/// a provider agent and a role-table qualifier, and an agent named with one
+/// could be mistaken for either.
+#[must_use]
+pub fn agent_table(entries: &[crate::admin::CliAgent]) -> Vec<AgentSpec> {
+    let mut table: Vec<AgentSpec> = KNOWN_AGENTS.iter().map(AgentSpec::built_in).collect();
+    for entry in entries {
+        let id = entry.id.trim();
+        if id.is_empty() || id.contains('/') || id.contains(':') {
+            crate::trace!(
+                "agent",
+                "cli_agents entry `{id}` skipped: an id is not blank and holds no `/` or `:`"
+            );
+            continue;
+        }
+        match table.iter_mut().find(|s| s.id.eq_ignore_ascii_case(id)) {
+            Some(spec) => spec.apply(entry),
+            None => {
+                let mut spec = AgentSpec::added(id);
+                spec.apply(entry);
+                table.push(spec);
+            }
+        }
+    }
+    table
+}
+
+/// [`agent_table`] as this machine's admin.json gives it.
+#[must_use]
+pub fn configured_table() -> Vec<AgentSpec> {
+    agent_table(&crate::admin::AdminConfig::load_default().cli_agents)
+}
+
+/// The protocol `id` is driven by in `table`, or `None` for an id it does
+/// not hold.
+#[must_use]
+pub fn protocol_of(table: &[AgentSpec], id: &str) -> Option<Protocol> {
+    let id = id.trim();
+    table
+        .iter()
+        .find(|s| s.id.eq_ignore_ascii_case(id))
+        .map(|s| s.protocol)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DetectedAgent {
     pub id: String,
@@ -151,14 +281,6 @@ pub struct DetectedAgent {
     pub version: Option<String>,
     pub protocol: Protocol,
 }
-
-/// The catalogue id of the API route configured by environment variables
-/// ([`crate::agent::api::API_URL_ENV`] and its siblings).
-///
-/// One name for it, used both where the catalogue lists the route and where a
-/// backend is built for it, so the two cannot disagree about which id means
-/// "drive the configured API".
-pub const API_ROUTE: &str = "api";
 
 /// The agent that will do the work, or why there is none.
 ///
@@ -243,9 +365,10 @@ pub fn choose(found: &[DetectedAgent], preferred: Option<&str>) -> Option<Detect
 pub fn no_drivable_reason(found: &[DetectedAgent]) -> String {
     if found.is_empty() {
         return format!(
-            "Nothing to send the work to. Either install an agent CLI and log in — incode drives              one on your own subscription — or configure a model endpoint by setting {} and {},              which needs no CLI at all.",
-            crate::agent::api::API_URL_ENV,
-            crate::agent::api::API_KEY_ENV
+            "Nothing to send the work to. Either install an agent CLI and log in — incode drives \
+             one on your own subscription — or add a model to `api_models` in {}, which needs \
+             no CLI at all.",
+            crate::admin::ADMIN_FILE
         );
     }
     let names = found
@@ -259,31 +382,10 @@ pub fn no_drivable_reason(found: &[DetectedAgent]) -> String {
 }
 
 impl DetectedAgent {
-    /// The configured API, as a route.
-    ///
-    /// Reported as an agent because that is what it is from here: somewhere a
-    /// turn can be sent. Named for what it is rather than for a provider — the
-    /// endpoint is the operator's, and this harness does not know or care whose
-    /// it is.
-    #[must_use]
-    pub fn over_api(model: &str) -> Self {
-        Self {
-            id: API_ROUTE.to_string(),
-            display_name: "a model over the configured API".to_string(),
-            // No binary: nothing is spawned on this route.
-            command: String::new(),
-            path: None,
-            version: if model.is_empty() {
-                None
-            } else {
-                Some(model.to_string())
-            },
-            protocol: Protocol::HarnessApi,
-        }
-    }
-
     /// A route over an API, by the id it is chosen by — a configured model's
-    /// name or a provider agent's `<provider>/<agent>`. Its backend is built
+    /// name or a provider agent's `<provider>/<agent>`. Reported as an agent
+    /// because that is what it is from here: somewhere a turn can be sent.
+    /// No binary: nothing is spawned on this route. Its backend is built
     /// from [`crate::agent::models::settings_for`] with the same id.
     #[must_use]
     pub fn api_route(settings: &crate::agent::api::Settings) -> Self {
@@ -326,8 +428,14 @@ impl DetectedAgent {
     }
 }
 
-/// Resolve a command to an absolute path via `where` / `which`.
+/// Resolve a command to an absolute path via `where` / `which` — or, when
+/// admin.json names the program by its path, that path if a file is there.
 fn find_command_path(cmd: &str) -> Option<String> {
+    let as_path = std::path::Path::new(cmd);
+    if as_path.is_absolute() {
+        return as_path.is_file().then(|| cmd.to_string());
+    }
+
     #[cfg(windows)]
     let which_cmd = "where";
     #[cfg(not(windows))]
@@ -354,7 +462,7 @@ fn find_command_path(cmd: &str) -> Option<String> {
 }
 
 /// Run `<cmd> --version` and return the first line, capped at 80 characters.
-fn probe_version(cmd: &str, args: &[&str]) -> Option<String> {
+fn probe_version(cmd: &str, args: &[String]) -> Option<String> {
     let out = Command::new(cmd)
         .args(args)
         .stdin(Stdio::null())
@@ -378,22 +486,29 @@ fn probe_version(cmd: &str, args: &[&str]) -> Option<String> {
     Some(line.chars().take(80).collect())
 }
 
-/// Discover every known agent present on this machine.
+/// Discover every agent in this machine's [`configured_table`] that is
+/// present on it.
 #[must_use]
 pub fn discover() -> Vec<DetectedAgent> {
+    discover_in(&configured_table())
+}
+
+/// Discover every agent of `table` present on this machine.
+#[must_use]
+pub fn discover_in(table: &[AgentSpec]) -> Vec<DetectedAgent> {
     let mut found = Vec::new();
-    for probe in KNOWN_AGENTS {
-        for cmd in probe.commands {
+    for spec in table {
+        for cmd in &spec.commands {
             let Some(path) = find_command_path(cmd) else {
                 continue;
             };
             found.push(DetectedAgent {
-                id: probe.id.to_string(),
-                display_name: probe.display_name.to_string(),
-                command: (*cmd).to_string(),
+                id: spec.id.clone(),
+                display_name: spec.display_name.clone(),
+                command: cmd.clone(),
                 path: Some(path),
-                version: probe_version(cmd, probe.version_args),
-                protocol: probe.protocol,
+                version: probe_version(cmd, &spec.version_args),
+                protocol: spec.protocol,
             });
             break; // first matching command wins
         }
@@ -435,13 +550,91 @@ mod tests {
         let reason = no_drivable_reason(&[]);
         assert!(reason.contains("install an agent CLI"), "got: {reason}");
         assert!(
-            reason.contains(crate::agent::api::API_URL_ENV),
-            "and how to configure an endpoint: {reason}"
+            reason.contains("api_models") && reason.contains(crate::admin::ADMIN_FILE),
+            "and where a model is configured, or it cannot be acted on: {reason}"
         );
-        assert!(
-            reason.contains(crate::agent::api::API_KEY_ENV),
-            "naming both variables, or it cannot be acted on: {reason}"
+    }
+
+    fn cli(id: &str) -> crate::admin::CliAgent {
+        crate::admin::CliAgent {
+            id: id.to_string(),
+            ..crate::admin::CliAgent::default()
+        }
+    }
+
+    /// **admin.json changes a built-in agent field by field.** Pointing
+    /// `codex` at another program must not also forget how it is driven.
+    #[test]
+    fn an_entry_for_a_built_in_agent_changes_only_what_it_sets() {
+        let table = agent_table(&[crate::admin::CliAgent {
+            commands: vec!["  ".to_string(), "codex-nightly".to_string()],
+            ..cli("CODEX")
+        }]);
+        let codex = table.iter().find(|s| s.id == CODEX).expect("still listed");
+        assert_eq!(codex.commands, vec!["codex-nightly"], "blanks dropped");
+        assert_eq!(codex.protocol, Protocol::CodexJson, "kept");
+        assert_eq!(codex.display_name, "Codex CLI", "kept");
+        assert_eq!(
+            table.len(),
+            KNOWN_AGENTS.len(),
+            "a change is not a second entry"
         );
+
+        // Control: with no entries the table is exactly the built-in one.
+        let plain = agent_table(&[]);
+        let built_in = plain.iter().find(|s| s.id == CODEX).expect("listed");
+        assert_eq!(built_in.commands, vec!["codex"]);
+    }
+
+    /// **An agent admin.json adds is looked for, and driven only when it
+    /// names a verified protocol.**
+    #[test]
+    fn an_added_agent_is_found_by_its_entry_and_driven_only_on_a_named_protocol() {
+        let table = agent_table(&[
+            crate::admin::CliAgent {
+                commands: vec!["my-agent".to_string()],
+                protocol: Some(Protocol::ClaudeStreamJson),
+                ..cli("mine")
+            },
+            crate::admin::CliAgent {
+                commands: vec!["other-agent".to_string()],
+                ..cli("theirs")
+            },
+        ]);
+        let mine = table.iter().find(|s| s.id == "mine").expect("added");
+        assert_eq!(mine.protocol, Protocol::ClaudeStreamJson);
+        assert_eq!(mine.version_args, vec!["--version"]);
+        assert_eq!(mine.default_sub_agent, "mine");
+        let theirs = table.iter().find(|s| s.id == "theirs").expect("added");
+        assert_eq!(
+            theirs.protocol,
+            Protocol::Unverified,
+            "no protocol named, none guessed"
+        );
+        assert_eq!(table.len(), KNOWN_AGENTS.len() + 2);
+    }
+
+    /// An id that could be read as a provider agent or a role qualifier is
+    /// not taken.
+    #[test]
+    fn an_ambiguous_or_blank_id_is_skipped() {
+        let table = agent_table(&[cli(""), cli("team/coder"), cli("a:b")]);
+        assert_eq!(table.len(), KNOWN_AGENTS.len());
+    }
+
+    /// The protocol is written by name in admin.json, and the API route's own
+    /// protocol cannot be claimed there.
+    #[test]
+    fn a_protocol_is_named_in_the_file_and_the_api_one_is_refused() {
+        let read = |word: &str| serde_json::from_str::<Protocol>(&format!("\"{word}\""));
+        assert_eq!(
+            read("claude-stream-json").ok(),
+            Some(Protocol::ClaudeStreamJson)
+        );
+        assert_eq!(read("codex-json").ok(), Some(Protocol::CodexJson));
+        assert_eq!(read("agy-stream-json").ok(), Some(Protocol::AgyStreamJson));
+        assert_eq!(read("unverified").ok(), Some(Protocol::Unverified));
+        assert!(read("harness-api").is_err());
     }
 
     /// A verified protocol is drivable; an unverified one is not. Guessing at a

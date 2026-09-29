@@ -133,12 +133,9 @@ impl Toolbox {
             tools: self.child_tools(definition.as_ref()),
             edits: self.code_edits.as_ref().map(super::CodeEdits::child),
         };
-        // The parent's own route first: a model chosen by name hands work to
-        // the same service. Then the environment's, as before.
-        let route = self
-            .api_route
-            .clone()
-            .or_else(crate::agent::api::Settings::from_env);
+        // The parent's own route: a model chosen by name hands work to the
+        // same service. No other place configures one.
+        let route = self.api_route.clone();
         let (mut child, agent) = match route {
             Some(settings) => (self.api_child(settings, &spec), "api"),
             None => match &self.cli_agent {

@@ -86,8 +86,8 @@ There are **three** processes and they are not peers.
 **The harness uses the CLI as a model only.** It holds no subscription login: the CLI
 authenticates itself, and incode decides what is worth doing, runs the tools the model
 asks for, and checks whether the work was actually done. The one route where incode
-talks to a model directly is the optional API route (`agent::api`, `INCODE_API_URL` /
-`INCODE_API_KEY` / `INCODE_API_MODEL`): the key is read from the environment when a
+talks to a model directly is the optional API route (`agent::api`, an admin.json
+`api_models` entry): the key is read from the variable its `key_env` names when a
 request is made and never stored, and incode runs the tool loop itself.
 
 Everything the harness knows that outlives a session, it asks for. It caches none of
@@ -801,9 +801,10 @@ and never the work.
 ### Which agent — the catalogue
 
 `agent::catalogue` builds one list of every agent the session could use, once at
-session start: local CLIs found on the PATH, the API configured by `INCODE_API_URL` /
-`INCODE_API_KEY` / `INCODE_API_MODEL` (id `api`), and the agents each API provider in
-`admin.json` lists about itself. Every entry is marked usable, or not usable with the
+session start: local CLIs found on the PATH (as `registry::agent_table` names them:
+the built-in `KNOWN_AGENTS` with admin.json `cli_agents` applied), each admin.json
+`api_models` entry, and the agents each API provider in `admin.json` lists about
+itself. No environment variable configures a route; only keys are read from it. Every entry is marked usable, or not usable with the
 reason. `/agent` prints it; `/agent <id>` saves the lead (`agent`) and
 `/agent sub <id>` the sub-agents (`sub_agent`), both applying from the next `/run` and
 the next session.
@@ -811,8 +812,12 @@ the next session.
 - **Lead**: `INCODE_AGENT`, else `admin.json` `agent`, when usable; else the first
   usable local agent; else a usable API agent.
 - **Sub-agents** (the agent that works `/run`'s tasks, sequential and in lanes): the
-  saved `sub_agent` when usable; else the lead's entry in the table beside
-  `registry::KNOWN_AGENTS` (every agent maps to itself today); else the lead.
+  saved `sub_agent` when usable; else the lead's `default_sub_agent` in the agent
+  table (every built-in maps to itself; `cli_agents` may say otherwise); else the lead.
+- **CLI dispatch**: a CLI backend is chosen by the PROTOCOL the table gives the id
+  (`cli::backend_for_protocol`), so an agent `cli_agents` adds is driven by the
+  backend for the protocol it names. An added agent that names none is `unverified`:
+  listed, never driven.
 
 #### The provider contract
 
@@ -823,9 +828,10 @@ the next session.
 `key_env` is the NAME of an environment variable; the key is read from it when needed
 and never written to disk or printed.
 
-- **Request**: `GET {url}/v1/agents` (trailing `/` on `url` removed) with
-  `Authorization: Bearer <value of key_env>`, finished within 3 seconds
-  (`catalogue::PROVIDER_TIMEOUT`). Providers are asked one after another.
+- **Request**: `GET {url}{agents_path}` (default `/v1/agents`; trailing `/` on `url`
+  removed) with `Authorization: Bearer <value of key_env>`, finished within
+  `list_timeout_secs` (default 3, `catalogue::DEFAULT_PROVIDER_TIMEOUT`). Providers are
+  asked one after another.
   The url must be `https`, or plain `http` to this machine only (`localhost`
   or a loopback address); any other url is refused before the key is sent.
 - **Reply**: a 2xx status and `{"agents": [{"id": "coder", "name": "Coder", "model": "model-1"}]}`.
@@ -839,14 +845,16 @@ and never written to disk or printed.
   reply that breaks the rules above lists the provider as ONE entry, not usable, with
   the reason.
 
-- **Turns**: `POST {url}/v1/chat/completions` in the chat-completions format, with the
+- **Turns**: `POST {url}{turns_path}` (default `/v1/chat/completions`) in the
+  chat-completions format, with the
   key as a bearer and `model` set to the agent's `id` (`agent::models::provider_settings`).
 
 ### API models, and the two wire formats
 
 admin.json `api_models` names each service reached with a key — `name`, `format`,
-`url`, `key_env`, `model`, `sub_model`, `auth` — and `agent::models` is the one place an
-id (`api`, a model's `name`, or `<provider>/<agent>`) becomes the `Settings` a backend
+`url`, `key_env`, `model`, `sub_model`, `aliases`, `auth`, `max_tokens`, `max_steps`,
+`timeout_secs`, `api_version` — and `agent::models` is the one place an
+id (a model's `name`, or `<provider>/<agent>`) becomes the `Settings` a backend
 is built from; the catalogue lists an id as usable by the same functions, so the two
 cannot disagree. Every key is sent only over `https` or to loopback
 (`catalogue::key_may_travel_to`), checked again in `ApiBackend::run_turn`.
@@ -857,7 +865,7 @@ is reached through `agent::openai`, which translates the request on the way out
 following user message) and the reply — whole or streamed — back into the messages
 shape, so one parser and one loop serve both. The key travels in the one header `auth`
 names (`x-api-key` or `bearer`, default by format); the messages format also sends
-`anthropic-version: 2023-06-01`. A route's `sub_model` is what its sub-agents run on;
+`anthropic-version`, the entry's `api_version` (default `2023-06-01`). A route's `sub_model` is what its sub-agents run on;
 `/models` reads the service's own `…/models` list, every page.
 
 ---

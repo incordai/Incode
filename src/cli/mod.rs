@@ -1470,13 +1470,39 @@ fn run_backend_with_desktop(
     desktop: bool,
     mode: crate::permissions::PermissionMode,
 ) -> Box<dyn crate::agent::AgentBackend> {
-    match agent_id {
-        // The registry ID, not the command name. `agy` is the binary; the agent
-        // is `antigravity`. Matching the binary name here compiled, passed a
-        // unit test that had invented the same wrong id on both sides, and
-        // could never once have fired in a real run — the live check is what
-        // caught it.
-        crate::agent::registry::ANTIGRAVITY => Box::new(
+    // By the PROTOCOL the agent table gives the id — not by the id itself, so
+    // an agent admin.json adds (`cli_agents`) is driven by the backend for the
+    // protocol it names. Looked up by the registry ID, never the command name:
+    // `agy` is the binary, `antigravity` the agent, and matching the binary
+    // once compiled, passed a test that invented the same wrong id on both
+    // sides, and never fired in a real run.
+    let protocol =
+        crate::agent::registry::protocol_of(&crate::agent::registry::configured_table(), agent_id);
+    backend_for_protocol(
+        protocol,
+        workspace,
+        binary,
+        guards,
+        system_prompt,
+        desktop,
+        mode,
+    )
+}
+
+/// The CLI backend for a protocol: each verified protocol has its own, and
+/// anything else is driven as the stream-json one, as before this was keyed
+/// on the protocol.
+fn backend_for_protocol(
+    protocol: Option<crate::agent::Protocol>,
+    workspace: &Path,
+    binary: &str,
+    guards: &crate::guards::Guards,
+    system_prompt: &[String],
+    desktop: bool,
+    mode: crate::permissions::PermissionMode,
+) -> Box<dyn crate::agent::AgentBackend> {
+    match protocol {
+        Some(crate::agent::Protocol::AgyStreamJson) => Box::new(
             crate::agent::agy::AgyBackend::new(workspace.to_path_buf())
                 .with_binary(binary.to_string())
                 // No guards argument: this agent has no flag to enforce them.
@@ -1486,7 +1512,7 @@ fn run_backend_with_desktop(
                 // this whole split exists to prevent.
                 .with_system_context(system_prompt.to_vec()),
         ),
-        crate::agent::registry::CODEX => {
+        Some(crate::agent::Protocol::CodexJson) => {
             let mut backend = crate::agent::codex::CodexBackend::new(workspace.to_path_buf())
                 .with_binary(binary.to_string())
                 .with_system_context(system_prompt.to_vec());
@@ -2018,6 +2044,36 @@ mod tests {
         // of asking each backend rather than assuming one answer.
         assert_ne!(claude.enforces(), agy.enforces());
         assert_ne!(claude.enforces(), codex.enforces());
+    }
+
+    /// **An agent admin.json adds is driven by the backend for the protocol
+    /// it names**, not by the default: an id no built-in has, speaking the
+    /// codex protocol, gets the codex backend on its own program.
+    #[test]
+    fn an_added_agent_is_driven_by_its_protocols_backend() {
+        let guards = crate::guards::Guards::default();
+        let build = |protocol| {
+            backend_for_protocol(
+                protocol,
+                Path::new("."),
+                "my-agent",
+                &guards,
+                &[],
+                false,
+                crate::permissions::PermissionMode::WorkspaceWrite,
+            )
+        };
+        let codex = run_backend(
+            Path::new("."),
+            crate::agent::registry::CODEX,
+            "codex",
+            &guards,
+            &[],
+        );
+        let added = build(Some(crate::agent::Protocol::CodexJson));
+        assert_eq!(added.enforces(), codex.enforces(), "the codex backend");
+        let fallback = build(None);
+        assert_ne!(fallback.enforces(), codex.enforces(), "not the codex one");
     }
 
     /// An empty session context is not an error — a project with no brief, no
