@@ -173,7 +173,12 @@ impl InputThread {
         // simulate input"), so the grant is asked for first, by name and with
         // where to give it, rather than surfacing as the library's sentence.
         #[cfg(target_os = "macos")]
-        super::macos::require(super::macos::Grant::Accessibility)?;
+        {
+            // The session first: over SSH the grant check passes yet every
+            // event is dropped (see `macos::require_graphic_session`).
+            super::macos::require_graphic_session()?;
+            super::macos::require(super::macos::Grant::Accessibility)?;
+        }
 
         let (tx, rx) = mpsc::channel::<Job>();
         let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), String>>(1);

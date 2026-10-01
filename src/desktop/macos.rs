@@ -70,6 +70,16 @@ extern "C" {
     fn CGPreflightScreenCaptureAccess() -> bool;
 }
 
+#[link(name = "Security", kind = "framework")]
+extern "C" {
+    fn SessionGetInfo(session: i32, session_id: *mut u32, attributes: *mut u32) -> i32;
+}
+
+/// `callerSecuritySession`: the session this process runs in.
+const CALLER_SECURITY_SESSION: i32 = -1;
+/// `sessionHasGraphicAccess` in `SessionAttributeBits`.
+const SESSION_HAS_GRAPHIC_ACCESS: u32 = 0x0010;
+
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
     fn CFRelease(cf: CFTypeRef);
@@ -162,6 +172,35 @@ pub(crate) fn missing_grants() -> Vec<String> {
         .filter(|g| !g.granted())
         .map(|g| g.name().to_string())
         .collect()
+}
+
+/// Whether this process runs in a session that can reach the window server.
+///
+/// Measured on 26.6.2: a process started over SSH (attributes 0x5020) passes
+/// the Accessibility check, yet every event it posts is dropped without an
+/// error — `move_mouse` answered "moved" and the cursor stayed put — while
+/// the logged-in user's session (0x6030) carries `sessionHasGraphicAccess`.
+fn has_graphic_session() -> bool {
+    let (mut id, mut attributes) = (0u32, 0u32);
+    // SAFETY: two out-pointers to locals; the call only reads this process's
+    // own session.
+    let status = unsafe { SessionGetInfo(CALLER_SECURITY_SESSION, &mut id, &mut attributes) };
+    status == 0 && attributes & SESSION_HAS_GRAPHIC_ACCESS != 0
+}
+
+/// Refuse when this process cannot reach the window server, so a dropped
+/// action is never reported as done.
+pub(crate) fn require_graphic_session() -> Result<(), DesktopError> {
+    if has_graphic_session() {
+        return Ok(());
+    }
+    Err(DesktopError::Os(
+        "this process is not in a logged-in graphical session (it was started over SSH, or \
+         as a background service), so macOS would drop every click and keystroke without an \
+         error. Start it inside the user's session: from Terminal on the Mac, or as a \
+         LaunchAgent in gui/<uid>."
+            .to_string(),
+    ))
 }
 
 /// Refuse, naming the grant and where to give it, when it is missing.
