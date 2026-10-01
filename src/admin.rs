@@ -372,6 +372,11 @@ pub struct ApiModel {
     /// [`crate::agent::api::DEFAULT_MAX_RETRIES`]; 0 never retries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_retries: Option<u32>,
+    /// Whether the `anthropic` format marks prompt-cache breakpoints (the
+    /// tools, the system prompt, the conversation so far). Unset is on; set
+    /// false for a service that refuses `cache_control`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache: Option<bool>,
     /// Which header carries the key: `x-api-key` or `bearer`. Unset is the
     /// format's own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1361,6 +1366,7 @@ mod tests {
                 max_steps: Some(60),
                 timeout_secs: Some(600),
                 max_retries: Some(0),
+                prompt_cache: Some(false),
                 auth: Some(crate::agent::api::KeyHeader::Bearer),
                 api_version: Some("2099-01-01".to_string()),
             }],

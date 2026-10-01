@@ -120,6 +120,52 @@ pub const DEFAULT_MAX_RETRIES: u32 = 3;
 /// `Retry-After` asks for — a wait is bounded, not taken on trust.
 const MAX_RETRY_WAIT: Duration = Duration::from_secs(30);
 
+/// The request with the messages format's cache breakpoints marked: the last
+/// tool, the system prompt, and the last message's last block — at most the
+/// four the format allows. A tool loop re-sends the whole conversation every
+/// round, so caching it up to the newest message is what makes the next round
+/// read the prefix from cache instead of paying for it again.
+///
+/// Pure, so the shape is tested without a network. A string system prompt or
+/// message is turned into one text block, which is the same request.
+fn with_cache_marks(body: &Value) -> Value {
+    let mark = || json!({"type": "ephemeral"});
+    let mut out = body.clone();
+    if let Some(last) = out
+        .get_mut("tools")
+        .and_then(Value::as_array_mut)
+        .and_then(|tools| tools.last_mut())
+    {
+        last["cache_control"] = mark();
+    }
+    if let Some(system) = out.get("system").and_then(Value::as_str) {
+        if !system.is_empty() {
+            out["system"] = json!([{"type": "text", "text": system, "cache_control": mark()}]);
+        }
+    }
+    if let Some(last) = out
+        .get_mut("messages")
+        .and_then(Value::as_array_mut)
+        .and_then(|messages| messages.last_mut())
+    {
+        match last.get("content").cloned() {
+            Some(Value::String(text)) if !text.is_empty() => {
+                last["content"] = json!([{"type": "text", "text": text, "cache_control": mark()}]);
+            }
+            Some(Value::Array(_)) => {
+                if let Some(block) = last["content"]
+                    .as_array_mut()
+                    .and_then(|blocks| blocks.last_mut())
+                {
+                    block["cache_control"] = mark();
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Whether a status means "busy, try again" rather than "this request is
 /// wrong": rate-limited, unavailable, or overloaded.
 fn is_retryable(status: u16) -> bool {
@@ -165,6 +211,9 @@ pub struct Settings {
     pub timeout_secs: u64,
     /// How many times a busy answer (429, 503, 529) is retried.
     pub max_retries: u32,
+    /// Whether the messages format marks its cache breakpoints
+    /// ([`with_cache_marks`]); unused by the chat format.
+    pub prompt_cache: bool,
     /// The version header the messages format sends; unused by the other.
     pub api_version: String,
     /// The catalogue id this route is chosen by: a configured model's name,
@@ -186,6 +235,7 @@ impl Default for Settings {
             max_steps: DEFAULT_MAX_STEPS,
             timeout_secs: DEFAULT_TIMEOUT_SECS,
             max_retries: DEFAULT_MAX_RETRIES,
+            prompt_cache: true,
             api_version: DEFAULT_API_VERSION.to_string(),
             route: String::new(),
         }
@@ -944,6 +994,7 @@ struct Http {
     timeout: Duration,
     api_version: String,
     retries: u32,
+    prompt_cache: bool,
 }
 
 impl Http {
@@ -998,6 +1049,9 @@ impl Http {
             KeyHeader::Bearer => request.bearer_auth(&self.key),
         };
         match self.format {
+            WireFormat::Anthropic if self.prompt_cache => request
+                .header("anthropic-version", &self.api_version)
+                .json(&with_cache_marks(payload)),
             WireFormat::Anthropic => request
                 .header("anthropic-version", &self.api_version)
                 .json(payload),
@@ -1199,6 +1253,7 @@ impl AgentBackend for ApiBackend {
             timeout: Duration::from_secs(self.settings.timeout_secs),
             api_version: self.settings.api_version.clone(),
             retries: self.settings.max_retries,
+            prompt_cache: self.settings.prompt_cache,
         };
         self.run_turn_with(&transport, prompt, on_event)
     }

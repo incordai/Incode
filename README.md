@@ -335,6 +335,10 @@ a vendor is built into incode: these are ordinary entries you write.
   503 or 529 — is sent again. The wait is the service's `Retry-After`, else 1,
   2, 4… seconds, never more than 30 s; a wrong request (400, 401…) is never
   retried.
+- `prompt_cache` (default on; `anthropic` format only): marks the tools, the
+  system prompt and the newest message with `cache_control`, so each tool round
+  reads the conversation so far from the service's cache. Set `false` for a
+  service that refuses the field.
 - `api_version`: the `anthropic-version` header the `anthropic` format sends.
   Unset, `2023-06-01`, the value that format documents.
 - `/model <id>` switches to any model the service offers; `/models` lists them.
@@ -718,7 +722,7 @@ and `--admin` prints which layer decided each value.
 | `scaffold` | The generator you want [a new project](#a-new-project) laid out with, per stack. A preference handed to the model when it writes `## Layout`; incode runs nothing from it itself |
 | `memory_url` · `engine_bin` | Where the memory service listens · where its engine binary is |
 | `api_providers` | Services that list API agents ([contract](#the-api-providers-contract)): `name`, `url`, `key_env`, `agents_path`, `turns_path`, `list_timeout_secs` |
-| `api_models` | [Models reached with a key](#api-models): `name`, `format`, `url`, `key_env`, `model`, `sub_model`, `aliases`, `auth`, `max_tokens`, `max_steps`, `timeout_secs`, `max_retries`, `api_version` |
+| `api_models` | [Models reached with a key](#api-models): `name`, `format`, `url`, `key_env`, `model`, `sub_model`, `aliases`, `auth`, `max_tokens`, `max_steps`, `timeout_secs`, `max_retries`, `prompt_cache`, `api_version` |
 | `cli_agents` | [Agent CLIs](#cli-agents) to look for, changed or added: `id`, `commands`, `protocol`, `version_args`, `display_name`, `default_sub_agent` |
 | `web_search` | `WebSearch`'s endpoint (`url`, the query sent as `q`) and the name of its key's variable. The key is sent only over https or to loopback |
 | `tools` | [External tools](#external-tools): each one's release, version, asset, `run` and `provides` |

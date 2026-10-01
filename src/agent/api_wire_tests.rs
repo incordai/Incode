@@ -62,6 +62,7 @@ fn http(endpoint: String, format: WireFormat, auth: KeyHeader) -> Http {
         timeout: std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
         api_version: DEFAULT_API_VERSION.to_string(),
         retries: DEFAULT_MAX_RETRIES,
+        prompt_cache: true,
     }
 }
 
@@ -217,9 +218,73 @@ fn the_messages_format_sends_its_version_and_only_its_own_key_header() {
         !head.contains("authorization:"),
         "the key went in a second header: {head}"
     );
-    assert_eq!(body["system"], "be brief");
+    assert_eq!(body["system"][0]["text"], "be brief");
     assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
     assert_eq!(parse_reply(&raw).expect("parsed").text, "hello");
+}
+
+/// **A TOOL LOOP READS ITS PREFIX FROM CACHE.** Every round re-sends the
+/// whole conversation, so the messages format marks the tools, the system
+/// prompt and the newest message as cache breakpoints — and an entry that
+/// turns `prompt_cache` off sends the request exactly as built.
+#[test]
+fn the_messages_format_marks_its_cache_breakpoints_unless_told_not_to() {
+    let (base, server) = serve_once(MESSAGES_REPLY, false);
+    let transport = http(
+        format!("{base}/v1/messages"),
+        WireFormat::Anthropic,
+        KeyHeader::XApiKey,
+    );
+    transport.send(&prompt_body()).expect("sent");
+    let (_, body) = head_and_body(&server.join().expect("server"));
+    let ephemeral = json!({"type": "ephemeral"});
+    assert_eq!(body["tools"][0]["cache_control"], ephemeral, "{body}");
+    assert_eq!(body["system"][0]["cache_control"], ephemeral, "{body}");
+    assert_eq!(body["messages"][0]["content"][0]["text"], "hi", "{body}");
+    assert_eq!(
+        body["messages"][0]["content"][0]["cache_control"], ephemeral,
+        "{body}"
+    );
+
+    let (base, server) = serve_once(MESSAGES_REPLY, false);
+    let transport = Http {
+        prompt_cache: false,
+        ..http(
+            format!("{base}/v1/messages"),
+            WireFormat::Anthropic,
+            KeyHeader::XApiKey,
+        )
+    };
+    transport.send(&prompt_body()).expect("sent");
+    let (_, body) = head_and_body(&server.join().expect("server"));
+    assert_eq!(body, prompt_body(), "sent as built");
+}
+
+/// A tool result is the usual newest message: its LAST block takes the mark,
+/// earlier blocks and earlier messages are left as they were.
+#[test]
+fn only_the_newest_block_of_the_conversation_is_marked() {
+    let body = request_body(
+        "m",
+        "",
+        &[
+            json!({"role": "user", "content": "first"}),
+            json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "a", "content": "one"},
+                {"type": "tool_result", "tool_use_id": "b", "content": "two"},
+            ]}),
+        ],
+        &[],
+    );
+    let marked = with_cache_marks(&body);
+    assert_eq!(marked["messages"][0]["content"], "first");
+    let blocks = &marked["messages"][1]["content"];
+    assert!(blocks[0].get("cache_control").is_none(), "{marked}");
+    assert_eq!(blocks[1]["cache_control"]["type"], "ephemeral");
+    assert_eq!(
+        marked["system"], body["system"],
+        "an empty system stays as it was"
+    );
 }
 
 /// **The version header is the entry's, when it names one** (`api_version`):

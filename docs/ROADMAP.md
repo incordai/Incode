@@ -54,7 +54,11 @@ This is fully true for claude; section 0b says what is not.
   at the edge), `anthropic-version`, one key header per route (`auth`), the
   https-or-loopback rule on every API key, a route's `sub_model` for its
   sub-agents, and `/models`. Not run against a live service: no key was used.
-- **The API route still lacks** prompt caching. The session's permission mode
+- **The API route's gaps are closed (2026-10-01).** Prompt caching: the
+  `anthropic` format marks the tools, the system prompt and the newest message
+  as cache breakpoints (`prompt_cache`, default on); the chat format relies on
+  the service's own automatic caching and reads its cached-token count. Not yet
+  measured against a live service. The session's permission mode
   and `--add-dir` reach its toolbox since 2026-10-01 — before that a `plan`
   session on an API model could write (shown by a control: the test failed
   with "a plan session wrote a file" when the forwarding was removed). The reply ceiling, tool rounds and request
