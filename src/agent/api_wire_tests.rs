@@ -61,7 +61,119 @@ fn http(endpoint: String, format: WireFormat, auth: KeyHeader) -> Http {
         auth,
         timeout: std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
         api_version: DEFAULT_API_VERSION.to_string(),
+        retries: DEFAULT_MAX_RETRIES,
     }
+}
+
+/// Serve one connection per reply, in order: each `(status, extra headers,
+/// body)`. Returns the address and a count of the requests that came in.
+fn serve_in_turn(
+    replies: Vec<(u16, &'static str, &'static str)>,
+) -> (
+    String,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    std::thread::JoinHandle<()>,
+) {
+    use std::sync::atomic::Ordering;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = seen.clone();
+    let server = std::thread::spawn(move || {
+        for (status, headers, body) in replies {
+            let Ok((mut conn, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 8192];
+            let mut request = Vec::new();
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                match conn.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => request.extend_from_slice(&buf[..n]),
+                }
+            }
+            counted.fetch_add(1, Ordering::SeqCst);
+            let answer = format!(
+                "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\n{headers}\
+                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = conn.write_all(answer.as_bytes());
+        }
+    });
+    (format!("http://{addr}"), seen, server)
+}
+
+/// **A BUSY SERVICE IS ASKED AGAIN.** A 429 with `Retry-After: 0`, then a 529,
+/// then the answer: the turn gets the answer, after exactly three requests.
+#[test]
+fn a_busy_answer_is_retried_until_the_service_answers() {
+    let (base, seen, server) = serve_in_turn(vec![
+        (429, "retry-after: 0\r\n", r#"{"error":"slow down"}"#),
+        (529, "retry-after: 0\r\n", r#"{"error":"overloaded"}"#),
+        (200, "", MESSAGES_REPLY),
+    ]);
+    let transport = http(
+        format!("{base}/v1/messages"),
+        WireFormat::Anthropic,
+        KeyHeader::XApiKey,
+    );
+    let raw = transport.send(&prompt_body()).expect("answered in the end");
+    server.join().expect("server");
+    assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 3);
+    assert_eq!(parse_reply(&raw).expect("parsed").text, "hello");
+}
+
+/// A request that is WRONG is not retried — a 400 would be the same 400 —
+/// and when retries run out the error says how many were made.
+#[test]
+fn a_wrong_request_is_not_retried_and_running_out_says_so() {
+    let (base, seen, server) = serve_in_turn(vec![(400, "", r#"{"error":"bad field"}"#)]);
+    let transport = http(
+        format!("{base}/v1/messages"),
+        WireFormat::Anthropic,
+        KeyHeader::XApiKey,
+    );
+    let why = transport.send(&prompt_body()).expect_err("refused");
+    server.join().expect("server");
+    assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(why.contains("400") && why.contains("bad field"), "{why}");
+    assert!(!why.contains("retries"), "{why}");
+
+    let (base, seen, server) = serve_in_turn(vec![
+        (503, "retry-after: 0\r\n", "busy"),
+        (503, "retry-after: 0\r\n", "still busy"),
+    ]);
+    let transport = Http {
+        retries: 1,
+        ..http(
+            format!("{base}/v1/messages"),
+            WireFormat::Anthropic,
+            KeyHeader::XApiKey,
+        )
+    };
+    let why = transport.send(&prompt_body()).expect_err("gave up");
+    server.join().expect("server");
+    assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert!(
+        why.contains("after 1 retries") && why.contains("still busy"),
+        "{why}"
+    );
+}
+
+/// The wait is the service's `Retry-After` when it gives one, else 1, 2, 4
+/// seconds — and never more than the cap, whatever it asks for.
+#[test]
+fn the_wait_between_retries_is_bounded() {
+    use std::time::Duration;
+    assert_eq!(retry_wait(0, None), Duration::from_secs(1));
+    assert_eq!(retry_wait(2, None), Duration::from_secs(4));
+    assert_eq!(retry_wait(0, Some("2.5")), Duration::from_millis(2500));
+    assert_eq!(retry_wait(0, Some("86400")), MAX_RETRY_WAIT);
+    assert_eq!(retry_wait(9, None), MAX_RETRY_WAIT);
+    assert_eq!(retry_wait(1, Some("soon")), Duration::from_secs(2));
+    assert!(is_retryable(429) && is_retryable(503) && is_retryable(529));
+    assert!(!is_retryable(400) && !is_retryable(401) && !is_retryable(500));
 }
 
 fn prompt_body() -> Value {

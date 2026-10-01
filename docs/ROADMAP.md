@@ -54,10 +54,15 @@ This is fully true for claude; section 0b says what is not.
   at the edge), `anthropic-version`, one key header per route (`auth`), the
   https-or-loopback rule on every API key, a route's `sub_model` for its
   sub-agents, and `/models`. Not run against a live service: no key was used.
-- **The API route still lacks**: the session's permission mode and `--add-dir`
-  on its toolbox, retry on 429/529, and prompt caching. The reply ceiling, tool
-  rounds and request timeout are per-entry config (`max_tokens`, `max_steps`,
-  `timeout_secs`).
+- **The API route still lacks** prompt caching. The session's permission mode
+  and `--add-dir` reach its toolbox since 2026-10-01 — before that a `plan`
+  session on an API model could write (shown by a control: the test failed
+  with "a plan session wrote a file" when the forwarding was removed). The reply ceiling, tool rounds and request
+  timeout are per-entry config (`max_tokens`, `max_steps`, `timeout_secs`).
+  Retry on a busy answer is DONE 2026-10-01: 429, 503 and 529 are sent again
+  up to `max_retries` (default 3), waiting `Retry-After` or 1, 2, 4… s, capped
+  at 30 s, before any of the reply is read (so a streamed turn never repeats
+  text); a wrong request is not retried.
 - **No SSE MCP transport.** An ACP client's HTTP MCP servers are spoken to over
   Streamable HTTP (`toolbox::mcp_http`, `mcpCapabilities.http: true`); the older SSE
   transport is not, and `initialize` says so. A server that forgets its session

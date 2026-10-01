@@ -1017,6 +1017,7 @@ mod tests {
             max_tokens: None,
             max_steps: None,
             timeout_secs: None,
+            max_retries: None,
             auth: None,
             api_version: None,
         };

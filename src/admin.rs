@@ -367,6 +367,11 @@ pub struct ApiModel {
     /// [`crate::agent::api::DEFAULT_TIMEOUT_SECS`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
+    /// How many times a busy answer (429, 503, 529) is retried, with a
+    /// bounded wait between. Unset is
+    /// [`crate::agent::api::DEFAULT_MAX_RETRIES`]; 0 never retries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_retries: Option<u32>,
     /// Which header carries the key: `x-api-key` or `bearer`. Unset is the
     /// format's own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1355,6 +1360,7 @@ mod tests {
                 max_tokens: Some(64_000),
                 max_steps: Some(60),
                 timeout_secs: Some(600),
+                max_retries: Some(0),
                 auth: Some(crate::agent::api::KeyHeader::Bearer),
                 api_version: Some("2099-01-01".to_string()),
             }],

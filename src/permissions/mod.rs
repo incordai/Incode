@@ -64,6 +64,19 @@ impl PermissionMode {
         }
     }
 
+    /// The mode an agent-mode word names — the inverse of
+    /// [`Self::agent_mode`], for a backend whose tools are incode's own. A
+    /// word nobody recognises lands on read-only, as
+    /// [`Self::from_str_lossy`] does: an unknown mode never widens.
+    #[must_use]
+    pub fn from_agent_mode(word: &str) -> Self {
+        match word {
+            "acceptEdits" => Self::WorkspaceWrite,
+            "default" => Self::Prompt,
+            _ => Self::ReadOnly,
+        }
+    }
+
     /// Rung on the capability ladder, if this mode is one.
     ///
     /// `Prompt` and `Allow` are policies and have no rung — which is exactly

@@ -331,6 +331,10 @@ a vendor is built into incode: these are ordinary entries you write.
 - `max_tokens` (reply ceiling, default 8192), `max_steps` (tool rounds per
   turn, default 40) and `timeout_secs` (per request and per model-list page,
   default 300) are per entry too.
+- `max_retries` (default 3; 0 never retries): how often a busy answer — 429,
+  503 or 529 — is sent again. The wait is the service's `Retry-After`, else 1,
+  2, 4… seconds, never more than 30 s; a wrong request (400, 401…) is never
+  retried.
 - `api_version`: the `anthropic-version` header the `anthropic` format sends.
   Unset, `2023-06-01`, the value that format documents.
 - `/model <id>` switches to any model the service offers; `/models` lists them.
@@ -714,7 +718,7 @@ and `--admin` prints which layer decided each value.
 | `scaffold` | The generator you want [a new project](#a-new-project) laid out with, per stack. A preference handed to the model when it writes `## Layout`; incode runs nothing from it itself |
 | `memory_url` · `engine_bin` | Where the memory service listens · where its engine binary is |
 | `api_providers` | Services that list API agents ([contract](#the-api-providers-contract)): `name`, `url`, `key_env`, `agents_path`, `turns_path`, `list_timeout_secs` |
-| `api_models` | [Models reached with a key](#api-models): `name`, `format`, `url`, `key_env`, `model`, `sub_model`, `aliases`, `auth`, `max_tokens`, `max_steps`, `timeout_secs`, `api_version` |
+| `api_models` | [Models reached with a key](#api-models): `name`, `format`, `url`, `key_env`, `model`, `sub_model`, `aliases`, `auth`, `max_tokens`, `max_steps`, `timeout_secs`, `max_retries`, `api_version` |
 | `cli_agents` | [Agent CLIs](#cli-agents) to look for, changed or added: `id`, `commands`, `protocol`, `version_args`, `display_name`, `default_sub_agent` |
 | `web_search` | `WebSearch`'s endpoint (`url`, the query sent as `q`) and the name of its key's variable. The key is sent only over https or to loopback |
 | `tools` | [External tools](#external-tools): each one's release, version, asset, `run` and `provides` |
@@ -819,8 +823,6 @@ moved. The old `INCORD_*` variables are not read any more: rename them.
   not spoken.
 - The Windows sandbox does not confine workspace-write, and no OS restricts
   the network.
-- On an API model, the session's permission mode and `--add-dir` are not yet
-  applied to its toolbox, and a 429 or 529 is not retried.
 
 The full list is in `docs/ROADMAP.md`.
 
