@@ -463,7 +463,13 @@ fn set_clipboard(text: &str) -> Result<(), DesktopError> {
     super::macos::set_clipboard(text)
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+/// Put text on the X display's clipboard.
+#[cfg(target_os = "linux")]
+fn set_clipboard(text: &str) -> Result<(), DesktopError> {
+    super::linux::set_clipboard(text)
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 fn set_clipboard(_text: &str) -> Result<(), DesktopError> {
     Err(DesktopError::Unsupported("this platform"))
 }

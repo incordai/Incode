@@ -680,7 +680,10 @@ pub(crate) fn tool_definitions() -> Vec<Value> {
             "description": "Describe every display: id, position, size in physical pixels, \
                             DPI, scale and which is primary. Call this before naming any \
                             coordinate. Also reports whether the process is DPI-aware — if \
-                            it is not, the geometry is virtualised and coordinates are wrong.",
+                            it is not, the geometry is virtualised and coordinates are wrong. \
+                            On Linux, `display` names the X display this server drives: \
+                            start an application there (`DISPLAY=<display>`, with \
+                            WAYLAND_DISPLAY unset) for it to be seen and driven.",
             "inputSchema": {"type": "object", "properties": {}},
         }),
         json!({

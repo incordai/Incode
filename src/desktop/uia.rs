@@ -209,6 +209,41 @@ pub(crate) fn role_of_ax(role: &str, subrole: Option<&str>) -> Role {
     }
 }
 
+/// An AT-SPI2 role name (`GetRoleName`: "push button", "entry", …) in this
+/// module's vocabulary.
+///
+/// Pure and on every platform, like [`role_of_ax`]. The names are AT-SPI's
+/// own (`atspi_role_get_name`), the same whatever toolkit drew the control.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn role_of_atspi(role: &str) -> Role {
+    match role {
+        "push button" | "toggle button" | "button" | "push button menu" => Role::Button,
+        "entry" | "text" | "password text" | "editbar" | "spin button" | "terminal" => Role::Edit,
+        "label" | "static" | "heading" | "paragraph" | "caption" => Role::Text,
+        "list" | "list box" => Role::List,
+        "list item" | "table cell" => Role::ListItem,
+        "check box" | "switch" => Role::CheckBox,
+        "radio button" => Role::RadioButton,
+        "combo box" => Role::ComboBox,
+        "menu" | "menu bar" | "popup menu" => Role::Menu,
+        "menu item" | "check menu item" | "radio menu item" | "tearoff menu item" => Role::MenuItem,
+        "page tab list" => Role::Tab,
+        "page tab" => Role::TabItem,
+        "link" => Role::Link,
+        "image" | "icon" => Role::Image,
+        "frame" | "dialog" | "window" | "alert" | "file chooser" => Role::Window,
+        "panel" | "scroll pane" | "split pane" | "viewport" | "tool bar" | "filler"
+        | "internal frame" | "layered pane" | "root pane" | "status bar" => Role::Pane,
+        "tree" | "tree table" => Role::Tree,
+        "tree item" => Role::TreeItem,
+        "table" => Role::Table,
+        "slider" | "scroll bar" => Role::Slider,
+        // "generic" is GTK4's name for a layout box.
+        "grouping" | "section" | "form" | "generic" => Role::Group,
+        _ => Role::Other,
+    }
+}
+
 /// Walk the focused window's accessibility tree.
 pub fn focused_window_tree(depth: u32) -> Result<Tree, DesktopError> {
     platform::focused_window_tree(depth.min(DEFAULT_DEPTH * 4))
@@ -403,13 +438,21 @@ mod platform {
     }
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(target_os = "linux")]
+mod platform {
+    use super::*;
+
+    pub(super) fn focused_window_tree(max_depth: u32) -> Result<Tree, DesktopError> {
+        super::super::linux::focused_window_tree(max_depth)
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 mod platform {
     use super::*;
 
     pub(super) fn focused_window_tree(_max_depth: u32) -> Result<Tree, DesktopError> {
-        // Linux needs AT-SPI2, which is not written yet. Naming the platform
-        // beats a generic failure — see `DesktopError`.
+        // Naming the platform beats a generic failure — see `DesktopError`.
         Err(DesktopError::Unsupported("this platform"))
     }
 }
@@ -420,7 +463,7 @@ mod platform {
 ///
 /// `describe` reads one element; `children` lists one element's children.
 /// Generic over the handle, so a platform supplies only those two.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 pub(crate) fn walk<N>(
     root: &N,
     max_depth: u32,
@@ -553,6 +596,20 @@ mod tests {
         assert_eq!(role_of_ax("AXRadioButton", None), Role::RadioButton);
         assert_eq!(role_of_ax("AXPopUpButton", None), Role::ComboBox);
         assert_eq!(role_of_ax("AXSomethingNew", None), Role::Other);
+    }
+
+    /// AT-SPI's role names map onto the same vocabulary: a GTK entry is an
+    /// edit, a notebook page is a tab item, a frame is a window.
+    #[test]
+    fn atspi_roles_map_onto_the_shared_vocabulary() {
+        assert_eq!(role_of_atspi("push button"), Role::Button);
+        assert_eq!(role_of_atspi("entry"), Role::Edit);
+        assert_eq!(role_of_atspi("label"), Role::Text);
+        assert_eq!(role_of_atspi("page tab"), Role::TabItem);
+        assert_eq!(role_of_atspi("check menu item"), Role::MenuItem);
+        assert_eq!(role_of_atspi("frame"), Role::Window);
+        assert_eq!(role_of_atspi("filler"), Role::Pane);
+        assert_eq!(role_of_atspi("something new"), Role::Other);
     }
 
     #[test]

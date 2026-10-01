@@ -238,6 +238,19 @@ libc = "0.2"
 # Pinned exactly, like every other toolbox dependency.
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "=0.4.7"
+# Computer use on Linux (`src/desktop/linux.rs`), on an X11 display —
+# `docs/COMPUTER_USE.md` decision 5.
+#   - enigo's `x11rb` backend: without it enigo on Linux has no backend at all
+#     and every action fails. Vetted in a scratch copy of this manifest: it
+#     adds THREE packages — x11rb 0.13.2, x11rb-protocol 0.13.2 and
+#     gethostname 1.1.0 (MIT OR Apache-2.0, pure Rust, no C library) — and
+#     nothing on Windows or macOS, since this table is Linux-only. enigo
+#     0.6.1 (the latest) pins x11rb 0.13, so 0.14 is not a choice here.
+#   - zbus for the AT-SPI2 accessibility tree: NO NEW PACKAGE. xcap already
+#     resolves zbus 5.19.0 (the latest) on Linux with its default features,
+#     which include the blocking API used here.
+enigo = { version = "0.6.1", default-features = false, features = ["x11rb"] }
+zbus = "5.19"
 
 # ---------------------------------------------------------------------------
 # Features

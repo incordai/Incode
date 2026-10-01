@@ -270,6 +270,16 @@ pub struct AdminConfig {
         skip_serializing_if = "crate::hooks::HookConfig::is_empty"
     )]
     pub desktop_hooks: crate::hooks::HookConfig,
+
+    /// Linux: the X display computer use drives. `":N"` attaches to a display
+    /// that is already running; `"xvfb"` (or `"xvfb:WIDTHxHEIGHT"`) starts a
+    /// private one for the desktop server's lifetime and stops it after.
+    ///
+    /// Unset is a refusal, not a fallback to `$DISPLAY`: an agent that quietly
+    /// lands on the operator's own desktop is the failure the isolation
+    /// decision exists to prevent (`docs/COMPUTER_USE.md` 7e).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop_display: Option<String>,
 }
 
 /// One service that serves API agents and lists them on request.
@@ -1418,6 +1428,7 @@ mod tests {
                 pre_tool_use: vec!["a-guard-command".to_string()],
                 post_tool_use: vec!["a-logging-command".to_string()],
             },
+            desktop_display: Some("xvfb:1280x800".to_string()),
         };
         admin.save(dir.path()).expect("saves");
 

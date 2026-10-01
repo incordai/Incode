@@ -8,7 +8,14 @@
 > through `pbcopy`, and the two TCC grants probed before every action and reported by
 > `screen_info` (`missing_grants`). Compiled and unit-tested on macOS 26.6.2 (arm64);
 > the live drive of a real window needs a person to grant Accessibility and Screen
-> Recording once. Linux/Xvfb (Phase D) is still open (`ROADMAP.md` B1).
+> Recording once. Linux on X11 (Phase D) is built (2026-10-01, `src/desktop/linux.rs`):
+> admin.json `desktop_display` names the display (`":N"`, or `"xvfb"` for a private one the
+> server starts and stops; unset refuses rather than using `$DISPLAY`), enigo's x11rb
+> backend for input, `xclip`/`xsel` for the clipboard, and the AT-SPI2 tree over zbus,
+> kept to the applications whose own `DISPLAY` is the server's. Driven live in Docker
+> (Debian 13): a GTK3 window walked at true screen positions, clicked by element, typed
+> and pasted into; a GTK4 window's tree is REFUSED, because GTK 4.18.6 reports every
+> control at (0,0) — pixels and keys still work there. The pixel viewer (14b) is not built.
 >
 > **The invariant in 4c, as built:** one coordinate space at the tool surface — physical
 > pixels on Windows and X11, **points** on macOS (the space CGEvent and AXUIElement both

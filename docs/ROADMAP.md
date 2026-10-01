@@ -372,12 +372,31 @@ Accessibility and Screen Recording once (System Settings › Privacy & Security)
 then `screen_info`, `screenshot`, `ui_tree` and a click are run against it.
 Isolation stays a VM (`COMPUTER_USE.md` 7e).
 
-**Linux/Xvfb — not built yet.** Found: HEAD does not build on a bare Linux
-(xcap's Wayland stack needs `libwayland-dev`, `libpipewire-0.3-dev` and
-`libclang`), and enigo's X11 input is OFF (`default-features = false` drops
-its `x11rb` default) — enabling it adds 3 packages (x11rb 0.13.2,
-x11rb-protocol 0.13.2, gethostname 1.1.0), vetted in a scratch copy. The WSL
-test machine's apt is broken by an interrupted dpkg run from Sep 18.
+**Linux on X11 — built 2026-10-01** (`src/desktop/linux.rs`), tested in Docker
+(Debian 13, Rust 1.97) instead of the WSL machine, whose apt is broken:
+- the display is NAMED in admin.json `desktop_display`: `":N"` attaches,
+  `"xvfb"`/`"xvfb:WxH"` starts a private Xvfb (`-displayfd`, so no race for a
+  number; `PR_SET_PDEATHSIG`, so it dies with the server however that ends);
+  unset is a refusal — never `$DISPLAY`, the operator's own desktop (7e);
+- input through enigo's x11rb backend (the 3 packages above, now added);
+  clipboard through `xclip` or `xsel`, refusing by name when neither is there;
+- the AT-SPI2 tree over zbus (already in the lock), filtered to applications
+  whose process `DISPLAY` is this server's, the active window or the one
+  showing; GTK4's SENSITIVE-without-ENABLED read as enabled;
+- **GTK4 trees are refused, measured not assumed:** GTK 4.18.6 reports every
+  control at (0,0) in screen AND parent coordinates (GTK 3.24.49 reports true
+  positions), so `ui_tree` names the toolkit and points at screenshot + click.
+
+Live, against the real `incode --desktop-mcp` (8/8): a GTK3 window walked at
+its true position, `click_element` moved focus off a button into the entry,
+`type_text` + `paste_text` + `key enter` made it return `hello world`, a
+screenshot came back, GTK4 was refused by name yet typed into, and the private
+Xvfb was gone after the server ended. Whole lib suite on Linux: 1821 passed;
+the 2 `file_ops` failures were the read-only source mount (they write into the
+crate directory), and pass on a writable copy.
+
+**Still open on Linux:** the pixel viewer (x11vnc + noVNC, 14b); Qt and
+Chromium trees not yet measured.
 
 ### B2 — The codex MCP tool call
 

@@ -24,9 +24,10 @@
 //!   accessibility and capture backends. Nothing in this module may treat
 //!   `not(windows)` as Linux.
 //!
-//! Windows is implemented first (decision 8). The other platforms return a
-//! [`DesktopError::Unsupported`] that names itself, rather than silently
-//! reporting an empty or invented display.
+//! Windows came first (decision 8), then macOS (`macos.rs`) and Linux on X11
+//! (`linux.rs`). Any other platform returns a [`DesktopError::Unsupported`]
+//! that names itself, rather than silently reporting an empty or invented
+//! display.
 
 use std::fmt;
 
@@ -41,6 +42,8 @@ pub mod safety;
 pub mod thread;
 pub mod uia;
 
+#[cfg(target_os = "linux")]
+pub mod linux;
 #[cfg(target_os = "macos")]
 pub(crate) mod macos;
 #[cfg(windows)]
@@ -169,6 +172,12 @@ pub struct ScreenInfo {
     /// to look like a broken tool. Empty everywhere else.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub missing_grants: Vec<String>,
+
+    /// Linux: the X display this server drives (`":99"`). An application
+    /// appears here only when it is started on it — `DISPLAY=:99`, with
+    /// `WAYLAND_DISPLAY` unset so the toolkit does not pick Wayland instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<String>,
 }
 
 impl ScreenInfo {
@@ -217,11 +226,17 @@ pub fn screen_info() -> Result<ScreenInfo, DesktopError> {
     #[cfg(not(target_os = "macos"))]
     let missing_grants = Vec::new();
 
+    #[cfg(target_os = "linux")]
+    let display = linux::attached_display();
+    #[cfg(not(target_os = "linux"))]
+    let display = None;
+
     Ok(ScreenInfo {
         dpi_awareness_summary: awareness.summary(),
         coordinates_are_physical: awareness.coordinates_are_physical(),
         monitors,
         missing_grants,
+        display,
     })
 }
 
@@ -290,6 +305,7 @@ mod tests {
             coordinates_are_physical: true,
             monitors,
             missing_grants: Vec::new(),
+            display: None,
         }
     }
 
@@ -452,6 +468,7 @@ mod tests {
             coordinates_are_physical: dpi::Awareness::Virtualised(0).coordinates_are_physical(),
             monitors: sound.monitors.clone(),
             missing_grants: Vec::new(),
+            display: None,
         };
         assert!(!suspect.coordinates_are_physical);
         assert!(suspect.dpi_awareness_summary.contains("UNAWARE"));
