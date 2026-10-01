@@ -39,13 +39,14 @@ use serde::{Deserialize, Serialize};
 
 /// How much journal to keep before the oldest records are dropped.
 ///
-/// The input thread caps the agent at 120 actions per minute
-/// ([`crate::desktop::thread::MAX_ACTIONS_PER_MINUTE`]), so an agent driving
-/// flat out writes on the order of 30 KB a minute. A quarter of a megabyte is
-/// therefore several minutes of the most recent activity, which is what an
-/// operator asking "what is it doing right now" actually wants, and it bounds
-/// the cost of the tail read the viewer performs on every poll.
-pub const MAX_BYTES: u64 = 256 * 1024;
+/// The input thread caps the agent at 120 actions per minute by default
+/// ([`crate::desktop::limits`]), so an agent driving flat out writes on the
+/// order of 30 KB a minute. A quarter of a megabyte is therefore several
+/// minutes of the most recent activity, which is what an operator asking
+/// "what is it doing right now" actually wants, and it bounds the cost of the
+/// tail read the viewer performs on every poll. admin.json
+/// `desktop_limits.journal_max_bytes` changes it.
+pub const MAX_BYTES: u64 = super::limits::DEFAULT_JOURNAL_MAX_BYTES;
 
 /// Where the journal lives inside a workspace.
 ///
@@ -98,6 +99,8 @@ pub struct Entry {
 pub struct Journal {
     path: PathBuf,
     next_seq: u64,
+    /// admin.json `desktop_limits.journal_max_bytes`, default [`MAX_BYTES`].
+    max_bytes: u64,
 }
 
 impl Journal {
@@ -110,7 +113,11 @@ impl Journal {
     #[must_use]
     pub fn at(path: PathBuf) -> Self {
         let next_seq = last_seq(&path).map_or(0, |s| s + 1);
-        Self { path, next_seq }
+        Self {
+            path,
+            next_seq,
+            max_bytes: super::limits::get().journal_max_bytes,
+        }
     }
 
     /// The file being written.
@@ -176,7 +183,7 @@ impl Journal {
         let Ok(meta) = std::fs::metadata(&self.path) else {
             return Ok(()); // nothing written yet
         };
-        if meta.len() <= MAX_BYTES {
+        if meta.len() <= self.max_bytes {
             return Ok(());
         }
 

@@ -152,7 +152,21 @@ fn main() -> anyhow::Result<()> {
             // This process holds no workspace, so a machine-wide file is the
             // only place its configuration can come from — and a guard on the
             // desktop is a machine-wide concern anyway.
-            let admin = incord_code::admin::AdminConfig::load_default();
+            //
+            // `load`, not `load_default`: a malformed file is refused here
+            // rather than read as empty, because empty would start the
+            // desktop with no hooks and default limits — a guard the
+            // operator wrote, silently gone.
+            let admin = incord_code::admin::AdminConfig::load(
+                &incord_code::admin::AdminConfig::default_dir(),
+            )
+            .map_err(|e| anyhow::anyhow!("the desktop will not start: {e}"))?;
+            incord_code::desktop::limits::set(
+                admin
+                    .desktop_limits
+                    .resolve()
+                    .map_err(|e| anyhow::anyhow!("the desktop will not start: {e}"))?,
+            );
             // Linux: the display comes FIRST, while this process is still one
             // thread — attaching sets `DISPLAY`, which the input thread reads
             // when it connects. Held until the server returns, so a private

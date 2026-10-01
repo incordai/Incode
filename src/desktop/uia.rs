@@ -32,10 +32,17 @@ use super::{DesktopError, Rect};
 /// Deep enough for real dialogs and settings panes, shallow enough that a
 /// browser — whose DOM arrives here as tens of thousands of elements — cannot
 /// turn one `ui_tree` call into a context-exhausting reply.
-pub const DEFAULT_DEPTH: u32 = 12;
+/// admin.json `desktop_limits.tree_depth` changes it.
+pub const DEFAULT_DEPTH: u32 = super::limits::DEFAULT_TREE_DEPTH;
 
-/// Most elements returned in one walk, whatever the depth allows.
-pub const MAX_ELEMENTS: usize = 400;
+/// Most elements returned in one walk, whatever the depth allows, by default;
+/// admin.json `desktop_limits.tree_max_elements` changes it.
+pub const MAX_ELEMENTS: usize = super::limits::DEFAULT_TREE_MAX_ELEMENTS as usize;
+
+/// The element cap in force.
+fn max_elements() -> usize {
+    super::limits::get().tree_max_elements
+}
 
 /// A control's kind, in a small closed vocabulary.
 ///
@@ -162,7 +169,8 @@ impl Tree {
         }
         if self.truncated {
             out.push_str(&format!(
-                "\n… stopped at {MAX_ELEMENTS} elements. Narrow the request.\n"
+                "\n… stopped at {} elements. Narrow the request.\n",
+                max_elements()
             ));
         }
         out
@@ -246,7 +254,7 @@ pub(crate) fn role_of_atspi(role: &str) -> Role {
 
 /// Walk the focused window's accessibility tree.
 pub fn focused_window_tree(depth: u32) -> Result<Tree, DesktopError> {
-    platform::focused_window_tree(depth.min(DEFAULT_DEPTH * 4))
+    platform::focused_window_tree(depth.min(super::limits::get().tree_depth.saturating_mul(4)))
 }
 
 /// Where the element with this id is now, re-read from the live tree.
@@ -384,7 +392,7 @@ mod platform {
         next_id: &mut u32,
         truncated: &mut bool,
     ) {
-        if out.len() >= MAX_ELEMENTS {
+        if out.len() >= max_elements() {
             *truncated = true;
             return;
         }
@@ -417,7 +425,7 @@ mod platform {
                 next_id,
                 truncated,
             );
-            if out.len() >= MAX_ELEMENTS {
+            if out.len() >= max_elements() {
                 *truncated = true;
                 return;
             }
@@ -481,7 +489,7 @@ pub(crate) fn walk<N>(
 
     impl<N> Walk<'_, N> {
         fn visit(&mut self, node: &N, depth: u32) {
-            if self.out.len() >= MAX_ELEMENTS {
+            if self.out.len() >= max_elements() {
                 self.truncated = true;
                 return;
             }
@@ -495,7 +503,7 @@ pub(crate) fn walk<N>(
             }
             for child in (self.children)(node) {
                 self.visit(&child, depth + 1);
-                if self.out.len() >= MAX_ELEMENTS {
+                if self.out.len() >= max_elements() {
                     self.truncated = true;
                     return;
                 }

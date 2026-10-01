@@ -37,6 +37,7 @@ pub mod capture;
 pub mod coords;
 pub mod dpi;
 pub mod journal;
+pub mod limits;
 pub mod mcp;
 pub mod safety;
 pub mod thread;

@@ -39,12 +39,10 @@ use super::coords::PhysicalPoint;
 use super::safety::Safety;
 use super::DesktopError;
 
-/// Most actions allowed in any rolling minute.
-///
-/// Sized for an agent driving a UI, which acts in ones and twos with thinking
-/// in between — not for a loop. A human clicking briskly does not approach it;
-/// a runaway hits it within seconds.
-pub const MAX_ACTIONS_PER_MINUTE: usize = 120;
+// The cap on actions in any rolling minute is `limits::max_actions_per_minute`
+// (default 120, stricter only). Sized for an agent driving a UI, which acts in
+// ones and twos with thinking in between — not for a loop. A human clicking
+// briskly does not approach it; a runaway hits it within seconds.
 
 const WINDOW: Duration = Duration::from_secs(60);
 
@@ -356,6 +354,7 @@ fn worker(rx: Receiver<Job>, ready: SyncSender<Result<(), String>>, safety: Safe
     };
 
     let mut recent: VecDeque<Instant> = VecDeque::new();
+    let cap = super::limits::get().max_actions_per_minute;
 
     while let Ok(job) = rx.recv() {
         let now = Instant::now();
@@ -367,9 +366,9 @@ fn worker(rx: Receiver<Job>, ready: SyncSender<Result<(), String>>, safety: Safe
             run(&mut enigo, job.command)
         } else if let Err(refused) = safety.authorise(now) {
             Err(refused)
-        } else if !allow(&mut recent, now) {
+        } else if !allow(&mut recent, now, cap) {
             Err(DesktopError::Os(format!(
-                "refused: more than {MAX_ACTIONS_PER_MINUTE} actions in the last minute. \
+                "refused: more than {cap} actions in the last minute. \
                  This is the runaway guard, not a transient error — an agent hitting it \
                  is looping, and waiting will not help."
             )))
@@ -386,7 +385,7 @@ fn worker(rx: Receiver<Job>, ready: SyncSender<Result<(), String>>, safety: Safe
 
 /// Rate-cap decision over a rolling window. Pure, so the policy is testable
 /// without a thread or a desktop.
-fn allow(recent: &mut VecDeque<Instant>, now: Instant) -> bool {
+fn allow(recent: &mut VecDeque<Instant>, now: Instant, cap: usize) -> bool {
     while let Some(front) = recent.front() {
         if now.duration_since(*front) >= WINDOW {
             recent.pop_front();
@@ -395,7 +394,7 @@ fn allow(recent: &mut VecDeque<Instant>, now: Instant) -> bool {
         }
     }
 
-    if recent.len() >= MAX_ACTIONS_PER_MINUTE {
+    if recent.len() >= cap {
         return false;
     }
 
@@ -618,21 +617,34 @@ mod tests {
         .is_action());
     }
 
+    const CAP: usize = super::super::limits::DEFAULT_MAX_ACTIONS_PER_MINUTE as usize;
+
     #[test]
     fn the_cap_allows_a_normal_burst_and_refuses_a_runaway() {
         let mut recent = VecDeque::new();
         let start = Instant::now();
 
-        for i in 0..MAX_ACTIONS_PER_MINUTE {
+        for i in 0..CAP {
             assert!(
-                allow(&mut recent, start),
+                allow(&mut recent, start, CAP),
                 "action {i} refused while still inside the cap"
             );
         }
         assert!(
-            !allow(&mut recent, start),
-            "action {MAX_ACTIONS_PER_MINUTE} must be refused"
+            !allow(&mut recent, start, CAP),
+            "action {CAP} must be refused"
         );
+    }
+
+    /// A stricter cap from admin.json is the one that holds.
+    #[test]
+    fn a_configured_cap_is_the_cap() {
+        let mut recent = VecDeque::new();
+        let start = Instant::now();
+        for _ in 0..5 {
+            assert!(allow(&mut recent, start, 5));
+        }
+        assert!(!allow(&mut recent, start, 5), "the sixth must be refused");
     }
 
     #[test]
@@ -640,17 +652,17 @@ mod tests {
         let mut recent = VecDeque::new();
         let start = Instant::now();
 
-        for _ in 0..MAX_ACTIONS_PER_MINUTE {
-            assert!(allow(&mut recent, start));
+        for _ in 0..CAP {
+            assert!(allow(&mut recent, start, CAP));
         }
-        assert!(!allow(&mut recent, start));
+        assert!(!allow(&mut recent, start, CAP));
 
         // Just inside the window: still refused. A fixed bucket that reset on
         // the minute would allow a double-rate burst across the boundary.
-        assert!(!allow(&mut recent, start + Duration::from_secs(59)));
+        assert!(!allow(&mut recent, start + Duration::from_secs(59), CAP));
 
         // Past it: the old entries age out and budget returns.
-        assert!(allow(&mut recent, start + Duration::from_secs(61)));
+        assert!(allow(&mut recent, start + Duration::from_secs(61), CAP));
     }
 
     #[test]

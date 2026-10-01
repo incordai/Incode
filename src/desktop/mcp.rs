@@ -486,10 +486,11 @@ impl Server {
             }
 
             "ui_tree" => {
-                let depth =
-                    args.get("depth")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(u64::from(super::uia::DEFAULT_DEPTH)) as u32;
+                let depth = args
+                    .get("depth")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(u64::from(super::limits::get().tree_depth))
+                    as u32;
                 let tree = super::uia::focused_window_tree(depth).map_err(|e| e.to_string())?;
                 Ok(vec![text(format!("{}\n{UNTRUSTED}", tree.render()))])
             }
@@ -509,7 +510,7 @@ impl Server {
                 // the agent reading a tree and acting on it a list can scroll
                 // or a dialog can move, and clicking the old position would hit
                 // whatever took its place — silently, and on the wrong control.
-                let element = super::uia::locate(id, super::uia::DEFAULT_DEPTH)
+                let element = super::uia::locate(id, super::limits::get().tree_depth)
                     .map_err(|e| e.to_string())?
                     .ok_or_else(|| {
                         format!(

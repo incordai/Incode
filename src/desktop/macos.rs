@@ -33,10 +33,10 @@ const AX_VALUE_CG_POINT: u32 = 1;
 const AX_VALUE_CG_SIZE: u32 = 2;
 const UTF8: u32 = 0x0800_0100;
 
-/// How long one accessibility request may take. An application that has
-/// stopped answering would otherwise hold the walk — and the agent — for the
-/// system default of several seconds per element.
-const AX_TIMEOUT_SECS: f32 = 1.0;
+// How long one accessibility request may take is admin.json
+// `desktop_limits.accessibility_call_timeout_ms` (default 1 s): an
+// application that has stopped answering would otherwise hold the walk — and
+// the agent — for the system default of several seconds per element.
 
 #[repr(C)]
 #[derive(Default)]
@@ -359,7 +359,10 @@ pub(crate) fn focused_window_tree(max_depth: u32) -> Result<Tree, DesktopError> 
     // set on it is the global one for every later request in this process.
     let system = Owned::take(unsafe { AXUIElementCreateSystemWide() })
         .ok_or_else(|| DesktopError::Os("the accessibility service is unavailable".to_string()))?;
-    unsafe { AXUIElementSetMessagingTimeout(system.0, AX_TIMEOUT_SECS) };
+    let timeout = super::limits::get()
+        .accessibility_call_timeout
+        .as_secs_f32();
+    unsafe { AXUIElementSetMessagingTimeout(system.0, timeout) };
 
     let app = attribute(&system, "AXFocusedApplication")
         .ok_or_else(|| DesktopError::Os("no application has the focus".to_string()))?;

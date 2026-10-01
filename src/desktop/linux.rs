@@ -41,15 +41,11 @@ use super::{DesktopError, Rect};
 /// The size of a private display when the setting names none.
 pub const DEFAULT_XVFB_SIZE: (u32, u32) = (1920, 1080);
 
-/// How long a private `Xvfb` has to report that it is ready.
-const XVFB_START_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// How long the clipboard program has to take the text.
-const CLIPBOARD_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Each accessibility call: a hung application must cost a second, not the
-/// whole walk.
-const ATSPI_CALL_TIMEOUT: Duration = Duration::from_secs(1);
+// How long a private Xvfb has to report it is ready, the clipboard program
+// has to take the text, and each accessibility call may take (a hung
+// application costs that, not the whole walk): admin.json `desktop_limits`
+// (`xvfb_start_timeout_secs`, `clipboard_timeout_secs`,
+// `accessibility_call_timeout_ms`), read through `limits::get()`.
 
 /// The display this process attached to, by number.
 static ATTACHED: OnceLock<u32> = OnceLock::new();
@@ -262,14 +258,15 @@ fn start_xvfb(width: u32, height: u32) -> Result<Display, DesktopError> {
             format!("{why}. Xvfb said:\n{said}")
         })
     };
-    let line = match rx.recv_timeout(XVFB_START_TIMEOUT) {
+    let start_timeout = super::limits::get().xvfb_start_timeout;
+    let line = match rx.recv_timeout(start_timeout) {
         Ok(line) => line,
         Err(_) => {
             return Err(fail(
                 &mut child,
                 format!(
                     "Xvfb did not report a display within {}s",
-                    XVFB_START_TIMEOUT.as_secs()
+                    start_timeout.as_secs()
                 ),
             ))
         }
@@ -314,7 +311,8 @@ pub(crate) fn set_clipboard(text: &str) -> Result<(), DesktopError> {
                 DesktopError::Os(format!("could not hand the text to {program}: {e}"))
             })?;
         }
-        let deadline = Instant::now() + CLIPBOARD_TIMEOUT;
+        let timeout = super::limits::get().clipboard_timeout;
+        let deadline = Instant::now() + timeout;
         loop {
             match child.try_wait() {
                 Ok(Some(status)) if status.success() => return Ok(()),
@@ -331,7 +329,7 @@ pub(crate) fn set_clipboard(text: &str) -> Result<(), DesktopError> {
                     let _ = child.wait();
                     return Err(DesktopError::Os(format!(
                         "{program} did not take the text within {}s",
-                        CLIPBOARD_TIMEOUT.as_secs()
+                        timeout.as_secs()
                     )));
                 }
                 Err(e) => return Err(DesktopError::Os(format!("{program}: {e}"))),
@@ -378,7 +376,10 @@ fn a11y_bus() -> Result<Connection, DesktopError> {
         Ok(address) if !address.is_empty() => address,
         _ => {
             let session = zbus::blocking::connection::Builder::session()
-                .and_then(|b| b.method_timeout(ATSPI_CALL_TIMEOUT).build())
+                .and_then(|b| {
+                    b.method_timeout(super::limits::get().accessibility_call_timeout)
+                        .build()
+                })
                 .map_err(|e| {
                     DesktopError::Os(format!(
                         "the accessibility tree needs a D-Bus session bus, and none answered \
@@ -403,7 +404,10 @@ fn a11y_bus() -> Result<Connection, DesktopError> {
         }
     };
     zbus::blocking::connection::Builder::address(address.as_str())
-        .and_then(|b| b.method_timeout(ATSPI_CALL_TIMEOUT).build())
+        .and_then(|b| {
+            b.method_timeout(super::limits::get().accessibility_call_timeout)
+                .build()
+        })
         .map_err(|e| DesktopError::Os(format!("could not reach the accessibility bus: {e}")))
 }
 

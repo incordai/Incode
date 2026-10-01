@@ -280,6 +280,15 @@ pub struct AdminConfig {
     /// decision exists to prevent (`docs/COMPUTER_USE.md` 7e).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub desktop_display: Option<String>,
+
+    /// The desktop's limits — rate cap, heartbeat, tree size, journal size,
+    /// timeouts. Unset fields are the defaults; the two safety limits may
+    /// only be made stricter. See [`crate::desktop::limits`].
+    #[serde(
+        default,
+        skip_serializing_if = "crate::desktop::limits::DesktopLimits::is_empty"
+    )]
+    pub desktop_limits: crate::desktop::limits::DesktopLimits,
 }
 
 /// One service that serves API agents and lists them on request.
@@ -1429,6 +1438,11 @@ mod tests {
                 post_tool_use: vec!["a-logging-command".to_string()],
             },
             desktop_display: Some("xvfb:1280x800".to_string()),
+            desktop_limits: crate::desktop::limits::DesktopLimits {
+                max_actions_per_minute: Some(60),
+                tree_depth: Some(20),
+                ..Default::default()
+            },
         };
         admin.save(dir.path()).expect("saves");
 
