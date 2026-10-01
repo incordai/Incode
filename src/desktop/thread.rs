@@ -168,6 +168,13 @@ impl InputThread {
         // they are only physical if the process is per-monitor aware.
         super::dpi::ensure_per_monitor_aware();
 
+        // macOS refuses the input connection itself without Accessibility
+        // (measured on 26.6.2: enigo's "does not have the permission to
+        // simulate input"), so the grant is asked for first, by name and with
+        // where to give it, rather than surfacing as the library's sentence.
+        #[cfg(target_os = "macos")]
+        super::macos::require(super::macos::Grant::Accessibility)?;
+
         let (tx, rx) = mpsc::channel::<Job>();
         let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), String>>(1);
 
