@@ -41,6 +41,8 @@ pub mod safety;
 pub mod thread;
 pub mod uia;
 
+#[cfg(target_os = "macos")]
+pub(crate) mod macos;
 #[cfg(windows)]
 mod win32;
 
@@ -160,6 +162,13 @@ pub struct ScreenInfo {
     pub coordinates_are_physical: bool,
 
     pub monitors: Vec<MonitorInfo>,
+
+    /// Permissions the OS has not granted this program, by name (macOS:
+    /// "Accessibility", "Screen Recording"). Without them the OS drops input
+    /// and blanks captures silently, so they are reported rather than left
+    /// to look like a broken tool. Empty everywhere else.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_grants: Vec<String>,
 }
 
 impl ScreenInfo {
@@ -203,10 +212,16 @@ pub fn screen_info() -> Result<ScreenInfo, DesktopError> {
     let awareness = dpi::ensure_per_monitor_aware();
     let monitors = platform_monitors()?;
 
+    #[cfg(target_os = "macos")]
+    let missing_grants = macos::missing_grants();
+    #[cfg(not(target_os = "macos"))]
+    let missing_grants = Vec::new();
+
     Ok(ScreenInfo {
         dpi_awareness_summary: awareness.summary(),
         coordinates_are_physical: awareness.coordinates_are_physical(),
         monitors,
+        missing_grants,
     })
 }
 
@@ -215,14 +230,11 @@ fn platform_monitors() -> Result<Vec<MonitorInfo>, DesktopError> {
     win32::monitors()
 }
 
-#[cfg(target_os = "macos")]
+/// macOS and Linux: the displays as the capture library sees them, which is
+/// in the same units input uses — points on macOS, pixels on X11.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn platform_monitors() -> Result<Vec<MonitorInfo>, DesktopError> {
-    Err(DesktopError::Unsupported("macOS"))
-}
-
-#[cfg(target_os = "linux")]
-fn platform_monitors() -> Result<Vec<MonitorInfo>, DesktopError> {
-    Err(DesktopError::Unsupported("Linux"))
+    capture::monitor_infos()
 }
 
 #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
@@ -234,6 +246,7 @@ fn platform_monitors() -> Result<Vec<MonitorInfo>, DesktopError> {
 ///
 /// A free function rather than a method so it can be tested on every platform,
 /// including the ones with no monitor implementation yet.
+#[cfg_attr(not(windows), allow(dead_code))] // the monitor list's on Windows
 pub(crate) fn scale_from_dpi(dpi: u32) -> f64 {
     if dpi == 0 {
         // Never observed, but a zero here would divide the whole coordinate
@@ -249,6 +262,7 @@ pub(crate) fn scale_from_dpi(dpi: u32) -> f64 {
 /// Win32 fills the tail of `szDevice` with zeroes; decoding the whole buffer
 /// yields a name with a run of NULs on the end that looks fine in a debugger
 /// and breaks any comparison.
+#[cfg_attr(not(windows), allow(dead_code))] // Win32 strings only
 pub(crate) fn decode_utf16_nul_padded(buf: &[u16]) -> String {
     let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
     String::from_utf16_lossy(&buf[..end])
@@ -275,6 +289,7 @@ mod tests {
             dpi_awareness_summary: "test".to_string(),
             coordinates_are_physical: true,
             monitors,
+            missing_grants: Vec::new(),
         }
     }
 
@@ -436,6 +451,7 @@ mod tests {
             dpi_awareness_summary: dpi::Awareness::Virtualised(0).summary(),
             coordinates_are_physical: dpi::Awareness::Virtualised(0).coordinates_are_physical(),
             monitors: sound.monitors.clone(),
+            missing_grants: Vec::new(),
         };
         assert!(!suspect.coordinates_are_physical);
         assert!(suspect.dpi_awareness_summary.contains("UNAWARE"));

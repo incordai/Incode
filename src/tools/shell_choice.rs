@@ -54,8 +54,10 @@ const SHELL_ENV: &str = "INCODE_SHELL";
 #[cfg(windows)]
 const PROBE_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// The two kinds of shell the tool can run a command in.
+/// The two kinds of shell the tool can run a command in. PowerShell, and the
+/// round trip through the sandbox helper's argv, exist on Windows only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) enum Flavor {
     /// `sh -c`, bash and the like.
     Posix,
@@ -63,6 +65,7 @@ pub(crate) enum Flavor {
     PowerShell,
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 impl Flavor {
     /// The word the sandbox helper's argv uses.
     #[must_use]
@@ -95,8 +98,9 @@ pub(crate) struct Shell {
 
 impl Shell {
     /// A shell rebuilt from what the sandbox helper was handed. The label is
-    /// not needed there.
+    /// not needed there. Windows only, as that helper is.
     #[must_use]
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub(crate) fn from_parts(program: PathBuf, flavor: Flavor) -> Self {
         Self {
             program,
@@ -107,12 +111,14 @@ impl Shell {
 
     /// The executable.
     #[must_use]
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub(crate) fn program(&self) -> &Path {
         &self.program
     }
 
     /// POSIX or PowerShell.
     #[must_use]
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub(crate) fn flavor(&self) -> Flavor {
         self.flavor
     }

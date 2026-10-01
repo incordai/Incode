@@ -121,7 +121,11 @@ pub(super) fn find_soffice(env: &dyn Fn(&str) -> Option<OsString>) -> Option<Pat
 /// so the guards and the checkpoint see the same path the tool writes.
 pub(super) fn output_path(input: &Value) -> String {
     let named = input.get("path").and_then(Value::as_str).unwrap_or("");
-    let pdf_name = Path::new(named)
+    // The name after the LAST separator of either kind, as the directory is
+    // found below. `Path::file_stem` alone splits on this OS's separator only,
+    // so on macOS and Linux `a\b.pptx` became `a\a\b.pdf`.
+    let file_name = named.rsplit(['/', '\\']).next().unwrap_or(named);
+    let pdf_name = Path::new(file_name)
         .file_stem()
         .map(|stem| format!("{}.pdf", stem.to_string_lossy()))
         .unwrap_or_default();

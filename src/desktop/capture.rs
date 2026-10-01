@@ -125,6 +125,42 @@ pub fn capture_monitor(
     capture(monitor, options)
 }
 
+/// Every display as [`super::MonitorInfo`], from the capture library — the
+/// monitor list on macOS and Linux, where its units are the ones input uses
+/// (points on macOS, pixels on X11). `id` is the position in this list, the
+/// same index [`capture_monitor`] takes.
+///
+/// The library reports no reserved areas (menu bar, dock, panels), so the
+/// work area is the whole display there.
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) fn monitor_infos() -> Result<Vec<super::MonitorInfo>, DesktopError> {
+    let read = |what: &str, i: usize, e: xcap::XCapError| {
+        DesktopError::Os(format!("could not read display {i}'s {what}: {e}"))
+    };
+    all_monitors()?
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let rect = Rect {
+                x: m.x().map_err(|e| read("x", i, e))?,
+                y: m.y().map_err(|e| read("y", i, e))?,
+                width: m.width().map_err(|e| read("width", i, e))? as i32,
+                height: m.height().map_err(|e| read("height", i, e))? as i32,
+            };
+            let scale = f64::from(m.scale_factor().map_err(|e| read("scale", i, e))?);
+            Ok(super::MonitorInfo {
+                id: i as u32,
+                name: m.friendly_name().or_else(|_| m.name()).unwrap_or_default(),
+                rect,
+                work_area: rect,
+                dpi: (96.0 * scale).round() as u32,
+                scale,
+                primary: m.is_primary().unwrap_or(false),
+            })
+        })
+        .collect()
+}
+
 fn all_monitors() -> Result<Vec<Monitor>, DesktopError> {
     // BEFORE the enumeration, not merely before the capture: xcap reads process
     // awareness while it works, so a late call would leave part of this answer
@@ -146,29 +182,32 @@ fn capture(monitor: &Monitor, options: CaptureOptions) -> Result<Screenshot, Des
         .y()
         .map_err(|e| DesktopError::Os(format!("could not read display {id}'s y: {e}")))?;
 
+    let desktop_width = monitor
+        .width()
+        .map_err(|e| DesktopError::Os(format!("could not read display {id}'s width: {e}")))?;
+    let desktop_height = monitor
+        .height()
+        .map_err(|e| DesktopError::Os(format!("could not read display {id}'s height: {e}")))?;
+
+    #[cfg(target_os = "macos")]
+    super::macos::require(super::macos::Grant::ScreenRecording)?;
     let full = monitor
         .capture_image()
         .map_err(|e| DesktopError::Os(format!("could not capture display {id}: {e}")))?;
 
-    // The captured image's OWN dimensions, not monitor.width()/height(). See
-    // rule 2 in the module docs: if the two ever disagree, the image is what
-    // the model sees and therefore what its coordinates refer to.
-    let source = Rect {
-        x: origin_x,
-        y: origin_y,
-        width: full.width() as i32,
-        height: full.height() as i32,
-    };
+    let transform = desktop_view(
+        PhysicalPoint {
+            x: origin_x,
+            y: origin_y,
+        },
+        (desktop_width, desktop_height),
+        (full.width(), full.height()),
+        options.max_edge,
+    )
+    .map_err(|why| DesktopError::Os(format!("display {id}: {why}")))?;
 
-    let transform = ViewTransform::fit(source, options.max_edge).ok_or_else(|| {
-        DesktopError::Os(format!(
-            "display {id} captured as {}x{}, which has no usable geometry",
-            full.width(),
-            full.height()
-        ))
-    })?;
-
-    let shown = if transform.is_identity() {
+    let shown = if (full.width(), full.height()) == (transform.model_width, transform.model_height)
+    {
         full
     } else {
         image::imageops::resize(
@@ -191,6 +230,57 @@ fn capture(monitor: &Monitor, options: CaptureOptions) -> Result<Screenshot, Des
         transform,
         monitor_id: id,
         monitor_name: name,
+    })
+}
+
+/// How an image of a display maps back onto the desktop.
+///
+/// The REGION is the display in desktop units — what the OS's monitor API
+/// reports, and the space input and the accessibility tree use. The MODEL
+/// size comes from the image actually captured. On Windows and X11 the two
+/// are the same numbers; on a macOS Retina display the desktop is in points
+/// and the image in pixels at twice that. Taking the region's size from the
+/// image, as this once did, put a click at twice its distance from the
+/// display's corner.
+///
+/// Pure, so the arithmetic is tested without a screen.
+pub(crate) fn desktop_view(
+    origin: PhysicalPoint,
+    (desktop_width, desktop_height): (u32, u32),
+    (image_width, image_height): (u32, u32),
+    max_edge: u32,
+) -> Result<ViewTransform, String> {
+    if desktop_width == 0 || desktop_height == 0 || image_width == 0 || image_height == 0 {
+        return Err(format!(
+            "it measured {desktop_width}x{desktop_height} and was captured as \
+             {image_width}x{image_height}, which has no usable geometry"
+        ));
+    }
+    // One scale for both axes, or the capture is not of this display: a
+    // mismatch here would put every click somewhere the model did not mean.
+    let across = f64::from(image_width) / f64::from(desktop_width);
+    let down = f64::from(image_height) / f64::from(desktop_height);
+    if (across - down).abs() > 0.02 * across.max(down) {
+        return Err(format!(
+            "it measures {desktop_width}x{desktop_height} but was captured as \
+             {image_width}x{image_height}, a different shape, so no coordinate in the \
+             image could be mapped back"
+        ));
+    }
+    let image = Rect {
+        x: 0,
+        y: 0,
+        width: image_width as i32,
+        height: image_height as i32,
+    };
+    let fitted = ViewTransform::fit(image, max_edge)
+        .ok_or_else(|| "it has no usable geometry".to_string())?;
+    Ok(ViewTransform {
+        origin,
+        source_width: desktop_width,
+        source_height: desktop_height,
+        model_width: fitted.model_width,
+        model_height: fitted.model_height,
     })
 }
 
@@ -238,6 +328,73 @@ mod tests {
         RgbaImage::from_fn(width, height, |x, y| {
             image::Rgba([(x % 256) as u8, (y % 256) as u8, 128, 255])
         })
+    }
+
+    /// **A RETINA CLICK LANDS WHERE THE MODEL POINTED.** A 1512x982-point
+    /// display captured at 3024x1964 pixels: the model's right edge is the
+    /// display's right edge in POINTS — not twice as far, where the old
+    /// pixel-sized region put it.
+    #[test]
+    fn a_retina_capture_maps_back_to_points() {
+        let origin = PhysicalPoint { x: 0, y: 0 };
+        let view = desktop_view(origin, (1512, 982), (3024, 1964), 1092).expect("view");
+        assert_eq!((view.model_width, view.model_height), (1092, 709));
+        let right = view.to_physical(super::super::coords::ModelPoint { x: 1091, y: 354 });
+        assert!(
+            (1505..=1511).contains(&right.x),
+            "the right edge mapped to x={} on a 1512-point display",
+            right.x
+        );
+        assert!((485..=495).contains(&right.y), "y={}", right.y);
+    }
+
+    /// Windows and X11, where desktop units ARE the image's pixels: the result
+    /// is exactly what fitting the image alone gave before.
+    #[test]
+    fn a_pixel_desktop_maps_as_before() {
+        let origin = PhysicalPoint { x: -1920, y: 0 };
+        let view = desktop_view(origin, (1920, 1080), (1920, 1080), 1092).expect("view");
+        let before = ViewTransform::fit(
+            Rect {
+                x: -1920,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+            1092,
+        )
+        .expect("fit");
+        assert_eq!(view, before);
+    }
+
+    /// A capture whose shape is not the display's is refused with both sizes,
+    /// rather than mapped — every click from it would land somewhere else.
+    #[test]
+    fn a_capture_of_another_shape_is_refused_by_name() {
+        let origin = PhysicalPoint { x: 0, y: 0 };
+        let why = desktop_view(origin, (1920, 1080), (1920, 1200), 1092).expect_err("refused");
+        assert!(
+            why.contains("1920x1080") && why.contains("1920x1200"),
+            "{why}"
+        );
+        assert!(desktop_view(origin, (0, 1080), (1920, 1080), 1092).is_err());
+    }
+
+    /// The round trip holds within one desktop unit on a Retina display:
+    /// a point read off the image goes back to where it was.
+    #[test]
+    fn a_retina_point_round_trips() {
+        let origin = PhysicalPoint { x: 100, y: 50 };
+        let view = desktop_view(origin, (1512, 982), (3024, 1964), 1092).expect("view");
+        for (x, y) in [(100, 50), (856, 541), (1611, 1031)] {
+            let p = PhysicalPoint { x, y };
+            let m = view.to_model(p).expect("on the display");
+            let back = view.to_physical(m);
+            assert!(
+                (back.x - x).abs() <= 1 && (back.y - y).abs() <= 1,
+                "{p:?} -> {m:?} -> {back:?}"
+            );
+        }
     }
 
     #[test]

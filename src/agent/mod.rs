@@ -692,7 +692,9 @@ mod handover_tests {
 
     #[test]
     fn budget_for_spawn_bounds_oversized_prompt() {
-        let giant_prompt = "A".repeat(40_000);
+        // Over this OS's limit, whichever it is: a fixed 40,000 was over the
+        // Windows limit and under the Unix one, so it tested nothing there.
+        let giant_prompt = "A".repeat(MAX_CMDLINE_PAYLOAD_LEN + 10_000);
         let context = vec!["<guards>safe</guards>".to_string()];
         let (p, c) = budget_for_spawn(&giant_prompt, &context);
         assert!(p.len() + c.len() <= MAX_CMDLINE_PAYLOAD_LEN);

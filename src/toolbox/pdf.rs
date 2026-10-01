@@ -373,12 +373,18 @@ fn print_into(
     let child = command
         .spawn()
         .map_err(|e| format!("could not start {}: {e}", bin.display()))?;
-    let output = crate::tools::bash::wait_with_timeout(child, PDF_DEADLINE).map_err(|e| {
-        format!("the browser did not finish printing: {e}; its processes were stopped")
-    })?;
-    if out.is_file() {
+    // Done when the PDF is, not when the browser exits. Measured on macOS
+    // (Chrome 152): the PDF was whole within a second and the browser was
+    // still running thirty seconds later, so waiting for the exit turned every
+    // print into a 120-second timeout reported as a failure.
+    let waited =
+        crate::tools::bash::wait_with_timeout_or(child, PDF_DEADLINE, &|| is_whole_pdf(&out));
+    if is_whole_pdf(&out) {
         return std::fs::read(&out).map_err(|e| format!("the printed PDF could not be read: {e}"));
     }
+    let output = waited.map_err(|e| {
+        format!("the browser did not finish printing: {e}; its processes were stopped")
+    })?;
     let said = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
@@ -391,9 +397,49 @@ fn print_into(
     ))
 }
 
+/// Whether `path` holds a finished PDF: the header at the start and the
+/// end-of-file marker at the end. A file still being written has the first
+/// and not yet the second.
+fn is_whole_pdf(path: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    const TAIL: u64 = 1024;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut head = [0u8; 5];
+    if file.read_exact(&mut head).is_err() || &head != b"%PDF-" {
+        return false;
+    }
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let mut tail = Vec::new();
+    if file
+        .seek(SeekFrom::Start(len.saturating_sub(TAIL)))
+        .is_err()
+        || file.read_to_end(&mut tail).is_err()
+    {
+        return false;
+    }
+    tail.trim_ascii_end().ends_with(b"%%EOF")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A PDF is whole only once its end marker is written: a print still in
+    /// progress must not be taken and its browser stopped half-way.
+    #[test]
+    fn a_pdf_is_whole_only_with_its_end_marker() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let path = dir.path().join("out.pdf");
+        assert!(!is_whole_pdf(&path), "no file yet");
+        std::fs::write(&path, b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\n").expect("write");
+        assert!(!is_whole_pdf(&path), "still being written");
+        std::fs::write(&path, b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\n%%EOF\n").expect("write");
+        assert!(is_whole_pdf(&path), "header and end marker");
+        std::fs::write(&path, b"<html>%%EOF").expect("write");
+        assert!(!is_whole_pdf(&path), "not a PDF at all");
+    }
 
     fn env_of<'a>(pairs: &'a [(&'a str, OsString)]) -> impl Fn(&str) -> Option<OsString> + 'a {
         move |name| {

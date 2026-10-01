@@ -102,10 +102,14 @@ This is fully true for claude; section 0b says what is not.
   AppContainer could, and it cannot read the workspace or toolchains ungranted).
   Not verified live: the macOS profile (the Mac was offline) and the Linux
   enforced path (WSL's kernel is 5.15, ABI V1).
-- **A full macOS build and test of HEAD is not verified.** The Mac was offline, and
-  since tree-sitter's C grammars went in (`079988b`), the crate can no longer be
-  compile-checked for macOS from Windows. The macOS sandbox profile itself was
-  validated live on macOS during phase 8.
+- ~~**A full macOS build and test of HEAD is not verified.**~~ DONE 2026-10-01 on
+  the owner's Mac: it built, and 7 tests failed. Two were real bugs, fixed —
+  RenderPdf hung for its 120 s deadline on macOS because Chrome writes the PDF
+  and does not exit (the print now ends when the PDF is whole), and
+  `convert::output_path` turned `a\b.pptx` into `a\a\b.pdf` off Windows. Five
+  were tests that assumed Windows (a `node` dependency, a backslash literal,
+  the Windows command-line limit, an off-by-one in a Unix loop, CRLF bytes).
+  Now 1814 lib + 46 bin pass there, and the macOS-only build warnings are gone.
 - **External tools — done; the owner's own release is not published yet.** A
   program incode runs is an `admin.json` `tools` entry, downloaded from its
   release only when asked (`/tools add|update|remove`, `incode --install-tools`),
@@ -336,15 +340,35 @@ is gone (`tools/mod.rs` records it). `with_defaults` names `read_file`,
 
 ### B1 — Desktop on macOS (Phase C) and Linux/Xvfb (Phase D)
 
-`COMPUTER_USE.md` has the design. Neither can be *verified* from this machine,
-and `PROCESS.md` §4 says a claim about an external system needs that system.
-Writing it blind produces code that compiles and has never run.
+Both machines now exist: the owner's Mac (macOS 26.6.2, arm64, over ssh) and
+WSL2 Ubuntu 24.04 on the development PC.
 
-**Needs:** a machine of that kind, or an explicit decision to ship it untested
-and say so in the docs.
+**macOS — built 2026-10-01** (`src/desktop/macos.rs`), compiled and its whole
+suite run on the Mac (1814 lib + 46 bin passed, 0 failed):
+- monitors and capture through xcap, in POINTS (`dpi::Awareness::Points`);
+- **a Retina bug fixed on the way** — `capture` took the region's size from
+  the image (pixels) and its origin from the display (points), so every click
+  landed at twice its distance from the corner; `capture::desktop_view` now
+  takes the region in desktop units and only the model size from the image,
+  and refuses a capture whose shape is not the display's;
+- the accessibility tree through AXUIElement (direct framework calls, no new
+  package), sharing the walk with Windows (`uia::walk`), 1 s per request;
+- the clipboard through `pbcopy` (its test puts the owner's clipboard back);
+- the Accessibility and Screen Recording grants probed before each action and
+  reported by `screen_info` (`missing_grants`), refusing by name rather than
+  letting macOS drop the action silently.
 
-The desktop is unchanged by section 0; only the OS sandbox for shell commands
-was validated on macOS (phase 8).
+**Still open on macOS:** the live drive of a real window — a person grants
+Accessibility and Screen Recording once (System Settings › Privacy & Security),
+then `screen_info`, `screenshot`, `ui_tree` and a click are run against it.
+Isolation stays a VM (`COMPUTER_USE.md` 7e).
+
+**Linux/Xvfb — not built yet.** Found: HEAD does not build on a bare Linux
+(xcap's Wayland stack needs `libwayland-dev`, `libpipewire-0.3-dev` and
+`libclang`), and enigo's X11 input is OFF (`default-features = false` drops
+its `x11rb` default) — enabling it adds 3 packages (x11rb 0.13.2,
+x11rb-protocol 0.13.2, gethostname 1.1.0), vetted in a scratch copy. The WSL
+test machine's apt is broken by an interrupted dpkg run from Sep 18.
 
 ### B2 — The codex MCP tool call
 

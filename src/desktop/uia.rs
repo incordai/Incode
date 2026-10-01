@@ -174,6 +174,41 @@ impl Tree {
     }
 }
 
+/// A macOS accessibility role (`AXButton`, …) and subrole, in this module's
+/// vocabulary.
+///
+/// Pure and on every platform, so the mapping is tested where it is written.
+/// A tab is a radio button with the `AXTabButton` subrole on macOS, which is
+/// why the subrole is consulted at all.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn role_of_ax(role: &str, subrole: Option<&str>) -> Role {
+    if subrole == Some("AXTabButton") {
+        return Role::TabItem;
+    }
+    match role {
+        "AXButton" | "AXMenuButton" | "AXDisclosureTriangle" => Role::Button,
+        "AXTextField" | "AXTextArea" | "AXSearchField" | "AXSecureTextField" => Role::Edit,
+        "AXStaticText" | "AXHeading" => Role::Text,
+        "AXList" | "AXCollection" => Role::List,
+        "AXCell" | "AXRow" => Role::ListItem,
+        "AXCheckBox" | "AXSwitch" => Role::CheckBox,
+        "AXRadioButton" => Role::RadioButton,
+        "AXComboBox" | "AXPopUpButton" => Role::ComboBox,
+        "AXMenu" | "AXMenuBar" => Role::Menu,
+        "AXMenuItem" | "AXMenuBarItem" => Role::MenuItem,
+        "AXTabGroup" => Role::Tab,
+        "AXLink" => Role::Link,
+        "AXImage" => Role::Image,
+        "AXWindow" | "AXSheet" | "AXDrawer" => Role::Window,
+        "AXScrollArea" | "AXSplitGroup" | "AXLayoutArea" | "AXToolbar" => Role::Pane,
+        "AXOutline" | "AXBrowser" => Role::Tree,
+        "AXTable" | "AXGrid" => Role::Table,
+        "AXSlider" | "AXIncrementor" => Role::Slider,
+        "AXGroup" | "AXRadioGroup" => Role::Group,
+        _ => Role::Other,
+    }
+}
+
 /// Walk the focused window's accessibility tree.
 pub fn focused_window_tree(depth: u32) -> Result<Tree, DesktopError> {
     platform::focused_window_tree(depth.min(DEFAULT_DEPTH * 4))
@@ -359,19 +394,82 @@ mod platform {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+mod platform {
+    use super::*;
+
+    pub(super) fn focused_window_tree(max_depth: u32) -> Result<Tree, DesktopError> {
+        super::super::macos::focused_window_tree(max_depth)
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 mod platform {
     use super::*;
 
     pub(super) fn focused_window_tree(_max_depth: u32) -> Result<Tree, DesktopError> {
-        // macOS needs AXUIElement and Linux needs AT-SPI2; neither is written.
-        // Naming the platform beats a generic failure — see `DesktopError`.
-        Err(DesktopError::Unsupported(if cfg!(target_os = "macos") {
-            "macOS"
-        } else {
-            "this platform"
-        }))
+        // Linux needs AT-SPI2, which is not written yet. Naming the platform
+        // beats a generic failure — see `DesktopError`.
+        Err(DesktopError::Unsupported("this platform"))
     }
+}
+
+/// The walk every platform's tree shares: depth-first, ids advancing for
+/// every element visited (kept or not, so two walks of an unchanged window
+/// agree), at most [`MAX_ELEMENTS`] kept, and no deeper than `max_depth`.
+///
+/// `describe` reads one element; `children` lists one element's children.
+/// Generic over the handle, so a platform supplies only those two.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn walk<N>(
+    root: &N,
+    max_depth: u32,
+    describe: &dyn Fn(&N, u32, u32) -> Element,
+    children: &dyn Fn(&N) -> Vec<N>,
+) -> (Vec<Element>, bool) {
+    struct Walk<'a, N> {
+        max_depth: u32,
+        describe: &'a dyn Fn(&N, u32, u32) -> Element,
+        children: &'a dyn Fn(&N) -> Vec<N>,
+        out: Vec<Element>,
+        next_id: u32,
+        truncated: bool,
+    }
+
+    impl<N> Walk<'_, N> {
+        fn visit(&mut self, node: &N, depth: u32) {
+            if self.out.len() >= MAX_ELEMENTS {
+                self.truncated = true;
+                return;
+            }
+            let described = (self.describe)(node, self.next_id, depth);
+            self.next_id += 1;
+            if described.is_useful() {
+                self.out.push(described);
+            }
+            if depth >= self.max_depth {
+                return;
+            }
+            for child in (self.children)(node) {
+                self.visit(&child, depth + 1);
+                if self.out.len() >= MAX_ELEMENTS {
+                    self.truncated = true;
+                    return;
+                }
+            }
+        }
+    }
+
+    let mut walk = Walk {
+        max_depth,
+        describe,
+        children,
+        out: Vec::new(),
+        next_id: 0,
+        truncated: false,
+    };
+    walk.visit(root, 0);
+    (walk.out, walk.truncated)
 }
 
 #[cfg(test)]
@@ -387,6 +485,74 @@ mod tests {
             rect,
             enabled: true,
         }
+    }
+
+    /// A small tree for [`walk`]: each node is (role, name, children).
+    #[derive(Clone)]
+    struct Node(Role, &'static str, Vec<Node>);
+
+    fn walk_of(root: &Node, depth: u32) -> (Vec<Element>, bool) {
+        walk(
+            root,
+            depth,
+            &|n: &Node, id, d| Element {
+                id,
+                depth: d,
+                role: n.0,
+                name: n.1.to_string(),
+                rect: Rect::from_edges(0, 0, 10, 10),
+                enabled: true,
+            },
+            &|n: &Node| n.2.clone(),
+        )
+    }
+
+    /// **The shared walk numbers every element it visits**, kept or not, so a
+    /// structural wrapper the filter drops still takes its id — the property
+    /// that makes two walks of one window agree.
+    #[test]
+    fn the_walk_numbers_what_it_visits_and_keeps_what_is_useful() {
+        let tree = Node(
+            Role::Window,
+            "Settings",
+            vec![
+                Node(Role::Group, "", vec![Node(Role::Button, "OK", vec![])]),
+                Node(Role::Edit, "Name", vec![]),
+            ],
+        );
+        let (kept, truncated) = walk_of(&tree, 8);
+        let seen: Vec<(u32, &str)> = kept.iter().map(|e| (e.id, e.name.as_str())).collect();
+        assert_eq!(seen, vec![(0, "Settings"), (2, "OK"), (3, "Name")]);
+        assert!(!truncated);
+
+        // The depth limit stops the walk below it.
+        let (shallow, _) = walk_of(&tree, 1);
+        assert!(shallow.iter().all(|e| e.depth <= 1), "{shallow:?}");
+        assert!(!shallow.iter().any(|e| e.name == "OK"));
+    }
+
+    /// The walk stops at [`MAX_ELEMENTS`] and says so.
+    #[test]
+    fn a_huge_tree_is_cut_and_reported_as_cut() {
+        let leaves = vec![Node(Role::Button, "b", vec![]); MAX_ELEMENTS + 50];
+        let (kept, truncated) = walk_of(&Node(Role::Window, "w", leaves), 4);
+        assert_eq!(kept.len(), MAX_ELEMENTS);
+        assert!(truncated);
+    }
+
+    /// macOS roles map onto the same vocabulary as Windows; a tab is a radio
+    /// button with a subrole there, and an unknown role is `Other`.
+    #[test]
+    fn macos_roles_map_onto_the_shared_vocabulary() {
+        assert_eq!(role_of_ax("AXButton", None), Role::Button);
+        assert_eq!(role_of_ax("AXTextField", None), Role::Edit);
+        assert_eq!(
+            role_of_ax("AXRadioButton", Some("AXTabButton")),
+            Role::TabItem
+        );
+        assert_eq!(role_of_ax("AXRadioButton", None), Role::RadioButton);
+        assert_eq!(role_of_ax("AXPopUpButton", None), Role::ComboBox);
+        assert_eq!(role_of_ax("AXSomethingNew", None), Role::Other);
     }
 
     #[test]

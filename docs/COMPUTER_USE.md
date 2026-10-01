@@ -3,7 +3,18 @@
 > **Status note, 2026-09-26.** The first line below is out of date. The Windows desktop
 > (`src/desktop/`) is built, and its twelve tools are Toolbox tools behind incode's
 > gate, executed by `incode --desktop-mcp` (`ARCHITECTURE.md` §5b, "The desktop").
-> macOS (Phase C) and Linux/Xvfb (Phase D) are still open (`ROADMAP.md` B1).
+> macOS (Phase C) is built (2026-10-01, `src/desktop/macos.rs`): monitors and capture
+> through xcap in POINTS, the accessibility tree through AXUIElement, the clipboard
+> through `pbcopy`, and the two TCC grants probed before every action and reported by
+> `screen_info` (`missing_grants`). Compiled and unit-tested on macOS 26.6.2 (arm64);
+> the live drive of a real window needs a person to grant Accessibility and Screen
+> Recording once. Linux/Xvfb (Phase D) is still open (`ROADMAP.md` B1).
+>
+> **The invariant in 4c, as built:** one coordinate space at the tool surface — physical
+> pixels on Windows and X11, **points** on macOS (the space CGEvent and AXUIElement both
+> use), top-left origin. Each image carries its transform back to that space; on a
+> Retina display the image is in pixels and the region in points
+> (`capture::desktop_view`).
 
 **Status: DESIGN ONLY. Nothing in this document is implemented.** Every claim about the
 existing tree cites a file and was measured on 2026-09-16. Every claim about a crate's

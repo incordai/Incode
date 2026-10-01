@@ -520,6 +520,9 @@ fn locate_from(
 
 /// Where the engine installs itself, most authoritative first.
 fn default_locations() -> Vec<PathBuf> {
+    // Only the Windows install locations are known; elsewhere the list stays
+    // empty and the engine is found by `engine_bin` or its variable.
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut out = Vec::new();
     #[cfg(windows)]
     {

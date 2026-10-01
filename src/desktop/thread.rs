@@ -457,12 +457,24 @@ fn set_clipboard(text: &str) -> Result<(), DesktopError> {
         .map_err(|e| DesktopError::Os(format!("could not set the clipboard: {e}")))
 }
 
-#[cfg(not(windows))]
+/// Put text on the macOS clipboard.
+#[cfg(target_os = "macos")]
+fn set_clipboard(text: &str) -> Result<(), DesktopError> {
+    super::macos::set_clipboard(text)
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn set_clipboard(_text: &str) -> Result<(), DesktopError> {
     Err(DesktopError::Unsupported("this platform"))
 }
 
 fn run(enigo: &mut Enigo, command: Command) -> Result<Reply, DesktopError> {
+    // Without the Accessibility grant macOS drops synthetic input without a
+    // word, which reads as a click that missed. Refuse by name instead.
+    #[cfg(target_os = "macos")]
+    if !matches!(command, Command::Ping) {
+        super::macos::require(super::macos::Grant::Accessibility)?;
+    }
     match command {
         Command::Ping => Ok(Reply::Done),
 
