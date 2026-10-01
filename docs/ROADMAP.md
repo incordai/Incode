@@ -367,10 +367,27 @@ suite run on the Mac (1814 lib + 46 bin passed, 0 failed):
   reported by `screen_info` (`missing_grants`), refusing by name rather than
   letting macOS drop the action silently.
 
-**Still open on macOS:** the live drive of a real window — a person grants
-Accessibility and Screen Recording once (System Settings › Privacy & Security),
-then `screen_info`, `screenshot`, `ui_tree` and a click are run against it.
-Isolation stays a VM (`COMPUTER_USE.md` 7e).
+**Live on the owner's Mac, 2026-10-01 (over SSH):** `screen_info` (Retina
+1440x900 pt, scale 2), `ui_tree` on a TextEdit window at true point positions,
+and the cursor read all worked; `screenshot` was refused by name (Screen
+Recording not granted). **Input did not land**: macOS drops events from a
+session without window-server access (SessionGetInfo 0x5020 over SSH, 0x6030
+logged in) while `move_mouse` answered "moved" — now refused at startup
+(`macos::require_graphic_session`), as is a missing Accessibility grant.
+
+**Still open on macOS:** click/type/paste/screenshot in the logged-in session.
+The owner's grant covers the SSH chain, not the binary: grant Accessibility and
+Screen Recording to the binary that runs (e.g. `/tmp/incode-mac-test/incode`),
+then run it there (Terminal, or a LaunchAgent in `gui/<uid>`). Isolation stays
+a VM (`COMPUTER_USE.md` 7e).
+
+**Windows, live 2026-10-01 (7/7):** against a dedicated WinForms window whose
+focus starts on a button — `move_mouse` landed, `ui_tree` walked it at true
+positions, `click_element` moved focus into the text box, `type_text` +
+`paste_text` filled it (read back from the window itself), `screenshot`
+returned an image and `key enter` submitted `hello world`. A first run failed
+only because the owner was using the mouse at the same time — the shared
+desktop 7e warns about.
 
 **Linux on X11 — built 2026-10-01** (`src/desktop/linux.rs`), tested in Docker
 (Debian 13, Rust 1.97) instead of the WSL machine, whose apt is broken:
