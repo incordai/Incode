@@ -4,7 +4,10 @@
 //!
 //! Pushing publishes work and a pull request is seen by other people, so
 //! nothing here runs on its own: `/pr` is typed by the operator, at the REPL
-//! or over `--acp`, and no tool the model can call reaches it.
+//! or over `--acp`, and no tool the model can call reaches it. The one other
+//! caller is a run the operator started with `INCODE_LANES_AS=pr`, which
+//! opens each lane whose check passed as a draft pull request through
+//! [`open_onto`] — with the same refusals ([`crate::parallel::Landing`]).
 //!
 //! # What it refuses, before anything leaves the machine
 //!
@@ -58,6 +61,24 @@ pub trait Forge {
         method: MergeMethod,
         head: &str,
     ) -> Result<String, String>;
+    /// Where pull request `pr` (its URL) stands, open or not — the question
+    /// [`Self::pr_status`] cannot answer, since it sees only open ones.
+    fn review(&self, repo: &Path, pr: &str) -> Result<Review, String>;
+}
+
+/// Whether a pull request is still open, was merged, or was closed unmerged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrState {
+    Open,
+    Merged,
+    Closed,
+}
+
+/// A pull request's state and the branch it was opened onto.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Review {
+    pub state: PrState,
+    pub base: String,
 }
 
 /// How `/pr merge` lands a pull request on its base.
@@ -270,6 +291,37 @@ impl Forge for GitHubCli {
             ],
         )
     }
+
+    fn review(&self, repo: &Path, pr: &str) -> Result<Review, String> {
+        // Read back from the ledger, a file on disk: only a URL is passed on,
+        // so nothing there can reach `gh` as an option.
+        if !pr.starts_with("https://") {
+            return Err(format!("\"{pr}\" is not a pull request URL"));
+        }
+        parse_review(&Self::run(
+            repo,
+            &["pr", "view", pr, "--json", "state,baseRefName"],
+        )?)
+    }
+}
+
+/// [`Review`] from `gh pr view --json state,baseRefName`. A state other than
+/// the three GitHub documents is an error, not a guess.
+pub fn parse_review(json: &str) -> Result<Review, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| format!("gh printed unreadable JSON: {e}"))?;
+    let state = match v["state"].as_str() {
+        Some("OPEN") => PrState::Open,
+        Some("MERGED") => PrState::Merged,
+        Some("CLOSED") => PrState::Closed,
+        other => return Err(format!("gh reported a pull request state of {other:?}")),
+    };
+    let base = v["baseRefName"]
+        .as_str()
+        .filter(|b| !b.is_empty())
+        .ok_or("gh reported no base branch for the pull request")?
+        .to_string();
+    Ok(Review { state, base })
 }
 
 /// [`PrStatus`] from `gh pr view --json …`; `None` for one that is not open.
@@ -517,6 +569,19 @@ pub fn open(
     draft: bool,
     forge: &dyn Forge,
 ) -> Result<Opened, String> {
+    open_onto(repo, branch, None, draft, forge)
+}
+
+/// [`open`], onto `base` when given rather than the forge's default branch:
+/// a lane branched from a feature branch is opened onto that branch, or its
+/// pull request would carry every commit the feature branch has.
+pub fn open_onto(
+    repo: &Path,
+    branch: Option<&str>,
+    base: Option<&str>,
+    draft: bool,
+    forge: &dyn Forge,
+) -> Result<Opened, String> {
     let (branch, current, _) = resolve_branch(repo, branch)?;
     if branch == current {
         let dirty = git(repo, &["status", "--porcelain"])?;
@@ -530,7 +595,10 @@ pub fn open(
     git(repo, &["remote", "get-url", "origin"])
         .map_err(|_| "this repository has no `origin` remote to push to".to_string())?;
 
-    let base = forge.default_branch(repo)?;
+    let base = match base {
+        Some(base) => base.to_string(),
+        None => forge.default_branch(repo)?,
+    };
     if branch == base {
         return Err(format!(
             "\"{branch}\" is the default branch; a pull request needs a branch of its own \
@@ -631,6 +699,9 @@ mod tests {
                 .borrow_mut()
                 .push((number, method, head.to_string()));
             Ok("0123456789abcdef".to_string())
+        }
+        fn review(&self, _: &Path, _: &str) -> Result<Review, String> {
+            Err("not asked in these tests".to_string())
         }
     }
 
@@ -769,6 +840,61 @@ mod tests {
         );
         let closed = r#"{"number":5,"state":"MERGED","statusCheckRollup":[]}"#;
         assert_eq!(parse_status(closed).expect("json"), None);
+    }
+
+    /// **MERGED AND CLOSED ARE TOLD APART**, which `parse_status` cannot do:
+    /// one finishes a task, the other sends it back.
+    #[test]
+    fn a_pull_requests_state_and_base_are_read() {
+        for (state, want) in [
+            ("OPEN", PrState::Open),
+            ("MERGED", PrState::Merged),
+            ("CLOSED", PrState::Closed),
+        ] {
+            let json = format!(r#"{{"state":"{state}","baseRefName":"dev"}}"#);
+            assert_eq!(
+                parse_review(&json).expect("read"),
+                Review {
+                    state: want,
+                    base: "dev".to_string()
+                }
+            );
+        }
+        assert!(parse_review(r#"{"state":"DRAFTY","baseRefName":"dev"}"#).is_err());
+        assert!(parse_review(r#"{"state":"OPEN"}"#).is_err());
+    }
+
+    /// **A PULL REQUEST ONTO THE BRANCH IT CAME FROM** carries only its own
+    /// commit, not everything that branch has beyond the default one — and
+    /// the forge is not asked for its default branch at all.
+    #[test]
+    fn a_branch_is_opened_onto_the_base_it_is_given() {
+        let (_dir, _remote, work) = repo();
+        sh(&work, &["checkout", "-b", "dev"]);
+        commit(&work, "d.txt", "work already on dev");
+        sh(&work, &["push", "origin", "dev"]);
+        sh(&work, &["fetch", "origin"]);
+        sh(&work, &["checkout", "-b", "lane/t-1"]);
+        commit(&work, "l.txt", "the lane's change");
+        sh(&work, &["checkout", "dev"]);
+        let mut forge = forge(None);
+        forge.default = "never-asked".to_string();
+
+        let opened = open_onto(&work, Some("lane/t-1"), Some("dev"), true, &forge).expect("opened");
+        assert_eq!(opened.base, "dev");
+        let created = forge.created.borrow();
+        assert_eq!(created[0].base, "dev");
+        assert!(created[0].draft);
+        assert!(
+            created[0].body.contains("the lane's change"),
+            "{}",
+            created[0].body
+        );
+        assert!(
+            !created[0].body.contains("work already on dev"),
+            "{}",
+            created[0].body
+        );
     }
 
     fn sh(dir: &Path, args: &[&str]) {

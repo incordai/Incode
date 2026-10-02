@@ -367,7 +367,7 @@ Decision: benchmark lessons are kept in a JSONL file under the work folder, not 
 | 9 | `insi` workspace and binary; CLI | 1 | Built |
 | — | **The Phase 1 measurement**: lessons off vs on, newer half, 3 seeds | 1 | Next, once validation ends |
 | 10 | MCP server (read side) | 2 | `insi mcp` written (`insi_briefing`, `insi_lessons_for_error`); tests pending |
-| 11 | Check inside a worktree before any merge or PR (also needed by `/run` lanes-as-PRs) | 2 | Lane check before merge written in incode (`INCODE_LANE_CHECK`); tests pending. Lanes-as-PRs: design in `docs/LANES_AS_PRS.md`, awaiting approval |
+| 11 | Check inside a worktree before any merge or PR (also needed by `/run` lanes-as-PRs) | 2 | Done in incode: lane check before merge (`INCODE_LANE_CHECK`, 6f1ecdf) and lanes opened as draft PRs (`INCODE_LANES_AS=pr`), settled on the next run (`docs/LANES_AS_PRS.md`). Not yet run against GitHub live |
 | 12 | PR body with evidence; secret/PII scan before opening | 2 | incode `/pr` credential scan built (`289090a`); `insi issue` PR body with evidence and the same scan written, tests pending. PII scan left |
 | 13 | Trusted-label issue intake | 2 | `insi issue --number N` written: open + labelled only, draft PR after `test_cmd` passes; tests pending |
 | 14 | GitHub App with short-lived, PR-only tokens | 2 | Not started; `gh`'s login is used meanwhile |

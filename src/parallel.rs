@@ -221,6 +221,11 @@ pub enum Merged {
     CheckFailed { why: String },
     /// The merge could not be attempted.
     Failed { why: String },
+    /// Its check passed in its lane and it was opened as a pull request
+    /// ([`Landing::Review`]); nothing was merged here. Not landed: a person
+    /// merges it, and the next run checks the pulled tree before the task is
+    /// done.
+    Opened { url: String },
 }
 
 impl Merged {
@@ -255,7 +260,129 @@ impl Merged {
             Merged::Failed { why } => {
                 format!("`{}` could not be merged: {why}", lane.task_id)
             }
+            Merged::Opened { url } => format!(
+                "`{}` passed its check in its own lane and is open for review at {url} \
+                 (branch `{}`). Nothing was merged here; once it is merged, the next run \
+                 checks the pulled tree and finishes the task.",
+                lane.task_id, lane.branch
+            ),
         }
+    }
+}
+
+/// Where a lane's work goes once its own check has passed.
+pub enum Landing<'a> {
+    /// Merged into the tree the run started from.
+    Here,
+    /// Pushed and opened as a draft pull request onto `base`, the branch the
+    /// run is on; a person merges it.
+    Review {
+        forge: &'a dyn crate::tools::pull_request::Forge,
+        base: String,
+    },
+}
+
+/// The switch for [`lanes_as_pull_requests`].
+pub const LANES_AS_ENV: &str = "INCODE_LANES_AS";
+
+/// Whether the operator asked for lanes to be opened as pull requests
+/// (`INCODE_LANES_AS=pr`) rather than merged here, the default.
+#[must_use]
+pub fn lanes_as_pull_requests() -> bool {
+    std::env::var(LANES_AS_ENV)
+        .map(|v| v.trim().eq_ignore_ascii_case("pr"))
+        .unwrap_or(false)
+}
+
+/// The branch lanes are opened onto as pull requests: the one checked out
+/// at `repo_root`. Asked once, at the start of a run, so a run that cannot
+/// open pull requests says so before any lane works rather than per lane.
+///
+/// # Errors
+///
+/// HEAD detached, no `origin`, the forge unreachable (`gh` missing or not
+/// logged in), or the branch not on `origin` — a pull request needs a base
+/// the forge has.
+pub fn review_base(
+    repo_root: &Path,
+    forge: &dyn crate::tools::pull_request::Forge,
+) -> Result<String, String> {
+    let branch = git(repo_root, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    if branch == "HEAD" {
+        return Err("HEAD is detached, so there is no branch to open them onto".to_string());
+    }
+    git(repo_root, &["remote", "get-url", "origin"])
+        .map_err(|_| "this repository has no `origin` remote".to_string())?;
+    forge.default_branch(repo_root)?;
+    git(
+        repo_root,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/remotes/origin/{branch}"),
+        ],
+    )
+    .map_err(|_| format!("`{branch}` is not on origin; push it first"))?;
+    Ok(branch)
+}
+
+/// Refused when HEAD has commits `origin/<base>` lacks: lanes branch from
+/// HEAD, so each pull request would carry those commits as well as its own.
+/// Asked before each batch, since the run can move HEAD.
+///
+/// # Errors
+///
+/// The commits are unpushed, or git could not say.
+pub fn nothing_unpushed(repo_root: &Path, base: &str) -> Result<(), String> {
+    git(
+        repo_root,
+        &[
+            "merge-base",
+            "--is-ancestor",
+            "HEAD",
+            &format!("origin/{base}"),
+        ],
+    )
+    .map_err(|_| {
+        format!(
+            "`{base}` has commits origin does not, and every pull request would carry them; \
+             push `{base}` first"
+        )
+    })
+    .map(|_| ())
+}
+
+/// Seal a lane and open its branch as a draft pull request onto `base`,
+/// through `/pr`'s own path and refusals (nothing new, a credential in the
+/// diff). A task with no check is merged here instead: nothing could finish
+/// it after the review, and the runner hands such a task to the owner.
+pub fn open_for_review(
+    repo_root: &Path,
+    lane: &Lane,
+    task: &crate::ledger::Task,
+    forge: &dyn crate::tools::pull_request::Forge,
+    base: &str,
+) -> Merged {
+    if task.verify.is_empty() {
+        return merge_lane(repo_root, lane);
+    }
+    match seal_lane(lane) {
+        Ok(false) => return Merged::Nothing,
+        Ok(true) => {}
+        Err(why) => return Merged::Failed { why },
+    }
+    match crate::tools::pull_request::open_onto(
+        repo_root,
+        Some(&lane.branch),
+        Some(base),
+        true,
+        forge,
+    ) {
+        Ok(opened) => Merged::Opened { url: opened.url },
+        Err(why) => Merged::Failed {
+            why: format!("it could not be opened for review: {why}"),
+        },
     }
 }
 
@@ -474,6 +601,9 @@ pub struct LaneOutcome {
 /// branch ([`Merged::CheckFailed`]) and the task is done again in the main
 /// tree. `None` skips this gate ([`lane_check_wanted`]).
 ///
+/// A lane past that gate is merged here, or opened as a pull request when
+/// `landing` is [`Landing::Review`] ([`open_for_review`]).
+///
 /// # Merges are serial even though the work was not
 ///
 /// `git merge` moves `HEAD`; two at once in one repository race. Merging in
@@ -484,6 +614,7 @@ pub fn run_batch<F>(
     repo_root: &Path,
     tasks: &[crate::ledger::Task],
     check_in: Option<&Path>,
+    landing: &Landing<'_>,
     make_worker: F,
 ) -> Vec<LaneOutcome>
 where
@@ -580,7 +711,12 @@ where
                     why: "the agent did not finish, so nothing was merged".to_string(),
                 },
                 (Ok(_), Some(why)) => Merged::CheckFailed { why },
-                (Ok(_), None) => merge_lane(repo_root, lane),
+                (Ok(_), None) => match landing {
+                    Landing::Here => merge_lane(repo_root, lane),
+                    Landing::Review { forge, base } => {
+                        open_for_review(repo_root, lane, task, *forge, base)
+                    }
+                },
             };
             close_lane_or_report(repo_root, lane);
             LaneOutcome {
@@ -999,7 +1135,7 @@ mod tests {
             }
         }
 
-        let outcomes = run_batch(&root, &[ready("t-1")], None, |workspace| {
+        let outcomes = run_batch(&root, &[ready("t-1")], None, &Landing::Here, |workspace| {
             Box::new(GivesUp(workspace.to_path_buf()))
         });
 
@@ -1115,7 +1251,7 @@ mod tests {
         let tasks = vec![ready("t-1"), ready("t-2")];
         let gate = std::sync::Arc::new(std::sync::Barrier::new(tasks.len()));
 
-        let outcomes = run_batch(&root, &tasks, None, |workspace| {
+        let outcomes = run_batch(&root, &tasks, None, &Landing::Here, |workspace| {
             Box::new(Rendezvous {
                 workspace: workspace.to_path_buf(),
                 gate: std::sync::Arc::clone(&gate),
@@ -1171,7 +1307,7 @@ mod tests {
         }
 
         let tasks = vec![ready("t-1")];
-        let outcomes = run_batch(&root, &tasks, None, |workspace| {
+        let outcomes = run_batch(&root, &tasks, None, &Landing::Here, |workspace| {
             Box::new(Refuses(workspace.to_path_buf()))
         });
 
@@ -1229,6 +1365,7 @@ mod tests {
             &root,
             &[passes.clone(), fails.clone()],
             Some(Path::new("")),
+            &Landing::Here,
             |workspace| Box::new(Writes(workspace.to_path_buf())),
         );
         assert_eq!(outcomes[0].merged, Merged::Clean);
@@ -1265,7 +1402,7 @@ mod tests {
         // lane merges as before (the runner's check still judges it).
         let mut again = ready("t-ungated");
         again.verify = fails.verify.clone();
-        let ungated = run_batch(&root, &[again], None, |workspace| {
+        let ungated = run_batch(&root, &[again], None, &Landing::Here, |workspace| {
             Box::new(Writes(workspace.to_path_buf()))
         });
         assert_eq!(ungated[0].merged, Merged::Clean);
@@ -1296,6 +1433,151 @@ mod tests {
         std::env::set_var(LANE_CHECK_ENV, "1");
         assert!(lane_check_wanted());
         std::env::remove_var(LANE_CHECK_ENV);
+    }
+
+    /// GitHub, stood in for: what would have been opened, and a fixed URL.
+    #[derive(Default)]
+    struct ReviewForge {
+        created: std::sync::Mutex<Vec<crate::tools::pull_request::NewPr>>,
+    }
+
+    impl crate::tools::pull_request::Forge for ReviewForge {
+        fn default_branch(&self, _: &Path) -> Result<String, String> {
+            Ok("main".to_string())
+        }
+        fn open_pr(&self, _: &Path, _: &str) -> Result<Option<String>, String> {
+            Ok(None)
+        }
+        fn create(
+            &self,
+            _: &Path,
+            new: &crate::tools::pull_request::NewPr,
+        ) -> Result<String, String> {
+            self.created.lock().expect("lock").push(new.clone());
+            Ok("https://github.com/o/r/pull/9".to_string())
+        }
+        fn pr_status(
+            &self,
+            _: &Path,
+            _: &str,
+        ) -> Result<Option<crate::tools::pull_request::PrStatus>, String> {
+            Ok(None)
+        }
+        fn merge(
+            &self,
+            _: &Path,
+            _: u64,
+            _: crate::tools::pull_request::MergeMethod,
+            _: &str,
+        ) -> Result<String, String> {
+            Err("not asked".to_string())
+        }
+        fn review(&self, _: &Path, _: &str) -> Result<crate::tools::pull_request::Review, String> {
+            Err("not asked".to_string())
+        }
+    }
+
+    /// `a_repo` with a bare `origin` holding its branch, as a pull request
+    /// needs. The remote's tempdir is returned so it outlives the test.
+    fn a_repo_with_origin() -> Option<(tempfile::TempDir, tempfile::TempDir, PathBuf, String)> {
+        let (guard, root) = a_repo()?;
+        let remote = tempfile::tempdir().ok()?;
+        git(remote.path(), &["init", "--bare"]).ok()?;
+        git(&root, &["remote", "add", "origin", remote.path().to_str()?]).ok()?;
+        let branch = git(&root, &["rev-parse", "--abbrev-ref", "HEAD"]).ok()?;
+        git(&root, &["push", "origin", &branch]).ok()?;
+        git(&root, &["fetch", "origin"]).ok()?;
+        Some((guard, remote, root, branch))
+    }
+
+    /// **A LANE OPENED FOR REVIEW LEAVES THE MAIN TREE ALONE.** Its check
+    /// passed, its branch is on the remote, a draft pull request onto the
+    /// run's own branch was opened — and nothing was merged here, so the
+    /// runner cannot prove the task against a tree without the change.
+    #[test]
+    fn a_lane_opened_for_review_is_pushed_and_not_merged() {
+        let Some((_guard, remote, root, base)) = a_repo_with_origin() else {
+            return;
+        };
+        struct Writes(PathBuf);
+        impl crate::runner::TaskWorker for Writes {
+            fn work(&mut self, task: &crate::ledger::Task) -> Result<String, String> {
+                std::fs::write(self.0.join(format!("{}.txt", task.id)), "done\n")
+                    .map_err(|e| e.to_string())?;
+                Ok(format!("{} finished", task.id))
+            }
+        }
+        let mut task = ready("t-pr");
+        task.verify = ["git", "ls-files", "--error-unmatch", "shared.txt"]
+            .map(String::from)
+            .to_vec();
+        let forge = ReviewForge::default();
+        let landing = Landing::Review {
+            forge: &forge,
+            base: base.clone(),
+        };
+
+        let outcomes = run_batch(&root, &[task], Some(Path::new("")), &landing, |w| {
+            Box::new(Writes(w.to_path_buf()))
+        });
+        assert_eq!(
+            outcomes[0].merged,
+            Merged::Opened {
+                url: "https://github.com/o/r/pull/9".to_string()
+            }
+        );
+        assert!(!outcomes[0].merged.landed());
+        assert!(!root.join("t-pr.txt").exists(), "the lane was merged here");
+        let created = forge.created.lock().expect("lock");
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].base, base);
+        assert!(created[0].draft);
+        assert_eq!(created[0].head, outcomes[0].branch);
+        git(
+            remote.path(),
+            &[
+                "rev-parse",
+                "--verify",
+                &format!("refs/heads/{}", outcomes[0].branch),
+            ],
+        )
+        .expect("the lane's branch was not pushed");
+    }
+
+    /// Lanes cannot be opened onto a branch the remote lacks, nor while the
+    /// branch has commits the remote lacks — each pull request would carry
+    /// them.
+    #[test]
+    fn a_review_base_must_be_on_the_remote_with_nothing_unpushed() {
+        let Some((_guard, _remote, root, base)) = a_repo_with_origin() else {
+            return;
+        };
+        let forge = ReviewForge::default();
+        assert_eq!(review_base(&root, &forge).as_deref(), Ok(base.as_str()));
+        assert!(nothing_unpushed(&root, &base).is_ok());
+
+        std::fs::write(root.join("local.txt"), "x").expect("write");
+        git(&root, &["add", "-A"]).expect("add");
+        git(&root, &["commit", "-m", "not pushed"]).expect("commit");
+        assert!(nothing_unpushed(&root, &base)
+            .expect_err("unpushed")
+            .contains("push"));
+
+        git(&root, &["checkout", "-b", "local-only"]).expect("branch");
+        assert!(review_base(&root, &forge)
+            .expect_err("not on origin")
+            .contains("not on origin"));
+    }
+
+    #[test]
+    fn lanes_are_merged_here_unless_pull_requests_are_asked_for() {
+        std::env::remove_var(LANES_AS_ENV);
+        assert!(!lanes_as_pull_requests());
+        std::env::set_var(LANES_AS_ENV, "PR");
+        assert!(lanes_as_pull_requests());
+        std::env::set_var(LANES_AS_ENV, "merge");
+        assert!(!lanes_as_pull_requests());
+        std::env::remove_var(LANES_AS_ENV);
     }
 
     /// The requested count is read from the environment and clamped.

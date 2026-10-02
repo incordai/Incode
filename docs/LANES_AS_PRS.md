@@ -1,56 +1,74 @@
-# Lanes as pull requests — design
+# Lanes as pull requests
 
-Status: proposed, not built. Builds on the lane check (each lane's check runs
-in its own checkout before anything leaves it), which is built.
+Status: built. Builds on the lane check (each lane's check runs in its own
+checkout before anything leaves it).
 
 ## What changes for the operator
 
 Today a `/run` with `INCODE_LANES=N` merges each lane's branch into the
 checked-out branch on this machine. With `INCODE_LANES_AS=pr`, a lane whose
-own check passed is pushed and opened as a pull request instead, and nothing
-is merged locally. A person reviews and merges it on GitHub. The run goes on
-with the other tasks.
+own check passed is pushed and opened as a **draft** pull request onto the
+branch the run is on, and nothing is merged locally. A person reviews and
+merges it on GitHub. The run goes on with the other tasks.
 
 ## Why it is more than swapping `merge_lane` for `/pr`
 
 The ledger's law is that a task reaches `Done` only through a passing check on
-the tree the work is in (`src/ledger.rs:42-57`, `src/runner.rs:1482`). A lane
-opened as a pull request is neither done (its work is not in the tree) nor
-running (no agent is on it) nor failed. It needs a state of its own, and a way
-back to `Done` once a person has merged it.
+the tree the work is in. A lane opened as a pull request is neither done (its
+work is not in the tree) nor running (no agent is on it) nor failed.
 
-## The design
+## What was built
 
-1. **A state: `InReview`.** Open (`is_open()` is true), not `Ready`, so no
-   runner picks it up and its dependants stay `Pending` until it is done —
-   exactly as now, because their work assumes its change.
-2. **The task records its pull request:** `pull_request: Option<String>` (the
-   URL), set when the lane is opened as one, alongside the existing
-   `unmerged_branch`.
-3. **Opening:** in `run_batch`, after the lane check passes, call the existing
-   `/pr` path (`tools::pull_request::open`, with its refusals: default branch,
-   nothing new, credentials in the diff). Its result becomes
-   `Merged::Opened { url }`; `landed()` stays false.
-4. **Coming back:** at the start of every `/run`, for each `InReview` task,
-   ask the forge (`Forge::pr_status`) whether its PR was merged. If merged:
-   `git pull` the base, run the task's check on the main tree, and complete it
-   through the ordinary `verify` path — the same single edge into `Done`. If
-   closed without merging: the task goes back to `Ready` with its branch
-   remembered, as for a conflict. If still open: nothing.
-5. **Off by default.** Without `INCODE_LANES_AS=pr` nothing changes.
+1. **It waits `Blocked`, with the URL recorded** (`Task.pull_request`,
+   `Ledger::await_review`). The proposal was an eighth state, `InReview`; the
+   ledger holds itself to seven (`src/ledger.rs`), and `Blocked` already
+   means "a decision is outstanding with a person", which a review is. So
+   nothing picks it up, its dependants stay `Pending`, a run that drains
+   around it stops with `NothingRunnable` naming it, and the existing
+   progress and dashboard views show it as waiting on a person — with the
+   URL in its note.
+2. **Opening** (`parallel::open_for_review`, `Merged::Opened { url }`): after
+   the lane check passes, the lane is sealed and opened through `/pr`'s own
+   path (`pull_request::open_onto`) with its refusals — nothing new, a
+   credential in the diff. `landed()` is false, and no report is cached, so
+   the runner never checks a tree without the change. A task with no check is
+   merged here instead: nothing could finish it after a review.
+3. **The base is the branch the run is on**, not the forge's default: a lane
+   cut from a feature branch would otherwise carry that branch's commits.
+   Checked once at the start (`parallel::review_base`: a branch, not detached;
+   an `origin`; `gh` reachable; the branch on `origin`) and before each batch
+   (`parallel::nothing_unpushed`: HEAD has nothing `origin` lacks). If either
+   fails, the run says why and merges locally, as before.
+4. **Coming back** (`reviews::settle`, at the start of every run, whatever
+   `INCODE_LANES_AS` says): for each task waiting on a pull request, the
+   forge is asked its state (`Forge::review`, `gh pr view --json
+   state,baseRefName`).
+   - Merged: if this checkout is on that base, it is fast-forwarded from
+     `origin` (only a fast-forward), the task's check runs, and only a pass
+     completes it. A failing check is a failed attempt. A checkout on another
+     branch, or one that cannot fast-forward, is left alone and the task
+     waits with a note saying to pull.
+   - Closed unmerged: a failed attempt; back to the queue with its branch
+     remembered (or set aside, if out of attempts).
+   - Open, or unreadable: left waiting.
+5. **Off by default.** Without `INCODE_LANES_AS=pr` nothing is opened.
 
-## What it refuses
+## Tests
 
-- No GitHub remote, or `gh` not logged in: the run says so at the start and
-  merges locally as today, rather than discovering it per lane.
-- A lane that failed its check is never opened as a pull request — the same
-  rule as for a local merge.
+- `parallel::a_lane_opened_for_review_is_pushed_and_not_merged`
+- `parallel::a_review_base_must_be_on_the_remote_with_nothing_unpushed`
+- `parallel::lanes_are_merged_here_unless_pull_requests_are_asked_for`
+- `reviews::a_merged_pull_request_is_pulled_checked_and_done`
+- `reviews::a_merged_pull_request_whose_check_fails_is_a_failed_attempt`
+- `reviews::a_closed_pull_request_sends_the_task_back_with_its_branch`
+- `reviews::an_open_pull_request_leaves_the_task_waiting`
+- `reviews::a_checkout_on_another_branch_is_not_merged_into`
+- `reviews::the_dependants_of_a_task_in_review_are_not_started`
+- `pull_request::a_pull_requests_state_and_base_are_read`
+- `pull_request::a_branch_is_opened_onto_the_base_it_is_given`
 
-## Tests it needs
+## Not yet exercised
 
-- A lane opened as a PR leaves the main tree untouched and the task `InReview`
-  with the URL recorded (fake forge, as `/pr`'s tests use).
-- A merged PR completes the task only after the check passes on the pulled
-  tree; a failing check after the merge records a failure, not `Done`.
-- A closed PR returns the task to `Ready` with its branch.
-- Dependants of an `InReview` task are not started.
+A live run against GitHub. Every test stands in for the forge; the `gh`
+calls (`pr view --json state,baseRefName`, `pr create --draft`) are the ones
+`/pr` already makes, plus the state query.

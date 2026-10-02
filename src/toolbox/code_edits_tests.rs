@@ -7,10 +7,13 @@ use serde_json::{json, Value};
 
 use super::*;
 
+/// How a [`Recorder`] answers each call.
+type Answer = Box<dyn Fn(Route, &Value) -> Result<Value, LedgerError> + Send + Sync>;
+
 /// A ledger that records every call and answers from `answer`.
 struct Recorder {
     calls: Mutex<Vec<(Route, Value)>>,
-    answer: Box<dyn Fn(Route, &Value) -> Result<Value, LedgerError> + Send + Sync>,
+    answer: Answer,
 }
 
 impl EditLedger for Recorder {

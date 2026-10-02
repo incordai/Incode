@@ -35,6 +35,7 @@ pub mod plan;
 pub mod recall;
 pub mod recorder;
 pub mod research;
+pub mod reviews;
 pub mod roles;
 pub mod rules;
 pub mod runner;
