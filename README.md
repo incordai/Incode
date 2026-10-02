@@ -23,6 +23,7 @@ tools — see [Limits](#limits).)
 - [Choosing agents and models](#choosing-agents-and-models)
 - [Commands inside a session](#commands-inside-a-session)
 - [Tools](#tools)
+- [Computer use](#computer-use)
 - [Safety](#safety)
 - [Incord Memory integration](#incord-memory-integration)
 - [User-defined sub-agents](#user-defined-sub-agents)
@@ -68,6 +69,14 @@ tools — see [Limits](#limits).)
   that service's session hooks itself.
 - **Compresses verification logs.** Repeated lines and passing-test noise are
   collapsed before a failure report reaches a model; errors and panics are kept.
+- **Drives a desktop, when you turn it on.** [Computer use](#computer-use) on
+  Windows, macOS and Linux (X11): the model reads a window's accessibility tree
+  and acts on named controls, falling back to screenshots and pixels — through
+  the same gate as every other tool, with password managers never read, pictured
+  or touched.
+- **Reaches models with a key, too.** Besides the CLIs, any Anthropic- or
+  OpenAI-format service in `admin.json` (Anthropic, Z.ai, OpenRouter, …), run
+  by incode's own tool loop with prompt caching and retries on a busy service.
 
 ## How it is built
 
@@ -126,6 +135,11 @@ The design is in `docs/ARCHITECTURE.md`; the tool layer is its §5a and §5b.
 - **Optional programs** that add tools when found: a headless browser
   installed as an [external tool](#external-tools), a Chromium-family browser
   for text PDFs, and LibreOffice for `ConvertDocument` (see [Tools](#tools)).
+- **For computer use** (off unless `INCODE_DESKTOP=1`): nothing extra on
+  Windows; on macOS, the Accessibility and Screen Recording grants and a
+  logged-in graphical session; on Linux, an X11 display or `Xvfb`, a D-Bus
+  session with `at-spi2-core` for the accessibility tree, and `xclip` or `xsel`
+  for pasting. See [Computer use](#computer-use).
 
 ## Install
 
@@ -155,6 +169,7 @@ subset to drop grammars.
 incode                      # a session in the current directory; type /doctor
 incode -w path/to/project   # a session in another directory
 incode -t "add a health endpoint and a test for it"
+INCODE_DESKTOP=1 incode     # a session that may also drive the desktop
 ```
 
 ## A new project
@@ -411,6 +426,7 @@ it sets; any other `id` adds an agent.
 | `/skills` | The skills this session loaded from the shared store |
 | `/bg <cmd>` · `/jobs` · `/kill <id>` | Background shell jobs (shared with the model's background `Bash`) |
 | `/worktree [cmd]` | Git worktree create / list / remove |
+| `/pr [branch] [--draft]` | Push a branch (default: the current one) and open its GitHub pull request through `gh`, or report the one already open. Refuses the default branch, uncommitted work, a branch with nothing new and a bad name, before anything is pushed. Only you run it; no tool the model calls can |
 | `/add-dir <path>` | Also work in this directory — guards and undo extend to it too |
 | `/tools add <name>` · `/tools update [name]` · `/tools remove <name>` | Install, update or remove an [external tool](#external-tools) (also over `--acp`) |
 | `/tools` · `/mcp` · `/env` · `/compact` | Information screens (`/tools` also lists the external tools and what is installed) |
@@ -443,8 +459,8 @@ anything runs.
 | `Screenshot` | observe | A picture of a public page or a workspace HTML/SVG file. Offered only when the headless browser is found. |
 | `RenderPdf` | change | A public page or a workspace HTML/SVG file printed to PDF. Offered only when a printer is found (below). |
 | `ConvertDocument` | change | An office document to PDF through LibreOffice. Offered only when LibreOffice is found. |
-| `screen_info` · `screenshot` · `ui_tree` · `cursor_position` | observe | Look at the desktop. Offered only when `INCODE_DESKTOP=1`. |
-| `click_element` · `type_text` · `paste_text` · `key` · `scroll` · `drag` · `move_mouse` · `click` | run | Act on the desktop. Same condition; refused in read-only. |
+| `screen_info` · `list_windows` · `screenshot` · `ui_tree` · `cursor_position` | observe | Look at the desktop. Offered only when `INCODE_DESKTOP=1` — see [Computer use](#computer-use). |
+| `click_element` · `set_value` · `element_action` · `focus_window` · `type_text` · `paste_text` · `key` · `scroll` · `drag` · `move_mouse` · `click` | run | Act on the desktop. Same condition; refused in read-only. |
 | `Skill` | observe | Read one skill's text from the shared store. |
 | `Agent` | run | Hand a self-contained task to a sub-agent (a second headless run of the session's CLI, or the API route), with the session's mode, guards and cancel; at most 2 levels deep. Takes `agent: <name>` for a [user-defined sub-agent](#user-defined-sub-agents). |
 | `AskUserQuestion` | session | A multiple-choice question to the owner: answered in the owner's app through the memory engine, else at the terminal, else reported unanswered. |
@@ -539,6 +555,85 @@ browser incode's own `Screenshot`, `RenderPdf` and `WebFetch` `render_js` use.
 Its tools join the session after it starts; a tool installed during a session
 is offered from the next one.
 
+## Computer use
+
+The model can see and drive a desktop: read a window's accessibility tree,
+act on its controls by name, and fall back to screenshots and pixel clicks
+where a program exposes no tree. It is **off** unless you set
+`INCODE_DESKTOP=1`: it is the one kind of action a checkpoint cannot undo.
+
+The tools are run by a separate process, `incode --desktop-mcp`, which incode
+starts and hands to the model's CLI. Every call goes through the same
+[Toolbox gate](#safety) as the other tools, and the desktop process checks
+again on its own: the permission mode, the stop file, the runaway limit, and
+your `desktop_hooks`.
+
+### Platforms
+
+| OS | Input | Accessibility tree | Notes |
+|---|---|---|---|
+| Windows | `SendInput` | UI Automation | Works in the logged-in session. **It drives your own desktop**: while it runs, do not use the mouse or keyboard, or your input and the agent's interleave. |
+| macOS | CGEvent | AXUIElement | Needs the **Accessibility** and **Screen Recording** grants for the binary that runs, and a logged-in graphical session. Over SSH there is no window-server access and posted events vanish silently, so incode refuses to start there instead. `screen_info` reports any missing grant by name. Coordinates are in **points**. |
+| Linux | X11 (XTEST) | AT-SPI2 over D-Bus | X11 only, not Wayland. `desktop_display` names the display: `":N"` attaches to a running one, `"xvfb"` or `"xvfb:1280x800"` starts a private Xvfb that ends with the server. Unset is a refusal; `$DISPLAY`, your own desktop, is never used. Only applications whose own `DISPLAY` is that display are seen. |
+
+GTK 4 (measured on 4.18.6) reports every control at the window's corner. Its
+tree comes back with a note saying so: `set_value` and `element_action` work
+on it by id, while clicking by id and capturing its windows are refused, and
+plain screenshots and pixel clicks still work.
+
+### The tools
+
+| Tool | What it does |
+|---|---|
+| `screen_info` | Displays, their sizes and scale, and on macOS any missing grant. |
+| `list_windows` | The open windows: `id`, title, app, pid, focused, rectangle. A blocked app's window is listed without its title. |
+| `ui_tree` | One window's controls as `[e<id>] Role "name" (x,y,w×h)`, with `password` on secret fields. `window` picks the window (default: the focused one); `depth` limits the walk. |
+| `screenshot` | The primary display, or one `window`. The reply carries the region and origin, so a point in the picture maps back to the screen. |
+| `cursor_position` | Where the pointer is. |
+| `click_element` | Click a control by id, at its centre as it is *now*. |
+| `set_value` | Set a text field's value through the accessibility interface: no typing, no focus, no clipboard. Read back and marked `(verified)`, or `(unverified: why)`. A password field is never read back. |
+| `element_action` | Run one of a control's own actions without the mouse: `press`, `toggle`, `expand`, `collapse`, `select` and `focus` everywhere, plus what the platform adds (`scroll_into_view` on Windows; `show_menu`, `increment`, `decrement`, `confirm`, `cancel` on macOS). An action the control lacks is refused, and the refusal lists the ones it offers. |
+| `focus_window` | Bring a window to the front so typing reaches it. |
+| `type_text` · `key` · `paste_text` | Keystrokes, a chord (`["cmdorctrl","s"]`: Cmd on macOS, Ctrl elsewhere), or a paste. `paste_text` puts the old clipboard back after `paste_restore_delay_ms`, and refuses to paste at all when the clipboard cannot be read. |
+| `scroll` | Wheel steps (`dy` down, `dx` right) over a control by `id`, or under the pointer. |
+| `drag` | Press, move in steps, release: between two controls (`from_id`, `to_id`) or two points. |
+| `move_mouse` · `click` | The pixel fallback. `click` takes `button` and `count` (1–3). |
+
+Every acting tool also takes `window`; typing into a window that is not the
+focused one is refused rather than sent elsewhere. It also takes
+`screenshot_after`, which returns a picture once the screen has settled.
+
+### What it will not do
+
+- **Act on a control it did not show you.** An id is a position in one
+  `ui_tree` result. incode keeps what each window's last tree showed, and acts
+  on an id only while the control in that place has the same role, depth and
+  name. When a row is inserted above it, or a dialog has replaced it, the id is
+  refused: "call ui_tree again".
+- **Touch a password manager.** 1Password, Bitwarden, LastPass, Dashlane,
+  KeePass, NordPass, Proton Pass, Enpass, RoboForm and Keeper, plus anything in
+  `desktop_limits.blocked_apps`, are never walked, pictured or acted on.
+  - No click, scroll or drag point may fall inside one of their windows, and no
+    capture may overlap one, even where another window is on top.
+  - A full screenshot is refused while one is on screen.
+  - A window whose owning program cannot be named is treated the same way.
+- **Read a secret.** A password field is marked as one, and its value is never
+  read: not into a tree, a result or the journal.
+- **Run unsupervised or unbounded.**
+  - `incode --desktop-stop` (or `.incode/desktop.stop`) halts it for the rest
+    of the session.
+  - It stops when the process driving it goes away, and stops acting after
+    `heartbeat_deadline_secs` with no request.
+  - It refuses more than `max_actions_per_minute` actions.
+  - Scrolls, coordinates and tree walks are bounded (`desktop_limits`).
+- **Keep what it typed.** Every call is written to `.incode/desktop.jsonl`,
+  with typed and pasted text recorded by length only.
+
+Everything the desktop returns — titles, tree text, pictures — is marked as
+untrusted data, never instructions. The design and the measurements behind it
+are in `docs/COMPUTER_USE.md`; the status per platform is in
+`docs/ROADMAP.md` B1.
+
 ## Safety
 
 In the order a call meets them:
@@ -593,12 +688,22 @@ workspace-write, `off` for the two full-access modes.
 |---|---|---|
 | Linux | Landlock (kernel, unprivileged) | Landlock: writes only in the workspace, each `--add-dir` and temp |
 | macOS | `sandbox-exec` (Seatbelt) profile | Seatbelt: writes only in the roots, temp and device sinks |
-| Windows | a write-restricted token: nothing can be written but `NUL` | **not confined.** The only sound route rewrites the workspace's ACL on every command; incode does not do that, and says so in the trace |
+| Windows | a write-restricted token: nothing can be written but `NUL` | **only when you name it** (`sandbox: "workspace-write"` or `INCODE_SANDBOX`): for the session, one inheritable ACE for a private per-session SID on each root and on a session temp folder, and every command under a write-restricted token limited to that SID. The grant takes a few seconds on a large tree and is removed when the session ends; one a crashed session left is swept by the next. Left to the permission-mode default, workspace-write runs unconfined here and the trace says so |
 
-Honest limits: **the network is not restricted on any OS**; Windows
-workspace-write runs unconfined; and the operator's own `/bg` jobs at the REPL
-are never sandboxed. Where a mode cannot be applied, the command runs
-unconfined and the trace says which.
+**The network**, separately: `admin.json` `sandbox_network` or
+`INCODE_SANDBOX_NETWORK`, `allow` (the default) or `deny`, independent of the
+mode above.
+
+| OS | `deny` |
+|---|---|
+| Linux | Landlock ABI v4 (kernel 6.7+): every TCP bind and connect, loopback included; UDP is not covered. An older kernel is reported as not enforced |
+| macOS | the Seatbelt profile denies the network and re-allows loopback and Unix sockets |
+| Windows | **not enforced**, and said so: only an AppContainer could, and it cannot read the workspace or your toolchains without granting each one |
+
+Honest limits: Windows does not restrict the network, and workspace-write is
+confined only when named; the operator's own `/bg` jobs at the REPL are never
+sandboxed. Where a mode cannot be applied, the command runs unconfined and the
+trace says which.
 
 ## Incord Memory integration
 
@@ -661,15 +766,19 @@ You review changes. Report each problem with its file and line.
 
 The model runs one with the `Agent` tool: `{"agent": "reviewer", ...}`.
 
-**Two come with incode**, written into `~/.incode/agents/` the first time
-incode starts: `standards-reviewer` (a change against the repository's own
-docs — conventions, `## Layout`, `## Language` — and common smells) and
+**Three come with incode**, written into `~/.incode/agents/` the first time
+incode starts (or, for one added later, the first start after it was):
+`standards-reviewer` (a change against the repository's own docs —
+conventions, `## Layout`, `## Language` — and common smells) and
 `spec-reviewer` (a change against the PRD and its non-goals, the contracts and
-`VERIFICATION.md`). Both are `review` agents limited to `Read`, `Grep`, `Glob`,
-`Outline` and `LS`, and both answer with findings only — neither decides that
-work is done. They are ordinary files: edit them, or delete them; incode never
-writes one again once it has been seeded (`~/.incode/agents/.seeded` records
-which were).
+`VERIFICATION.md`) are `review` agents limited to `Read`, `Grep`, `Glob`,
+`Outline` and `LS`, and answer with findings only — neither decides that work
+is done. `researcher` is an `explore` agent that answers a question needing
+outside facts: memory first (`recall_index`, `memory_search`), then
+`WebSearch`/`WebFetch`, with a source for every claim, saving what it
+established with `remember`; it never edits the project. They are ordinary
+files: edit them, or delete them; incode never writes one again once it has
+been seeded (`~/.incode/agents/.seeded` records which were).
 
 ## Configuration
 
@@ -706,6 +815,9 @@ and `--admin` prints which layer decided each value.
               "provides": "browser" }],
   "pdf_renderer": "auto",
   "sandbox": "workspace-write",
+  "sandbox_network": "allow",
+  "desktop_display": "xvfb:1280x800",
+  "desktop_limits": { "max_actions_per_minute": 60, "blocked_apps": ["My Bank"] },
   "hooks": { "pre_tool_use": ["my-check"], "post_tool_use": ["my-log"] },
   "plugins": { "owner": true, "auditor": true, "recorder": true, "guards": true,
                "skills": true, "mcp": true, "disabled_skills": [], "disabled_mcp": [] }
@@ -728,8 +840,9 @@ and `--admin` prints which layer decided each value.
 | `tools` | [External tools](#external-tools): each one's release, version, asset, `run` and `provides` |
 | `browser_bin` · `pdf_renderer` | For development, a headless browser executable that wins over the installed one · which program `RenderPdf` uses |
 | `sandbox` | `off` · `workspace-write` · `read-only`; unset follows the permission mode |
+| `sandbox_network` | `allow` (default) · `deny` — see [the OS sandbox](#the-os-sandbox) |
 | `hooks` (also `desktop_hooks`) | Your `pre_tool_use` / `post_tool_use` commands, run for every tool. The event is JSON on stdin; exit 2 on a pre-tool command denies; bounded at 10 s |
-| `desktop_limits` | The desktop's limits, each optional: `max_actions_per_minute` (120), `heartbeat_deadline_secs` (30), `tree_depth` (12), `tree_max_elements` (400), `journal_max_bytes` (262144), `xvfb_start_timeout_secs` (10), `clipboard_timeout_secs` (5), `accessibility_call_timeout_ms` (1000). The first two are safety limits and may only be lowered; zero and unknown keys are refused, and the desktop does not start on a malformed admin.json |
+| `desktop_limits` | The desktop's limits, each optional: `max_actions_per_minute` (120), `heartbeat_deadline_secs` (30), `tree_depth` (12), `tree_max_elements` (400), `journal_max_bytes` (262144), `xvfb_start_timeout_secs` (10), `clipboard_timeout_secs` (5), `accessibility_call_timeout_ms` (1000), `paste_restore_delay_ms` (500, how long the pasted text stays on the clipboard before the old one is put back), `settle_ms` (300, the pause before a `screenshot_after`), `max_scroll_steps` (50, wheel steps in one `scroll`), `tree_max_visited` (4000, elements one tree walk may visit), and `blocked_apps` (application names, matched case-insensitively as a part of the name, added to the built-in password managers: 1Password, Bitwarden, LastPass, Dashlane, KeePass, NordPass, Proton Pass, Enpass, RoboForm, Keeper). The first two are safety limits and may only be lowered; zero and unknown keys are refused, and the desktop does not start on a malformed admin.json |
 | `desktop_display` | Linux computer use: `":N"` drives a running X display; `"xvfb"` or `"xvfb:1280x800"` starts a private Xvfb for the desktop server's lifetime (default 1920x1080). Unset refuses rather than using `$DISPLAY`. `paste_text` needs `xclip` or `xsel`; `ui_tree` needs a D-Bus session with at-spi2-core |
 | `plugins` | Which memory-service parts are used; all on by default |
 
@@ -744,8 +857,8 @@ Environment variables:
 | `INCODE_VERIFY_CMD` | The check command |
 | `INCODE_CHECK_CMD` | What `Diagnostics` runs |
 | `INCODE_LANES` | Parallel `/run` lanes (needs git; at most 8) |
-| `INCODE_SANDBOX` | The sandbox mode |
-| `INCODE_DESKTOP` | `1` offers the desktop tools |
+| `INCODE_SANDBOX` · `INCODE_SANDBOX_NETWORK` | The sandbox mode · the network switch |
+| `INCODE_DESKTOP` | `1` offers the [computer use](#computer-use) tools |
 | The variable each `key_env` names | That entry's key — the only part of an API route read from the environment |
 | `INCORD_MEMORY_URL` · `INCORD_ENGINE_BIN` | The memory service · its engine binary |
 | `INCODE_BROWSER` · `INCODE_PDF_BROWSER` · `INCODE_SOFFICE` | The headless browser · the PDF printer · LibreOffice |
@@ -770,6 +883,7 @@ Environment variables:
 | `<project>/.incode/checkpoints/<session>/` | Each turn's "before", for `/undo` and `/rewind` |
 | `<project>/.incode/transcripts/` · `.incode/context/` | Session transcripts · oversized memory blocks |
 | `<project>/.incode/transcripts/tasks/<task>.jsonl` | What each `/run` agent was told and did, one file per task |
+| `<project>/.incode/desktop.jsonl` · `.incode/desktop.stop` | Every desktop call, typed text by length only · the stop file `--desktop-stop` writes |
 | `<project>/.incode/.gitignore` | Which of the above is this machine's own and is not committed |
 
 Per-project state lives **in the project**; `~/.incode` is yours. Of the
@@ -827,15 +941,19 @@ moved. The old `INCORD_*` variables are not read any more: rename them.
   only. On those routes the guards are a sentinel (detection), not a gate.
 - A client's MCP servers are stdio or Streamable HTTP; the older SSE transport is
   not spoken.
-- The Windows sandbox does not confine workspace-write, and no OS restricts
-  the network.
+- The Windows sandbox confines workspace-write only when you name it, and does
+  not restrict the network.
+- Computer use: on Windows and macOS it shares your own desktop (a private
+  desktop needs a VM there); Linux is X11 only, not Wayland; GTK 4 reports no
+  control positions; macOS has been built and unit-tested on a Mac but its
+  live drive (clicking and typing in a GUI session) is still to be run.
 
 The full list is in `docs/ROADMAP.md`.
 
 ## Development
 
 ```sh
-cargo test                          # 1,700+ #[test] functions
+cargo test                          # about 1,900 tests (1,878 library, 46 binary)
 cargo clippy --all-targets -- -D warnings
 cargo fmt
 ```
