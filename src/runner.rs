@@ -175,14 +175,20 @@ fn run_lanes_if_useful(
         return;
     }
 
-    let outcomes = crate::parallel::run_batch(repo_root, &batch, |lane_workspace| {
-        lanes.spawn_for(lane_workspace).unwrap_or_else(|| {
-            // The probe above said yes. A pool that then changes its mind
-            // must not take the batch down with it: this lane reports a
-            // failure and the task goes back to the queue.
-            Box::new(UnavailableWorker)
-        })
-    });
+    // Each lane's check runs in its own checkout, in the folder matching this
+    // workspace, before its work may be merged (`INCODE_LANE_CHECK=0` turns
+    // that gate off; the check after the merge runs either way).
+    let check_in =
+        crate::parallel::lane_check_wanted().then(|| crate::parallel::workspace_prefix(workspace));
+    let outcomes =
+        crate::parallel::run_batch(repo_root, &batch, check_in.as_deref(), |lane_workspace| {
+            lanes.spawn_for(lane_workspace).unwrap_or_else(|| {
+                // The probe above said yes. A pool that then changes its mind
+                // must not take the batch down with it: this lane reports a
+                // failure and the task goes back to the queue.
+                Box::new(UnavailableWorker)
+            })
+        });
 
     for outcome in outcomes {
         // CHARGED FOR EVERY LANE, including the ones that failed or could not
@@ -205,14 +211,18 @@ fn run_lanes_if_useful(
         reports.notes.push(outcome.merged.summary(&lane));
 
         // WHERE THE UNMERGED WORK IS, written onto the task itself so the
-        // retry can be pointed at it. Recorded only for a conflict: that is
-        // the case where a real change exists on a branch and the tree simply
-        // moved underneath it. A lane whose agent failed left no change worth
-        // reconciling, and telling the next attempt to go and merge one would
-        // send it after a branch with nothing on it.
+        // retry can be pointed at it. Recorded for a conflict — a real change
+        // on a branch, with the tree moved underneath it — and for a lane
+        // whose finished work failed its own check: a whole change the retry
+        // can read and correct rather than redo. A lane whose agent failed
+        // left no change worth reconciling, and telling the next attempt to
+        // go and merge one would send it after a branch with nothing on it.
         if let Some(entry) = ledger.get_mut_public(&outcome.task.id) {
             match &outcome.merged {
-                crate::parallel::Merged::Conflict { .. } if !outcome.branch.is_empty() => {
+                crate::parallel::Merged::Conflict { .. }
+                | crate::parallel::Merged::CheckFailed { .. }
+                    if !outcome.branch.is_empty() =>
+                {
                     entry.unmerged_branch = Some(outcome.branch.clone());
                 }
                 // Landed, so any branch remembered from an earlier round is

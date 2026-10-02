@@ -315,7 +315,7 @@ Each phase is useful on its own: phase 1 alone shows whether topic memory reduce
 
 ## Status: what exists today, and what is left
 
-As of Oct 2, 2026. "incode" paths are in `D:\Projects\incord-code`; rows 10–20 below are not started.
+As of Oct 2, 2026. "incode" paths are in `D:\Projects\incord-code`.
 
 ### Already built (Insi reuses these)
 
@@ -366,17 +366,17 @@ Decision: benchmark lessons are kept in a JSONL file under the work folder, not 
 | 8 | Briefing builder and just-in-time injection through the pre-tool hook | 1 | Pre-task briefing built; just-in-time injection left |
 | 9 | `insi` workspace and binary; CLI | 1 | Built |
 | — | **The Phase 1 measurement**: lessons off vs on, newer half, 3 seeds | 1 | Next, once validation ends |
-| 10 | MCP server (read side) | 2 |
-| 11 | Check inside a worktree before any merge or PR (also needed by `/run` lanes-as-PRs) | 2 |
-| 12 | PR body with evidence; secret/PII scan before opening | 2 |
-| 13 | Trusted-label issue intake | 2 |
-| 14 | GitHub App with short-lived, PR-only tokens | 2 |
-| 15 | `harness-config/` folder, read by incode | 3 |
-| 16 | Proposer, accept-if-better, UCB1 bandit, audit events | 3 |
-| 17 | Connectors: CI logs, error tracking, docs, email | 4 |
-| 18 | Containers for issue work | 4 |
-| 19 | `insi init` for any repo: `.insi/config.toml`, `evals/`, CI workflow, MCP/hook registration | 2 |
-| 20 | Packages: `insi` on crates.io, npm and pip wrappers — after the Phase 1 gate | 2 |
+| 10 | MCP server (read side) | 2 | `insi mcp` written (`insi_briefing`, `insi_lessons_for_error`); tests pending |
+| 11 | Check inside a worktree before any merge or PR (also needed by `/run` lanes-as-PRs) | 2 | Lane check before merge written in incode (`INCODE_LANE_CHECK`); tests pending. Lanes-as-PRs: design in `docs/LANES_AS_PRS.md`, awaiting approval |
+| 12 | PR body with evidence; secret/PII scan before opening | 2 | incode `/pr` credential scan built (`289090a`); `insi issue` PR body with evidence and the same scan written, tests pending. PII scan left |
+| 13 | Trusted-label issue intake | 2 | `insi issue --number N` written: open + labelled only, draft PR after `test_cmd` passes; tests pending |
+| 14 | GitHub App with short-lived, PR-only tokens | 2 | Not started; `gh`'s login is used meanwhile |
+| 15 | `harness-config/` folder, read by incode | 3 | Not started |
+| 16 | Proposer, accept-if-better, UCB1 bandit, audit events | 3 | Not started |
+| 17 | Connectors: CI logs, error tracking, docs, email | 4 | Not started |
+| 18 | Containers for issue work | 4 | Not started |
+| 19 | `insi init` for any repo: `.insi/config.toml`, `evals/`, CI workflow, MCP/hook registration | 2 | `insi init` built (`ded3d68`): detects Node/Rust/Python/Go, writes the config, ignores the work folder. CI workflows for Insi and incord-code committed. MCP/hook registration left |
+| 20 | Packages: `insi` on crates.io, npm and pip wrappers — after the Phase 1 gate | 2 | Not started |
 
 ## Decisions (were open questions)
 

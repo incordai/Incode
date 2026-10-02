@@ -215,6 +215,10 @@ pub enum Merged {
     Nothing,
     /// Two lanes touched the same lines. NOT resolved here.
     Conflict { files: Vec<String> },
+    /// The task's check failed in the lane's own checkout, so the work was
+    /// not merged: it stays on its branch and the task is done again in the
+    /// main tree.
+    CheckFailed { why: String },
     /// The merge could not be attempted.
     Failed { why: String },
 }
@@ -241,11 +245,50 @@ impl Merged {
                 files.join(", "),
                 lane.branch
             ),
+            Merged::CheckFailed { why } => format!(
+                "`{}` failed its check in its own lane, so it was NOT merged. Its work is \
+                 kept on branch `{}` and the task goes back to the queue. The check said: {}",
+                lane.task_id,
+                lane.branch,
+                crate::text::head_bytes(why, 600)
+            ),
             Merged::Failed { why } => {
                 format!("`{}` could not be merged: {why}", lane.task_id)
             }
         }
     }
+}
+
+/// Whether each lane's check runs in the lane before its work is merged.
+///
+/// On unless `INCODE_LANE_CHECK` is `0`, `false` or `off`. Off is for a
+/// project whose check cannot run in a fresh checkout (dependencies installed
+/// only in the main tree): there a lane's check fails for want of them, and
+/// every lane falls back to being done again in the main tree.
+#[must_use]
+pub fn lane_check_wanted() -> bool {
+    !matches!(
+        std::env::var(LANE_CHECK_ENV)
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "false" | "off"
+    )
+}
+
+/// The switch for [`lane_check_wanted`].
+pub const LANE_CHECK_ENV: &str = "INCODE_LANE_CHECK";
+
+/// Where `workspace` sits inside its repository (`git rev-parse
+/// --show-prefix`), so a lane's check runs in the same folder of the lane's
+/// checkout as the run's check does in the main tree. Empty at the root, and
+/// when git cannot say.
+#[must_use]
+pub fn workspace_prefix(workspace: &Path) -> PathBuf {
+    git(workspace, &["rev-parse", "--show-prefix"])
+        .map(|p| PathBuf::from(p.trim_end_matches('/')))
+        .unwrap_or_default()
 }
 
 /// Run git in a directory and return stdout, or the error it printed.
@@ -411,19 +454,25 @@ pub struct LaneOutcome {
 ///
 /// # What this deliberately does NOT do
 ///
-/// It does not verify, does not touch the ledger, and does not decide that
-/// anything is done. Those belong to [`crate::runner`], which owns the law
-/// that the only edge into `Done` runs through [`crate::verify`]. This owns
-/// the two things the runner cannot do from inside a sequential loop:
-/// concurrency, and git.
+/// It does not touch the ledger and does not decide that anything is done.
+/// Those belong to [`crate::runner`], which owns the law that the only edge
+/// into `Done` runs through [`crate::verify`]. This owns the things the runner
+/// cannot do from inside a sequential loop: concurrency, git, and the gate
+/// in front of each merge.
 ///
-/// # Why the check must run AFTER the merge, not in the lane
+/// # The check runs twice: in the lane, and after the merge
 ///
-/// A lane's own tree contains one agent's work. Proving that tree proves the
-/// agent did not break its own lane — which is not the question. Two lanes can
-/// each pass alone and break the moment they are put together, which is the
-/// ordinary result of two people editing one codebase. So the report comes
-/// back as a claim and the runner checks the MERGED tree, serially, after.
+/// AFTER the merge, by the runner, on the merged tree: a lane's own tree holds
+/// one agent's work, and two lanes can each pass alone and break the moment
+/// they are put together. Only the merged tree answers whether the task is
+/// done, so that is still where `Done` is decided.
+///
+/// IN the lane, here, before the merge (`check_in`): without it, work that
+/// fails its own check is merged into the tree every later task builds on,
+/// and the post-merge failure only marks the task — the broken change stays
+/// in `HEAD`. A lane whose check fails is not merged; its work is kept on its
+/// branch ([`Merged::CheckFailed`]) and the task is done again in the main
+/// tree. `None` skips this gate ([`lane_check_wanted`]).
 ///
 /// # Merges are serial even though the work was not
 ///
@@ -434,6 +483,7 @@ pub struct LaneOutcome {
 pub fn run_batch<F>(
     repo_root: &Path,
     tasks: &[crate::ledger::Task],
+    check_in: Option<&Path>,
     make_worker: F,
 ) -> Vec<LaneOutcome>
 where
@@ -462,7 +512,12 @@ where
 
     // Scoped so the borrow of `lanes` and `make_worker` needs no Arc, and so
     // every thread is joined before anything is merged.
-    type LaneResult = (Result<String, String>, crate::runtime::usage::TokenUsage);
+    // The agent's report, what it spent, and why its lane's check failed.
+    type LaneResult = (
+        Result<String, String>,
+        crate::runtime::usage::TokenUsage,
+        Option<String>,
+    );
     let mut reports: Vec<LaneResult> = std::thread::scope(|scope| {
         let handles: Vec<_> = lanes
             .iter()
@@ -475,7 +530,18 @@ where
                     // Read HERE, on the lane's own thread, because the worker
                     // is dropped the moment this closure ends and nothing
                     // outside can ask it afterwards.
-                    (report, worker.spent_since_last_call())
+                    let spent = worker.spent_since_last_call();
+                    // On the lane's thread too, so the lanes' checks run at
+                    // the same time as each other. Only for work the agent
+                    // finished and a task that has a check: a task with none
+                    // is the runner's to escalate, not this gate's to judge.
+                    let failed_check = match check_in {
+                        Some(prefix) if report.is_ok() && !task.verify.is_empty() => {
+                            crate::verify::verify(&task.verify, &lane.workspace.join(prefix)).err()
+                        }
+                        _ => None,
+                    };
+                    (report, spent, failed_check)
                 })
             })
             .collect();
@@ -493,6 +559,7 @@ where
                     (
                         Err("the lane panicked".to_string()),
                         crate::runtime::usage::TokenUsage::default(),
+                        None,
                     )
                 })
             })
@@ -503,17 +570,17 @@ where
         .iter()
         .zip(tasks)
         .zip(reports.drain(..))
-        .map(|((lane, task), (report, spent))| {
+        .map(|((lane, task), (report, spent, failed_check))| {
             // A lane whose agent FAILED is not merged. Its work stays on the
             // branch: half a change that could not finish is the last thing
             // the main tree should be given, and the branch keeps it for
-            // anyone who wants to look.
-            let merged = if report.is_ok() {
-                merge_lane(repo_root, lane)
-            } else {
-                Merged::Failed {
+            // anyone who wants to look. Nor is one whose own check failed.
+            let merged = match (&report, failed_check) {
+                (Err(_), _) => Merged::Failed {
                     why: "the agent did not finish, so nothing was merged".to_string(),
-                }
+                },
+                (Ok(_), Some(why)) => Merged::CheckFailed { why },
+                (Ok(_), None) => merge_lane(repo_root, lane),
             };
             close_lane_or_report(repo_root, lane);
             LaneOutcome {
@@ -932,7 +999,7 @@ mod tests {
             }
         }
 
-        let outcomes = run_batch(&root, &[ready("t-1")], |workspace| {
+        let outcomes = run_batch(&root, &[ready("t-1")], None, |workspace| {
             Box::new(GivesUp(workspace.to_path_buf()))
         });
 
@@ -1048,7 +1115,7 @@ mod tests {
         let tasks = vec![ready("t-1"), ready("t-2")];
         let gate = std::sync::Arc::new(std::sync::Barrier::new(tasks.len()));
 
-        let outcomes = run_batch(&root, &tasks, |workspace| {
+        let outcomes = run_batch(&root, &tasks, None, |workspace| {
             Box::new(Rendezvous {
                 workspace: workspace.to_path_buf(),
                 gate: std::sync::Arc::clone(&gate),
@@ -1104,7 +1171,7 @@ mod tests {
         }
 
         let tasks = vec![ready("t-1")];
-        let outcomes = run_batch(&root, &tasks, |workspace| {
+        let outcomes = run_batch(&root, &tasks, None, |workspace| {
             Box::new(Refuses(workspace.to_path_buf()))
         });
 
@@ -1127,6 +1194,108 @@ mod tests {
 
         assert_eq!(merge_lane(&root, &lanes[0]), Merged::Nothing);
         close_lane(&root, &lanes[0]).expect("close");
+    }
+
+    /// **WORK THAT FAILS ITS OWN CHECK NEVER REACHES THE MAIN TREE.** Two
+    /// lanes finish; one task's check passes in its lane and is merged, the
+    /// other's fails and is not — its file is absent from the main tree, kept
+    /// on its branch, and the outcome says why. With the gate off the same
+    /// failing lane merges, as it did before the gate existed.
+    #[test]
+    fn a_lane_that_fails_its_check_is_not_merged() {
+        let Some((_guard, root)) = a_repo() else {
+            return;
+        };
+        struct Writes(PathBuf);
+        impl crate::runner::TaskWorker for Writes {
+            fn work(&mut self, task: &crate::ledger::Task) -> Result<String, String> {
+                std::fs::write(self.0.join(format!("{}.txt", task.id)), "done\n")
+                    .map_err(|e| e.to_string())?;
+                Ok(format!("{} finished", task.id))
+            }
+        }
+        // Real checks, run in the lane: `shared.txt` exists in every checkout
+        // of this repository; `missing.txt` exists in none.
+        let mut passes = ready("t-pass");
+        passes.verify = ["git", "ls-files", "--error-unmatch", "shared.txt"]
+            .map(String::from)
+            .to_vec();
+        let mut fails = ready("t-fail");
+        fails.verify = ["git", "ls-files", "--error-unmatch", "missing.txt"]
+            .map(String::from)
+            .to_vec();
+
+        let outcomes = run_batch(
+            &root,
+            &[passes.clone(), fails.clone()],
+            Some(Path::new("")),
+            |workspace| Box::new(Writes(workspace.to_path_buf())),
+        );
+        assert_eq!(outcomes[0].merged, Merged::Clean);
+        assert!(
+            root.join("t-pass.txt").exists(),
+            "the passing lane did not land"
+        );
+        assert!(
+            matches!(&outcomes[1].merged, Merged::CheckFailed { .. }),
+            "{:?}",
+            outcomes[1].merged
+        );
+        assert!(!outcomes[1].merged.landed());
+        assert!(
+            !root.join("t-fail.txt").exists(),
+            "work that failed its check reached the main tree"
+        );
+        git(
+            &root,
+            &["show", &format!("{}:t-fail.txt", outcomes[1].branch)],
+        )
+        .expect("the failed lane's work was not kept on its branch");
+        let lane = Lane {
+            task_id: "t-fail".into(),
+            workspace: root.clone(),
+            branch: outcomes[1].branch.clone(),
+        };
+        assert!(outcomes[1]
+            .merged
+            .summary(&lane)
+            .contains(&outcomes[1].branch));
+
+        // The gate off: the failing check is not run in the lane, and the
+        // lane merges as before (the runner's check still judges it).
+        let mut again = ready("t-ungated");
+        again.verify = fails.verify.clone();
+        let ungated = run_batch(&root, &[again], None, |workspace| {
+            Box::new(Writes(workspace.to_path_buf()))
+        });
+        assert_eq!(ungated[0].merged, Merged::Clean);
+    }
+
+    /// A workspace below the repository's root checks in the same folder of
+    /// the lane; at the root the prefix is empty.
+    #[test]
+    fn the_check_runs_in_the_lane_folder_matching_the_workspace() {
+        let Some((_guard, root)) = a_repo() else {
+            return;
+        };
+        assert_eq!(workspace_prefix(&root), PathBuf::new());
+        let sub = root.join("app").join("web");
+        std::fs::create_dir_all(&sub).expect("dir");
+        assert_eq!(workspace_prefix(&sub), Path::new("app").join("web"));
+    }
+
+    #[test]
+    fn the_lane_check_is_on_unless_switched_off() {
+        // A variable of its own, so this cannot race the lane-count test.
+        std::env::remove_var(LANE_CHECK_ENV);
+        assert!(lane_check_wanted(), "on by default");
+        for off in ["0", "false", "OFF"] {
+            std::env::set_var(LANE_CHECK_ENV, off);
+            assert!(!lane_check_wanted(), "{off}");
+        }
+        std::env::set_var(LANE_CHECK_ENV, "1");
+        assert!(lane_check_wanted());
+        std::env::remove_var(LANE_CHECK_ENV);
     }
 
     /// The requested count is read from the environment and clamped.
