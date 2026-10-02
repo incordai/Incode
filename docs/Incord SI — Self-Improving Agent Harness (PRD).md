@@ -315,7 +315,7 @@ Each phase is useful on its own: phase 1 alone shows whether topic memory reduce
 
 ## Status: what exists today, and what is left
 
-As of Oct 1, 2026. "incode" paths are in `D:\Projects\incord-code`.
+As of Oct 2, 2026. "incode" paths are in `D:\Projects\incord-code`; rows 10–20 below are not started.
 
 ### Already built (Insi reuses these)
 
@@ -334,19 +334,38 @@ As of Oct 1, 2026. "incode" paths are in `D:\Projects\incord-code`.
 | Memory client | Recorder lookup and handoff, `remember`, recall | incode `src/recorder.rs`, `src/knowledge.rs` |
 | Running under the Watchman app | incode as the lead of a Watchman orchestration reaches its orchestrator (the control credentials pass incode's environment filter) | incode `src/tools/env_filter.rs` |
 
+### Built in the Insi repo (Phase 1, Oct 2, 2026)
+
+`D:\Projects\insi`, a Cargo workspace, local commits only. Crates `insi-core`, `insi-eval`, `insi-memory` and the `insi` binary; 36 tests, clippy and fmt clean.
+
+| Piece | What exists |
+| --- | --- |
+| `insi mine` | Every fix commit that changed source and a test file of its own becomes a task: parent = start, message = prompt, test files = hidden check, commit = reference, commit date kept. Reads the source repository only |
+| Private checks | Hidden test files stored apart (`--private`), outside every checkout; copied into the worktree only after the worker stops, over anything it wrote at those paths |
+| `insi validate` | Controls per task: the check must fail at the base and pass at the reference; only such tasks are "fair" (`--fair-only`) |
+| `insi eval` | Each attempt in its own worktree of Insi's own clone; setup, worker (wall-clock budget), hidden check; records pass, time, tokens (from incode's `stream-json`), failure signature, tags, artifacts (worker diff, outputs). `--seeds`, `--jobs N`, `--half older\|newer` |
+| Signature normalizer | Terminal colour stripped; paths, hashes, numbers normalised; only lines that say what failed |
+| Lesson writer (`insi learn`) | A failed attempt on a fair task + its verified fix → one lesson (issue, root cause, use, avoid), refused when a field is empty, oversized or holds code; `verified_by: check` |
+| Briefing | Lessons of the task's repository learned strictly before the task (compared as instants), never from the task itself, newest first, within 4,000 characters; attempts tagged `lessons=on\|off` and record which lessons they got |
+| `insi report` | Pass rate, repeat failures (same signature again), timeouts, errors, tokens and time per condition |
+| Watchman benchmark | 38 tasks mined; the first 3 validated as fair (pilot); the rest validating |
+
+Decision: benchmark lessons are kept in a JSONL file under the work folder, not in Incord Memory. `lesson_write` files an item under the project of the folder it names, which would put benchmark lessons in Watchman's memory, and its retrieval is semantic; an experiment needs a set it can reset and reproduce. Writing verified lessons to Incord Memory is the production path, behind the same store trait.
+
 ### Left to build
 
-| # | Piece | Phase |
-| --- | --- | --- |
-| 1 | Benchmark format and `insi eval`: tasks, public and private checks, seeds, results | 1 |
-| 2 | Private-check repository, outside every checkout | 1 |
-| 3 | First 20–30 tasks, from bug-fix commits in the Watchman app's history that changed a separate test file | 1 |
-| 4 | Dollar and wall-time budgets (incode has tokens only) | 1 |
-| 5 | Error-signature normalizer | 1 |
-| 6 | Lesson writer: failed-then-verified task → lesson with evidence, in Incord Memory | 1 |
-| 7 | Topic resolution rules (repo, path, command) and topic fields on lessons — confirm what Incord Memory already stores | 1 |
-| 8 | Briefing builder and just-in-time injection through the pre-tool hook | 1 |
-| 9 | `insi` workspace and binary; CLI | 1 |
+| # | Piece | Phase | Status |
+| --- | --- | --- | --- |
+| 1 | Benchmark format and `insi eval`: tasks, public and private checks, seeds, results | 1 | Built, except a separate public check |
+| 2 | Private-check repository, outside every checkout | 1 | Built as a folder; a repository of its own is not needed yet |
+| 3 | First 20–30 tasks, from bug-fix commits in the Watchman app's history that changed a separate test file | 1 | 38 mined; validation running |
+| 4 | Dollar and wall-time budgets (incode has tokens only) | 1 | Wall time built; dollars left |
+| 5 | Error-signature normalizer | 1 | Built |
+| 6 | Lesson writer: failed-then-verified task → lesson with evidence, in Incord Memory | 1 | Built, file store; Incord Memory store left |
+| 7 | Topic resolution rules (repo, path, command) and topic fields on lessons — confirm what Incord Memory already stores | 1 | Topic = repository only; path and command rules left |
+| 8 | Briefing builder and just-in-time injection through the pre-tool hook | 1 | Pre-task briefing built; just-in-time injection left |
+| 9 | `insi` workspace and binary; CLI | 1 | Built |
+| — | **The Phase 1 measurement**: lessons off vs on, newer half, 3 seeds | 1 | Next, once validation ends |
 | 10 | MCP server (read side) | 2 |
 | 11 | Check inside a worktree before any merge or PR (also needed by `/run` lanes-as-PRs) | 2 |
 | 12 | PR body with evidence; secret/PII scan before opening | 2 |
