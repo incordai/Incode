@@ -105,7 +105,17 @@ Insi is a standalone Rust service with its own binary, `insi`, not code inside a
 | **MCP server** (read side) | Any agent, inside incode or not | Briefings, lesson lookup by error signature, topic load. Advisory only: MCP is called at the agent's discretion, so nothing that must hold is enforced here |
 | **GitHub webhooks** (a GitHub App) | GitHub | Report labelled issues and CI results; never a write path into Insi's state |
 
-**How a worker runs.** Insi does not start Claude Code, Codex or agy itself. It starts **incode** (`incode -t … --output-format stream-json`, or `--acp`) in a sandbox worktree. incode drives the chosen agent, so every worker gets incode's guards, permission gate, checkpoints and proof by exit code without Insi re-implementing them.
+**How a worker runs.** Insi drives a worker through a **worker adapter**: a command line, configured per repo, that takes the task's prompt and works in the sandbox worktree it is started in. The first adapter is **incode** (`incode -t … --output-format stream-json`): it drives Claude Code, Codex or agy and gives every worker incode's guards, permission gate, checkpoints and proof by exit code without Insi re-implementing them. Any other agent that runs headless in a folder is a second adapter, not a code change — so incode is the recommended worker, never a requirement.
+
+**Usable from any project.** Insi is one binary that works in a repository of any language, added in one of three ways:
+
+| Layer | What it is | Who uses it |
+| --- | --- | --- |
+| **The `insi` binary** | CLI and MCP server in one program, installed once per machine | Every project, any language |
+| **`insi init`** | Run inside a repo: writes `.insi/config.toml`, an `evals/` folder, a CI workflow that runs the checks on agent PRs, and the MCP/hook registration for the agents in use | How a project adopts Insi |
+| **Packages per ecosystem** | `insi` as a Rust library crate, and thin npm and pip packages that fetch the binary — the pattern Ruff, Biome and esbuild use | Teams that want it pinned in their own lockfile |
+
+Nothing is published until the Phase 1 gate is met: private first.
 
 **Outputs.** The engine produces two things only: audit records in Incord Memory, and pull requests a human reviews.
 
@@ -172,19 +182,20 @@ Insi is a standalone Rust service with its own binary, `insi`, not code inside a
 
 ### F9. Per-repo config
 
-A repo already carries incode's `.incode/` folder. Insi adds one file there, and **reuses** what incode already has rather than repeating it:
+Insi keeps its own folder, `.insi/`, so it works in a repo that has never seen incode; `insi init` writes it. Where incode is present, its settings are read rather than repeated: protected paths from `.incode/guards.json`, the check command from incode's `verify_command`. `.incord/` belongs to Incord Memory and is not used.
 
-- protected paths: incode's `.incode/guards.json` (plus the built-in protected set);
-- the check command: incode's `verify_command`;
-- `.incord/` is not used: it belongs to Incord Memory.
-
-`.incode/si.toml`:
+`.insi/config.toml`:
 
 ```toml
 topic = "incord/memory-service"
-eval_tasks = "evals/tasks"           # public task definitions
-private_checks = "git@github.com:org/insi-private-checks.git"
+test_cmd = "cargo test --workspace"          # the public check
+protected = [".github/workflows/**", "evals/**"]
+eval_tasks = "evals/tasks"                   # public task definitions
+private_checks = "<path or git URL of the private-checks repo>"
 trusted_issue_label = "agent-ok"
+
+[worker]                                     # the worker adapter
+command = ["incode", "-t", "{prompt}", "--output-format", "stream-json"]
 ```
 
 ## Security and governance
@@ -215,17 +226,16 @@ One Cargo workspace, `insi`, with its own binary, next to `incord-memory-service
 
 | Crate | Responsibility | Starting point |
 | --- | --- | --- |
-| `si-core` | Shared types: Topic, Lesson, Task, EvalResult, Candidate, Trust | `serde`, `thiserror` |
-| `si-config` | Parse `.incode/si.toml` and `harness-config/` | `toml`, `serde` |
-| `si-memory` | Client for Incord Memory: topic load, lesson write, audit events | HTTP (`reqwest`) |
-| `si-connectors` | `Connector` trait + GitHub, code, CI logs, email | `gh` CLI first |
-| `si-sandbox` | Worktree create/cleanup, sandboxed run, resource limits | `git` CLI; containers later |
-| `si-eval` | Task runner, budgets, public/private checks, multi-seed stats | `tokio` |
-| `si-loop` | Proposer, bandit, compare, accept/reject | `tokio`, seeded `rand` |
-| `si-guard` | Path policy, secret/PII scan, dependency-change detector | `globset`, `regex` |
-| `si-pr` | Branch, commit, PR body with evidence | `gh` CLI first; GitHub App before unattended runs |
-| `si-server` | GitHub App webhooks, MCP server, scheduler | `axum`, an MCP server crate |
-| `si-cli` | `insi eval`, `insi run`, `insi audit`, `insi propose` | `clap` |
+Built first (Phase 1), at `D:\Projects\insi`:
+
+| Crate | Responsibility | Starting point |
+| --- | --- | --- |
+| `insi-core` | Shared types (Task, Budget, EvalResult, Lesson, Trust), `.insi/config.toml`, the error-signature normalizer | `serde`, `toml` |
+| `insi-eval` | Mining tasks from history, the task runner in a throwaway worktree, budgets, public/private checks, multi-seed results | `git` CLI, std processes |
+| `insi-memory` | Client for Incord Memory: lesson write, briefing load, audit events | HTTP |
+| `insi` (binary) | `insi mine`, `insi eval`, `insi report`, later `insi init`, `insi run`, `insi propose` | std argument parsing first |
+
+Later phases add `insi-loop` (proposer, bandit, accept/reject), `insi-guard` (path policy, secret/PII scan, dependency-change detector — a dependency of the PR step, so no PR is opened without it), `insi-pr` (`gh` first; GitHub App before unattended runs), `insi-connectors` and `insi-server` (webhooks, MCP server, scheduler).
 
 Dependency names are starting candidates; pick per crate after a spike, vetted like any other dependency.
 
@@ -330,7 +340,7 @@ As of Oct 1, 2026. "incode" paths are in `D:\Projects\incord-code`.
 | --- | --- | --- |
 | 1 | Benchmark format and `insi eval`: tasks, public and private checks, seeds, results | 1 |
 | 2 | Private-check repository, outside every checkout | 1 |
-| 3 | First 20–30 tasks, from bug-fix commits in incord-code's history that came with a test | 1 |
+| 3 | First 20–30 tasks, from bug-fix commits in the Watchman app's history that changed a separate test file | 1 |
 | 4 | Dollar and wall-time budgets (incode has tokens only) | 1 |
 | 5 | Error-signature normalizer | 1 |
 | 6 | Lesson writer: failed-then-verified task → lesson with evidence, in Incord Memory | 1 |
@@ -346,12 +356,15 @@ As of Oct 1, 2026. "incode" paths are in `D:\Projects\incord-code`.
 | 16 | Proposer, accept-if-better, UCB1 bandit, audit events | 3 |
 | 17 | Connectors: CI logs, error tracking, docs, email | 4 |
 | 18 | Containers for issue work | 4 |
+| 19 | `insi init` for any repo: `.insi/config.toml`, `evals/`, CI workflow, MCP/hook registration | 2 |
+| 20 | Packages: `insi` on crates.io, npm and pip wrappers — after the Phase 1 gate | 2 |
 
 ## Decisions (were open questions)
 
 Proposed answers; each stands until revised.
 
-- **First benchmark repo:** incord-code itself. Its bug-fix commits that added a test are ready-made tasks: the parent commit is the starting state, and the new test is the private check.
+- **First benchmark repo:** the Watchman app (`D:\Projects\watchman`), read only — Insi works in its own clone and never touches that checkout. Measured on Oct 2: 722 commits, 427 changing source together with a separate test file, 36 of them fixes. A fix commit's parent is the starting state and its test file the private check. incord-code was the first idea and was measured too small for it: 79 commits, 4 fix-like, and tests inline in the source, so a fix's test cannot be held back without the fix.
+- **Published or private:** private until the Phase 1 gate is met.
 - **Acceptance margin and seeds:** start at 3 seeds; set the margin from the variance the first baseline measures.
 - **Sandbox runtime:** worktrees plus incode's OS sandbox first; Docker for issue work in phase 4.
 - **Inside incode or separate:** a separate `insi` binary that drives workers through incode, so it serves any agent and any repo.
