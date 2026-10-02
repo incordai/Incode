@@ -65,6 +65,8 @@ pub enum SlashCommand {
     Kill(u32),
     Background(String),
     Worktree(Option<String>),
+    /// Push a branch and open (or find) its GitHub pull request.
+    PullRequest(Option<String>),
     /// Diff code or workspace against older versions.
     Diff(Option<String>),
     /// Send a picture with the next message.
@@ -165,6 +167,7 @@ impl SlashCommand {
                 }
             }
             "/worktree" | "/wt" => Self::Worktree(arg),
+            "/pr" => Self::PullRequest(arg),
             "/diff" | "/df" => Self::Diff(arg),
             "/image" | "/img" => match arg.filter(|path| !path.is_empty()) {
                 Some(path) => Self::Image(path),
@@ -278,6 +281,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
     (
         "/worktree [cmd]",
         "Git worktree management (create/list/remove)",
+    ),
+    (
+        "/pr [branch] [--draft]",
+        "Push a branch (default: the current one) and open its GitHub pull request",
     ),
     (
         "/diff [file] [rev]",
@@ -1389,6 +1396,35 @@ pub fn handle_worktree(arg: Option<&str>, workspace: &std::path::Path) {
             render::print_error(&format!("Unknown worktree subcommand: {sub}"));
             render::print_info("Usage: /worktree [list | create <name> | remove <name>]");
         }
+    }
+    outln!();
+}
+
+// ---------------------------------------------------------------------------
+// Pull request handler
+// ---------------------------------------------------------------------------
+
+/// `/pr [branch] [--draft]`: push the branch and open its pull request, or
+/// report the one already open.
+pub fn handle_pull_request(arg: Option<&str>, workspace: &std::path::Path) {
+    let words: Vec<&str> = arg.unwrap_or("").split_whitespace().collect();
+    let draft = words.contains(&"--draft");
+    let named: Vec<&str> = words.iter().copied().filter(|w| *w != "--draft").collect();
+    if named.len() > 1 {
+        render::print_error("Usage: /pr [branch] [--draft]");
+        return;
+    }
+    let forge = crate::tools::pull_request::GitHubCli;
+    match crate::tools::pull_request::open(workspace, named.first().copied(), draft, &forge) {
+        Ok(opened) if opened.created => render::print_info(&format!(
+            "Pushed {} and opened a pull request into {}: {}",
+            opened.branch, opened.base, opened.url
+        )),
+        Ok(opened) => render::print_info(&format!(
+            "Pushed {}; its pull request was already open: {}",
+            opened.branch, opened.url
+        )),
+        Err(why) => render::print_error(&format!("/pr: {why}")),
     }
     outln!();
 }

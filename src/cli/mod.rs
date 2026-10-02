@@ -1110,6 +1110,9 @@ impl CliApp {
                     SlashCommand::Worktree(arg) => {
                         slash_commands::handle_worktree(arg.as_deref(), &workspace);
                     }
+                    SlashCommand::PullRequest(arg) => {
+                        slash_commands::handle_pull_request(arg.as_deref(), &workspace);
+                    }
                     SlashCommand::Diff(arg) => {
                         slash_commands::handle_diff(arg.as_deref(), &workspace);
                     }

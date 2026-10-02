@@ -117,6 +117,9 @@ pub(crate) fn run(
         SlashCommand::Memories(query) => slash_commands::handle_memories(query.as_deref()),
         SlashCommand::Remember(text) => slash_commands::handle_remember(&text, workspace),
         SlashCommand::Worktree(arg) => slash_commands::handle_worktree(arg.as_deref(), workspace),
+        SlashCommand::PullRequest(arg) => {
+            slash_commands::handle_pull_request(arg.as_deref(), workspace)
+        }
         SlashCommand::Agent(arg) => slash_commands::handle_agent(
             arg.as_deref(),
             &settings.catalogue,

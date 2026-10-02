@@ -145,6 +145,23 @@ const ALLOWED_API_KEYS: &[&str] = &[
     "HUGGING_FACE_HUB_TOKEN",
 ];
 
+/// The Watchman desktop app's per-session grants, by exact name.
+///
+/// When Watchman makes this session the lead of an orchestration run (or
+/// gives it the `/operator` app CLI), it puts a loopback endpoint and a token
+/// for THIS session into the environment and tells the model to run
+/// `watchman control …` / `watchman app …`, which read them. Withholding them
+/// would leave the lead unable to delegate, review or finish — every call
+/// failing with "credentials missing". Each token is scoped to one session,
+/// answered only on 127.0.0.1, and revoked by Watchman when the session ends;
+/// no other `WATCHMAN_*` variable is passed.
+const WATCHMAN_GRANTS: &[&str] = &[
+    "WATCHMAN_CONTROL_ENDPOINT",
+    "WATCHMAN_CONTROL_TOKEN",
+    "WATCHMAN_APP_ENDPOINT",
+    "WATCHMAN_APP_TOKEN",
+];
+
 /// Filter environment variables to only include allowed ones.
 ///
 /// Returns a new HashMap containing only vars from the allowlists.
@@ -177,6 +194,9 @@ pub fn is_allowed(name: &str) -> bool {
         .iter()
         .any(|v| v.eq_ignore_ascii_case(name))
     {
+        return true;
+    }
+    if WATCHMAN_GRANTS.iter().any(|v| v.eq_ignore_ascii_case(name)) {
         return true;
     }
 
@@ -234,6 +254,22 @@ mod tests {
         assert!(is_allowed("INCODE_TRACE"));
         assert!(is_allowed("INCORD_MEMORY_URL"));
         assert!(is_allowed("INCORD_BINANCE_KEY"));
+    }
+
+    /// **AN INCODE LEAD UNDER WATCHMAN CAN REACH ITS ORCHESTRATOR.** The four
+    /// grant variables pass; nothing else of Watchman's does.
+    #[test]
+    fn watchman_session_grants_pass_and_nothing_else_of_its() {
+        for name in [
+            "WATCHMAN_CONTROL_ENDPOINT",
+            "WATCHMAN_CONTROL_TOKEN",
+            "WATCHMAN_APP_ENDPOINT",
+            "WATCHMAN_APP_TOKEN",
+        ] {
+            assert!(is_allowed(name), "{name}");
+        }
+        assert!(!is_allowed("WATCHMAN_DATA_DIR"));
+        assert!(!is_allowed("WATCHMAN_ANYTHING_ELSE"));
     }
 
     #[test]
