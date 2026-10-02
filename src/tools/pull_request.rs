@@ -11,8 +11,10 @@
 //! A branch name git would not accept, a detached HEAD, the default branch
 //! itself (that is a push, not a pull request), a current branch with
 //! uncommitted changes (they would not be in the PR the operator thinks they
-//! are opening), a branch with no commits its base lacks, and a missing
-//! `origin`. Each is refused by name and nothing is pushed.
+//! are opening), a branch with no commits its base lacks, a missing
+//! `origin`, and a branch that adds something credential-shaped
+//! ([`crate::tools::secret_scan`]). Each is refused by name and nothing is
+//! pushed.
 //!
 //! # GitHub through `gh`
 //!
@@ -479,6 +481,32 @@ pub fn merge(
     })
 }
 
+/// Refused when what `range` adds, or its commit messages, hold something
+/// credential-shaped: pushing is publishing, and a key in a pull request
+/// has to be revoked, not just deleted. The refusal names each place and
+/// never the value.
+fn refuse_credentials(repo: &Path, range: &str) -> Result<(), String> {
+    use crate::tools::secret_scan::{scan_diff, scan_messages};
+    let diff = git(repo, &["diff", "--no-color", "--no-ext-diff", "-U0", range])?;
+    let messages = git(repo, &["log", "--format=%B", range])?;
+    let mut found = scan_diff(&diff);
+    found.extend(scan_messages(&messages));
+    if found.is_empty() {
+        return Ok(());
+    }
+    let listed: Vec<String> = found.iter().take(10).map(|f| format!("  {f}")).collect();
+    Err(format!(
+        "nothing was pushed: the branch adds what looks like a credential\n{}{}\n\
+         take it out of the history (not only the last commit), and revoke it if it is real",
+        listed.join("\n"),
+        if found.len() > listed.len() {
+            format!("\n  … and {} more", found.len() - listed.len())
+        } else {
+            String::new()
+        }
+    ))
+}
+
 fn short(sha: &str) -> &str {
     &sha[..sha.len().min(7)]
 }
@@ -523,6 +551,7 @@ pub fn open(
             "\"{branch}\" has no commits that {base_ref} lacks; nothing to open a pull request for"
         ));
     }
+    refuse_credentials(repo, &range)?;
 
     git(
         repo,
@@ -857,6 +886,35 @@ mod tests {
         assert!(forge.created.borrow().is_empty());
         assert!(Command::new("git")
             .args(["rev-parse", "--verify", "--quiet", "refs/heads/empty"])
+            .current_dir(&remote)
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(false));
+    }
+
+    /// **A KEY NEVER LEAVES THE MACHINE.** A branch that adds a
+    /// credential-shaped string is refused before the push: the remote never
+    /// sees the branch, no PR is created, and the refusal names the file and
+    /// line without the value.
+    #[test]
+    fn a_branch_that_adds_a_credential_is_refused_before_the_push() {
+        let (_dir, remote, work) = repo();
+        sh(&work, &["checkout", "-b", "feature/leak"]);
+        let token = format!("ghp_{}", "Q".repeat(36));
+        commit(&work, "config.js", &format!("const t = \"{token}\";"));
+        let forge = forge(None);
+
+        let why = open(&work, None, false, &forge).expect_err("refused");
+        assert!(why.contains("config.js:1: a GitHub token"), "{why}");
+        assert!(!why.contains(&token), "the value was repeated: {why}");
+        assert!(forge.created.borrow().is_empty());
+        assert!(Command::new("git")
+            .args([
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "refs/heads/feature/leak"
+            ])
             .current_dir(&remote)
             .output()
             .map(|o| !o.status.success())
