@@ -427,6 +427,7 @@ it sets; any other `id` adds an agent.
 | `/bg <cmd>` · `/jobs` · `/kill <id>` | Background shell jobs (shared with the model's background `Bash`) |
 | `/worktree [cmd]` | Git worktree create / list / remove |
 | `/pr [branch] [--draft]` | Push a branch (default: the current one) and open its GitHub pull request through `gh`, or report the one already open. Refuses the default branch, uncommitted work, a branch with nothing new and a bad name, before anything is pushed. Only you run it; no tool the model calls can |
+| `/pr merge [branch] [--squash\|--rebase]` | Merge that branch's open pull request (a merge commit by default; the branch is kept). Only as reviewed: refused for a draft, a conflict, a failing or still-running check, or when the PR's head is not your local branch's tip — and GitHub is told that head, so nothing pushed afterwards can ride along. Says so when no checks ran at all |
 | `/add-dir <path>` | Also work in this directory — guards and undo extend to it too |
 | `/tools add <name>` · `/tools update [name]` · `/tools remove <name>` | Install, update or remove an [external tool](#external-tools) (also over `--acp`) |
 | `/tools` · `/mcp` · `/env` · `/compact` | Information screens (`/tools` also lists the external tools and what is installed) |

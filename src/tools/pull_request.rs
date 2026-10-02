@@ -43,6 +43,75 @@ pub trait Forge {
     fn open_pr(&self, repo: &Path, branch: &str) -> Result<Option<String>, String>;
     /// Open one and return its URL.
     fn create(&self, repo: &Path, new: &NewPr) -> Result<String, String>;
+    /// The OPEN pull request whose head is `branch`, with what decides
+    /// whether it may be merged; `None` when there is none open.
+    fn pr_status(&self, repo: &Path, branch: &str) -> Result<Option<PrStatus>, String>;
+    /// Merge pull request `number` — only while its head is still `head`, so
+    /// nothing pushed after the checks were read can ride along — and return
+    /// the merge commit.
+    fn merge(
+        &self,
+        repo: &Path,
+        number: u64,
+        method: MergeMethod,
+        head: &str,
+    ) -> Result<String, String>;
+}
+
+/// How `/pr merge` lands a pull request on its base.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeMethod {
+    /// A merge commit; every commit of the branch is kept.
+    Merge,
+    /// One commit with the branch's changes.
+    Squash,
+    /// The branch's commits replayed onto the base.
+    Rebase,
+}
+
+impl MergeMethod {
+    fn flag(self) -> &'static str {
+        match self {
+            MergeMethod::Merge => "--merge",
+            MergeMethod::Squash => "--squash",
+            MergeMethod::Rebase => "--rebase",
+        }
+    }
+}
+
+/// One check's verdict on a pull request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckState {
+    Passed,
+    Failed,
+    Pending,
+}
+
+/// An open pull request, as `/pr merge` needs to judge it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrStatus {
+    pub number: u64,
+    pub url: String,
+    pub draft: bool,
+    /// GitHub's word: `MERGEABLE`, `CONFLICTING`, or `UNKNOWN` while it is
+    /// still working it out.
+    pub mergeable: String,
+    /// The commit the pull request's head is at on the forge.
+    pub head: String,
+    pub checks: Vec<(String, CheckState)>,
+}
+
+/// What `/pr merge` did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Merged {
+    pub number: u64,
+    pub url: String,
+    pub branch: String,
+    pub commit: String,
+    pub method: MergeMethod,
+    /// How many checks had run and passed; zero is said out loud, since a
+    /// merge with nothing checked is the operator's word alone.
+    pub checks_passed: usize,
 }
 
 /// A pull request to open.
@@ -156,6 +225,99 @@ impl Forge for GitHubCli {
         let out = Self::run_with_input(repo, &args, Some(&new.body))?;
         pr_url(&out).ok_or_else(|| format!("gh pr create printed no pull request URL: {out}"))
     }
+
+    fn pr_status(&self, repo: &Path, branch: &str) -> Result<Option<PrStatus>, String> {
+        let fields = "number,url,state,isDraft,mergeable,headRefOid,statusCheckRollup";
+        match Self::run(repo, &["pr", "view", branch, "--json", fields]) {
+            Ok(json) => parse_status(&json),
+            // gh's own wording when the branch has no pull request at all.
+            Err(why) if why.contains("no pull requests found") => Ok(None),
+            Err(why) => Err(why),
+        }
+    }
+
+    fn merge(
+        &self,
+        repo: &Path,
+        number: u64,
+        method: MergeMethod,
+        head: &str,
+    ) -> Result<String, String> {
+        let number = number.to_string();
+        Self::run(
+            repo,
+            &[
+                "pr",
+                "merge",
+                &number,
+                method.flag(),
+                "--match-head-commit",
+                head,
+            ],
+        )?;
+        Self::run(
+            repo,
+            &[
+                "pr",
+                "view",
+                &number,
+                "--json",
+                "mergeCommit",
+                "--jq",
+                ".mergeCommit.oid",
+            ],
+        )
+    }
+}
+
+/// [`PrStatus`] from `gh pr view --json …`; `None` for one that is not open.
+///
+/// A check is a CheckRun (`status`, `conclusion`) or a commit status
+/// (`state`); both are read. Anything not plainly passed or plainly still
+/// running counts as failed — an unknown verdict must not let a merge
+/// through.
+pub fn parse_status(json: &str) -> Result<Option<PrStatus>, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| format!("gh printed unreadable JSON: {e}"))?;
+    if v["state"].as_str() != Some("OPEN") {
+        return Ok(None);
+    }
+    let checks = v["statusCheckRollup"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .map(|c| {
+                    let name = c["name"]
+                        .as_str()
+                        .or_else(|| c["context"].as_str())
+                        .unwrap_or("a check")
+                        .to_string();
+                    let state = match (c["status"].as_str(), c["conclusion"].as_str()) {
+                        (Some(status), _) if status != "COMPLETED" => CheckState::Pending,
+                        (Some(_), Some("SUCCESS" | "NEUTRAL" | "SKIPPED")) => CheckState::Passed,
+                        (Some(_), _) => CheckState::Failed,
+                        (None, _) => match c["state"].as_str() {
+                            Some("SUCCESS") => CheckState::Passed,
+                            Some("PENDING" | "EXPECTED") => CheckState::Pending,
+                            _ => CheckState::Failed,
+                        },
+                    };
+                    (name, state)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(Some(PrStatus {
+        number: v["number"]
+            .as_u64()
+            .ok_or("gh printed a pull request with no number")?,
+        url: v["url"].as_str().unwrap_or_default().to_string(),
+        draft: v["isDraft"].as_bool().unwrap_or(false),
+        mergeable: v["mergeable"].as_str().unwrap_or("UNKNOWN").to_string(),
+        head: v["headRefOid"].as_str().unwrap_or_default().to_string(),
+        checks,
+    }))
 }
 
 /// The pull request URL `gh pr create` printed: its last `https://` line.
@@ -201,12 +363,11 @@ pub fn describe(branch: &str, subjects: &[String]) -> (String, String) {
 
 /// Push `branch` (the current one when `None`) to `origin` and open its pull
 /// request against the repository's default branch — or report the open one.
-pub fn open(
-    repo: &Path,
-    branch: Option<&str>,
-    draft: bool,
-    forge: &dyn Forge,
-) -> Result<Opened, String> {
+/// The branch named (or the current one), as `(branch, current, its tip)`:
+/// refused when HEAD is detached and nothing is named, when the name is not
+/// one git accepts — which also rules out one that starts with `-` and would
+/// be read as an option — or when no local branch has it.
+fn resolve_branch(repo: &Path, branch: Option<&str>) -> Result<(String, String, String), String> {
     let current = git(repo, &["rev-parse", "--abbrev-ref", "HEAD"])
         .map_err(|e| format!("not a git repository here: {e}"))?;
     let branch = match branch.map(str::trim).filter(|b| !b.is_empty()) {
@@ -218,11 +379,9 @@ pub fn open(
         }
         None => current.clone(),
     };
-    // A name git accepts as a branch, which also rules out one that starts
-    // with `-` and would be read as an option.
     git(repo, &["check-ref-format", "--branch", &branch])
         .map_err(|_| format!("\"{branch}\" is not a valid branch name"))?;
-    git(
+    let tip = git(
         repo,
         &[
             "rev-parse",
@@ -232,6 +391,105 @@ pub fn open(
         ],
     )
     .map_err(|_| format!("there is no local branch \"{branch}\""))?;
+    Ok((branch, current, tip))
+}
+
+/// Merge `branch`'s open pull request (the current branch's when `None`).
+///
+/// Refused — before GitHub is asked to merge anything — when there is no
+/// open pull request, it is a draft, GitHub reports a conflict or has not
+/// finished working out whether there is one, any check failed or is still
+/// running, or the pull request's head is not the local branch's tip (work
+/// pushed by someone else, or local commits not pushed yet: either way the
+/// operator would be merging something other than what they have). The
+/// merge itself is told that head, so a push in between is refused by
+/// GitHub too. The branch is kept.
+pub fn merge(
+    repo: &Path,
+    branch: Option<&str>,
+    method: MergeMethod,
+    forge: &dyn Forge,
+) -> Result<Merged, String> {
+    let (branch, _, tip) = resolve_branch(repo, branch)?;
+    let pr = forge
+        .pr_status(repo, &branch)?
+        .ok_or_else(|| format!("\"{branch}\" has no open pull request; open one with /pr"))?;
+    if pr.head != tip {
+        return Err(format!(
+            "pull request #{} is at {} but local \"{branch}\" is at {}: push with /pr (or pull) \
+             so you merge what you have reviewed",
+            pr.number,
+            short(&pr.head),
+            short(&tip)
+        ));
+    }
+    if pr.draft {
+        return Err(format!(
+            "pull request #{} is a draft; mark it ready for review first",
+            pr.number
+        ));
+    }
+    match pr.mergeable.as_str() {
+        "MERGEABLE" => {}
+        "CONFLICTING" => {
+            return Err(format!(
+                "pull request #{} conflicts with its base; resolve that first",
+                pr.number
+            ))
+        }
+        _ => {
+            return Err(format!(
+                "GitHub has not finished checking whether #{} merges cleanly; try again in a \
+                 moment",
+                pr.number
+            ))
+        }
+    }
+    let names = |want: CheckState| -> Vec<&str> {
+        pr.checks
+            .iter()
+            .filter(|(_, s)| *s == want)
+            .map(|(n, _)| n.as_str())
+            .collect()
+    };
+    let failed = names(CheckState::Failed);
+    if !failed.is_empty() {
+        return Err(format!(
+            "pull request #{} has failing checks: {}",
+            pr.number,
+            failed.join(", ")
+        ));
+    }
+    let pending = names(CheckState::Pending);
+    if !pending.is_empty() {
+        return Err(format!(
+            "pull request #{} has checks still running: {}",
+            pr.number,
+            pending.join(", ")
+        ));
+    }
+    let commit = forge.merge(repo, pr.number, method, &pr.head)?;
+    Ok(Merged {
+        number: pr.number,
+        url: pr.url,
+        branch,
+        commit,
+        method,
+        checks_passed: pr.checks.len(),
+    })
+}
+
+fn short(sha: &str) -> &str {
+    &sha[..sha.len().min(7)]
+}
+
+pub fn open(
+    repo: &Path,
+    branch: Option<&str>,
+    draft: bool,
+    forge: &dyn Forge,
+) -> Result<Opened, String> {
+    let (branch, current, _) = resolve_branch(repo, branch)?;
     if branch == current {
         let dirty = git(repo, &["status", "--porcelain"])?;
         if !dirty.is_empty() {
@@ -315,6 +573,8 @@ mod tests {
         default: String,
         existing: Option<String>,
         created: RefCell<Vec<NewPr>>,
+        status: RefCell<Option<PrStatus>>,
+        merged: RefCell<Vec<(u64, MergeMethod, String)>>,
     }
 
     impl Forge for FakeForge {
@@ -328,6 +588,21 @@ mod tests {
             self.created.borrow_mut().push(new.clone());
             Ok("https://github.com/o/r/pull/7".to_string())
         }
+        fn pr_status(&self, _: &Path, _: &str) -> Result<Option<PrStatus>, String> {
+            Ok(self.status.borrow().clone())
+        }
+        fn merge(
+            &self,
+            _: &Path,
+            number: u64,
+            method: MergeMethod,
+            head: &str,
+        ) -> Result<String, String> {
+            self.merged
+                .borrow_mut()
+                .push((number, method, head.to_string()));
+            Ok("0123456789abcdef".to_string())
+        }
     }
 
     fn forge(existing: Option<&str>) -> FakeForge {
@@ -335,7 +610,136 @@ mod tests {
             default: "main".to_string(),
             existing: existing.map(str::to_string),
             created: RefCell::new(Vec::new()),
+            status: RefCell::new(None),
+            merged: RefCell::new(Vec::new()),
         }
+    }
+
+    fn tip(work: &Path, branch: &str) -> String {
+        let out = Command::new("git")
+            .args(["rev-parse", branch])
+            .current_dir(work)
+            .output()
+            .expect("git");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// An open, ready, mergeable PR at `head` with the given checks.
+    fn ready(head: &str, checks: &[(&str, CheckState)]) -> PrStatus {
+        PrStatus {
+            number: 12,
+            url: "https://github.com/o/r/pull/12".to_string(),
+            draft: false,
+            mergeable: "MERGEABLE".to_string(),
+            head: head.to_string(),
+            checks: checks.iter().map(|(n, s)| (n.to_string(), *s)).collect(),
+        }
+    }
+
+    /// **A PR IS MERGED ONLY AS REVIEWED**: at the local tip, with every
+    /// check passed — and GitHub is told that head, so a later push cannot
+    /// ride along.
+    #[test]
+    fn a_ready_pull_request_is_merged_at_the_head_that_was_checked() {
+        let (_dir, _remote, work) = repo();
+        sh(&work, &["checkout", "-b", "feature/x"]);
+        commit(&work, "x.txt", "x");
+        let head = tip(&work, "feature/x");
+        let forge = forge(None);
+        *forge.status.borrow_mut() = Some(ready(&head, &[("build", CheckState::Passed)]));
+
+        let merged = merge(&work, None, MergeMethod::Squash, &forge).expect("merged");
+        assert_eq!(merged.number, 12);
+        assert_eq!(merged.checks_passed, 1);
+        assert_eq!(
+            forge.merged.borrow().as_slice(),
+            [(12, MergeMethod::Squash, head)]
+        );
+    }
+
+    /// **NOTHING IS MERGED** without an open PR, from a draft, over a
+    /// conflict or an unknown answer, past a failing or running check, or
+    /// when the PR is not at the local branch's tip.
+    #[test]
+    fn what_may_not_be_merged_is_refused_before_github_is_asked() {
+        let (_dir, _remote, work) = repo();
+        sh(&work, &["checkout", "-b", "feature/y"]);
+        commit(&work, "y.txt", "y");
+        let head = tip(&work, "feature/y");
+        let forge = forge(None);
+
+        let why = merge(&work, None, MergeMethod::Merge, &forge).expect_err("no PR");
+        assert!(why.contains("no open pull request"), "{why}");
+
+        let cases: Vec<(PrStatus, &str)> = vec![
+            (ready("0000000000", &[]), "push with /pr"),
+            (
+                PrStatus {
+                    draft: true,
+                    ..ready(&head, &[])
+                },
+                "draft",
+            ),
+            (
+                PrStatus {
+                    mergeable: "CONFLICTING".into(),
+                    ..ready(&head, &[])
+                },
+                "conflicts",
+            ),
+            (
+                PrStatus {
+                    mergeable: "UNKNOWN".into(),
+                    ..ready(&head, &[])
+                },
+                "try again",
+            ),
+            (
+                ready(
+                    &head,
+                    &[("build", CheckState::Passed), ("lint", CheckState::Failed)],
+                ),
+                "failing checks: lint",
+            ),
+            (
+                ready(&head, &[("test", CheckState::Pending)]),
+                "still running: test",
+            ),
+        ];
+        for (status, expect) in cases {
+            *forge.status.borrow_mut() = Some(status);
+            let why = merge(&work, None, MergeMethod::Merge, &forge).expect_err(expect);
+            assert!(why.contains(expect), "{expect}: {why}");
+        }
+        assert!(forge.merged.borrow().is_empty(), "nothing reached GitHub");
+    }
+
+    /// Both kinds of check `gh` reports are read, an unknown verdict counts
+    /// as failed, and a PR that is not open is no PR to merge.
+    #[test]
+    fn the_status_gh_prints_is_read_with_every_kind_of_check() {
+        let json = r#"{"number":5,"url":"https://github.com/o/r/pull/5","state":"OPEN",
+            "isDraft":false,"mergeable":"MERGEABLE","headRefOid":"abc",
+            "statusCheckRollup":[
+              {"__typename":"CheckRun","name":"build","status":"COMPLETED","conclusion":"SUCCESS"},
+              {"__typename":"CheckRun","name":"test","status":"IN_PROGRESS","conclusion":""},
+              {"__typename":"CheckRun","name":"e2e","status":"COMPLETED","conclusion":"TIMED_OUT"},
+              {"__typename":"StatusContext","context":"ci/legacy","state":"PENDING"},
+              {"__typename":"StatusContext","context":"ci/old","state":"WEIRD"}]}"#;
+        let status = parse_status(json).expect("json").expect("open");
+        assert_eq!(status.number, 5);
+        assert_eq!(
+            status.checks,
+            [
+                ("build".to_string(), CheckState::Passed),
+                ("test".to_string(), CheckState::Pending),
+                ("e2e".to_string(), CheckState::Failed),
+                ("ci/legacy".to_string(), CheckState::Pending),
+                ("ci/old".to_string(), CheckState::Failed),
+            ]
+        );
+        let closed = r#"{"number":5,"state":"MERGED","statusCheckRollup":[]}"#;
+        assert_eq!(parse_status(closed).expect("json"), None);
     }
 
     fn sh(dir: &Path, args: &[&str]) {

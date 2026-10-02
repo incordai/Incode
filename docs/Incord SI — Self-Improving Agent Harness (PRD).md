@@ -317,12 +317,12 @@ As of Oct 1, 2026. "incode" paths are in `D:\Projects\incord-code`.
 | Guards (F4) | Protected paths (tests, CI, migrations, `.env`, the ledger, `.incode/guards.json`) refused as write targets | incode `src/guards.rs` |
 | Permission decider (F4, hooks) | Incord Memory's `pre-tool` hook asked on every tool call: allow, block or ask a person; fails closed for writes | incode toolbox; `docs/incord-memory-integration.md` |
 | Worktrees (F6 sandbox) | Create, list, remove; parallel `/run` lanes in worktrees, merged back, conflicts kept on a branch | incode `src/tools/worktree.rs`, `src/parallel.rs` |
-| PR opening (F7, operator stage) | `/pr [branch] [--draft]`: refuses the default branch, uncommitted work, an empty branch and bad names before anything is pushed; pushes; reuses an open PR or runs `gh pr create` | incode `src/tools/pull_request.rs` (new, not yet committed) |
+| PR opening and merging (F7, operator stage) | `/pr [branch] [--draft]`: refuses the default branch, uncommitted work, an empty branch and bad names before anything is pushed; pushes; reuses an open PR or runs `gh pr create`. `/pr merge`: merges only a ready PR at the local tip with no failing or running check, pinned to that head | incode `src/tools/pull_request.rs` |
 | Routing between agents (F6 surface) | Roles with ordered model candidates, tiers, CLI agents and API models, all in `admin.json` | incode `src/roles.rs`, `src/agent/catalogue.rs` |
 | Agent definitions (F6 surface) | Sub-agents as Markdown files with role, model and tool allow-list; a built-in `researcher` (memory, then web, saves findings) | incode `src/subagents.rs`, `defaults/agents/` |
 | Token budget | A token ceiling that stops the next request and counts every request in full | incode `src/budget.rs` |
 | Memory client | Recorder lookup and handoff, `remember`, recall | incode `src/recorder.rs`, `src/knowledge.rs` |
-| Running under the Watchman app | incode as the lead of a Watchman orchestration reaches its orchestrator (the control credentials pass incode's environment filter) | incode `src/tools/env_filter.rs` (new, not yet committed) |
+| Running under the Watchman app | incode as the lead of a Watchman orchestration reaches its orchestrator (the control credentials pass incode's environment filter) | incode `src/tools/env_filter.rs` |
 
 ### Left to build
 

@@ -287,6 +287,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "Push a branch (default: the current one) and open its GitHub pull request",
     ),
     (
+        "/pr merge [branch] [--squash|--rebase]",
+        "Merge the branch's open pull request, only at its reviewed head with no failing or running check",
+    ),
+    (
         "/diff [file] [rev]",
         "Show git/file diff against older versions",
     ),
@@ -1408,6 +1412,10 @@ pub fn handle_worktree(arg: Option<&str>, workspace: &std::path::Path) {
 /// report the one already open.
 pub fn handle_pull_request(arg: Option<&str>, workspace: &std::path::Path) {
     let words: Vec<&str> = arg.unwrap_or("").split_whitespace().collect();
+    if words.first() == Some(&"merge") {
+        handle_pull_request_merge(&words[1..], workspace);
+        return;
+    }
     let draft = words.contains(&"--draft");
     let named: Vec<&str> = words.iter().copied().filter(|w| *w != "--draft").collect();
     if named.len() > 1 {
@@ -1425,6 +1433,40 @@ pub fn handle_pull_request(arg: Option<&str>, workspace: &std::path::Path) {
             opened.branch, opened.url
         )),
         Err(why) => render::print_error(&format!("/pr: {why}")),
+    }
+    outln!();
+}
+
+/// `/pr merge [branch] [--squash|--rebase]`: merge the branch's open pull
+/// request, only as it was reviewed and checked.
+fn handle_pull_request_merge(words: &[&str], workspace: &std::path::Path) {
+    use crate::tools::pull_request::MergeMethod;
+    let mut method = MergeMethod::Merge;
+    let mut named = Vec::new();
+    for word in words {
+        match *word {
+            "--squash" => method = MergeMethod::Squash,
+            "--rebase" => method = MergeMethod::Rebase,
+            "--merge" => method = MergeMethod::Merge,
+            other => named.push(other),
+        }
+    }
+    if named.len() > 1 {
+        render::print_error("Usage: /pr merge [branch] [--squash|--rebase]");
+        return;
+    }
+    let forge = crate::tools::pull_request::GitHubCli;
+    match crate::tools::pull_request::merge(workspace, named.first().copied(), method, &forge) {
+        Ok(merged) => {
+            render::print_info(&format!(
+                "Merged pull request #{} ({}) as {}: {}",
+                merged.number, merged.branch, merged.commit, merged.url
+            ));
+            if merged.checks_passed == 0 {
+                render::print_info("No checks ran on it: this merge rests on your review alone.");
+            }
+        }
+        Err(why) => render::print_error(&format!("/pr merge: {why}")),
     }
     outln!();
 }
