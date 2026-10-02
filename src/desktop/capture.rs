@@ -125,6 +125,106 @@ pub fn capture_monitor(
     capture(monitor, options)
 }
 
+/// Capture one region of the desktop — a window's rectangle — from the
+/// display its centre is on.
+///
+/// The region is in desktop units (the space input and the accessibility
+/// tree use), clipped to that display. What is IN FRONT of the window is
+/// captured with it: this is a crop of the screen, not the window's own
+/// buffer, so the caller brings the window forward first when it matters.
+pub fn capture_region(region: Rect, options: CaptureOptions) -> Result<Screenshot, DesktopError> {
+    let monitors = all_monitors()?;
+    let (cx, cy) = region.center();
+    let read = |what: &str, e: xcap::XCapError| {
+        DesktopError::Os(format!("could not read a display's {what}: {e}"))
+    };
+    let mut chosen = None;
+    for monitor in &monitors {
+        let (x, y) = (
+            monitor.x().map_err(|e| read("x", e))?,
+            monitor.y().map_err(|e| read("y", e))?,
+        );
+        let (w, h) = (
+            monitor.width().map_err(|e| read("width", e))? as i32,
+            monitor.height().map_err(|e| read("height", e))? as i32,
+        );
+        if cx >= x && cx < x + w && cy >= y && cy < y + h {
+            chosen = Some((
+                monitor,
+                Rect {
+                    x,
+                    y,
+                    width: w,
+                    height: h,
+                },
+            ));
+            break;
+        }
+    }
+    let (monitor, screen) = chosen.ok_or_else(|| {
+        DesktopError::Os(format!(
+            "the window at ({},{}) {}x{} is not on any display",
+            region.x, region.y, region.width, region.height
+        ))
+    })?;
+    let id = monitor
+        .id()
+        .map_err(|e| DesktopError::Os(format!("could not read a display's id: {e}")))?;
+
+    // The part of the region that is on this display, in desktop units.
+    let left = region.x.max(screen.x);
+    let top = region.y.max(screen.y);
+    let right = (region.x + region.width).min(screen.x + screen.width);
+    let bottom = (region.y + region.height).min(screen.y + screen.height);
+    if right <= left || bottom <= top {
+        return Err(DesktopError::Os(
+            "the window has no visible area".to_string(),
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    super::macos::require(super::macos::Grant::ScreenRecording)?;
+    let full = monitor
+        .capture_image()
+        .map_err(|e| DesktopError::Os(format!("could not capture display {id}: {e}")))?;
+
+    // Desktop units to image pixels: 1 on Windows and X11, the Retina factor
+    // on macOS.
+    let scale = f64::from(full.width()) / f64::from(screen.width.max(1));
+    let px = |v: i32| (f64::from(v) * scale).round() as u32;
+    let crop_x = px(left - screen.x).min(full.width().saturating_sub(1));
+    let crop_y = px(top - screen.y).min(full.height().saturating_sub(1));
+    let crop_w = px(right - left).clamp(1, full.width() - crop_x);
+    let crop_h = px(bottom - top).clamp(1, full.height() - crop_y);
+    let cropped = image::imageops::crop_imm(&full, crop_x, crop_y, crop_w, crop_h).to_image();
+
+    let transform = desktop_view(
+        PhysicalPoint { x: left, y: top },
+        ((right - left) as u32, (bottom - top) as u32),
+        (cropped.width(), cropped.height()),
+        options.max_edge,
+    )
+    .map_err(|why| DesktopError::Os(format!("the window region: {why}")))?;
+    let shown =
+        if (cropped.width(), cropped.height()) == (transform.model_width, transform.model_height) {
+            cropped
+        } else {
+            image::imageops::resize(
+                &cropped,
+                transform.model_width,
+                transform.model_height,
+                image::imageops::FilterType::Triangle,
+            )
+        };
+    Ok(Screenshot {
+        bytes: encode(&shown, options.format, options.jpeg_quality)?,
+        format: options.format,
+        transform,
+        monitor_id: id,
+        monitor_name: monitor.name().unwrap_or_default(),
+    })
+}
+
 /// Every display as [`super::MonitorInfo`], from the capture library — the
 /// monitor list on macOS and Linux, where its units are the ones input uses
 /// (points on macOS, pixels on X11). `id` is the position in this list, the

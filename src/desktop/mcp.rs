@@ -40,6 +40,181 @@ use super::capture::{self, CaptureOptions, ShotFormat};
 use super::coords::PhysicalPoint;
 use super::safety::Safety;
 use super::thread::{InputThread, MouseButton};
+use super::uia::{self, WindowInfo};
+
+/// The tools that change the machine and so may end with a screenshot
+/// (`screenshot_after`).
+const ACTING: &[&str] = &[
+    "click_element",
+    "set_value",
+    "element_action",
+    "focus_window",
+    "type_text",
+    "paste_text",
+    "key",
+    "scroll",
+    "drag",
+    "move_mouse",
+    "click",
+];
+
+/// The `window` argument, when one was given.
+fn window_arg(args: &Value) -> Option<String> {
+    args.get("window")
+        .and_then(|w| match w {
+            Value::String(s) => Some(s.trim().to_string()),
+            // A handle is a number on Windows; take it either way.
+            Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        })
+        .filter(|s| !s.is_empty())
+}
+
+/// Refuse a window that belongs to a blocked application (a password
+/// manager, or one admin.json names). Checked BEFORE anything is read from
+/// it or done to it.
+fn refuse_blocked(info: &WindowInfo) -> Result<(), String> {
+    refuse_app(&info.app)
+}
+
+fn refuse_app(app: &str) -> Result<(), String> {
+    match super::limits::get().blocked(app) {
+        Some(entry) if entry == super::limits::UNNAMED_APP => Err(
+            "refused: the application that owns that window could not be named, so it cannot be \
+             told apart from a password manager; incode does not read or act on it."
+                .to_string(),
+        ),
+        Some(entry) => Err(format!(
+            "refused: that window belongs to \"{app}\", which is blocked (\"{entry}\" — a \
+             password manager, or desktop_limits.blocked_apps). incode never reads or acts on it."
+        )),
+        None => Ok(()),
+    }
+}
+
+/// The focused window, checked before an action that goes wherever the focus
+/// is: refused when it belongs to a blocked application, and — when the
+/// caller named `window` — when that window is not the focused one, so
+/// keystrokes can never land in a window nobody meant.
+fn guard_focus(window: Option<&str>) -> Result<Option<WindowInfo>, String> {
+    match (uia::foreground(), window) {
+        (Ok(Some(focused)), want) => {
+            refuse_blocked(&focused)?;
+            if let Some(want) = want {
+                if focused.id != want {
+                    return Err(format!(
+                        "refused: window {want} is not focused — \"{}\" ({}) is, so the input \
+                         would go there. Call focus_window (or click in the window) first.",
+                        focused.title, focused.app
+                    ));
+                }
+            }
+            Ok(Some(focused))
+        }
+        (Ok(None), Some(want)) => Err(format!(
+            "refused: no window is focused, so the input would not reach window {want}. Call \
+             focus_window first."
+        )),
+        (Err(e), Some(want)) => Err(format!(
+            "refused: could not tell which window is focused ({e}), so the input cannot be \
+             checked to reach window {want}"
+        )),
+        // Nothing named and nothing knowable: pixels-only desktops still work.
+        (_, None) => Ok(None),
+    }
+}
+
+/// Where a result says the input went.
+fn into(focused: &Option<WindowInfo>) -> String {
+    match focused {
+        Some(w) => format!(" into \"{}\" ({})", w.title, w.app),
+        None => String::new(),
+    }
+}
+
+/// The blocked windows on screen. A desktop whose windows cannot be listed
+/// is refused rather than taken to have none: the check would otherwise
+/// pass exactly when it can see nothing.
+fn blocked_windows() -> Result<Vec<WindowInfo>, String> {
+    let windows = uia::list_windows().map_err(|e| {
+        format!(
+            "refused: the windows on screen could not be listed ({e}), so this cannot be checked \
+             against blocked applications"
+        )
+    })?;
+    Ok(windows
+        .into_iter()
+        .filter(|w| super::limits::get().blocked(&w.app).is_some())
+        .collect())
+}
+
+/// Refuse a pointer action at a point inside a blocked application's window.
+///
+/// By rectangle, not by what is drawn on top: a point inside a blocked
+/// window is refused even where another window covers it, since stacking can
+/// change between this check and the click, and a click that falls through
+/// to a password manager is the one that must never happen.
+fn refuse_point(at: PhysicalPoint) -> Result<(), String> {
+    match blocked_windows()?
+        .iter()
+        .find(|w| w.rect.contains(at.x, at.y))
+    {
+        Some(w) => Err(format!(
+            "refused: {},{} is inside a window of a blocked application ({}); incode never acts \
+             on it",
+            at.x,
+            at.y,
+            if w.app.trim().is_empty() {
+                "one whose name could not be read"
+            } else {
+                &w.app
+            }
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Refuse a capture of `region` when any blocked window shares area with it:
+/// a window's picture is a crop of the screen, so whatever overlaps it is in
+/// the picture too.
+fn refuse_region(region: super::Rect) -> Result<(), String> {
+    match blocked_windows()?.iter().find(|w| w.rect.overlaps(region)) {
+        Some(_) => Err(
+            "refused: a blocked application's window overlaps that area, and a capture would \
+             show it. Move or minimise it first."
+                .to_string(),
+        ),
+        None => Ok(()),
+    }
+}
+
+/// A wheel step count, held to `desktop_limits.max_scroll_steps`.
+fn scroll_steps(args: &Value, key: &str) -> Result<i32, String> {
+    let Some(raw) = args.get(key) else {
+        return Ok(0);
+    };
+    let max = i64::from(super::limits::get().max_scroll_steps);
+    match raw.as_i64() {
+        Some(n) if n.abs() <= max => Ok(n as i32),
+        Some(n) => Err(format!(
+            "{key}={n} is more than {max} wheel steps (desktop_limits.max_scroll_steps); scroll \
+             in smaller steps and look between them"
+        )),
+        None => Err(format!("{key} must be a whole number of wheel steps")),
+    }
+}
+
+/// A coordinate argument, refused rather than wrapped when it does not fit.
+fn coordinate(args: &Value, key: &str) -> Result<Option<i32>, String> {
+    match args.get(key) {
+        None => Ok(None),
+        Some(v) => v
+            .as_i64()
+            .and_then(|n| i32::try_from(n).ok())
+            .map(Some)
+            .ok_or_else(|| format!("{key} must be a whole number of pixels")),
+    }
+}
 
 /// Negotiated down to this by the live server when asked for `2025-06-18`.
 const PROTOCOL_VERSION: &str = "2024-11-05";
@@ -316,7 +491,13 @@ impl Server {
             (Err(reason), _, _) => Err(reason.clone()),
             (Ok(()), true, _) => Err(super::safety::Refusal::Stopped.message()),
             (Ok(()), false, Some(why)) => Err(why),
-            (Ok(()), false, None) => self.run_tool(name, &args),
+            (Ok(()), false, None) => self.run_tool(name, &args).map(|mut content| {
+                let wanted = args.get("screenshot_after").and_then(Value::as_bool) == Some(true);
+                if wanted && ACTING.contains(&name) {
+                    content.extend(after_shot(&args));
+                }
+                content
+            }),
         };
 
         // AFTER, and only for a call that actually ran. A post hook told about
@@ -384,6 +565,14 @@ impl Server {
             // `ui_tree` the agent read to get the id, which is itself a
             // journalled call, so an operator can follow `e16` back to it.
             "click_element" => format!("element e{}", n("id")),
+            // LENGTH ONLY, like typing: a value set may be a password.
+            "set_value" => format!(
+                "element e{}, {} characters",
+                n("id"),
+                s("value").chars().count()
+            ),
+            "element_action" => format!("element e{} {}", n("id"), s("action")),
+            "focus_window" => format!("window {}", window_arg(args).unwrap_or_default()),
             "click" | "move_mouse" => format!("({}, {})", n("x"), n("y")),
             "drag" => format!(
                 "({}, {}) -> ({}, {})",
@@ -441,34 +630,82 @@ impl Server {
                     ..CaptureOptions::default()
                 };
 
-                let shot = capture::capture_primary(options).map_err(|e| e.to_string())?;
-                let (width, height) = shot.model_size();
+                shoot(window_arg(args).as_deref(), options)
+            }
 
-                Ok(vec![
-                    // The transform travels BESIDE the image, because a
-                    // coordinate the model names is meaningless without it.
-                    text(
-                        json!({
-                            "width": width,
-                            "height": height,
-                            "monitor_id": shot.monitor_id,
-                            "monitor": shot.monitor_name,
-                            "note": UNTRUSTED,
-                        })
-                        .to_string(),
-                    ),
-                    image(&shot.bytes, shot.format),
-                ])
+            "list_windows" => {
+                let windows = uia::list_windows().map_err(|e| e.to_string())?;
+                let listed: Vec<Value> = windows
+                    .iter()
+                    .map(|w| match super::limits::get().blocked(&w.app) {
+                        // Listed so the agent knows it is there and not to
+                        // try, with the area every click and capture keeps
+                        // off; its title (often an entry's name) is not.
+                        Some(_) => {
+                            json!({"id": w.id, "app": w.app, "blocked": true, "rect": w.rect})
+                        }
+                        None => json!({
+                            "id": w.id,
+                            "title": w.title,
+                            "app": w.app,
+                            "pid": w.pid,
+                            "focused": w.focused,
+                            "rect": w.rect,
+                        }),
+                    })
+                    .collect();
+                Ok(vec![text(format!(
+                    "{}\n{UNTRUSTED}",
+                    serde_json::to_string_pretty(&listed).unwrap_or_default()
+                ))])
+            }
+
+            "focus_window" => {
+                let window =
+                    window_arg(args).ok_or("window is required — take it from list_windows")?;
+                let info = uia::window_info(Some(&window)).map_err(|e| e.to_string())?;
+                refuse_blocked(&info)?;
+                let done = uia::focus_window(&window).map_err(|e| e.to_string())?;
+                Ok(vec![text(done.render())])
+            }
+
+            "set_value" => {
+                let window = window_arg(args);
+                let id = element_id(args)?;
+                let value = args
+                    .get("value")
+                    .and_then(Value::as_str)
+                    .ok_or("value is required")?;
+                let info = uia::window_info(window.as_deref()).map_err(|e| e.to_string())?;
+                refuse_blocked(&info)?;
+                let done = uia::set_value(Some(&info.id), id, value).map_err(|e| e.to_string())?;
+                Ok(vec![text(done.render())])
+            }
+
+            "element_action" => {
+                let window = window_arg(args);
+                let id = element_id(args)?;
+                let action = args
+                    .get("action")
+                    .and_then(Value::as_str)
+                    .ok_or("action is required, e.g. \"press\"")?;
+                let info = uia::window_info(window.as_deref()).map_err(|e| e.to_string())?;
+                refuse_blocked(&info)?;
+                let done = uia::act(Some(&info.id), id, action).map_err(|e| e.to_string())?;
+                Ok(vec![text(done.render())])
             }
 
             "move_mouse" => {
                 let at = point(args)?;
+                guard_focus(None)?;
                 self.input.move_mouse(at).map_err(|e| e.to_string())?;
                 Ok(vec![text(format!("moved to {},{}", at.x, at.y))])
             }
 
             "click" => {
                 let at = point(args)?;
+                guard_focus(None)?;
+                refuse_point(at)?;
                 let button = match args.get("button").and_then(Value::as_str) {
                     Some("right") => MouseButton::Right,
                     Some("middle") => MouseButton::Middle,
@@ -491,35 +728,29 @@ impl Server {
                     .and_then(Value::as_u64)
                     .unwrap_or(u64::from(super::limits::get().tree_depth))
                     as u32;
-                let tree = super::uia::focused_window_tree(depth).map_err(|e| e.to_string())?;
+                let tree = uia::window_tree(window_arg(args).as_deref(), depth)
+                    .map_err(|e| e.to_string())?;
+                // Walked in this process, and discarded unread when blocked.
+                refuse_app(&tree.app)?;
                 Ok(vec![text(format!("{}\n{UNTRUSTED}", tree.render()))])
             }
 
             "click_element" => {
-                let id =
-                    args.get("id")
-                        .and_then(Value::as_u64)
-                        .ok_or("id is required — take it from ui_tree")? as u32;
+                let window = window_arg(args);
+                let id = element_id(args)?;
                 let button = match args.get("button").and_then(Value::as_str) {
                     Some("right") => MouseButton::Right,
                     Some("middle") => MouseButton::Middle,
                     _ => MouseButton::Left,
                 };
+                let info = uia::window_info(window.as_deref()).map_err(|e| e.to_string())?;
+                refuse_blocked(&info)?;
 
                 // RE-READ, never trust the id's remembered rectangle. Between
                 // the agent reading a tree and acting on it a list can scroll
                 // or a dialog can move, and clicking the old position would hit
                 // whatever took its place — silently, and on the wrong control.
-                let element = super::uia::locate(id, super::limits::get().tree_depth)
-                    .map_err(|e| e.to_string())?
-                    .ok_or_else(|| {
-                        format!(
-                            "element e{id} is no longer in the focused window. \
-                             The UI changed — call ui_tree again rather than \
-                             clicking where it used to be."
-                        )
-                    })?;
-
+                let element = live_element(&info, id)?;
                 if !element.enabled {
                     return Err(format!(
                         "e{id} \"{}\" is disabled; clicking it would do nothing",
@@ -528,11 +759,17 @@ impl Server {
                 }
 
                 let at = element.click_point();
+                // The element is in an allowed window, but its centre may be
+                // under a blocked one (or scrolled out of its own view).
+                refuse_point(at)?;
                 self.input.click(at, button, 1).map_err(|e| e.to_string())?;
 
                 Ok(vec![text(format!(
-                    "clicked e{id} \"{}\" ({:?}) at {},{}",
-                    element.name, element.role, at.x, at.y
+                    "clicked {} at {},{} (unverified: a click has no state to read back; look \
+                     at the result)",
+                    element.label(),
+                    at.x,
+                    at.y
                 ))])
             }
 
@@ -541,10 +778,12 @@ impl Server {
                     .get("text")
                     .and_then(Value::as_str)
                     .ok_or("text is required")?;
+                let focused = guard_focus(window_arg(args).as_deref())?;
                 self.input.type_text(body).map_err(|e| e.to_string())?;
                 Ok(vec![text(format!(
-                    "typed {} characters",
-                    body.chars().count()
+                    "typed {} characters{} (unverified: keystrokes are not read back)",
+                    body.chars().count(),
+                    into(&focused)
                 ))])
             }
 
@@ -553,10 +792,18 @@ impl Server {
                     .get("text")
                     .and_then(Value::as_str)
                     .ok_or("text is required")?;
-                self.input.paste_text(body).map_err(|e| e.to_string())?;
+                let focused = guard_focus(window_arg(args).as_deref())?;
+                let restored = self.input.paste_text(body).map_err(|e| e.to_string())?;
                 Ok(vec![text(format!(
-                    "pasted {} characters (the clipboard now holds them)",
-                    body.chars().count()
+                    "pasted {} characters{} ({})",
+                    body.chars().count(),
+                    into(&focused),
+                    if restored {
+                        "the clipboard was put back as it was"
+                    } else {
+                        "the clipboard held no text before, so it now holds this; an image or \
+                         anything else that was on it is gone"
+                    }
                 ))])
             }
 
@@ -568,41 +815,84 @@ impl Server {
                     .iter()
                     .filter_map(|k| k.as_str().map(str::to_string))
                     .collect();
+                let focused = guard_focus(window_arg(args).as_deref())?;
                 self.input.chord(&keys).map_err(|e| e.to_string())?;
-                Ok(vec![text(format!("pressed {}", keys.join("+")))])
+                Ok(vec![text(format!(
+                    "pressed {}{}",
+                    keys.join("+"),
+                    into(&focused)
+                ))])
             }
 
             "scroll" => {
-                let dx = args.get("dx").and_then(Value::as_i64).unwrap_or(0) as i32;
-                let dy = args.get("dy").and_then(Value::as_i64).unwrap_or(0) as i32;
+                let dx = scroll_steps(args, "dx")?;
+                let dy = scroll_steps(args, "dy")?;
                 if dx == 0 && dy == 0 {
                     return Err("scroll needs a non-zero dx or dy".to_string());
                 }
+                // Over an element when one is named: the cursor goes to its
+                // centre first, since a wheel scrolls whatever is under it.
+                let over = match args.get("id") {
+                    Some(_) => {
+                        let info = uia::window_info(window_arg(args).as_deref())
+                            .map_err(|e| e.to_string())?;
+                        refuse_blocked(&info)?;
+                        let element = live_element(&info, element_id(args)?)?;
+                        refuse_point(element.click_point())?;
+                        self.input
+                            .move_mouse(element.click_point())
+                            .map_err(|e| e.to_string())?;
+                        format!(" over {}", element.label())
+                    }
+                    None => {
+                        guard_focus(None)?;
+                        refuse_point(self.input.cursor_position().map_err(|e| e.to_string())?)?;
+                        String::new()
+                    }
+                };
                 self.input.scroll(dx, dy).map_err(|e| e.to_string())?;
-                Ok(vec![text(format!("scrolled dx={dx} dy={dy}"))])
+                Ok(vec![text(format!("scrolled dx={dx} dy={dy}{over}"))])
             }
 
             "drag" => {
-                let from = PhysicalPoint {
-                    x: args
-                        .get("from_x")
-                        .and_then(Value::as_i64)
-                        .ok_or("from_x is required")? as i32,
-                    y: args
-                        .get("from_y")
-                        .and_then(Value::as_i64)
-                        .ok_or("from_y is required")? as i32,
+                let (from, to) = match (args.get("from_id"), args.get("to_id")) {
+                    (Some(from), Some(to)) => {
+                        let info = uia::window_info(window_arg(args).as_deref())
+                            .map_err(|e| e.to_string())?;
+                        refuse_blocked(&info)?;
+                        let id = |v: &Value, what: &str| {
+                            v.as_u64()
+                                .map(|n| n as u32)
+                                .ok_or(format!("{what} must be an element id from ui_tree"))
+                        };
+                        (
+                            live_element(&info, id(from, "from_id")?)?.click_point(),
+                            live_element(&info, id(to, "to_id")?)?.click_point(),
+                        )
+                    }
+                    _ => {
+                        guard_focus(None)?;
+                        let n = |key: &str| {
+                            coordinate(args, key)?.ok_or(format!(
+                                "{key} is required (or from_id and to_id from ui_tree)"
+                            ))
+                        };
+                        (
+                            PhysicalPoint {
+                                x: n("from_x")?,
+                                y: n("from_y")?,
+                            },
+                            PhysicalPoint {
+                                x: n("to_x")?,
+                                y: n("to_y")?,
+                            },
+                        )
+                    }
                 };
-                let to = PhysicalPoint {
-                    x: args
-                        .get("to_x")
-                        .and_then(Value::as_i64)
-                        .ok_or("to_x is required")? as i32,
-                    y: args
-                        .get("to_y")
-                        .and_then(Value::as_i64)
-                        .ok_or("to_y is required")? as i32,
-                };
+                // Both ends: the press picks up what is under `from`, and the
+                // release drops onto whatever is under `to`.
+                refuse_point(from)?;
+                refuse_point(to)?;
                 let button = match args.get("button").and_then(Value::as_str) {
                     Some("right") => MouseButton::Right,
                     Some("middle") => MouseButton::Middle,
@@ -628,18 +918,100 @@ struct Failure {
 }
 
 fn point(args: &Value) -> Result<PhysicalPoint, String> {
-    let x = args
-        .get("x")
-        .and_then(Value::as_i64)
-        .ok_or("x is required and must be a number")?;
-    let y = args
-        .get("y")
-        .and_then(Value::as_i64)
-        .ok_or("y is required and must be a number")?;
     Ok(PhysicalPoint {
-        x: x as i32,
-        y: y as i32,
+        x: coordinate(args, "x")?.ok_or("x is required and must be a number")?,
+        y: coordinate(args, "y")?.ok_or("y is required and must be a number")?,
     })
+}
+
+fn element_id(args: &Value) -> Result<u32, String> {
+    args.get("id")
+        .and_then(Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+        .ok_or_else(|| "id is required — take it from ui_tree".to_string())
+}
+
+/// The element `id` in `window` as it is NOW, re-read from the live tree.
+fn live_element(window: &WindowInfo, id: u32) -> Result<uia::Element, String> {
+    uia::locate(Some(&window.id), id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| {
+            format!(
+                "element e{id} is no longer in window \"{}\". The UI changed — call ui_tree \
+                 again rather than acting where it used to be.",
+                window.title
+            )
+        })
+}
+
+/// A screenshot of one window, or of the primary display — refused when a
+/// blocked application's window is in what would be captured.
+fn shoot(window: Option<&str>, options: CaptureOptions) -> Result<Vec<Value>, String> {
+    let (shot, of) = match window {
+        Some(id) => {
+            let info = uia::window_info(Some(id)).map_err(|e| e.to_string())?;
+            refuse_blocked(&info)?;
+            if let Some(why) = uia::window_position_unknown(&info) {
+                return Err(format!(
+                    "{why} so that window's area cannot be cut out of the screen; take a \
+                     screenshot without `window`"
+                ));
+            }
+            refuse_region(info.rect)?;
+            let shot = capture::capture_region(info.rect, options).map_err(|e| e.to_string())?;
+            (shot, Some(info))
+        }
+        None => {
+            // Every window on screen is in a full capture, so every one is
+            // checked — and a desktop that cannot list them is refused.
+            if let Some(blocked) = blocked_windows()?.first() {
+                return Err(format!(
+                    "refused: a window of \"{}\" is on screen, and it is blocked; a full \
+                     screenshot would show it. Pass `window` to capture one window, or close \
+                     or minimise it.",
+                    blocked.app
+                ));
+            }
+            (
+                capture::capture_primary(options).map_err(|e| e.to_string())?,
+                None,
+            )
+        }
+    };
+    let (width, height) = shot.model_size();
+    let t = shot.transform;
+    Ok(vec![
+        // The transform travels BESIDE the image, because a coordinate the
+        // model names is meaningless without it: physical = origin +
+        // image point * (region / image size).
+        text(
+            json!({
+                "width": width,
+                "height": height,
+                "origin": {"x": t.origin.x, "y": t.origin.y},
+                "region": {"width": t.source_width, "height": t.source_height},
+                "monitor_id": shot.monitor_id,
+                "monitor": shot.monitor_name,
+                "window": of.as_ref().map(|w| &w.id),
+                "note": UNTRUSTED,
+            })
+            .to_string(),
+        ),
+        image(&shot.bytes, shot.format),
+    ])
+}
+
+/// The screenshot an action asked for with `screenshot_after`: of the window
+/// it named, else of the focused window, after the screen has had a moment
+/// to change. A failure is reported beside the action's result rather than
+/// replacing it — the action itself already happened.
+fn after_shot(args: &Value) -> Vec<Value> {
+    std::thread::sleep(super::limits::get().settle);
+    let window = window_arg(args).or_else(|| uia::foreground().ok().flatten().map(|w| w.id));
+    match shoot(window.as_deref(), CaptureOptions::default()) {
+        Ok(content) => content,
+        Err(why) => vec![text(format!("(no screenshot after: {why})"))],
+    }
 }
 
 fn text(body: String) -> Value {
@@ -675,7 +1047,103 @@ fn error_response(id: Value, code: i64, message: &str) -> String {
 /// Every desktop tool, in MCP's shape. The toolbox offers these same
 /// definitions to a model (`toolbox::desktop`), so they are written once.
 pub(crate) fn tool_definitions() -> Vec<Value> {
+    /// The tools that take a `window` from list_windows.
+    const WINDOWED: &[&str] = &[
+        "screenshot",
+        "ui_tree",
+        "click_element",
+        "set_value",
+        "element_action",
+        "focus_window",
+        "type_text",
+        "paste_text",
+        "key",
+        "scroll",
+        "drag",
+    ];
+    let mut tools = base_definitions();
+    for tool in &mut tools {
+        let name = tool["name"].as_str().unwrap_or_default().to_string();
+        let properties = &mut tool["inputSchema"]["properties"];
+        if WINDOWED.contains(&name.as_str()) {
+            let what = match name.as_str() {
+                "type_text" | "paste_text" | "key" => {
+                    "The window this input is meant for, from list_windows. If it is not the \
+                     focused window the call is REFUSED rather than typing somewhere else."
+                }
+                "screenshot" => "Capture only this window, from list_windows.",
+                _ => "The window, from list_windows. Default: the focused window.",
+            };
+            properties["window"] = json!({"type": "string", "description": what});
+        }
+        if ACTING.contains(&name.as_str()) {
+            properties["screenshot_after"] = json!({
+                "type": "boolean",
+                "description": "Also return a screenshot of the window afterwards, to check \
+                                the result. Default false."
+            });
+        }
+    }
+    tools
+}
+
+fn base_definitions() -> Vec<Value> {
     vec![
+        json!({
+            "name": "list_windows",
+            "description": format!(
+                "Every top-level window: id, title, app, pid, whether it is focused, and its \
+                 rectangle. Pass an id as `window` to ui_tree, screenshot and the actions to \
+                 work on that window rather than whichever has focus. Windows of blocked \
+                 applications (password managers) are listed as blocked, without a title. \
+                 {UNTRUSTED}"
+            ),
+            "inputSchema": {"type": "object", "properties": {}},
+        }),
+        json!({
+            "name": "focus_window",
+            "description": "Bring a window to the front so keystrokes go to it. Reports \
+                            whether it actually came to the front.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "required": ["window"],
+            },
+        }),
+        json!({
+            "name": "set_value",
+            "description": "Set a control's value (a text field, a slider) directly through \
+                            the accessibility interface, by the id ui_tree gave it — no \
+                            typing, no focus needed, no clipboard. PREFER THIS over \
+                            type_text for a field. The value is read back where allowed and \
+                            the result says whether it matched (a password field is never \
+                            read back).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer", "description": "The eN number from ui_tree."},
+                    "value": {"type": "string"}
+                },
+                "required": ["id", "value"],
+            },
+        }),
+        json!({
+            "name": "element_action",
+            "description": "Run a control's own action by the id ui_tree gave it, without \
+                            the mouse: the cursor does not move and no other window gets \
+                            the click. Actions: press, toggle, expand, collapse, select, \
+                            scroll_into_view, focus, default (macOS also show_menu, \
+                            confirm, increment, decrement, cancel, raise). An action the \
+                            control does not have is refused with the ones it does.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer", "description": "The eN number from ui_tree."},
+                    "action": {"type": "string"}
+                },
+                "required": ["id", "action"],
+            },
+        }),
         json!({
             "name": "screen_info",
             "description": "Describe every display: id, position, size in physical pixels, \
@@ -690,9 +1158,11 @@ pub(crate) fn tool_definitions() -> Vec<Value> {
         json!({
             "name": "screenshot",
             "description": format!(
-                "Capture the primary display, downscaled so the longest edge fits `max_edge`. \
-                 Returns the image AND the size the image was sent at; name coordinates in \
-                 THAT space, not the display's. {UNTRUSTED}"
+                "Capture the primary display, or one `window`, downscaled so the longest edge \
+                 fits `max_edge`. Returns the image AND the size it was sent at, its origin \
+                 and the region it covers: physical = origin + image point * region / size. \
+                 A full capture is refused while a blocked application's window is on \
+                 screen. {UNTRUSTED}"
             ),
             "inputSchema": {
                 "type": "object",
@@ -712,8 +1182,9 @@ pub(crate) fn tool_definitions() -> Vec<Value> {
         json!({
             "name": "ui_tree",
             "description": format!(
-                "The focused window's controls, with names, roles and exact rectangles. \
-                 PREFER THIS OVER screenshot: clicking by element id hits the true centre \
+                "A window's controls (the focused one, or `window` from list_windows), with \
+                 names, roles and exact rectangles; password fields are marked and never \
+                 read. PREFER THIS OVER screenshot: clicking by element id hits the true centre \
                  of a named control, where a coordinate read off a downscaled image is a \
                  guess that can miss silently. Falls back to screenshot for canvas, images \
                  and custom-drawn UI, which expose no tree. {UNTRUSTED}"
@@ -761,10 +1232,10 @@ pub(crate) fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "paste_text",
-            "description": "Put text on the clipboard and paste it with Ctrl+V. Much more \
-                            reliable than type_text for long or non-ASCII text, and near \
-                            instant. NOTE it REPLACES the clipboard contents and does not \
-                            restore them.",
+            "description": "Put text on the clipboard and paste it with Ctrl+V (Cmd+V on \
+                            macOS). Much more reliable than type_text for long or non-ASCII \
+                            text, and near instant. The clipboard's previous text is put \
+                            back afterwards.",
             "inputSchema": {
                 "type": "object",
                 "properties": {"text": {"type": "string"}},
@@ -788,13 +1259,14 @@ pub(crate) fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "scroll",
-            "description": "Scroll at the cursor. Positive dy scrolls down, positive dx right. \
-                            Move the cursor over the thing to scroll first.",
+            "description": "Scroll. Positive dy scrolls down, positive dx right. Over the \
+                            element `id` from ui_tree when given; otherwise at the cursor.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "dx": {"type": "integer"},
-                    "dy": {"type": "integer"}
+                    "dy": {"type": "integer"},
+                    "id": {"type": "integer", "description": "Scroll over this element."}
                 },
             },
         }),
@@ -802,17 +1274,19 @@ pub(crate) fn tool_definitions() -> Vec<Value> {
             "name": "drag",
             "description": "Press at one point, move in steps, release at another. Stepped \
                             rather than teleported, because many drag targets ignore a single \
-                            jump. Coordinates are PHYSICAL pixels.",
+                            jump. Either from_id and to_id (elements from ui_tree, dragged \
+                            centre to centre) or the four coordinates in PHYSICAL pixels.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "from_id": {"type": "integer"},
+                    "to_id": {"type": "integer"},
                     "from_x": {"type": "integer"},
                     "from_y": {"type": "integer"},
                     "to_x": {"type": "integer"},
                     "to_y": {"type": "integer"},
                     "button": {"type": "string", "enum": ["left", "right", "middle"]}
                 },
-                "required": ["from_x", "from_y", "to_x", "to_y"],
             },
         }),
         json!({
@@ -1440,9 +1914,9 @@ mod tests {
             );
         }
 
-        /// paste_text costs the clipboard, and that has to be visible.
+        /// paste_text uses the clipboard and puts it back, and says so.
         #[test]
-        fn paste_warns_that_it_replaces_the_clipboard() {
+        fn paste_says_it_puts_the_clipboard_back() {
             let tools = tool_definitions();
             let paste = tools
                 .iter()
@@ -1450,8 +1924,8 @@ mod tests {
                 .expect("a paste tool");
             let description = paste["description"].as_str().expect("a description");
             assert!(
-                description.contains("REPLACES the clipboard"),
-                "an agent must know it destroys the clipboard: {description}"
+                description.contains("clipboard") && description.contains("put back"),
+                "an agent must know what happens to the clipboard: {description}"
             );
         }
 
@@ -1497,8 +1971,11 @@ mod tests {
             let why = reply["result"]["content"][0]["text"]
                 .as_str()
                 .expect("a reason");
+            // An id no tree showed is refused before any walk: either no
+            // tree of that window was read, or it was not in the last one.
             assert!(
-                why.contains("no longer")
+                why.contains("ui_tree")
+                    || why.contains("no longer")
                     || why.contains("no focused")
                     || why.contains("unavailable"),
                 "the refusal must explain, not just fail: {why}"

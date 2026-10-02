@@ -14,8 +14,15 @@
 > backend for input, `xclip`/`xsel` for the clipboard, and the AT-SPI2 tree over zbus,
 > kept to the applications whose own `DISPLAY` is the server's. Driven live in Docker
 > (Debian 13): a GTK3 window walked at true screen positions, clicked by element, typed
-> and pasted into; a GTK4 window's tree is REFUSED, because GTK 4.18.6 reports every
-> control at (0,0) — pixels and keys still work there. The pixel viewer (14b) is not built.
+> and pasted into; a GTK4 window's tree comes with a NOTE instead of positions, because
+> GTK 4.18.6 reports every control at (0,0) — `set_value`/`element_action` work on it by
+> id, clicking by id is refused. The pixel viewer (14b) is not built.
+>
+> **Second round, 2026-10-01** (`docs/ROADMAP.md` B1): `list_windows`, `focus_window`,
+> `set_value`, `element_action`, `window` and `screenshot_after` on every tool, scroll and
+> drag by element, password managers blocked (`desktop_limits.blocked_apps` adds more).
+> An element id is acted on only while the control the last `ui_tree` showed there is
+> still there; clicks and captures never land inside a blocked window's rectangle.
 >
 > **The invariant in 4c, as built:** one coordinate space at the tool surface — physical
 > pixels on Windows and X11, **points** on macOS (the space CGEvent and AXUIElement both

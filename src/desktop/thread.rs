@@ -262,22 +262,42 @@ impl InputThread {
         self.send(Command::Type(text.to_string())).map(|_| ())
     }
 
-    /// Put text on the clipboard and paste it with Ctrl+V.
+    /// Put text on the clipboard, paste it (Ctrl+V; Cmd+V on macOS), and put
+    /// the operator's clipboard back.
     ///
     /// Far more reliable than typing for long or non-ASCII text, and near
     /// instant where typing is linear in length.
     ///
-    /// **It costs the clipboard.** Whatever the operator had copied is gone,
-    /// and this does not restore it — restoring would need to read the previous
-    /// contents, which on an agent's desktop may be something it should not
-    /// see. Losing a clipboard is the smaller harm, and it is stated rather
-    /// than hidden.
-    pub fn paste_text(&self, text: &str) -> Result<(), DesktopError> {
+    /// The previous text is read into THIS process only — never returned to
+    /// the agent or journalled — and restored after
+    /// `desktop_limits.paste_restore_delay_ms`, since the application reads a
+    /// paste asynchronously. Returns whether it was restored: a clipboard that
+    /// held no text (an image, nothing) cannot be, and the caller says so.
+    /// A clipboard that cannot be READ refuses the paste before touching it,
+    /// rather than replacing what it holds with no way back.
+    pub fn paste_text(&self, text: &str) -> Result<bool, DesktopError> {
         if text.is_empty() {
-            return Ok(());
+            return Ok(true);
         }
+        let previous = get_clipboard().map_err(|why| {
+            DesktopError::Os(format!(
+                "refused: the clipboard could not be read ({why}), so it could not be put back \
+                 after the paste; use type_text instead"
+            ))
+        })?;
         set_clipboard(text)?;
-        self.chord(&["control".to_string(), "v".to_string()])
+        let pasted = self.chord(&["cmdorctrl".to_string(), "v".to_string()]);
+        // Restored even when the paste failed, so a failure never also
+        // costs the operator their clipboard.
+        let restored = match previous {
+            Some(old) => {
+                std::thread::sleep(super::limits::get().paste_restore_delay);
+                set_clipboard(&old).is_ok()
+            }
+            None => false,
+        };
+        pasted?;
+        Ok(restored)
     }
 
     /// Press keys together, releasing in reverse order.
@@ -411,6 +431,15 @@ fn allow(recent: &mut VecDeque<Instant>, now: Instant, cap: usize) -> bool {
 pub fn key_from_name(name: &str) -> Result<Key, DesktopError> {
     let lower = name.trim().to_ascii_lowercase();
     Ok(match lower.as_str() {
+        // The platform's shortcut modifier, so one chord works everywhere:
+        // ["cmdorctrl","c"] is Cmd+C on macOS and Ctrl+C elsewhere.
+        "cmdorctrl" | "commandorcontrol" | "mod" => {
+            if cfg!(target_os = "macos") {
+                Key::Meta
+            } else {
+                Key::Control
+            }
+        }
         "control" | "ctrl" => Key::Control,
         "shift" => Key::Shift,
         "alt" => Key::Alt,
@@ -450,13 +479,47 @@ pub fn key_from_name(name: &str) -> Result<Key, DesktopError> {
                 _ => {
                     return Err(DesktopError::Os(format!(
                         "unknown key '{name}'. Use a single character, or one of: \
-                         control shift alt meta enter tab escape backspace delete \
+                         cmdorctrl control shift alt meta enter tab escape backspace delete \
                          space up down left right home end pageup pagedown f1-f12"
                     )))
                 }
             }
         }
     })
+}
+
+/// The clipboard's text now: `Some` when it holds text, `None` when it holds
+/// none (nothing, or only an image), and an error when it could not be read
+/// at all — which is not the same as empty, since restoring "nothing" would
+/// then wipe what was there.
+#[cfg(windows)]
+fn get_clipboard() -> Result<Option<String>, String> {
+    use clipboard_win::{formats, raw};
+    // Another program may hold the clipboard open for a moment; the open
+    // is retried before it counts as unreadable.
+    let _open = clipboard_win::Clipboard::new_attempts(10).map_err(|e| e.to_string())?;
+    if !raw::is_format_avail(formats::CF_UNICODETEXT) {
+        return Ok(None);
+    }
+    // UTF-8 from the clipboard's UTF-16, converted by Windows itself.
+    let mut bytes = Vec::new();
+    raw::get_string(&mut bytes).map_err(|e| e.to_string())?;
+    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+#[cfg(target_os = "macos")]
+fn get_clipboard() -> Result<Option<String>, String> {
+    super::macos::get_clipboard()
+}
+
+#[cfg(target_os = "linux")]
+fn get_clipboard() -> Result<Option<String>, String> {
+    super::linux::get_clipboard()
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+fn get_clipboard() -> Result<Option<String>, String> {
+    Err("no clipboard on this platform".to_string())
 }
 
 /// Put text on the Windows clipboard.

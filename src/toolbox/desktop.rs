@@ -34,10 +34,19 @@ use super::image::ToolOutput;
 use super::mcp_client::{ChildLink, Link, McpClient};
 
 /// The desktop tools that only look.
-pub(super) const OBSERVING: &[&str] = &["screen_info", "screenshot", "ui_tree", "cursor_position"];
+pub(super) const OBSERVING: &[&str] = &[
+    "screen_info",
+    "screenshot",
+    "ui_tree",
+    "cursor_position",
+    "list_windows",
+];
 /// The desktop tools that act on the machine.
 pub(super) const ACTING: &[&str] = &[
     "click_element",
+    "set_value",
+    "element_action",
+    "focus_window",
     "type_text",
     "paste_text",
     "key",

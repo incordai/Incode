@@ -19,7 +19,7 @@
 
 use std::ffi::{c_char, c_void};
 
-use super::uia::{role_of_ax, walk, Element, Tree};
+use super::uia::{find, role_of_ax, walk, Done, Element, Tree, Want, WindowInfo};
 use super::{DesktopError, Rect};
 
 type CFTypeRef = *const c_void;
@@ -63,11 +63,31 @@ extern "C" {
     ) -> AxError;
     fn AXUIElementSetMessagingTimeout(element: CFTypeRef, seconds: f32) -> AxError;
     fn AXValueGetValue(value: CFTypeRef, kind: u32, out: *mut c_void) -> Boolean;
+    fn AXUIElementCreateApplication(pid: i32) -> CFTypeRef;
+    fn AXUIElementGetPid(element: CFTypeRef, pid: *mut i32) -> AxError;
+    fn AXUIElementSetAttributeValue(
+        element: CFTypeRef,
+        attribute: CFTypeRef,
+        value: CFTypeRef,
+    ) -> AxError;
+    fn AXUIElementPerformAction(element: CFTypeRef, action: CFTypeRef) -> AxError;
+    fn AXUIElementCopyActionNames(element: CFTypeRef, names: *mut CFTypeRef) -> AxError;
+    // Not in the public headers, but exported by HIServices since 10.x and
+    // the one link from an accessibility window to the window server's own
+    // number for it — the identity a window keeps while others open, close
+    // and reorder around it.
+    fn _AXUIElementGetWindow(element: CFTypeRef, window: *mut u32) -> AxError;
 }
+
+/// `kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements`.
+const CG_ON_SCREEN_WITHOUT_DESKTOP: u32 = 1 | 16;
+/// `kCFNumberSInt64Type`.
+const CF_NUMBER_SINT64: CFIndex = 4;
 
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
     fn CGPreflightScreenCaptureAccess() -> bool;
+    fn CGWindowListCopyWindowInfo(option: u32, relative_to: u32) -> CFTypeRef;
 }
 
 #[link(name = "Security", kind = "framework")]
@@ -98,6 +118,12 @@ extern "C" {
         encoding: u32,
         external: Boolean,
     ) -> CFTypeRef;
+    static kCFBooleanTrue: CFTypeRef;
+    fn CFEqual(a: CFTypeRef, b: CFTypeRef) -> Boolean;
+    fn CFDictionaryGetValue(dictionary: CFTypeRef, key: CFTypeRef) -> CFTypeRef;
+    fn CFDictionaryGetTypeID() -> CFTypeId;
+    fn CFNumberGetTypeID() -> CFTypeId;
+    fn CFNumberGetValue(number: CFTypeRef, kind: CFIndex, out: *mut c_void) -> Boolean;
     fn CFStringGetLength(string: CFTypeRef) -> CFIndex;
     fn CFStringGetMaximumSizeForEncoding(len: CFIndex, encoding: u32) -> CFIndex;
     fn CFStringGetCString(
@@ -133,6 +159,14 @@ impl Drop for Owned {
         // SAFETY: constructed only from a non-null reference this module owns
         // (a Create/Copy result or a retain), released exactly once here.
         unsafe { CFRelease(self.0) }
+    }
+}
+
+impl Clone for Owned {
+    fn clone(&self) -> Self {
+        // SAFETY: `self.0` is a live reference this value owns; the retain
+        // gives the clone its own, released by its own drop.
+        Owned(unsafe { CFRetain(self.0) })
     }
 }
 
@@ -311,9 +345,17 @@ fn struct_attribute<T: Default>(element: &Owned, name: &str, kind: u32) -> Optio
 fn describe(element: &Owned, id: u32, depth: u32) -> Element {
     let role = text_attribute(element, "AXRole").unwrap_or_default();
     let subrole = text_attribute(element, "AXSubrole");
+    let secret = is_secure(&role, subrole.as_deref());
+    // A secure field's AXValue is NEVER read: only its title or description
+    // names it. Every other element may be named by its value, which is how
+    // static text says what it says.
     let name = text_attribute(element, "AXTitle")
         .or_else(|| text_attribute(element, "AXDescription"))
-        .or_else(|| text_attribute(element, "AXValue"))
+        .or_else(|| {
+            (!secret)
+                .then(|| text_attribute(element, "AXValue"))
+                .flatten()
+        })
         .unwrap_or_default();
     let at: CgPoint =
         struct_attribute(element, "AXPosition", AX_VALUE_CG_POINT).unwrap_or_default();
@@ -332,7 +374,15 @@ fn describe(element: &Owned, id: u32, depth: u32) -> Element {
         // Most static elements do not carry AXEnabled at all; only an element
         // that says it is disabled is marked so.
         enabled: bool_attribute(element, "AXEnabled").unwrap_or(true),
+        secret,
     }
+}
+
+/// Whether an element is a password field: NSSecureTextField reports the
+/// `AXSecureTextField` subrole under `AXTextField`, and some toolkits use it
+/// as the role itself. Pure.
+pub(crate) fn is_secure(role: &str, subrole: Option<&str>) -> bool {
+    role == "AXSecureTextField" || subrole == Some("AXSecureTextField")
 }
 
 /// An element's children, each owned.
@@ -352,33 +402,455 @@ fn children(element: &Owned) -> Vec<Owned> {
     }
 }
 
-/// The focused window's accessibility tree.
-pub(crate) fn focused_window_tree(max_depth: u32) -> Result<Tree, DesktopError> {
+fn ax_timeout() -> f32 {
+    super::limits::get()
+        .accessibility_call_timeout
+        .as_secs_f32()
+}
+
+/// The system-wide accessibility element, with the configured timeout.
+fn system_wide() -> Result<Owned, DesktopError> {
     require(Grant::Accessibility)?;
-    // SAFETY: creates the system-wide element, owned by `system`. The timeout
-    // set on it is the global one for every later request in this process.
+    // SAFETY: creates the system-wide element, owned by the result. The
+    // timeout set on it is the global one for every later request.
     let system = Owned::take(unsafe { AXUIElementCreateSystemWide() })
         .ok_or_else(|| DesktopError::Os("the accessibility service is unavailable".to_string()))?;
-    let timeout = super::limits::get()
-        .accessibility_call_timeout
-        .as_secs_f32();
-    unsafe { AXUIElementSetMessagingTimeout(system.0, timeout) };
+    unsafe { AXUIElementSetMessagingTimeout(system.0, ax_timeout()) };
+    Ok(system)
+}
 
-    let app = attribute(&system, "AXFocusedApplication")
-        .ok_or_else(|| DesktopError::Os("no application has the focus".to_string()))?;
-    let window = attribute(&app, "AXFocusedWindow")
+/// Set one attribute on an element; whether the element took it.
+fn set_attribute(element: &Owned, name: &str, value: CFTypeRef) -> bool {
+    let Some(key) = cf_string(name) else {
+        return false;
+    };
+    // SAFETY: `element` and `key` are live, owned references; `value` is a
+    // live CF object the caller holds for the length of the call.
+    unsafe { AXUIElementSetAttributeValue(element.0, key.0, value) == AX_SUCCESS }
+}
+
+/// An application's accessibility element.
+///
+/// Chromium and Electron build their accessibility tree only for a client
+/// that asks — `AXManualAccessibility`, the attribute Electron documents for
+/// exactly this — so it is set on every application looked at. One that does
+/// not know it ignores it.
+fn application(pid: i32) -> Option<Owned> {
+    // SAFETY: creates an element for a pid; owned by the result.
+    let app = Owned::take(unsafe { AXUIElementCreateApplication(pid) })?;
+    unsafe { AXUIElementSetMessagingTimeout(app.0, ax_timeout()) };
+    // SAFETY: kCFBooleanTrue is a static CoreFoundation constant.
+    set_attribute(&app, "AXManualAccessibility", unsafe { kCFBooleanTrue });
+    Some(app)
+}
+
+fn pid_of(element: &Owned) -> Option<i32> {
+    let mut pid = 0i32;
+    // SAFETY: `element` is live; `pid` is this function's own.
+    (unsafe { AXUIElementGetPid(element.0, &mut pid) } == AX_SUCCESS).then_some(pid)
+}
+
+/// The window server's number for an accessibility window.
+fn window_number(window: &Owned) -> Option<u32> {
+    let mut number = 0u32;
+    // SAFETY: `window` is live; `number` is this function's own.
+    (unsafe { _AXUIElementGetWindow(window.0, &mut number) } == AX_SUCCESS && number != 0)
+        .then_some(number)
+}
+
+fn same(a: &Owned, b: &Owned) -> bool {
+    // SAFETY: both are live, owned references.
+    unsafe { CFEqual(a.0, b.0) != 0 }
+}
+
+/// The elements of an array attribute, each owned.
+fn array_attribute(element: &Owned, name: &str) -> Vec<Owned> {
+    let Some(array) = attribute(element, name) else {
+        return Vec::new();
+    };
+    // SAFETY: type checked before use; each item is retained into its own
+    // `Owned` before `array` is released.
+    unsafe {
+        if CFGetTypeID(array.0) != CFArrayGetTypeID() {
+            return Vec::new();
+        }
+        (0..CFArrayGetCount(array.0))
+            .filter_map(|i| Owned::retain(CFArrayGetValueAtIndex(array.0, i)))
+            .collect()
+    }
+}
+
+/// The pids that own a window on screen, with the owner's name, in the
+/// window server's front-to-back order. Every layer counts, not only
+/// ordinary windows: a password manager's menu-bar popover sits above them,
+/// and a check that skipped it would let a click land on it.
+fn window_owners() -> Vec<(i32, String)> {
+    // SAFETY: a copy of the window list, owned by `list`.
+    let Some(list) =
+        Owned::take(unsafe { CGWindowListCopyWindowInfo(CG_ON_SCREEN_WITHOUT_DESKTOP, 0) })
+    else {
+        return Vec::new();
+    };
+    let number = |dict: CFTypeRef, key: &str| -> Option<i64> {
+        let key = cf_string(key)?;
+        // SAFETY: `dict` is a live dictionary from `list`; the value is
+        // borrowed and type checked before it is read.
+        unsafe {
+            let value = CFDictionaryGetValue(dict, key.0);
+            if value.is_null() || CFGetTypeID(value) != CFNumberGetTypeID() {
+                return None;
+            }
+            let mut out = 0i64;
+            (CFNumberGetValue(value, CF_NUMBER_SINT64, (&mut out as *mut i64).cast()) != 0)
+                .then_some(out)
+        }
+    };
+    let mut owners: Vec<(i32, String)> = Vec::new();
+    // SAFETY: `list` is a live array of dictionaries, read only while it is
+    // held.
+    unsafe {
+        if CFGetTypeID(list.0) != CFArrayGetTypeID() {
+            return owners;
+        }
+        for i in 0..CFArrayGetCount(list.0) {
+            let dict = CFArrayGetValueAtIndex(list.0, i);
+            if dict.is_null() || CFGetTypeID(dict) != CFDictionaryGetTypeID() {
+                continue;
+            }
+            let Some(pid) = number(dict, "kCGWindowOwnerPID") else {
+                continue;
+            };
+            let pid = pid as i32;
+            if owners.iter().any(|(p, _)| *p == pid) {
+                continue;
+            }
+            let name = cf_string("kCGWindowOwnerName")
+                .map(|key| CFDictionaryGetValue(dict, key.0))
+                .and_then(Owned::retain)
+                .as_ref()
+                .and_then(rust_string)
+                .unwrap_or_default();
+            owners.push((pid, name));
+        }
+    }
+    owners
+}
+
+fn rect_of(element: &Owned) -> Rect {
+    let at: CgPoint =
+        struct_attribute(element, "AXPosition", AX_VALUE_CG_POINT).unwrap_or_default();
+    let size: CgSize = struct_attribute(element, "AXSize", AX_VALUE_CG_SIZE).unwrap_or_default();
+    Rect {
+        x: at.x.round() as i32,
+        y: at.y.round() as i32,
+        width: size.width.round() as i32,
+        height: size.height.round() as i32,
+    }
+}
+
+/// The focused application's pid and window, when there are both.
+fn focused() -> Result<Option<(i32, Owned)>, DesktopError> {
+    let system = system_wide()?;
+    let Some(app) = attribute(&system, "AXFocusedApplication") else {
+        return Ok(None);
+    };
+    let Some(pid) = pid_of(&app) else {
+        return Ok(None);
+    };
+    Ok(attribute(&app, "AXFocusedWindow")
         .or_else(|| attribute(&app, "AXMainWindow"))
-        .ok_or_else(|| DesktopError::Os("the focused application has no window".to_string()))?;
-    let root_name = text_attribute(&window, "AXTitle")
-        .or_else(|| text_attribute(&app, "AXTitle"))
-        .unwrap_or_default();
+        .map(|window| (pid, window)))
+}
 
-    let (elements, truncated) = walk(&window, max_depth, &describe, &children);
+/// `None` when the window server has no number for the window: such a
+/// window cannot be named again, so it is not offered to be.
+fn info_of(
+    pid: i32,
+    window: &Owned,
+    app: &str,
+    focus: &Option<(i32, Owned)>,
+) -> Option<WindowInfo> {
+    Some(WindowInfo {
+        id: format!("{pid}.{}", window_number(window)?),
+        title: text_attribute(window, "AXTitle").unwrap_or_default(),
+        app: app.to_string(),
+        pid: pid as u32,
+        focused: matches!(focus, Some((p, w)) if *p == pid && same(w, window)),
+        rect: rect_of(window),
+    })
+}
+
+/// The name an application goes by: its accessibility title, else the
+/// window server's owner name for the pid. Empty only when neither can be
+/// read — which the blocklist then treats as blocked.
+fn app_name(app: &Owned, pid: i32) -> String {
+    text_attribute(app, "AXTitle")
+        .filter(|name| !name.trim().is_empty())
+        .or_else(|| {
+            window_owners()
+                .into_iter()
+                .find(|(p, _)| *p == pid)
+                .map(|(_, owner)| owner)
+        })
+        .unwrap_or_default()
+}
+
+pub(crate) fn list_windows() -> Result<Vec<WindowInfo>, DesktopError> {
+    let focus = focused()?;
+    let mut out = Vec::new();
+    for (pid, owner) in window_owners() {
+        let Some(app) = application(pid) else {
+            continue;
+        };
+        let name = text_attribute(&app, "AXTitle")
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or(owner);
+        for window in array_attribute(&app, "AXWindows") {
+            if bool_attribute(&window, "AXMinimized") == Some(true) {
+                continue;
+            }
+            out.extend(info_of(pid, &window, &name, &focus));
+        }
+    }
+    Ok(out)
+}
+
+pub(crate) fn foreground() -> Result<Option<WindowInfo>, DesktopError> {
+    let focus = focused()?;
+    let Some((pid, window)) = &focus else {
+        return Ok(None);
+    };
+    let Some(app) = application(*pid) else {
+        return Ok(None);
+    };
+    let name = app_name(&app, *pid);
+    Ok(info_of(*pid, window, &name, &focus))
+}
+
+/// `pid.number`, as [`list_windows`] gives it: the owner's pid and the
+/// window server's number for the window.
+pub(crate) fn parse_window_id(id: &str) -> Option<(i32, u32)> {
+    let (pid, number) = id.trim().split_once('.')?;
+    Some((
+        pid.parse().ok().filter(|p| *p > 0)?,
+        number.parse().ok().filter(|n| *n > 0)?,
+    ))
+}
+
+/// The window `window` names, or the focused one.
+fn target(window: Option<&str>) -> Result<(Owned, WindowInfo), DesktopError> {
+    let focus = focused()?;
+    let (pid, number) = match window {
+        Some(id) => parse_window_id(id).ok_or_else(|| {
+            DesktopError::Os(format!(
+                "\"{id}\" is not a window id; take one from list_windows"
+            ))
+        })?,
+        None => {
+            let info = foreground()?.ok_or_else(|| {
+                DesktopError::Os("no application has a focused window".to_string())
+            })?;
+            parse_window_id(&info.id)
+                .ok_or_else(|| DesktopError::Os("no focused window".to_string()))?
+        }
+    };
+    let app = application(pid)
+        .ok_or_else(|| DesktopError::Os(format!("no application with pid {pid}")))?;
+    let window = array_attribute(&app, "AXWindows")
+        .into_iter()
+        .find(|w| window_number(w) == Some(number))
+        .ok_or_else(|| {
+            DesktopError::Os(format!(
+                "window {pid}.{number} is not open any more; call list_windows again"
+            ))
+        })?;
+    let name = app_name(&app, pid);
+    let info = info_of(pid, &window, &name, &focus)
+        .ok_or_else(|| DesktopError::Os(format!("window {pid}.{number} has no number")))?;
+    Ok((window, info))
+}
+
+pub(crate) fn window_info(window: Option<&str>) -> Result<WindowInfo, DesktopError> {
+    Ok(target(window)?.1)
+}
+
+pub(crate) fn tree(window: Option<&str>, max_depth: u32) -> Result<Tree, DesktopError> {
+    let (root, info) = target(window)?;
+    let (elements, truncated) = walk(&root, max_depth, &describe, &children);
     Ok(Tree {
-        root_name,
+        root_name: info.title,
+        window: info.id,
+        app: info.app,
+        no_positions: None,
         elements,
         truncated,
     })
+}
+
+fn control(
+    window: Option<&str>,
+    want: &Want,
+    max_depth: u32,
+) -> Result<(Owned, Element), DesktopError> {
+    let (root, info) = target(window)?;
+    find(&root, max_depth, &describe, &children, want)
+        .ok_or_else(|| super::uia::gone(want.id, &info))
+}
+
+pub(crate) fn set_value(
+    window: Option<&str>,
+    want: &Want,
+    max_depth: u32,
+    value: &str,
+) -> Result<Done, DesktopError> {
+    let (element, described) = control(window, want, max_depth)?;
+    let what = described.label();
+    let text =
+        cf_string(value).ok_or_else(|| DesktopError::Os("could not hold the value".to_string()))?;
+    if !set_attribute(&element, "AXValue", text.0) {
+        return Err(DesktopError::Os(format!(
+            "{what} has no value to set; click_element it and use type_text instead"
+        )));
+    }
+    if described.secret {
+        return Ok(Done::unverified(
+            format!("set {what}"),
+            "a password field is never read back",
+        ));
+    }
+    Ok(match text_attribute(&element, "AXValue") {
+        Some(now) if now == value.trim() => Done::verified(format!("set {what}")),
+        Some(now) => Done::unverified(
+            format!("set {what}"),
+            &format!(
+                "it reads back as {} characters, not the {} sent",
+                now.chars().count(),
+                value.chars().count()
+            ),
+        ),
+        None => Done::unverified(format!("set {what}"), "its value could not be read back"),
+    })
+}
+
+/// The `AX…` action for one of the shared vocabulary's names. Pure.
+pub(crate) fn ax_action(wanted: &str) -> Option<&'static str> {
+    Some(match wanted.trim().to_ascii_lowercase().as_str() {
+        "press" | "invoke" | "click" | "toggle" | "default" | "expand" | "collapse" => "AXPress",
+        "show_menu" | "menu" => "AXShowMenu",
+        "confirm" => "AXConfirm",
+        "increment" => "AXIncrement",
+        "decrement" => "AXDecrement",
+        "cancel" => "AXCancel",
+        "raise" => "AXRaise",
+        "select" | "pick" => "AXPick",
+        _ => return None,
+    })
+}
+
+pub(crate) fn act(
+    window: Option<&str>,
+    want: &Want,
+    max_depth: u32,
+    action: &str,
+) -> Result<Done, DesktopError> {
+    let (element, described) = control(window, want, max_depth)?;
+    let what = described.label();
+    if action.trim().eq_ignore_ascii_case("focus") {
+        // SAFETY: kCFBooleanTrue is a static CoreFoundation constant.
+        let took = set_attribute(&element, "AXFocused", unsafe { kCFBooleanTrue });
+        return Ok(match (took, bool_attribute(&element, "AXFocused")) {
+            (true, Some(true)) => Done::verified(format!("focused {what}")),
+            _ => Done::unverified(
+                format!("asked {what} to take focus"),
+                "it does not report focus",
+            ),
+        });
+    }
+    let offered: Vec<String> = {
+        let mut names: CFTypeRef = std::ptr::null();
+        // SAFETY: `element` is live; on success the array is owned by `names`.
+        let ok = unsafe { AXUIElementCopyActionNames(element.0, &mut names) } == AX_SUCCESS;
+        match (ok, Owned::take(names)) {
+            (true, Some(array)) => {
+                // SAFETY: type checked before use; items are borrowed while
+                // `array` is held.
+                unsafe {
+                    if CFGetTypeID(array.0) == CFArrayGetTypeID() {
+                        (0..CFArrayGetCount(array.0))
+                            .filter_map(|i| Owned::retain(CFArrayGetValueAtIndex(array.0, i)))
+                            .filter_map(|s| rust_string(&s))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    }
+                }
+            }
+            _ => Vec::new(),
+        }
+    };
+    let name = ax_action(action)
+        .map(str::to_string)
+        .unwrap_or_else(|| action.trim().to_string());
+    if !offered.contains(&name) {
+        return Err(DesktopError::Os(format!(
+            "{what} does not offer \"{action}\" ({name}); it offers: {}",
+            if offered.is_empty() {
+                "nothing — use click_element or set_value".to_string()
+            } else {
+                offered.join(", ")
+            }
+        )));
+    }
+    let key = cf_string(&name).ok_or_else(|| DesktopError::Os("bad action name".to_string()))?;
+    // SAFETY: both references are live and owned.
+    let result = unsafe { AXUIElementPerformAction(element.0, key.0) };
+    if result != AX_SUCCESS {
+        return Err(DesktopError::Os(format!(
+            "{what} refused {name} (error {result})"
+        )));
+    }
+    Ok(Done::unverified(
+        format!("ran {name} on {what}"),
+        "an action has no state to read back; look at the result",
+    ))
+}
+
+pub(crate) fn focus_window(window: &str) -> Result<Done, DesktopError> {
+    let (element, info) = target(Some(window))?;
+    if let Some(app) = application(info.pid as i32) {
+        // SAFETY: kCFBooleanTrue is a static CoreFoundation constant.
+        set_attribute(&app, "AXFrontmost", unsafe { kCFBooleanTrue });
+    }
+    if let Some(raise) = cf_string("AXRaise") {
+        // SAFETY: both references are live and owned.
+        unsafe { AXUIElementPerformAction(element.0, raise.0) };
+    }
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let now = foreground()?;
+    Ok(match now {
+        Some(w) if w.id == info.id => Done::verified(format!("focused window \"{}\"", info.title)),
+        _ => Done::unverified(
+            format!("asked window \"{}\" to come to the front", info.title),
+            "another window still has the focus",
+        ),
+    })
+}
+
+/// The clipboard's text now, through the system's own `pbpaste`: `None`
+/// when it holds no text. `pbpaste` prints nothing for a clipboard holding
+/// only an image, so empty output is "no text", never text to put back.
+pub(crate) fn get_clipboard() -> Result<Option<String>, String> {
+    let output = std::process::Command::new("/usr/bin/pbpaste")
+        .env("LANG", "en_US.UTF-8")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("could not run pbpaste: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("pbpaste failed ({})", output.status));
+    }
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    Ok((!text.is_empty()).then_some(text))
 }
 
 /// Put text on the clipboard, through the system's own `pbcopy`.
@@ -415,6 +887,36 @@ pub(crate) fn set_clipboard(text: &str) -> Result<(), DesktopError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A secure text field is recognised by role or subrole, and nothing else
+    /// is.
+    #[test]
+    fn a_password_field_is_recognised_however_it_is_reported() {
+        assert!(is_secure("AXTextField", Some("AXSecureTextField")));
+        assert!(is_secure("AXSecureTextField", None));
+        assert!(!is_secure("AXTextField", None));
+        assert!(!is_secure("AXTextField", Some("AXSearchField")));
+    }
+
+    /// The shared action names become AX actions; an unknown one does not.
+    #[test]
+    fn the_shared_actions_name_ax_actions() {
+        assert_eq!(ax_action("press"), Some("AXPress"));
+        assert_eq!(ax_action(" Show_Menu "), Some("AXShowMenu"));
+        assert_eq!(ax_action("increment"), Some("AXIncrement"));
+        assert_eq!(ax_action("fly"), None);
+    }
+
+    /// A window id is `pid.number` (the window server's number, never 0);
+    /// anything else is refused, not guessed.
+    #[test]
+    fn a_window_id_is_a_pid_and_a_window_number() {
+        assert_eq!(parse_window_id("501.4211"), Some((501, 4211)));
+        assert_eq!(parse_window_id(" 77.3 "), Some((77, 3)));
+        for bad in ["501", "x.1", "0.1", "-4.1", "1.x", "1.0", ""] {
+            assert_eq!(parse_window_id(bad), None, "{bad}");
+        }
+    }
 
     /// The refusal names the grant, where to give it, and the program —
     /// everything a person needs, since the OS itself says nothing.

@@ -33,6 +33,45 @@ pub const DEFAULT_CLIPBOARD_TIMEOUT_SECS: u64 = 5;
 /// Each accessibility request (macOS AX, Linux AT-SPI): a hung application
 /// costs this, not the whole walk.
 pub const DEFAULT_ACCESSIBILITY_CALL_TIMEOUT_MS: u64 = 1000;
+/// How long `paste_text` waits after Ctrl+V before putting the operator's
+/// clipboard back: the paste is read by the application asynchronously, and
+/// restoring sooner would paste the old contents instead.
+pub const DEFAULT_PASTE_RESTORE_DELAY_MS: u64 = 500;
+/// How long an action waits before the screenshot `screenshot_after` asks
+/// for, so the screen has changed by the time it is taken.
+pub const DEFAULT_SETTLE_MS: u64 = 300;
+/// Most elements one walk VISITS, kept or not: a tree of thousands of unnamed
+/// wrappers keeps nothing, and without this would be walked in full on every
+/// action by id.
+pub const DEFAULT_TREE_MAX_VISITED: u32 = 4000;
+/// Most wheel steps one `scroll` takes in either direction. Each step is an
+/// input event, and an unbounded count is minutes of events the stop file
+/// cannot interrupt, counted as one action.
+pub const DEFAULT_MAX_SCROLL_STEPS: u32 = 50;
+
+/// What [`Limits::blocked`] reports for an application whose name could not
+/// be read: it cannot be told apart from a password manager, so it is not
+/// read or acted on either.
+pub const UNNAMED_APP: &str = "an application whose name could not be read";
+
+/// Applications the desktop never reads or acts on, matched against the
+/// owning program's name, case-insensitively. Password managers: a tree or a
+/// screenshot of one is every password the operator has. admin.json
+/// `desktop_limits.blocked_apps` ADDS to this list; it cannot shorten it.
+pub const BUILTIN_BLOCKED_APPS: &[&str] = &[
+    "1password",
+    "bitwarden",
+    "lastpass",
+    "dashlane",
+    "keepass",
+    "nordpass",
+    "proton pass",
+    "protonpass",
+    "enpass",
+    "roboform",
+    "keeper password",
+    "keeperpassword",
+];
 
 /// admin.json `desktop_limits`, as written. Every field optional.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,6 +93,17 @@ pub struct DesktopLimits {
     pub clipboard_timeout_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accessibility_call_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paste_restore_delay_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settle_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree_max_visited: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_scroll_steps: Option<u32>,
+    /// More applications to block, beside [`BUILTIN_BLOCKED_APPS`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked_apps: Vec<String>,
 }
 
 impl DesktopLimits {
@@ -131,6 +181,44 @@ impl DesktopLimits {
                 self.accessibility_call_timeout_ms,
                 DEFAULT_ACCESSIBILITY_CALL_TIMEOUT_MS,
             )?),
+            paste_restore_delay: Duration::from_millis(positive(
+                "paste_restore_delay_ms",
+                self.paste_restore_delay_ms,
+                DEFAULT_PASTE_RESTORE_DELAY_MS,
+            )?),
+            settle: Duration::from_millis(positive(
+                "settle_ms",
+                self.settle_ms,
+                DEFAULT_SETTLE_MS,
+            )?),
+            tree_max_visited: positive(
+                "tree_max_visited",
+                self.tree_max_visited,
+                DEFAULT_TREE_MAX_VISITED,
+            )?,
+            max_scroll_steps: positive(
+                "max_scroll_steps",
+                self.max_scroll_steps,
+                DEFAULT_MAX_SCROLL_STEPS,
+            )?,
+            blocked_apps: {
+                let mut all: Vec<String> =
+                    BUILTIN_BLOCKED_APPS.iter().map(|s| s.to_string()).collect();
+                for app in &self.blocked_apps {
+                    let app = app.trim().to_lowercase();
+                    if app.is_empty() {
+                        return Err(
+                            "desktop_limits.blocked_apps holds an empty name, which would \
+                             match every application"
+                                .to_string(),
+                        );
+                    }
+                    if !all.contains(&app) {
+                        all.push(app);
+                    }
+                }
+                all
+            },
         })
     }
 }
@@ -146,6 +234,30 @@ pub struct Limits {
     pub xvfb_start_timeout: Duration,
     pub clipboard_timeout: Duration,
     pub accessibility_call_timeout: Duration,
+    pub paste_restore_delay: Duration,
+    pub settle: Duration,
+    pub tree_max_visited: u32,
+    pub max_scroll_steps: u32,
+    /// Lower-case names; the built-in list plus admin.json's.
+    pub blocked_apps: Vec<String>,
+}
+
+impl Limits {
+    /// The blocked name `app` matches, if any: case-insensitive, and a match
+    /// anywhere in the name, so "1Password", "1Password 7" and
+    /// "com.1password.1password" are all one entry. An empty name — the
+    /// owner could not be read — is [`UNNAMED_APP`]: failing open there
+    /// would let a password manager through whenever its name read failed.
+    pub fn blocked(&self, app: &str) -> Option<&str> {
+        let app = app.to_lowercase();
+        if app.trim().is_empty() {
+            return Some(UNNAMED_APP);
+        }
+        self.blocked_apps
+            .iter()
+            .find(|b| app.contains(b.as_str()))
+            .map(String::as_str)
+    }
 }
 
 static IN_FORCE: OnceLock<Limits> = OnceLock::new();
@@ -184,6 +296,8 @@ mod tests {
             limits.accessibility_call_timeout,
             Duration::from_millis(1000)
         );
+        assert_eq!(limits.tree_max_visited, 4000);
+        assert_eq!(limits.max_scroll_steps, 50);
     }
 
     /// **THE SAFETY LIMITS ONLY TIGHTEN.** Stricter is taken; looser is
@@ -229,6 +343,46 @@ mod tests {
         .resolve()
         .expect_err("zero");
         assert!(why.contains("more than 0"), "{why}");
+    }
+
+    /// **PASSWORD MANAGERS ARE BLOCKED BY DEFAULT, AND THE LIST ONLY GROWS.**
+    /// Any spelling of a built-in one matches; admin.json adds names; an
+    /// empty name, which would block everything, is refused.
+    #[test]
+    fn password_managers_are_blocked_and_the_list_only_grows() {
+        let limits = DesktopLimits::default().resolve().expect("valid");
+        for app in [
+            "1Password",
+            "1Password 7",
+            "Bitwarden",
+            "KeePassXC",
+            "com.lastpass.LastPass",
+        ] {
+            assert!(limits.blocked(app).is_some(), "{app}");
+        }
+        for app in ["notepad", "TextEdit", "gedit"] {
+            assert!(limits.blocked(app).is_none(), "{app}");
+        }
+        // An owner that could not be named fails closed.
+        assert_eq!(limits.blocked(""), Some(UNNAMED_APP));
+        assert_eq!(limits.blocked("  "), Some(UNNAMED_APP));
+
+        let more = DesktopLimits {
+            blocked_apps: vec!["Banking App".to_string()],
+            ..DesktopLimits::default()
+        }
+        .resolve()
+        .expect("valid");
+        assert_eq!(more.blocked("My Banking App"), Some("banking app"));
+        assert!(more.blocked("1Password").is_some(), "the built-ins stay");
+
+        let why = DesktopLimits {
+            blocked_apps: vec!["  ".to_string()],
+            ..DesktopLimits::default()
+        }
+        .resolve()
+        .expect_err("empty");
+        assert!(why.contains("every application"), "{why}");
     }
 
     /// A misspelt key is an error, not a limit silently left at its default.

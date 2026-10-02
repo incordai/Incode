@@ -415,6 +415,45 @@ crate directory), and pass on a writable copy.
 **Still open on Linux:** the pixel viewer (x11vnc + noVNC, 14b); Qt and
 Chromium trees not yet measured.
 
+**Built 2026-10-01, second round — what Orca had and incode lacked, then a
+review of the result.** New tools: `list_windows` (ids, apps, rectangles),
+`focus_window`, `set_value` and `element_action` (no mouse: UIA patterns,
+AX actions, AT-SPI EditableText/Action, each read back where allowed and
+marked "(verified)" or "(unverified: why)"); every tool takes `window`, and
+the acting ones `screenshot_after`; `scroll`/`drag` take element ids;
+`paste_text` puts the clipboard back. Password managers are never read,
+pictured or acted on (`limits::BUILTIN_BLOCKED_APPS`, plus
+`desktop_limits.blocked_apps`); a password field's value is never read.
+
+A review of that work found eleven holes, all fixed before commit:
+- **an element id is checked, not trusted** — ids are positions in one walk,
+  so the server keeps what each window's last `ui_tree` showed (depth and
+  elements) and acts only on an id that tree showed, re-walked at the same
+  depth, and only while the control there has the same role, depth, secret
+  flag and name (`uia::same_control`; an edit field's name may change);
+- **blocked windows by rectangle** — every click, scroll and drag point, and
+  every window capture, is refused inside or over a blocked window's
+  rectangle, whatever is drawn on top; a desktop whose windows cannot be
+  listed is refused rather than taken to have none;
+- **an owner that cannot be named is blocked** (`limits::UNNAMED_APP`);
+  untitled blocked windows (Windows) and every window layer (macOS) count;
+- **Linux focus from the X server** (`linux::keyboard_target`, x11rb — no new
+  package): the window keys reach, by `_NET_WM_PID`; keys reaching a window
+  nobody can name are refused, not taken for "no window";
+- **macOS window ids are the window server's numbers** (`pid.number`), so an
+  id never drifts onto another window when windows reorder;
+- **bounds**: `max_scroll_steps` (50) and `tree_max_visited` (4000) in
+  `desktop_limits`; coordinates that do not fit are refused, not wrapped;
+- **the clipboard**: read in full however large (Linux drained while
+  `xclip` runs — it stalled at the 64 KiB pipe), and an unreadable clipboard
+  refuses the paste instead of losing what was on it;
+- a GTK 4 window's picture is refused by name (it reports no positions).
+
+Live in Docker against the real server: probe2 29/30 (the one miss is GTK
+4.18.6 reading a set value back as 0 characters — reported "unverified",
+and the value did land), probe3 4/4 (scroll down, right, left; drag element
+to element). Windows below; the Mac is still to run.
+
 ### B2 — The codex MCP tool call
 
 Registration syntax is proven — the TOML escaping was verified by an accidental

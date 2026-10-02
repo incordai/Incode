@@ -249,7 +249,11 @@ landlock = "=0.4.7"
 #   - zbus for the AT-SPI2 accessibility tree: NO NEW PACKAGE. xcap already
 #     resolves zbus 5.19.0 (the latest) on Linux with its default features,
 #     which include the blocking API used here.
+#   - x11rb, named directly to ask the X server which window keystrokes
+#     reach (`linux::keyboard_pid`): NO NEW PACKAGE — the same 0.13.2 the
+#     enigo backend above already resolves, core protocol only, no features.
 enigo = { version = "0.6.1", default-features = false, features = ["x11rb"] }
+x11rb = { version = "0.13.2", default-features = false }
 zbus = "5.19"
 
 # ---------------------------------------------------------------------------

@@ -121,6 +121,28 @@ impl Rect {
         let bottom = (self.y + self.height).max(other.y + other.height);
         Rect::from_edges(left, top, right, bottom)
     }
+
+    /// Whether the point is inside: the left and top edges are, the right
+    /// and bottom are not. In i64, so no rectangle or point can overflow it.
+    pub fn contains(self, x: i32, y: i32) -> bool {
+        let (x, y) = (i64::from(x), i64::from(y));
+        let (left, top) = (i64::from(self.x), i64::from(self.y));
+        x >= left
+            && y >= top
+            && x < left + i64::from(self.width)
+            && y < top + i64::from(self.height)
+    }
+
+    /// Whether the two share any area.
+    pub fn overlaps(self, other: Rect) -> bool {
+        let edges = |r: Rect| {
+            let (x, y) = (i64::from(r.x), i64::from(r.y));
+            (x, y, x + i64::from(r.width), y + i64::from(r.height))
+        };
+        let (l1, t1, r1, b1) = edges(self);
+        let (l2, t2, r2, b2) = edges(other);
+        l1 < r2 && l2 < r1 && t1 < b2 && t2 < b1
+    }
 }
 
 /// One display.
@@ -357,6 +379,31 @@ mod tests {
         let a = Rect::from_edges(-1920, -200, 0, 880);
         let b = Rect::from_edges(0, 0, 2560, 1440);
         assert_eq!(a.union(b), b.union(a));
+    }
+
+    /// A point on the right or bottom edge is outside, as it is for the next
+    /// rectangle along; nothing near `i32::MAX` overflows.
+    #[test]
+    fn contains_and_overlaps_are_half_open() {
+        let r = Rect::from_edges(100, 100, 200, 150);
+        assert!(r.contains(100, 100));
+        assert!(r.contains(199, 149));
+        assert!(!r.contains(200, 120));
+        assert!(!r.contains(150, 150));
+        assert!(!r.contains(i32::MIN, i32::MAX));
+        assert!(r.overlaps(Rect::from_edges(199, 149, 300, 300)));
+        assert!(
+            !r.overlaps(Rect::from_edges(200, 100, 300, 150)),
+            "touching"
+        );
+        let huge = Rect {
+            x: i32::MAX - 1,
+            y: 0,
+            width: i32::MAX,
+            height: 10,
+        };
+        assert!(huge.contains(i32::MAX, 5));
+        assert!(!r.overlaps(huge));
     }
 
     #[test]
