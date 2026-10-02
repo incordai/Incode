@@ -359,7 +359,7 @@ Decision: benchmark lessons are kept in a JSONL file under the work folder, not 
 | 1 | Benchmark format and `insi eval`: tasks, public and private checks, seeds, results | 1 | Built, except a separate public check |
 | 2 | Private-check repository, outside every checkout | 1 | Built as a folder; a repository of its own is not needed yet |
 | 3 | First 20–30 tasks, from bug-fix commits in the Watchman app's history that changed a separate test file | 1 | 38 mined; validation running |
-| 4 | Dollar and wall-time budgets (incode has tokens only) | 1 | Wall time built; dollars left |
+| 4 | Dollar and wall-time budgets (incode has tokens only) | 1 | Built: wall time; dollars — `[prices]` per model in config, `cost_usd` per attempt, `insi eval --max-dollars` (Insi `7587c56`) |
 | 5 | Error-signature normalizer | 1 | Built |
 | 6 | Lesson writer: failed-then-verified task → lesson with evidence, in Incord Memory | 1 | Built, file store; Incord Memory store left |
 | 7 | Topic resolution rules (repo, path, command) and topic fields on lessons — confirm what Incord Memory already stores | 1 | Topic = repository only; path and command rules left |
