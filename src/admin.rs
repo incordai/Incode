@@ -270,6 +270,25 @@ pub struct AdminConfig {
         skip_serializing_if = "crate::hooks::HookConfig::is_empty"
     )]
     pub desktop_hooks: crate::hooks::HookConfig,
+
+    /// Linux: the X display computer use drives. `":N"` attaches to a display
+    /// that is already running; `"xvfb"` (or `"xvfb:WIDTHxHEIGHT"`) starts a
+    /// private one for the desktop server's lifetime and stops it after.
+    ///
+    /// Unset is a refusal, not a fallback to `$DISPLAY`: an agent that quietly
+    /// lands on the operator's own desktop is the failure the isolation
+    /// decision exists to prevent (`docs/COMPUTER_USE.md` 7e).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop_display: Option<String>,
+
+    /// The desktop's limits — rate cap, heartbeat, tree size, journal size,
+    /// timeouts. Unset fields are the defaults; the two safety limits may
+    /// only be made stricter. See [`crate::desktop::limits`].
+    #[serde(
+        default,
+        skip_serializing_if = "crate::desktop::limits::DesktopLimits::is_empty"
+    )]
+    pub desktop_limits: crate::desktop::limits::DesktopLimits,
 }
 
 /// One service that serves API agents and lists them on request.
@@ -367,6 +386,16 @@ pub struct ApiModel {
     /// [`crate::agent::api::DEFAULT_TIMEOUT_SECS`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
+    /// How many times a busy answer (429, 503, 529) is retried, with a
+    /// bounded wait between. Unset is
+    /// [`crate::agent::api::DEFAULT_MAX_RETRIES`]; 0 never retries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_retries: Option<u32>,
+    /// Whether the `anthropic` format marks prompt-cache breakpoints (the
+    /// tools, the system prompt, the conversation so far). Unset is on; set
+    /// false for a service that refuses `cache_control`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache: Option<bool>,
     /// Which header carries the key: `x-api-key` or `bearer`. Unset is the
     /// format's own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1355,6 +1384,8 @@ mod tests {
                 max_tokens: Some(64_000),
                 max_steps: Some(60),
                 timeout_secs: Some(600),
+                max_retries: Some(0),
+                prompt_cache: Some(false),
                 auth: Some(crate::agent::api::KeyHeader::Bearer),
                 api_version: Some("2099-01-01".to_string()),
             }],
@@ -1405,6 +1436,12 @@ mod tests {
             desktop_hooks: crate::hooks::HookConfig {
                 pre_tool_use: vec!["a-guard-command".to_string()],
                 post_tool_use: vec!["a-logging-command".to_string()],
+            },
+            desktop_display: Some("xvfb:1280x800".to_string()),
+            desktop_limits: crate::desktop::limits::DesktopLimits {
+                max_actions_per_minute: Some(60),
+                tree_depth: Some(20),
+                ..Default::default()
             },
         };
         admin.save(dir.path()).expect("saves");

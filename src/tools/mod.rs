@@ -18,6 +18,7 @@ pub mod documents;
 pub mod env_filter;
 pub mod file_ops;
 pub mod git_context;
+pub mod pull_request;
 pub mod search;
 pub(crate) mod shell_choice;
 pub mod tool_status;

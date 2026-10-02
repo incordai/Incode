@@ -60,7 +60,7 @@
 //! command unconfined and [`Sandbox::note`] says so — the caller traces it, so
 //! a session that ran unconfined is never mistaken for one that was confined.
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", all(unix, test)))]
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -612,7 +612,10 @@ pub fn run_windows_helper(args: &[String]) -> anyhow::Result<i32> {
 
 /// The parsed argv of `--sandbox-exec <mode> [--network <allow|deny>]
 /// [--root <dir>]... -- <command>`.
+/// Parsed, and so validated, on every Unix; the mode, network and roots are
+/// applied only on Linux, where the helper confines itself in-process.
 #[cfg(unix)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct ExecArgs {
     mode: SandboxMode,
     network: SandboxNetwork,
@@ -666,7 +669,7 @@ impl ExecArgs {
 /// when it is `deny`, each root, then the command. Used by the platforms whose
 /// confinement is applied in-process (Linux); shared here so the shape is
 /// written once.
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", all(unix, test)))]
 fn helper_argv(exe: &Path, policy: SandboxPolicy, roots: &[PathBuf], command: &str) -> Vec<String> {
     let mut argv = vec![
         exe.to_string_lossy().into_owned(),

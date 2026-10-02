@@ -147,13 +147,48 @@ fn main() -> anyhow::Result<()> {
             //
             // Nothing is printed to stdout — it is the protocol channel, and a
             // banner there is a parse error at the client.
-            let input = incord_code::desktop::thread::InputThread::start()
-                .map_err(|e| anyhow::anyhow!("could not start desktop input: {e}"))?;
+            //
             // The operator's settings, read from `~/.incode/admin.json`.
             // This process holds no workspace, so a machine-wide file is the
             // only place its configuration can come from — and a guard on the
             // desktop is a machine-wide concern anyway.
-            let hooks = incord_code::admin::AdminConfig::load_default().desktop_hooks;
+            //
+            // `load`, not `load_default`: a malformed file is refused here
+            // rather than read as empty, because empty would start the
+            // desktop with no hooks and default limits — a guard the
+            // operator wrote, silently gone.
+            let admin = incord_code::admin::AdminConfig::load(
+                &incord_code::admin::AdminConfig::default_dir(),
+            )
+            .map_err(|e| anyhow::anyhow!("the desktop will not start: {e}"))?;
+            incord_code::desktop::limits::set(
+                admin
+                    .desktop_limits
+                    .resolve()
+                    .map_err(|e| anyhow::anyhow!("the desktop will not start: {e}"))?,
+            );
+            // Linux: the display comes FIRST, while this process is still one
+            // thread — attaching sets `DISPLAY`, which the input thread reads
+            // when it connects. Held until the server returns, so a private
+            // Xvfb lives exactly as long as the desktop it backs.
+            #[cfg(target_os = "linux")]
+            let _display = {
+                let display = incord_code::desktop::linux::attach(admin.desktop_display.as_deref())
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                eprintln!(
+                    "incode-desktop on display {}{}",
+                    display.name(),
+                    if display.is_private() {
+                        " (a private Xvfb, stopped when this server ends)"
+                    } else {
+                        ""
+                    }
+                );
+                display
+            };
+            let input = incord_code::desktop::thread::InputThread::start()
+                .map_err(|e| anyhow::anyhow!("could not start desktop input: {e}"))?;
+            let hooks = admin.desktop_hooks;
             if !hooks.pre_tool_use.is_empty() {
                 eprintln!(
                     "incode-desktop: {} pre-tool hook(s) will run before every action",

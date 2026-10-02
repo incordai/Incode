@@ -584,13 +584,8 @@ impl ClaudeCodeBackend {
     /// recognises lands on read-only, like
     /// [`crate::permissions::PermissionMode::from_str_lossy`].
     pub fn set_permission_mode(&mut self, mode: &str) {
-        use crate::permissions::PermissionMode;
-        let decided = match mode {
-            "acceptEdits" => PermissionMode::WorkspaceWrite,
-            "default" => PermissionMode::Prompt,
-            _ => PermissionMode::ReadOnly,
-        };
-        self.tools.set_permission_mode(decided);
+        self.tools
+            .set_permission_mode(crate::permissions::PermissionMode::from_agent_mode(mode));
     }
 
     /// Ask the memory engine before every tool call this model makes.

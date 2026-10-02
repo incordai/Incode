@@ -112,6 +112,79 @@ pub const DEFAULT_MAX_TOKENS: u64 = 8_192;
 /// a hung connection must not hang the session.
 pub const DEFAULT_TIMEOUT_SECS: u64 = 300;
 
+/// How many times a request the service turned away as busy (429, 503, 529)
+/// is sent again, unless the route's entry says otherwise (`max_retries`).
+pub const DEFAULT_MAX_RETRIES: u32 = 3;
+
+/// The longest one wait before a retry may be, whatever the service's
+/// `Retry-After` asks for — a wait is bounded, not taken on trust.
+const MAX_RETRY_WAIT: Duration = Duration::from_secs(30);
+
+/// The request with the messages format's cache breakpoints marked: the last
+/// tool, the system prompt, and the last message's last block — at most the
+/// four the format allows. A tool loop re-sends the whole conversation every
+/// round, so caching it up to the newest message is what makes the next round
+/// read the prefix from cache instead of paying for it again.
+///
+/// Pure, so the shape is tested without a network. A string system prompt or
+/// message is turned into one text block, which is the same request.
+fn with_cache_marks(body: &Value) -> Value {
+    let mark = || json!({"type": "ephemeral"});
+    let mut out = body.clone();
+    if let Some(last) = out
+        .get_mut("tools")
+        .and_then(Value::as_array_mut)
+        .and_then(|tools| tools.last_mut())
+    {
+        last["cache_control"] = mark();
+    }
+    if let Some(system) = out.get("system").and_then(Value::as_str) {
+        if !system.is_empty() {
+            out["system"] = json!([{"type": "text", "text": system, "cache_control": mark()}]);
+        }
+    }
+    if let Some(last) = out
+        .get_mut("messages")
+        .and_then(Value::as_array_mut)
+        .and_then(|messages| messages.last_mut())
+    {
+        match last.get("content").cloned() {
+            Some(Value::String(text)) if !text.is_empty() => {
+                last["content"] = json!([{"type": "text", "text": text, "cache_control": mark()}]);
+            }
+            Some(Value::Array(_)) => {
+                if let Some(block) = last["content"]
+                    .as_array_mut()
+                    .and_then(|blocks| blocks.last_mut())
+                {
+                    block["cache_control"] = mark();
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Whether a status means "busy, try again" rather than "this request is
+/// wrong": rate-limited, unavailable, or overloaded.
+fn is_retryable(status: u16) -> bool {
+    matches!(status, 429 | 503 | 529)
+}
+
+/// How long to wait before retry number `attempt` (0-based): the service's
+/// `Retry-After` in seconds when it gave one, else 1, 2, 4… seconds — capped
+/// at [`MAX_RETRY_WAIT`] either way.
+fn retry_wait(attempt: u32, retry_after: Option<&str>) -> Duration {
+    let asked = retry_after
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|s| s.is_finite() && *s >= 0.0)
+        .map(Duration::from_secs_f64);
+    asked
+        .unwrap_or_else(|| Duration::from_secs(1u64 << attempt.min(5)))
+        .min(MAX_RETRY_WAIT)
+}
+
 /// Where to send a request, and as whom.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
@@ -136,6 +209,11 @@ pub struct Settings {
     pub max_steps: usize,
     /// How long one request may take, in seconds.
     pub timeout_secs: u64,
+    /// How many times a busy answer (429, 503, 529) is retried.
+    pub max_retries: u32,
+    /// Whether the messages format marks its cache breakpoints
+    /// ([`with_cache_marks`]); unused by the chat format.
+    pub prompt_cache: bool,
     /// The version header the messages format sends; unused by the other.
     pub api_version: String,
     /// The catalogue id this route is chosen by: a configured model's name,
@@ -156,6 +234,8 @@ impl Default for Settings {
             max_tokens: DEFAULT_MAX_TOKENS,
             max_steps: DEFAULT_MAX_STEPS,
             timeout_secs: DEFAULT_TIMEOUT_SECS,
+            max_retries: DEFAULT_MAX_RETRIES,
+            prompt_cache: true,
             api_version: DEFAULT_API_VERSION.to_string(),
             route: String::new(),
         }
@@ -913,9 +993,51 @@ struct Http {
     auth: KeyHeader,
     timeout: Duration,
     api_version: String,
+    retries: u32,
+    prompt_cache: bool,
 }
 
 impl Http {
+    /// Send the request, sending it again — after a bounded wait — while the
+    /// service answers that it is busy and retries remain. Done before any of
+    /// the reply is read, so a retried streamed turn cannot repeat text.
+    ///
+    /// Returns the last response, and how many retries it took.
+    async fn post(
+        &self,
+        client: &reqwest::Client,
+        payload: &Value,
+    ) -> Result<(reqwest::Response, u32), String> {
+        let mut attempt = 0;
+        loop {
+            let response = self
+                .authorised(client, payload)
+                .send()
+                .await
+                .map_err(|e| format!("request failed: {e}"))?;
+            if !is_retryable(response.status().as_u16()) || attempt >= self.retries {
+                return Ok((response, attempt));
+            }
+            let wait = retry_wait(
+                attempt,
+                response
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok()),
+            );
+            crate::trace!(
+                "api",
+                "the model service answered {}; retrying in {:.1}s ({} of {})",
+                response.status(),
+                wait.as_secs_f64(),
+                attempt + 1,
+                self.retries
+            );
+            attempt += 1;
+            tokio::time::sleep(wait).await;
+        }
+    }
+
     /// A request as the route sends it: the body in its format's shape, and
     /// the key in the ONE header the route names.
     fn authorised(&self, client: &reqwest::Client, payload: &Value) -> reqwest::RequestBuilder {
@@ -927,12 +1049,27 @@ impl Http {
             KeyHeader::Bearer => request.bearer_auth(&self.key),
         };
         match self.format {
+            WireFormat::Anthropic if self.prompt_cache => request
+                .header("anthropic-version", &self.api_version)
+                .json(&with_cache_marks(payload)),
             WireFormat::Anthropic => request
                 .header("anthropic-version", &self.api_version)
                 .json(payload),
             WireFormat::Openai => request.json(&super::openai::request(payload)),
         }
     }
+}
+
+/// What a refused request says: the status, the service's own words, and —
+/// when it was busy each time — how often it was tried, so "rate limited
+/// once" is not mistaken for "rate limited after four tries".
+fn refused(status: reqwest::StatusCode, retried: u32, body: &str) -> String {
+    let tries = if retried > 0 {
+        format!(" (after {retried} retries)")
+    } else {
+        String::new()
+    };
+    format!("the model service answered {status}{tries}: {body}")
 }
 
 impl Transport for Http {
@@ -953,11 +1090,7 @@ impl Transport for Http {
                     .timeout(http.timeout)
                     .build()
                     .map_err(|e| format!("client: {e}"))?;
-                let response = http
-                    .authorised(&client, &payload)
-                    .send()
-                    .await
-                    .map_err(|e| format!("request failed: {e}"))?;
+                let (response, retried) = http.post(&client, &payload).await?;
                 let status = response.status();
                 let text = response
                     .text()
@@ -966,7 +1099,7 @@ impl Transport for Http {
                 if !status.is_success() {
                     // The body is kept: a 400 explains itself there, and the
                     // status alone is the category without the reason.
-                    return Err(format!("the model service answered {status}: {text}"));
+                    return Err(refused(status, retried, &text));
                 }
                 match format {
                     WireFormat::Anthropic => Ok(text),
@@ -1004,15 +1137,11 @@ impl Transport for Http {
                     .timeout(http.timeout)
                     .build()
                     .map_err(|e| format!("client: {e}"))?;
-                let mut response = http
-                    .authorised(&client, &payload)
-                    .send()
-                    .await
-                    .map_err(|e| format!("request failed: {e}"))?;
+                let (mut response, retried) = http.post(&client, &payload).await?;
                 let status = response.status();
                 if !status.is_success() {
                     let text = response.text().await.unwrap_or_default();
-                    return Err(format!("the model service answered {status}: {text}"));
+                    return Err(refused(status, retried, &text));
                 }
                 if format == WireFormat::Openai {
                     let mut whole = super::openai::ChatStream::new();
@@ -1123,6 +1252,8 @@ impl AgentBackend for ApiBackend {
             auth: self.settings.auth,
             timeout: Duration::from_secs(self.settings.timeout_secs),
             api_version: self.settings.api_version.clone(),
+            retries: self.settings.max_retries,
+            prompt_cache: self.settings.prompt_cache,
         };
         self.run_turn_with(&transport, prompt, on_event)
     }
@@ -1240,13 +1371,25 @@ impl AgentBackend for ApiBackend {
         self.system = joined;
     }
 
-    // set_extra_dirs, deny_rules, set_permission_mode and set_session_id keep
-    // the defaults, and the defaults are the truth. The toolbox works in one
-    // workspace, it checks the guards itself rather than handing rules to
-    // anyone, permission tiers belong to a CLI that has them, and a session
-    // cannot be resumed by id because the conversation lives in this process
-    // and is not written down. Each of those is a real limit of this route; a
-    // pretend implementation would hide it.
+    /// The session's mode, decided by this route's toolbox for every call —
+    /// the same toolbox, and the same decision, as on the CLI route. Before
+    /// this, a `plan` session on an API model could still write.
+    fn set_permission_mode(&mut self, mode: &str) {
+        self.tools
+            .set_permission_mode(crate::permissions::PermissionMode::from_agent_mode(mode));
+    }
+
+    /// Roots added with `--add-dir`, reachable by this route's toolbox under
+    /// the same guards as the workspace.
+    fn set_extra_dirs(&mut self, dirs: Vec<std::path::PathBuf>) {
+        self.tools.set_extra_dirs(dirs);
+    }
+
+    // deny_rules and set_session_id keep the defaults, and the defaults are
+    // the truth. The toolbox checks the guards itself rather than handing
+    // rules to anyone, and a session cannot be resumed by id because the
+    // conversation lives in this process and is not written down. Each is a
+    // real limit of this route; a pretend implementation would hide it.
 
     fn set_models(&mut self, candidates: &[String]) {
         // No fallback chain: one request goes to one model. The FIRST
@@ -1483,6 +1626,74 @@ mod tests {
         assert!(!outcome.is_error, "{outcome:?}");
         let second = transport.sent.borrow()[1].to_string();
         assert!(second.contains("no tool called"), "{second}");
+    }
+
+    /// **THE SESSION'S MODE GOVERNS AN API MODEL'S WRITES.** The same scripted
+    /// model asks to write a file twice: under `plan` the toolbox refuses and
+    /// nothing lands; under `acceptEdits` it is written. Before this, the
+    /// route kept no mode and wrote under `plan` too.
+    #[test]
+    fn the_session_mode_decides_whether_an_api_model_may_write() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let write = asked_for(
+            "w1",
+            crate::toolbox::WRITE,
+            json!({"path": "made.txt", "content": "hello"}),
+        );
+        let replies = [write.as_str(), &said("done")];
+
+        let mut planning = backend(dir.path());
+        AgentBackend::set_permission_mode(&mut planning, "plan");
+        planning
+            .run_turn_with(&Canned::new(&replies), "write it", &mut |_| {})
+            .expect("a turn");
+        assert!(
+            !dir.path().join("made.txt").exists(),
+            "a plan session wrote a file"
+        );
+
+        let mut editing = backend(dir.path());
+        AgentBackend::set_permission_mode(&mut editing, "acceptEdits");
+        editing
+            .run_turn_with(&Canned::new(&replies), "write it", &mut |_| {})
+            .expect("a turn");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("made.txt")).ok(),
+            Some("hello".to_string())
+        );
+    }
+
+    /// A root added with `--add-dir` is reachable; without it, the same
+    /// write outside the workspace is refused.
+    #[test]
+    fn an_added_root_is_reachable_by_an_api_model() {
+        let workspace = tempfile::tempdir().expect("ws");
+        let other = tempfile::tempdir().expect("other");
+        let target = other.path().join("out.txt");
+        let write = asked_for(
+            "w1",
+            crate::toolbox::WRITE,
+            json!({"path": target.to_string_lossy(), "content": "there"}),
+        );
+        let replies = [write.as_str(), &said("done")];
+
+        let mut confined = backend(workspace.path());
+        AgentBackend::set_permission_mode(&mut confined, "acceptEdits");
+        confined
+            .run_turn_with(&Canned::new(&replies), "write there", &mut |_| {})
+            .expect("a turn");
+        assert!(!target.exists(), "wrote outside the workspace unasked");
+
+        let mut widened = backend(workspace.path());
+        AgentBackend::set_permission_mode(&mut widened, "acceptEdits");
+        AgentBackend::set_extra_dirs(&mut widened, vec![other.path().to_path_buf()]);
+        widened
+            .run_turn_with(&Canned::new(&replies), "write there", &mut |_| {})
+            .expect("a turn");
+        assert_eq!(
+            std::fs::read_to_string(&target).ok(),
+            Some("there".to_string())
+        );
     }
 
     #[test]

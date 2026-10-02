@@ -39,12 +39,10 @@ use super::coords::PhysicalPoint;
 use super::safety::Safety;
 use super::DesktopError;
 
-/// Most actions allowed in any rolling minute.
-///
-/// Sized for an agent driving a UI, which acts in ones and twos with thinking
-/// in between — not for a loop. A human clicking briskly does not approach it;
-/// a runaway hits it within seconds.
-pub const MAX_ACTIONS_PER_MINUTE: usize = 120;
+// The cap on actions in any rolling minute is `limits::max_actions_per_minute`
+// (default 120, stricter only). Sized for an agent driving a UI, which acts in
+// ones and twos with thinking in between — not for a loop. A human clicking
+// briskly does not approach it; a runaway hits it within seconds.
 
 const WINDOW: Duration = Duration::from_secs(60);
 
@@ -168,6 +166,18 @@ impl InputThread {
         // they are only physical if the process is per-monitor aware.
         super::dpi::ensure_per_monitor_aware();
 
+        // macOS refuses the input connection itself without Accessibility
+        // (measured on 26.6.2: enigo's "does not have the permission to
+        // simulate input"), so the grant is asked for first, by name and with
+        // where to give it, rather than surfacing as the library's sentence.
+        #[cfg(target_os = "macos")]
+        {
+            // The session first: over SSH the grant check passes yet every
+            // event is dropped (see `macos::require_graphic_session`).
+            super::macos::require_graphic_session()?;
+            super::macos::require(super::macos::Grant::Accessibility)?;
+        }
+
         let (tx, rx) = mpsc::channel::<Job>();
         let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), String>>(1);
 
@@ -252,22 +262,42 @@ impl InputThread {
         self.send(Command::Type(text.to_string())).map(|_| ())
     }
 
-    /// Put text on the clipboard and paste it with Ctrl+V.
+    /// Put text on the clipboard, paste it (Ctrl+V; Cmd+V on macOS), and put
+    /// the operator's clipboard back.
     ///
     /// Far more reliable than typing for long or non-ASCII text, and near
     /// instant where typing is linear in length.
     ///
-    /// **It costs the clipboard.** Whatever the operator had copied is gone,
-    /// and this does not restore it — restoring would need to read the previous
-    /// contents, which on an agent's desktop may be something it should not
-    /// see. Losing a clipboard is the smaller harm, and it is stated rather
-    /// than hidden.
-    pub fn paste_text(&self, text: &str) -> Result<(), DesktopError> {
+    /// The previous text is read into THIS process only — never returned to
+    /// the agent or journalled — and restored after
+    /// `desktop_limits.paste_restore_delay_ms`, since the application reads a
+    /// paste asynchronously. Returns whether it was restored: a clipboard that
+    /// held no text (an image, nothing) cannot be, and the caller says so.
+    /// A clipboard that cannot be READ refuses the paste before touching it,
+    /// rather than replacing what it holds with no way back.
+    pub fn paste_text(&self, text: &str) -> Result<bool, DesktopError> {
         if text.is_empty() {
-            return Ok(());
+            return Ok(true);
         }
+        let previous = get_clipboard().map_err(|why| {
+            DesktopError::Os(format!(
+                "refused: the clipboard could not be read ({why}), so it could not be put back \
+                 after the paste; use type_text instead"
+            ))
+        })?;
         set_clipboard(text)?;
-        self.chord(&["control".to_string(), "v".to_string()])
+        let pasted = self.chord(&["cmdorctrl".to_string(), "v".to_string()]);
+        // Restored even when the paste failed, so a failure never also
+        // costs the operator their clipboard.
+        let restored = match previous {
+            Some(old) => {
+                std::thread::sleep(super::limits::get().paste_restore_delay);
+                set_clipboard(&old).is_ok()
+            }
+            None => false,
+        };
+        pasted?;
+        Ok(restored)
     }
 
     /// Press keys together, releasing in reverse order.
@@ -344,6 +374,7 @@ fn worker(rx: Receiver<Job>, ready: SyncSender<Result<(), String>>, safety: Safe
     };
 
     let mut recent: VecDeque<Instant> = VecDeque::new();
+    let cap = super::limits::get().max_actions_per_minute;
 
     while let Ok(job) = rx.recv() {
         let now = Instant::now();
@@ -355,9 +386,9 @@ fn worker(rx: Receiver<Job>, ready: SyncSender<Result<(), String>>, safety: Safe
             run(&mut enigo, job.command)
         } else if let Err(refused) = safety.authorise(now) {
             Err(refused)
-        } else if !allow(&mut recent, now) {
+        } else if !allow(&mut recent, now, cap) {
             Err(DesktopError::Os(format!(
-                "refused: more than {MAX_ACTIONS_PER_MINUTE} actions in the last minute. \
+                "refused: more than {cap} actions in the last minute. \
                  This is the runaway guard, not a transient error — an agent hitting it \
                  is looping, and waiting will not help."
             )))
@@ -374,7 +405,7 @@ fn worker(rx: Receiver<Job>, ready: SyncSender<Result<(), String>>, safety: Safe
 
 /// Rate-cap decision over a rolling window. Pure, so the policy is testable
 /// without a thread or a desktop.
-fn allow(recent: &mut VecDeque<Instant>, now: Instant) -> bool {
+fn allow(recent: &mut VecDeque<Instant>, now: Instant, cap: usize) -> bool {
     while let Some(front) = recent.front() {
         if now.duration_since(*front) >= WINDOW {
             recent.pop_front();
@@ -383,7 +414,7 @@ fn allow(recent: &mut VecDeque<Instant>, now: Instant) -> bool {
         }
     }
 
-    if recent.len() >= MAX_ACTIONS_PER_MINUTE {
+    if recent.len() >= cap {
         return false;
     }
 
@@ -400,6 +431,15 @@ fn allow(recent: &mut VecDeque<Instant>, now: Instant) -> bool {
 pub fn key_from_name(name: &str) -> Result<Key, DesktopError> {
     let lower = name.trim().to_ascii_lowercase();
     Ok(match lower.as_str() {
+        // The platform's shortcut modifier, so one chord works everywhere:
+        // ["cmdorctrl","c"] is Cmd+C on macOS and Ctrl+C elsewhere.
+        "cmdorctrl" | "commandorcontrol" | "mod" => {
+            if cfg!(target_os = "macos") {
+                Key::Meta
+            } else {
+                Key::Control
+            }
+        }
         "control" | "ctrl" => Key::Control,
         "shift" => Key::Shift,
         "alt" => Key::Alt,
@@ -439,13 +479,47 @@ pub fn key_from_name(name: &str) -> Result<Key, DesktopError> {
                 _ => {
                     return Err(DesktopError::Os(format!(
                         "unknown key '{name}'. Use a single character, or one of: \
-                         control shift alt meta enter tab escape backspace delete \
+                         cmdorctrl control shift alt meta enter tab escape backspace delete \
                          space up down left right home end pageup pagedown f1-f12"
                     )))
                 }
             }
         }
     })
+}
+
+/// The clipboard's text now: `Some` when it holds text, `None` when it holds
+/// none (nothing, or only an image), and an error when it could not be read
+/// at all — which is not the same as empty, since restoring "nothing" would
+/// then wipe what was there.
+#[cfg(windows)]
+fn get_clipboard() -> Result<Option<String>, String> {
+    use clipboard_win::{formats, raw};
+    // Another program may hold the clipboard open for a moment; the open
+    // is retried before it counts as unreadable.
+    let _open = clipboard_win::Clipboard::new_attempts(10).map_err(|e| e.to_string())?;
+    if !raw::is_format_avail(formats::CF_UNICODETEXT) {
+        return Ok(None);
+    }
+    // UTF-8 from the clipboard's UTF-16, converted by Windows itself.
+    let mut bytes = Vec::new();
+    raw::get_string(&mut bytes).map_err(|e| e.to_string())?;
+    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+#[cfg(target_os = "macos")]
+fn get_clipboard() -> Result<Option<String>, String> {
+    super::macos::get_clipboard()
+}
+
+#[cfg(target_os = "linux")]
+fn get_clipboard() -> Result<Option<String>, String> {
+    super::linux::get_clipboard()
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+fn get_clipboard() -> Result<Option<String>, String> {
+    Err("no clipboard on this platform".to_string())
 }
 
 /// Put text on the Windows clipboard.
@@ -457,12 +531,30 @@ fn set_clipboard(text: &str) -> Result<(), DesktopError> {
         .map_err(|e| DesktopError::Os(format!("could not set the clipboard: {e}")))
 }
 
-#[cfg(not(windows))]
+/// Put text on the macOS clipboard.
+#[cfg(target_os = "macos")]
+fn set_clipboard(text: &str) -> Result<(), DesktopError> {
+    super::macos::set_clipboard(text)
+}
+
+/// Put text on the X display's clipboard.
+#[cfg(target_os = "linux")]
+fn set_clipboard(text: &str) -> Result<(), DesktopError> {
+    super::linux::set_clipboard(text)
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 fn set_clipboard(_text: &str) -> Result<(), DesktopError> {
     Err(DesktopError::Unsupported("this platform"))
 }
 
 fn run(enigo: &mut Enigo, command: Command) -> Result<Reply, DesktopError> {
+    // Without the Accessibility grant macOS drops synthetic input without a
+    // word, which reads as a click that missed. Refuse by name instead.
+    #[cfg(target_os = "macos")]
+    if !matches!(command, Command::Ping) {
+        super::macos::require(super::macos::Grant::Accessibility)?;
+    }
     match command {
         Command::Ping => Ok(Reply::Done),
 
@@ -588,21 +680,34 @@ mod tests {
         .is_action());
     }
 
+    const CAP: usize = super::super::limits::DEFAULT_MAX_ACTIONS_PER_MINUTE as usize;
+
     #[test]
     fn the_cap_allows_a_normal_burst_and_refuses_a_runaway() {
         let mut recent = VecDeque::new();
         let start = Instant::now();
 
-        for i in 0..MAX_ACTIONS_PER_MINUTE {
+        for i in 0..CAP {
             assert!(
-                allow(&mut recent, start),
+                allow(&mut recent, start, CAP),
                 "action {i} refused while still inside the cap"
             );
         }
         assert!(
-            !allow(&mut recent, start),
-            "action {MAX_ACTIONS_PER_MINUTE} must be refused"
+            !allow(&mut recent, start, CAP),
+            "action {CAP} must be refused"
         );
+    }
+
+    /// A stricter cap from admin.json is the one that holds.
+    #[test]
+    fn a_configured_cap_is_the_cap() {
+        let mut recent = VecDeque::new();
+        let start = Instant::now();
+        for _ in 0..5 {
+            assert!(allow(&mut recent, start, 5));
+        }
+        assert!(!allow(&mut recent, start, 5), "the sixth must be refused");
     }
 
     #[test]
@@ -610,17 +715,17 @@ mod tests {
         let mut recent = VecDeque::new();
         let start = Instant::now();
 
-        for _ in 0..MAX_ACTIONS_PER_MINUTE {
-            assert!(allow(&mut recent, start));
+        for _ in 0..CAP {
+            assert!(allow(&mut recent, start, CAP));
         }
-        assert!(!allow(&mut recent, start));
+        assert!(!allow(&mut recent, start, CAP));
 
         // Just inside the window: still refused. A fixed bucket that reset on
         // the minute would allow a double-rate burst across the boundary.
-        assert!(!allow(&mut recent, start + Duration::from_secs(59)));
+        assert!(!allow(&mut recent, start + Duration::from_secs(59), CAP));
 
         // Past it: the old entries age out and budget returns.
-        assert!(allow(&mut recent, start + Duration::from_secs(61)));
+        assert!(allow(&mut recent, start + Duration::from_secs(61), CAP));
     }
 
     #[test]

@@ -1,0 +1,406 @@
+{
+  "_about": "Frozen interfaces for incord-code, written from the code AS IT IS (not as it might be). Checked by src/contracts.rs::check inside src/verify.rs on every task: a declared schema name must appear in some source file, and each of its fields must appear in a file that names the schema. Endpoint paths are matched by their route, method stripped. Matching is case- and punctuation-insensitive, so user_id / userId / UserId are one name. Types are recorded for readers; the checker does not interpret them.",
+  "_boundaries": "Three processes: the harness (this crate, binary `incode`), the delegated agent (an installed CLI, spawned as a child), and the body (Incord Memory, HTTP on 127.0.0.1:9180). Everything under `endpoints` is a call this crate MAKES on the body; the crate serves no HTTP of its own.",
+  "_unnamed_shapes": "Three wire shapes cross the boundary with no named type in the code — the enqueue card body, a decision-history row, and a handoff item. They are built or read field-by-field out of serde_json::Value. Declaring invented names for them would fail the check (measured: it did), so their fields are recorded under the relevant endpoint as `_request_fields` / `_response_row_fields` / `_response_item_fields`. Those keys are kept and ignored by the parser, so they are documentation and NOT enforced. Giving them real structs would make them enforceable; that is a code change, not a spec change.",
+
+  "schemas": {
+    "ProjectBrief": {
+      "_owner": "src/brief.rs — the body's brief for one project. The intake gate reads it; nothing here stores it.",
+      "_crosses": "harness <- body, GET /v1/owner/proxy",
+      "fields": {
+        "project": "string (workspace path or project name)",
+        "about": "string — what this project is",
+        "goals": "string — what the proxy should protect",
+        "synopsis": "string — the PRD in a few lines; rides every review prompt",
+        "prd": "string (markdown)",
+        "roadmap": "RoadmapItem[]"
+      }
+    },
+    "RoadmapItem": {
+      "_owner": "src/brief.rs — one item of the ordered plan. `status` is compared case-insensitively; anything that is not `done` reads as open.",
+      "fields": {
+        "id": "string",
+        "title": "string — must name a heading or a numbered section of the PRD, or it counts as untraceable scope",
+        "status": "string enum: todo | doing | done"
+      }
+    },
+    "BriefUpdate": {
+      "_owner": "src/brief.rs — what `save_brief` writes back. A field left absent keeps its current value; it is never cleared.",
+      "_crosses": "harness -> body, POST /v1/owner/proxy",
+      "fields": {
+        "about": "string?",
+        "goals": "string?",
+        "synopsis": "string?",
+        "prd": "string?",
+        "roadmap": "RoadmapItem[]?"
+      }
+    },
+
+    "Contracts": {
+      "_owner": "src/contracts.rs — this file's own shape.",
+      "_crosses": "harness <- .incord/contracts.json",
+      "fields": {
+        "schemas": "map<string, Schema>",
+        "endpoints": "Endpoint[] — or an object with a `routes` list; both are parsed"
+      }
+    },
+    "Schema": {
+      "_owner": "src/contracts.rs",
+      "fields": {
+        "fields": "map<string, string> — or a list of {wire|name|field, type}; both are parsed. Anything else is an ERROR, never an empty set."
+      }
+    },
+    "Endpoint": {
+      "_owner": "src/contracts.rs",
+      "fields": {
+        "path": "string, e.g. `POST /api/users`; may also arrive split as {method, route}",
+        "response": "string — the name of a declared schema",
+        "errors": "string[] — free text, not interpreted"
+      }
+    },
+
+    "Task": {
+      "_owner": "src/ledger.rs — one unit of execution. `state` reaches `done` through Ledger::complete alone, which cannot be called without a Verified.",
+      "_crosses": "harness <-> .incord/ledger.json",
+      "fields": {
+        "id": "string",
+        "roadmap_id": "string — the roadmap item this implements; the ledger is not a second plan",
+        "title": "string",
+        "state": "TaskState",
+        "verify": "string[] — argv of the check that settles this task",
+        "depends_on": "string[] — task ids",
+        "attempts": "u32 — capped at MAX_ATTEMPTS = 2",
+        "evidence": "string — the recorded command summary that closed it",
+        "note": "string",
+        "contracts": "string[] — the schema names this task must honour",
+        "est_tier": "string — which role/model tier the work is estimated at",
+        "worked_by": "string — the agent identity that attempted it, never the model",
+        "owner_note": "string — a `change` verdict's instruction, carried to the next pass"
+      }
+    },
+    "TaskState": {
+      "_owner": "src/ledger.rs — seven states, serialised snake_case. There is deliberately no `failed`: a failure is an attempts counter and a note.",
+      "fields": {
+        "pending": "in the ledger; dependencies not all done",
+        "ready": "eligible for pickup",
+        "running": "claimed by a runner",
+        "blocked": "an owner decision is outstanding",
+        "done": "verified by a passing command; terminal",
+        "abandoned": "out of attempts; not retried without a person",
+        "cancelled": "the owner dismissed it"
+      }
+    },
+    "Ledger": {
+      "_owner": "src/ledger.rs",
+      "fields": {
+        "version": "u32",
+        "tasks": "Task[]"
+      }
+    },
+
+    "CommandEvidence": {
+      "_owner": "src/verify.rs — what running a check actually produced. Fields are PRIVATE and only `run` constructs one, so proof cannot be minted for a command that never ran.",
+      "fields": {
+        "argv": "string[] — the command as run",
+        "exit": "i32? — None means killed or timed out, which is a failure and never a pass",
+        "stdout_tail": "string, last 4000 bytes",
+        "stderr_tail": "string, last 4000 bytes",
+        "elapsed_ms": "u128"
+      }
+    },
+
+    "Guards": {
+      "_owner": "src/guards.rs — extra protected paths beyond DEFAULT_PROTECTED, set once by a human.",
+      "_crosses": "harness <- .incord/guards.json",
+      "fields": {
+        "protected_paths": "string[] — matched against the workspace-relative path with forward slashes",
+        "allow_writes_to": "string[] — the operator's explicit exceptions"
+      }
+    },
+
+    "AdminConfig": {
+      "_owner": "src/admin.rs — one settings file. Every value can say which layer decided it.",
+      "_crosses": "harness <- ~/.incord-code/admin.json (dir overridable by INCORD_CODE_DIR)",
+      "fields": {
+        "model": "string?",
+        "roles": "map<string, string[]> — role name to ordered model candidates",
+        "budget_tokens": "u64?",
+        "verify_command": "string[]? — beats detection, loses to INCORD_VERIFY_CMD",
+        "memory_url": "string? — default http://127.0.0.1:9180",
+        "plugins": "Plugins"
+      }
+    },
+    "Plugins": {
+      "_owner": "src/admin.rs — which body-facing readers are switched on.",
+      "fields": {
+        "owner": "bool",
+        "auditor": "bool",
+        "recorder": "bool",
+        "guards": "bool",
+        "skills": "bool",
+        "mcp": "bool",
+        "disabled_skills": "string[]",
+        "disabled_mcp": "string[]"
+      }
+    },
+
+    "Ticket": {
+      "_owner": "src/owner.rs — the receipt for a raised card. No token means no answer can ever be read, which is an error and not a success.",
+      "_crosses": "harness <- body, POST /v1/owner/enqueue",
+      "fields": {
+        "token": "string — required, non-empty",
+        "item_id": "string"
+      }
+    },
+    "Verdict": {
+      "_owner": "src/owner.rs — what came back. Five verbs, matching the service. An unrecognised verb is an ERROR and is never read as approval.",
+      "_crosses": "harness <- body, GET /v1/owner/wait",
+      "fields": {
+        "decided": "bool — false is a real answer meaning `not yet`, not a failure",
+        "verb": "string enum: approve | change | dismiss | hold | info",
+        "by": "string — who decided; the owner or the proxy, never conflated",
+        "reason": "string",
+        "note": "string — `change` only: the instruction the next pass must read"
+      }
+    },
+    "Hit": {
+      "_owner": "src/recall.rs — one compact ranked match. Previews only; full content costs a second call.",
+      "_crosses": "harness <- body, POST /v1/memory/recall/index",
+      "fields": {
+        "conv_id": "string",
+        "idx": "u64",
+        "score": "f64",
+        "preview": "string",
+        "role": "string"
+      }
+    },
+    "IndexResponse": {
+      "_owner": "src/recall.rs",
+      "fields": { "hits": "Hit[]" }
+    },
+    "Ref": {
+      "_owner": "src/recall.rs — the pair that identifies one stored message.",
+      "_crosses": "harness -> body, POST /v1/memory/recall/get",
+      "fields": {
+        "conv_id": "string",
+        "idx": "u64"
+      }
+    },
+    "Message": {
+      "_owner": "src/recall.rs",
+      "_crosses": "harness <- body, POST /v1/memory/recall/get",
+      "fields": {
+        "conv_id": "string",
+        "idx": "u64",
+        "role": "string",
+        "content": "string"
+      }
+    },
+    "GetResponse": {
+      "_owner": "src/recall.rs",
+      "fields": { "messages": "Message[]" }
+    },
+
+    "Finding": {
+      "_owner": "src/auditor.rs — read-only. The auditor owns the findings lifecycle; a second trail here would be a copy that disagrees.",
+      "_crosses": "harness <- body, GET /v1/memory/audit/findings",
+      "fields": {
+        "id": "string",
+        "file": "string",
+        "symbol": "string",
+        "category": "string",
+        "severity": "u32 — MEASURED to arrive as a string on the live payload; both forms are accepted",
+        "status": "string",
+        "summary": "string — taken from rounds[0].text, the auditor's first statement"
+      }
+    },
+
+    "TurnOutcome": {
+      "_owner": "src/agent/mod.rs — how one delegated turn ended.",
+      "_crosses": "harness <- agent CLI (child process, stream-json on stdout)",
+      "fields": {
+        "session_id": "string",
+        "stop_reason": "string",
+        "is_error": "bool",
+        "served_by": "string[] — the models actually BILLED. Empty means `not reported`, never `none`."
+      }
+    },
+    "TokenUsage": {
+      "_owner": "src/runtime/usage.rs — cumulative for a turn; what the budget counts.",
+      "fields": {
+        "input_tokens": "u32",
+        "output_tokens": "u32",
+        "cache_creation_input_tokens": "u32",
+        "cache_read_input_tokens": "u32"
+      }
+    },
+    "RateLimitInfo": {
+      "_owner": "src/agent/claude_code.rs — subscription quota, reported instead of a dollar figure. Wire names are camelCase; the Rust names are snake_case via serde rename.",
+      "fields": {
+        "status": "string — `allowed` is the only value that means work can proceed",
+        "resets_at": "i64 (wire: resetsAt)",
+        "rate_limit_type": "string (wire: rateLimitType)",
+        "is_using_overage": "bool (wire: isUsingOverage)"
+      }
+    },
+
+    "ToolStatus": {
+      "_owner": "src/tools/tool_status.rs — whether an external binary is installed, cached so every session does not re-probe the PATH.",
+      "fields": {
+        "installed": "bool",
+        "path": "string",
+        "version": "string",
+        "last_checked": "i64 (unix seconds)"
+      }
+    },
+
+    "SpecFile": {
+      "_owner": "src/spec.rs — one document of the spec set. Every entry must have a named consumer; a file nothing reads is cost, not documentation.",
+      "fields": {
+        "path": "string, workspace-relative",
+        "holds": "string",
+        "consumer": "string — the role in the loop that reads it, or the owner",
+        "approval": "enum: Owner | Generated"
+      }
+    }
+  },
+
+  "endpoints": [
+    {
+      "path": "GET /v1/owner/proxy",
+      "response": "ProjectBrief",
+      "_module": "src/brief.rs",
+      "_note": "Returns the WHOLE ProxyConfig — briefs plus the owner's rules, mode, model and severity ceiling. Treated as opaque JSON and patched at one path.",
+      "errors": [
+        "connection refused — the body is not running; the gate reports this rather than assuming an empty brief",
+        "non-2xx — `the service answered <status>`",
+        "timeout after 5s — a slow answer before the first prompt is indistinguishable from a hung start"
+      ]
+    },
+    {
+      "path": "POST /v1/owner/proxy",
+      "response": "BriefUpdate",
+      "_module": "src/brief.rs",
+      "_note": "REPLACES the whole document. A partial struct posted here would silently delete the owner's rules. Read back after writing; `it returned ok` is not evidence the field landed.",
+      "errors": [
+        "the config has no `briefs` list",
+        "`briefs` is not a list",
+        "a brief needs a project name",
+        "the brief was written but could not be read back"
+      ]
+    },
+    {
+      "path": "POST /v1/owner/enqueue",
+      "response": "Ticket",
+      "_module": "src/owner.rs",
+      "_request_fields": {
+        "_why_not_a_schema": "built inline with serde_json::json! and has no named type in the code; recorded here rather than invented as a schema name the checker would not find",
+        "title": "string — required; the match key for a reusable past verdict",
+        "detail": "string",
+        "severity": "u8 — clamped 1..=5 by the service; decides whether a closed phone is buzzed",
+        "source": "string — always `guard`, so the proxy will not auto-decide the card",
+        "project": "string"
+      },
+      "errors": [
+        "a card with no title is rejected by the service",
+        "the card was accepted without a token, so no answer can be read"
+      ]
+    },
+    {
+      "path": "GET /v1/owner/wait",
+      "response": "Verdict",
+      "_module": "src/owner.rs",
+      "_note": "Query: token, timeout_secs.",
+      "errors": [
+        "the verdict did not parse",
+        "the verdict `<verb>` is not one this harness knows how to act on — never read as approval"
+      ]
+    },
+    {
+      "path": "GET /v1/owner/history",
+      "response": "",
+      "_module": "src/owner.rs",
+      "_note": "Query: limit. Reply carries `decided`, a list of rows. Only consumed `approve` / `dismiss` rows are reusable.",
+      "_response_row_fields": {
+        "_why_not_a_schema": "read field-by-field out of serde_json::Value; there is no named row type in the code",
+        "title": "string — matched EXACTLY; a differently phrased question is a different question",
+        "project": "string — compared by suffix, never by `contains`",
+        "consumed": "bool — an unconsumed row is not an answer",
+        "verb": "string",
+        "decided_by": "string",
+        "proxy_note": "string"
+      },
+      "errors": ["the history did not parse"]
+    },
+    {
+      "path": "GET /v1/memory/rules/for",
+      "response": "string",
+      "_module": "src/rules.rs",
+      "_note": "Query: query, top_k. Returns always-on rules unioned with the ones matching the turn, so they ride the turn rather than the system prompt.",
+      "errors": ["unreachable body — the turn proceeds without rules rather than failing"]
+    },
+    {
+      "path": "POST /v1/memory/recall/index",
+      "response": "IndexResponse",
+      "_module": "src/recall.rs",
+      "errors": ["unreachable body", "malformed response"]
+    },
+    {
+      "path": "POST /v1/memory/recall/get",
+      "response": "GetResponse",
+      "_module": "src/recall.rs",
+      "errors": ["unreachable body", "malformed response"]
+    },
+    {
+      "path": "POST /v1/memory/remember",
+      "response": "string",
+      "_module": "src/knowledge.rs",
+      "_note": "Body: {text, kind, subject}. Reply carries isError / content[0].text / stored / msg_id.",
+      "errors": ["isError true — reported as the tool's error, never swallowed"]
+    },
+    {
+      "path": "POST /v1/memory/search",
+      "response": "string",
+      "_module": "src/knowledge.rs",
+      "_note": "Body: {query, top_k}. Reply carries `matches`.",
+      "errors": ["no `matches` array — read as no results, not as a failure"]
+    },
+    {
+      "path": "POST /v1/memory/messages",
+      "response": "string",
+      "_module": "src/knowledge.rs",
+      "_note": "Correction path. Body carries {confirmed}; the reply carries confirmation_required / deleted / idx.",
+      "errors": ["confirmation_required — a preview, not a deletion; never auto-confirmed"]
+    },
+    {
+      "path": "GET /v1/memory/watchman/handoff",
+      "response": "",
+      "_module": "src/recorder.rs",
+      "_note": "Query: task=<absolute workspace path>. Reply carries `items`. Nothing is cached here; the recorder lives in the body.",
+      "_response_item_fields": {
+        "_why_not_a_schema": "read field-by-field out of serde_json::Value; there is no named item type in the code",
+        "name": "string — the tool name; an item without one is skipped",
+        "input": "json (compacted for the prompt)",
+        "output": "json (compacted for the prompt)",
+        "observations": "u64 — how many times it was witnessed"
+      },
+      "errors": ["unreachable body", "no `items` array — read as nothing solved yet"]
+    },
+    {
+      "path": "GET /v1/memory/audit/findings",
+      "response": "Finding",
+      "_module": "src/auditor.rs",
+      "errors": [
+        "the auditor's answer did not parse",
+        "no `findings` array — read as no findings, not as a failure"
+      ]
+    },
+    {
+      "path": "GET /v1/memory/enforcement",
+      "response": "Guards",
+      "_module": "src/guards.rs",
+      "_note": "The body's standing guard categories. Reply carries rules[].key, rules[].always and forward_all. Read once at session start, 4s budget.",
+      "errors": ["unreachable body — DEFAULT_PROTECTED still applies, so the guard never silently opens"]
+    }
+  ]
+}

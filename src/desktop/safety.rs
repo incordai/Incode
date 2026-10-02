@@ -39,7 +39,9 @@ use super::DesktopError;
 /// Long enough that a slow turn or a paused debugger does not trip it, short
 /// enough that a crashed supervisor cannot leave a clicking thread running for
 /// minutes. The harness is expected to beat far more often than this.
-pub const DEFAULT_HEARTBEAT_DEADLINE: Duration = Duration::from_secs(30);
+/// admin.json `desktop_limits.heartbeat_deadline_secs` may shorten it.
+pub const DEFAULT_HEARTBEAT_DEADLINE: Duration =
+    Duration::from_secs(super::limits::DEFAULT_HEARTBEAT_DEADLINE_SECS);
 
 /// Why an action was refused.
 ///
@@ -104,9 +106,11 @@ impl Safety {
         }
     }
 
-    /// A switch with [`DEFAULT_HEARTBEAT_DEADLINE`].
+    /// A switch with the configured deadline: admin.json
+    /// `desktop_limits.heartbeat_deadline_secs`, default
+    /// [`DEFAULT_HEARTBEAT_DEADLINE`], stricter only.
     pub fn with_default_deadline() -> Self {
-        Safety::new(DEFAULT_HEARTBEAT_DEADLINE)
+        Safety::new(super::limits::get().heartbeat_deadline)
     }
 
     /// Report that the supervisor is still alive.

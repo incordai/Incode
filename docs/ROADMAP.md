@@ -54,10 +54,19 @@ This is fully true for claude; section 0b says what is not.
   at the edge), `anthropic-version`, one key header per route (`auth`), the
   https-or-loopback rule on every API key, a route's `sub_model` for its
   sub-agents, and `/models`. Not run against a live service: no key was used.
-- **The API route still lacks**: the session's permission mode and `--add-dir`
-  on its toolbox, retry on 429/529, and prompt caching. The reply ceiling, tool
-  rounds and request timeout are per-entry config (`max_tokens`, `max_steps`,
-  `timeout_secs`).
+- **The API route's gaps are closed (2026-10-01).** Prompt caching: the
+  `anthropic` format marks the tools, the system prompt and the newest message
+  as cache breakpoints (`prompt_cache`, default on); the chat format relies on
+  the service's own automatic caching and reads its cached-token count. Not yet
+  measured against a live service. The session's permission mode
+  and `--add-dir` reach its toolbox since 2026-10-01 — before that a `plan`
+  session on an API model could write (shown by a control: the test failed
+  with "a plan session wrote a file" when the forwarding was removed). The reply ceiling, tool rounds and request
+  timeout are per-entry config (`max_tokens`, `max_steps`, `timeout_secs`).
+  Retry on a busy answer is DONE 2026-10-01: 429, 503 and 529 are sent again
+  up to `max_retries` (default 3), waiting `Retry-After` or 1, 2, 4… s, capped
+  at 30 s, before any of the reply is read (so a streamed turn never repeats
+  text); a wrong request is not retried.
 - **No SSE MCP transport.** An ACP client's HTTP MCP servers are spoken to over
   Streamable HTTP (`toolbox::mcp_http`, `mcpCapabilities.http: true`); the older SSE
   transport is not, and `initialize` says so. A server that forgets its session
@@ -102,10 +111,14 @@ This is fully true for claude; section 0b says what is not.
   AppContainer could, and it cannot read the workspace or toolchains ungranted).
   Not verified live: the macOS profile (the Mac was offline) and the Linux
   enforced path (WSL's kernel is 5.15, ABI V1).
-- **A full macOS build and test of HEAD is not verified.** The Mac was offline, and
-  since tree-sitter's C grammars went in (`079988b`), the crate can no longer be
-  compile-checked for macOS from Windows. The macOS sandbox profile itself was
-  validated live on macOS during phase 8.
+- ~~**A full macOS build and test of HEAD is not verified.**~~ DONE 2026-10-01 on
+  the owner's Mac: it built, and 7 tests failed. Two were real bugs, fixed —
+  RenderPdf hung for its 120 s deadline on macOS because Chrome writes the PDF
+  and does not exit (the print now ends when the PDF is whole), and
+  `convert::output_path` turned `a\b.pptx` into `a\a\b.pdf` off Windows. Five
+  were tests that assumed Windows (a `node` dependency, a backslash literal,
+  the Windows command-line limit, an off-by-one in a Unix loop, CRLF bytes).
+  Now 1814 lib + 46 bin pass there, and the macOS-only build warnings are gone.
 - **External tools — done; the owner's own release is not published yet.** A
   program incode runs is an `admin.json` `tools` entry, downloaded from its
   release only when asked (`/tools add|update|remove`, `incode --install-tools`),
@@ -336,15 +349,110 @@ is gone (`tools/mod.rs` records it). `with_defaults` names `read_file`,
 
 ### B1 — Desktop on macOS (Phase C) and Linux/Xvfb (Phase D)
 
-`COMPUTER_USE.md` has the design. Neither can be *verified* from this machine,
-and `PROCESS.md` §4 says a claim about an external system needs that system.
-Writing it blind produces code that compiles and has never run.
+Both machines now exist: the owner's Mac (macOS 26.6.2, arm64, over ssh) and
+WSL2 Ubuntu 24.04 on the development PC.
 
-**Needs:** a machine of that kind, or an explicit decision to ship it untested
-and say so in the docs.
+**macOS — built 2026-10-01** (`src/desktop/macos.rs`), compiled and its whole
+suite run on the Mac (1814 lib + 46 bin passed, 0 failed):
+- monitors and capture through xcap, in POINTS (`dpi::Awareness::Points`);
+- **a Retina bug fixed on the way** — `capture` took the region's size from
+  the image (pixels) and its origin from the display (points), so every click
+  landed at twice its distance from the corner; `capture::desktop_view` now
+  takes the region in desktop units and only the model size from the image,
+  and refuses a capture whose shape is not the display's;
+- the accessibility tree through AXUIElement (direct framework calls, no new
+  package), sharing the walk with Windows (`uia::walk`), 1 s per request;
+- the clipboard through `pbcopy` (its test puts the owner's clipboard back);
+- the Accessibility and Screen Recording grants probed before each action and
+  reported by `screen_info` (`missing_grants`), refusing by name rather than
+  letting macOS drop the action silently.
 
-The desktop is unchanged by section 0; only the OS sandbox for shell commands
-was validated on macOS (phase 8).
+**Live on the owner's Mac, 2026-10-01 (over SSH):** `screen_info` (Retina
+1440x900 pt, scale 2), `ui_tree` on a TextEdit window at true point positions,
+and the cursor read all worked; `screenshot` was refused by name (Screen
+Recording not granted). **Input did not land**: macOS drops events from a
+session without window-server access (SessionGetInfo 0x5020 over SSH, 0x6030
+logged in) while `move_mouse` answered "moved" — now refused at startup
+(`macos::require_graphic_session`), as is a missing Accessibility grant.
+
+**Still open on macOS:** click/type/paste/screenshot in the logged-in session.
+The owner's grant covers the SSH chain, not the binary: grant Accessibility and
+Screen Recording to the binary that runs (e.g. `/tmp/incode-mac-test/incode`),
+then run it there (Terminal, or a LaunchAgent in `gui/<uid>`). Isolation stays
+a VM (`COMPUTER_USE.md` 7e).
+
+**Windows, live 2026-10-01 (7/7):** against a dedicated WinForms window whose
+focus starts on a button — `move_mouse` landed, `ui_tree` walked it at true
+positions, `click_element` moved focus into the text box, `type_text` +
+`paste_text` filled it (read back from the window itself), `screenshot`
+returned an image and `key enter` submitted `hello world`. A first run failed
+only because the owner was using the mouse at the same time — the shared
+desktop 7e warns about.
+
+**Linux on X11 — built 2026-10-01** (`src/desktop/linux.rs`), tested in Docker
+(Debian 13, Rust 1.97) instead of the WSL machine, whose apt is broken:
+- the display is NAMED in admin.json `desktop_display`: `":N"` attaches,
+  `"xvfb"`/`"xvfb:WxH"` starts a private Xvfb (`-displayfd`, so no race for a
+  number; `PR_SET_PDEATHSIG`, so it dies with the server however that ends);
+  unset is a refusal — never `$DISPLAY`, the operator's own desktop (7e);
+- input through enigo's x11rb backend (the 3 packages above, now added);
+  clipboard through `xclip` or `xsel`, refusing by name when neither is there;
+- the AT-SPI2 tree over zbus (already in the lock), filtered to applications
+  whose process `DISPLAY` is this server's, the active window or the one
+  showing; GTK4's SENSITIVE-without-ENABLED read as enabled;
+- **GTK4 trees are refused, measured not assumed:** GTK 4.18.6 reports every
+  control at (0,0) in screen AND parent coordinates (GTK 3.24.49 reports true
+  positions), so `ui_tree` names the toolkit and points at screenshot + click.
+
+Live, against the real `incode --desktop-mcp` (8/8): a GTK3 window walked at
+its true position, `click_element` moved focus off a button into the entry,
+`type_text` + `paste_text` + `key enter` made it return `hello world`, a
+screenshot came back, GTK4 was refused by name yet typed into, and the private
+Xvfb was gone after the server ended. Whole lib suite on Linux: 1821 passed;
+the 2 `file_ops` failures were the read-only source mount (they write into the
+crate directory), and pass on a writable copy.
+
+**Still open on Linux:** the pixel viewer (x11vnc + noVNC, 14b); Qt and
+Chromium trees not yet measured.
+
+**Built 2026-10-01, second round — what Orca had and incode lacked, then a
+review of the result.** New tools: `list_windows` (ids, apps, rectangles),
+`focus_window`, `set_value` and `element_action` (no mouse: UIA patterns,
+AX actions, AT-SPI EditableText/Action, each read back where allowed and
+marked "(verified)" or "(unverified: why)"); every tool takes `window`, and
+the acting ones `screenshot_after`; `scroll`/`drag` take element ids;
+`paste_text` puts the clipboard back. Password managers are never read,
+pictured or acted on (`limits::BUILTIN_BLOCKED_APPS`, plus
+`desktop_limits.blocked_apps`); a password field's value is never read.
+
+A review of that work found eleven holes, all fixed before commit:
+- **an element id is checked, not trusted** — ids are positions in one walk,
+  so the server keeps what each window's last `ui_tree` showed (depth and
+  elements) and acts only on an id that tree showed, re-walked at the same
+  depth, and only while the control there has the same role, depth, secret
+  flag and name (`uia::same_control`; an edit field's name may change);
+- **blocked windows by rectangle** — every click, scroll and drag point, and
+  every window capture, is refused inside or over a blocked window's
+  rectangle, whatever is drawn on top; a desktop whose windows cannot be
+  listed is refused rather than taken to have none;
+- **an owner that cannot be named is blocked** (`limits::UNNAMED_APP`);
+  untitled blocked windows (Windows) and every window layer (macOS) count;
+- **Linux focus from the X server** (`linux::keyboard_target`, x11rb — no new
+  package): the window keys reach, by `_NET_WM_PID`; keys reaching a window
+  nobody can name are refused, not taken for "no window";
+- **macOS window ids are the window server's numbers** (`pid.number`), so an
+  id never drifts onto another window when windows reorder;
+- **bounds**: `max_scroll_steps` (50) and `tree_max_visited` (4000) in
+  `desktop_limits`; coordinates that do not fit are refused, not wrapped;
+- **the clipboard**: read in full however large (Linux drained while
+  `xclip` runs — it stalled at the 64 KiB pipe), and an unreadable clipboard
+  refuses the paste instead of losing what was on it;
+- a GTK 4 window's picture is refused by name (it reports no positions).
+
+Live in Docker against the real server: probe2 29/30 (the one miss is GTK
+4.18.6 reading a set value back as 0 characters — reported "unverified",
+and the value did land), probe3 4/4 (scroll down, right, left; drag element
+to element). Windows below; the Mac is still to run.
 
 ### B2 — The codex MCP tool call
 

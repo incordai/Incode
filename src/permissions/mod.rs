@@ -64,6 +64,19 @@ impl PermissionMode {
         }
     }
 
+    /// The mode an agent-mode word names — the inverse of
+    /// [`Self::agent_mode`], for a backend whose tools are incode's own. A
+    /// word nobody recognises lands on read-only, as
+    /// [`Self::from_str_lossy`] does: an unknown mode never widens.
+    #[must_use]
+    pub fn from_agent_mode(word: &str) -> Self {
+        match word {
+            "acceptEdits" => Self::WorkspaceWrite,
+            "default" => Self::Prompt,
+            _ => Self::ReadOnly,
+        }
+    }
+
     /// Rung on the capability ladder, if this mode is one.
     ///
     /// `Prompt` and `Allow` are policies and have no rung — which is exactly
@@ -221,6 +234,7 @@ impl PermissionPolicy {
             .with_tool_requirement("cursor_position", PermissionMode::ReadOnly)
             .with_tool_requirement("screenshot", PermissionMode::ReadOnly)
             .with_tool_requirement("ui_tree", PermissionMode::ReadOnly)
+            .with_tool_requirement("list_windows", PermissionMode::ReadOnly)
             // Acting. Each one changes the state of a machine the operator is
             // signed into.
             .with_tool_requirement("move_mouse", PermissionMode::WorkspaceWrite)
@@ -231,6 +245,9 @@ impl PermissionPolicy {
             .with_tool_requirement("key", PermissionMode::WorkspaceWrite)
             .with_tool_requirement("scroll", PermissionMode::WorkspaceWrite)
             .with_tool_requirement("drag", PermissionMode::WorkspaceWrite)
+            .with_tool_requirement("set_value", PermissionMode::WorkspaceWrite)
+            .with_tool_requirement("element_action", PermissionMode::WorkspaceWrite)
+            .with_tool_requirement("focus_window", PermissionMode::WorkspaceWrite)
     }
 
     /// Default permission requirements for the standard file/bash tools.

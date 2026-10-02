@@ -41,6 +41,12 @@ pub enum Awareness {
     /// Not a Windows target. Other platforms express scaling per-monitor
     /// instead of per-process, so there is nothing to set here.
     NotApplicable,
+
+    /// macOS: the desktop is measured in POINTS, top-left origin at the main
+    /// display — the space mouse events and the accessibility tree both use.
+    /// A screenshot is in pixels; each display's `scale` is its pixels per
+    /// point, and every image carries its own transform back to points.
+    Points,
 }
 
 impl Awareness {
@@ -67,6 +73,9 @@ impl Awareness {
                 format!("not per-monitor aware (DPI_AWARENESS = {other}) — geometry is suspect")
             }
             Awareness::NotApplicable => "not applicable on this platform".to_string(),
+            Awareness::Points => "macOS: coordinates are points (top-left, main display); \
+                                  each display's scale is its pixels per point"
+                .to_string(),
         }
     }
 }
@@ -114,7 +123,12 @@ fn set_and_measure() -> Awareness {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn set_and_measure() -> Awareness {
+    Awareness::Points
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn set_and_measure() -> Awareness {
     Awareness::NotApplicable
 }
@@ -177,7 +191,22 @@ mod tests {
         );
     }
 
-    #[cfg(not(windows))]
+    /// macOS speaks points, and says so: not "physical", and a summary that
+    /// names the unit, so a reader is not left to guess why rectangles are
+    /// half the size of a Retina screenshot.
+    #[test]
+    fn macos_points_are_reported_as_points() {
+        assert!(!Awareness::Points.coordinates_are_physical());
+        assert!(Awareness::Points.summary().contains("points"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_reports_points() {
+        assert_eq!(ensure_per_monitor_aware(), Awareness::Points);
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
     #[test]
     fn non_windows_reports_not_applicable() {
         assert_eq!(ensure_per_monitor_aware(), Awareness::NotApplicable);

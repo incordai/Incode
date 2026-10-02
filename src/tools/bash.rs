@@ -413,7 +413,8 @@ mod tests {
         {
             let mut c = Command::new("cmd");
             c.arg("/C").arg(format!(
-                "for /L %i in (1,1,{lines}) do @echo line %i padding padding padding padding padding"
+                "for /L %i in (1,1,{lines}) do @echo line %i padding padding padding padding \
+                 padding padding padding"
             ));
             c
         }
@@ -421,8 +422,8 @@ mod tests {
         {
             let mut c = Command::new("sh");
             c.arg("-c").arg(format!(
-                "i=0; while [ $i -lt {lines} ]; do echo \"line $i padding padding padding \
-                 padding padding\"; i=$((i+1)); done"
+                "i=1; while [ $i -le {lines} ]; do echo \"line $i padding padding padding \
+                 padding padding padding padding\"; i=$((i+1)); done"
             ));
             c
         }

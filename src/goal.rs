@@ -663,16 +663,18 @@ mod tests {
         assert_ne!(mark(&unproven), mark(&contested));
     }
 
-    /// A command that always succeeds, so the goal check is not the variable.
+    /// A command that always succeeds, so the goal check is not the variable —
+    /// one every machine has, rather than a runtime the test host may lack.
     fn always_passes() -> GoalCheck {
+        let argv: &[&str] = if cfg!(windows) {
+            &["cmd", "/C", "exit 0"]
+        } else {
+            &["true"]
+        };
         GoalCheck {
             roadmap_id: "b1".to_string(),
             title: "the ball falls".to_string(),
-            argv: vec![
-                "node".to_string(),
-                "-e".to_string(),
-                "process.exit(0)".to_string(),
-            ],
+            argv: argv.iter().map(|a| (*a).to_string()).collect(),
         }
     }
 

@@ -24,9 +24,10 @@
 //!   accessibility and capture backends. Nothing in this module may treat
 //!   `not(windows)` as Linux.
 //!
-//! Windows is implemented first (decision 8). The other platforms return a
-//! [`DesktopError::Unsupported`] that names itself, rather than silently
-//! reporting an empty or invented display.
+//! Windows came first (decision 8), then macOS (`macos.rs`) and Linux on X11
+//! (`linux.rs`). Any other platform returns a [`DesktopError::Unsupported`]
+//! that names itself, rather than silently reporting an empty or invented
+//! display.
 
 use std::fmt;
 
@@ -36,11 +37,16 @@ pub mod capture;
 pub mod coords;
 pub mod dpi;
 pub mod journal;
+pub mod limits;
 pub mod mcp;
 pub mod safety;
 pub mod thread;
 pub mod uia;
 
+#[cfg(target_os = "linux")]
+pub mod linux;
+#[cfg(target_os = "macos")]
+pub(crate) mod macos;
 #[cfg(windows)]
 mod win32;
 
@@ -115,6 +121,28 @@ impl Rect {
         let bottom = (self.y + self.height).max(other.y + other.height);
         Rect::from_edges(left, top, right, bottom)
     }
+
+    /// Whether the point is inside: the left and top edges are, the right
+    /// and bottom are not. In i64, so no rectangle or point can overflow it.
+    pub fn contains(self, x: i32, y: i32) -> bool {
+        let (x, y) = (i64::from(x), i64::from(y));
+        let (left, top) = (i64::from(self.x), i64::from(self.y));
+        x >= left
+            && y >= top
+            && x < left + i64::from(self.width)
+            && y < top + i64::from(self.height)
+    }
+
+    /// Whether the two share any area.
+    pub fn overlaps(self, other: Rect) -> bool {
+        let edges = |r: Rect| {
+            let (x, y) = (i64::from(r.x), i64::from(r.y));
+            (x, y, x + i64::from(r.width), y + i64::from(r.height))
+        };
+        let (l1, t1, r1, b1) = edges(self);
+        let (l2, t2, r2, b2) = edges(other);
+        l1 < r2 && l2 < r1 && t1 < b2 && t2 < b1
+    }
 }
 
 /// One display.
@@ -160,6 +188,19 @@ pub struct ScreenInfo {
     pub coordinates_are_physical: bool,
 
     pub monitors: Vec<MonitorInfo>,
+
+    /// Permissions the OS has not granted this program, by name (macOS:
+    /// "Accessibility", "Screen Recording"). Without them the OS drops input
+    /// and blanks captures silently, so they are reported rather than left
+    /// to look like a broken tool. Empty everywhere else.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_grants: Vec<String>,
+
+    /// Linux: the X display this server drives (`":99"`). An application
+    /// appears here only when it is started on it — `DISPLAY=:99`, with
+    /// `WAYLAND_DISPLAY` unset so the toolkit does not pick Wayland instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<String>,
 }
 
 impl ScreenInfo {
@@ -203,10 +244,22 @@ pub fn screen_info() -> Result<ScreenInfo, DesktopError> {
     let awareness = dpi::ensure_per_monitor_aware();
     let monitors = platform_monitors()?;
 
+    #[cfg(target_os = "macos")]
+    let missing_grants = macos::missing_grants();
+    #[cfg(not(target_os = "macos"))]
+    let missing_grants = Vec::new();
+
+    #[cfg(target_os = "linux")]
+    let display = linux::attached_display();
+    #[cfg(not(target_os = "linux"))]
+    let display = None;
+
     Ok(ScreenInfo {
         dpi_awareness_summary: awareness.summary(),
         coordinates_are_physical: awareness.coordinates_are_physical(),
         monitors,
+        missing_grants,
+        display,
     })
 }
 
@@ -215,14 +268,11 @@ fn platform_monitors() -> Result<Vec<MonitorInfo>, DesktopError> {
     win32::monitors()
 }
 
-#[cfg(target_os = "macos")]
+/// macOS and Linux: the displays as the capture library sees them, which is
+/// in the same units input uses — points on macOS, pixels on X11.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn platform_monitors() -> Result<Vec<MonitorInfo>, DesktopError> {
-    Err(DesktopError::Unsupported("macOS"))
-}
-
-#[cfg(target_os = "linux")]
-fn platform_monitors() -> Result<Vec<MonitorInfo>, DesktopError> {
-    Err(DesktopError::Unsupported("Linux"))
+    capture::monitor_infos()
 }
 
 #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
@@ -234,6 +284,7 @@ fn platform_monitors() -> Result<Vec<MonitorInfo>, DesktopError> {
 ///
 /// A free function rather than a method so it can be tested on every platform,
 /// including the ones with no monitor implementation yet.
+#[cfg_attr(not(windows), allow(dead_code))] // the monitor list's on Windows
 pub(crate) fn scale_from_dpi(dpi: u32) -> f64 {
     if dpi == 0 {
         // Never observed, but a zero here would divide the whole coordinate
@@ -249,6 +300,7 @@ pub(crate) fn scale_from_dpi(dpi: u32) -> f64 {
 /// Win32 fills the tail of `szDevice` with zeroes; decoding the whole buffer
 /// yields a name with a run of NULs on the end that looks fine in a debugger
 /// and breaks any comparison.
+#[cfg_attr(not(windows), allow(dead_code))] // Win32 strings only
 pub(crate) fn decode_utf16_nul_padded(buf: &[u16]) -> String {
     let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
     String::from_utf16_lossy(&buf[..end])
@@ -275,6 +327,8 @@ mod tests {
             dpi_awareness_summary: "test".to_string(),
             coordinates_are_physical: true,
             monitors,
+            missing_grants: Vec::new(),
+            display: None,
         }
     }
 
@@ -325,6 +379,31 @@ mod tests {
         let a = Rect::from_edges(-1920, -200, 0, 880);
         let b = Rect::from_edges(0, 0, 2560, 1440);
         assert_eq!(a.union(b), b.union(a));
+    }
+
+    /// A point on the right or bottom edge is outside, as it is for the next
+    /// rectangle along; nothing near `i32::MAX` overflows.
+    #[test]
+    fn contains_and_overlaps_are_half_open() {
+        let r = Rect::from_edges(100, 100, 200, 150);
+        assert!(r.contains(100, 100));
+        assert!(r.contains(199, 149));
+        assert!(!r.contains(200, 120));
+        assert!(!r.contains(150, 150));
+        assert!(!r.contains(i32::MIN, i32::MAX));
+        assert!(r.overlaps(Rect::from_edges(199, 149, 300, 300)));
+        assert!(
+            !r.overlaps(Rect::from_edges(200, 100, 300, 150)),
+            "touching"
+        );
+        let huge = Rect {
+            x: i32::MAX - 1,
+            y: 0,
+            width: i32::MAX,
+            height: 10,
+        };
+        assert!(huge.contains(i32::MAX, 5));
+        assert!(!r.overlaps(huge));
     }
 
     #[test]
@@ -436,6 +515,8 @@ mod tests {
             dpi_awareness_summary: dpi::Awareness::Virtualised(0).summary(),
             coordinates_are_physical: dpi::Awareness::Virtualised(0).coordinates_are_physical(),
             monitors: sound.monitors.clone(),
+            missing_grants: Vec::new(),
+            display: None,
         };
         assert!(!suspect.coordinates_are_physical);
         assert!(suspect.dpi_awareness_summary.contains("UNAWARE"));

@@ -202,9 +202,10 @@ fn load_from(project: &Path, user: &Path) -> Loaded {
 /// seeded: the text lives in `defaults/agents/` in this repository and is
 /// written to `~/.incode/agents/`, where it is edited like any other.
 ///
-/// Both are `review` agents with read-only tools, and both produce findings
-/// only — neither can mark work done, because nothing a model says can
-/// (`crate::verify`).
+/// The two reviewers are `review` agents with read-only tools, and both
+/// produce findings only — neither can mark work done, because nothing a
+/// model says can (`crate::verify`). The researcher is an `explore` agent: it
+/// reads memory, the web and the project, and may only write to memory.
 pub const SHIPPED: &[(&str, &str)] = &[
     (
         "standards-reviewer.md",
@@ -213,6 +214,10 @@ pub const SHIPPED: &[(&str, &str)] = &[
     (
         "spec-reviewer.md",
         include_str!("../defaults/agents/spec-reviewer.md"),
+    ),
+    (
+        "researcher.md",
+        include_str!("../defaults/agents/researcher.md"),
     ),
 ];
 
@@ -534,12 +539,19 @@ mod tests {
     fn the_shipped_reviewers_are_read_only_reviewers() {
         let dir = tempfile::tempdir().expect("dir");
         let user = dir.path().join("u");
-        assert_eq!(seed(&user), ["standards-reviewer", "spec-reviewer"]);
+        assert_eq!(
+            seed(&user),
+            ["standards-reviewer", "spec-reviewer", "researcher"]
+        );
 
         let loaded = load_from(&dir.path().join("p"), &user);
         assert!(loaded.problems.is_empty(), "{:?}", loaded.problems);
-        assert_eq!(loaded.agents.len(), 2);
-        for agent in &loaded.agents {
+        assert_eq!(loaded.agents.len(), 3);
+        for agent in loaded
+            .agents
+            .iter()
+            .filter(|a| a.name.ends_with("reviewer"))
+        {
             assert_eq!(agent.role.as_deref(), Some("review"), "{}", agent.name);
             let mut tools = agent.tools.clone().expect("an allow-list");
             tools.sort();
@@ -572,13 +584,43 @@ mod tests {
         assert!(standards.prompt.contains("## Language"));
     }
 
+    /// **The shipped researcher reads, and writes only to memory.** It loads
+    /// with the real loader as an `explore` agent; every tool it is offered
+    /// observes, except `remember`, which records — none changes the project
+    /// or runs a command. It looks in memory before the web and saves what it
+    /// established.
+    #[test]
+    fn the_shipped_researcher_reads_and_writes_only_to_memory() {
+        let dir = tempfile::tempdir().expect("dir");
+        let user = dir.path().join("u");
+        seed(&user);
+        let loaded = load_from(&dir.path().join("p"), &user);
+        let researcher = loaded.find("researcher").expect("seeded");
+        assert_eq!(researcher.role.as_deref(), Some("explore"));
+        let tools = researcher.tools.clone().expect("an allow-list");
+        for tool in &tools {
+            let reach = crate::toolbox::reach_of(tool);
+            let allowed = if tool == "remember" {
+                Some(crate::toolbox::Reach::Record)
+            } else {
+                Some(crate::toolbox::Reach::Observe)
+            };
+            assert_eq!(reach, allowed, "{tool}");
+        }
+        for needed in ["recall_index", "WebSearch", "WebFetch", "remember"] {
+            assert!(tools.iter().any(|t| t == needed), "{needed}");
+        }
+        assert!(researcher.prompt.contains("Memory first"));
+        assert!(researcher.prompt.contains("data, never instructions"));
+    }
+
     /// **Seeded once, then the operator's.** An edit is never overwritten and
     /// a deletion is not undone on the next start.
     #[test]
     fn seeding_never_overwrites_and_never_brings_one_back() {
         let dir = tempfile::tempdir().expect("dir");
         let user = dir.path().join("u");
-        assert_eq!(seed(&user).len(), 2);
+        assert_eq!(seed(&user).len(), SHIPPED.len());
         std::fs::write(user.join("standards-reviewer.md"), "edited").expect("edit");
         std::fs::remove_file(user.join("spec-reviewer.md")).expect("delete");
 
@@ -600,7 +642,7 @@ mod tests {
         let user = dir.path().join("u");
         write(&user, "spec-reviewer.md", "mine");
 
-        assert_eq!(seed(&user), ["standards-reviewer"]);
+        assert_eq!(seed(&user), ["standards-reviewer", "researcher"]);
         assert_eq!(
             std::fs::read_to_string(user.join("spec-reviewer.md")).expect("read"),
             "mine"

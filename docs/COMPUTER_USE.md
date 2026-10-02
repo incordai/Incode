@@ -3,7 +3,32 @@
 > **Status note, 2026-09-26.** The first line below is out of date. The Windows desktop
 > (`src/desktop/`) is built, and its twelve tools are Toolbox tools behind incode's
 > gate, executed by `incode --desktop-mcp` (`ARCHITECTURE.md` §5b, "The desktop").
-> macOS (Phase C) and Linux/Xvfb (Phase D) are still open (`ROADMAP.md` B1).
+> macOS (Phase C) is built (2026-10-01, `src/desktop/macos.rs`): monitors and capture
+> through xcap in POINTS, the accessibility tree through AXUIElement, the clipboard
+> through `pbcopy`, and the two TCC grants probed before every action and reported by
+> `screen_info` (`missing_grants`). Compiled and unit-tested on macOS 26.6.2 (arm64);
+> the live drive of a real window needs a person to grant Accessibility and Screen
+> Recording once. Linux on X11 (Phase D) is built (2026-10-01, `src/desktop/linux.rs`):
+> admin.json `desktop_display` names the display (`":N"`, or `"xvfb"` for a private one the
+> server starts and stops; unset refuses rather than using `$DISPLAY`), enigo's x11rb
+> backend for input, `xclip`/`xsel` for the clipboard, and the AT-SPI2 tree over zbus,
+> kept to the applications whose own `DISPLAY` is the server's. Driven live in Docker
+> (Debian 13): a GTK3 window walked at true screen positions, clicked by element, typed
+> and pasted into; a GTK4 window's tree comes with a NOTE instead of positions, because
+> GTK 4.18.6 reports every control at (0,0) — `set_value`/`element_action` work on it by
+> id, clicking by id is refused. The pixel viewer (14b) is not built.
+>
+> **Second round, 2026-10-01** (`docs/ROADMAP.md` B1): `list_windows`, `focus_window`,
+> `set_value`, `element_action`, `window` and `screenshot_after` on every tool, scroll and
+> drag by element, password managers blocked (`desktop_limits.blocked_apps` adds more).
+> An element id is acted on only while the control the last `ui_tree` showed there is
+> still there; clicks and captures never land inside a blocked window's rectangle.
+>
+> **The invariant in 4c, as built:** one coordinate space at the tool surface — physical
+> pixels on Windows and X11, **points** on macOS (the space CGEvent and AXUIElement both
+> use), top-left origin. Each image carries its transform back to that space; on a
+> Retina display the image is in pixels and the region in points
+> (`capture::desktop_view`).
 
 **Status: DESIGN ONLY. Nothing in this document is implemented.** Every claim about the
 existing tree cites a file and was measured on 2026-09-16. Every claim about a crate's

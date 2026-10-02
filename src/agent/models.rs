@@ -88,6 +88,9 @@ pub fn model_settings(
             .timeout_secs
             .filter(|n| *n > 0)
             .unwrap_or(super::api::DEFAULT_TIMEOUT_SECS),
+        // Zero is meaningful here — never retry — so it is taken as given.
+        max_retries: model.max_retries.unwrap_or(super::api::DEFAULT_MAX_RETRIES),
+        prompt_cache: model.prompt_cache.unwrap_or(true),
         api_version: model
             .api_version
             .as_deref()
@@ -325,6 +328,8 @@ mod tests {
             max_tokens: None,
             max_steps: None,
             timeout_secs: None,
+            max_retries: None,
+            prompt_cache: None,
             auth: None,
             api_version: None,
         }

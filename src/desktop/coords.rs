@@ -195,7 +195,10 @@ impl ViewTransform {
         })
     }
 
-    /// Whether the image was sent at native size.
+    /// Whether the region and the image are the same size. Not "sent at
+    /// native size" on a Retina display, where the region is in points and
+    /// the image in pixels — capture compares the image itself instead.
+    #[cfg(test)]
     pub fn is_identity(&self) -> bool {
         self.source_width == self.model_width && self.source_height == self.model_height
     }
