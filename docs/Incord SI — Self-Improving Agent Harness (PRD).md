@@ -348,7 +348,10 @@ As of Oct 2, 2026. "incode" paths are in `D:\Projects\incord-code`.
 | Lesson writer (`insi learn`) | A failed attempt on a fair task + its verified fix → one lesson (issue, root cause, use, avoid), refused when a field is empty, oversized or holds code; `verified_by: check` |
 | Briefing | Lessons of the task's repository learned strictly before the task (compared as instants), never from the task itself, newest first, within 4,000 characters; attempts tagged `lessons=on\|off` and record which lessons they got |
 | `insi report` | Pass rate, repeat failures (same signature again), timeouts, errors, tokens and time per condition |
-| Watchman benchmark | 38 tasks mined; the first 3 validated as fair (pilot); the rest validating |
+| Watchman benchmark | 38 tasks mined, all validated: 35 fair |
+| Interface brief (`insi brief`) | The prompt names the module paths and exported names the hidden tests import that the base lacks — never a test or expected value — and says nobody will answer questions. Insi `dd99838` |
+
+**Pilot findings (Oct 2).** The first pilot (incode worker, routed to `gemini-3.1-pro-high`, 1800 s) passed 0 of 4. Every failure was a name the prompt never gave: a module the fix created (`editorDoc`, `ompInterjections`) or a function it exported (`isHiddenEditorHost`, `decodePtyChunk`); one worker also asked a question and waited out its budget. 20 of the 38 tasks have such a gap. A benchmark whose baseline is zero cannot show lessons helping, so the interface brief above was added before measuring. Three attempts at once also ran the machine out of memory: attempts run one at a time.
 
 Decision: benchmark lessons are kept in a JSONL file under the work folder, not in Incord Memory. `lesson_write` files an item under the project of the folder it names, which would put benchmark lessons in Watchman's memory, and its retrieval is semantic; an experiment needs a set it can reset and reproduce. Writing verified lessons to Incord Memory is the production path, behind the same store trait.
 
