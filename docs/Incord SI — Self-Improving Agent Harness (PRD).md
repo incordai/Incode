@@ -378,7 +378,7 @@ Decision: benchmark lessons are kept in a JSONL file under the work folder, not 
 | 16 | Proposer, accept-if-better, UCB1 bandit, audit events | 3 | Not started |
 | 17 | Connectors: CI logs, error tracking, docs, email | 4 | Not started |
 | 18 | Containers for issue work | 4 | Not started |
-| 19 | `insi init` for any repo: `.insi/config.toml`, `evals/`, CI workflow, MCP/hook registration | 2 | `insi init` built (`ded3d68`): detects Node/Rust/Python/Go, writes the config, ignores the work folder. CI workflows for Insi and incord-code committed. `insi mcp` registered in `.mcp.json` (`5ae02c3`) and `insi hook` in `.claude/settings.json` (`bfb64c3`); an existing file is never rewritten. `evals/` folder and a CI workflow for agent PRs left |
+| 19 | `insi init` for any repo: `.insi/config.toml`, `evals/`, CI workflow, MCP/hook registration | 2 | `insi init` built (`ded3d68`): detects Node/Rust/Python/Go, writes the config, ignores the work folder. CI workflows for Insi and incord-code committed. `insi mcp` registered in `.mcp.json` (`5ae02c3`) and `insi hook` in `.claude/settings.json` (`bfb64c3`); an existing file is never rewritten. CI workflow for agent PRs built (`a73f599`): `.github/workflows/insi.yml` runs setup and the repo's own `test_cmd` on PRs from `insi/` branches, read-only token not persisted. No `evals/` folder, by decision: a task's definition holds its reference commit (the answer), so tasks stay in `private_checks` outside the checkout. Done |
 | 20 | Packages: `insi` on crates.io, npm and pip wrappers — after the Phase 1 gate | 2 | Not started |
 
 ## Decisions (were open questions)
