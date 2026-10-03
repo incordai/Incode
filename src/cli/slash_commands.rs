@@ -1292,6 +1292,7 @@ fn roles_listing(admin: &crate::admin::AdminConfig) -> String {
                     var
                 }
             }
+            Source::Harness => format!("the harness in {}", crate::harness::HARNESS_ENV),
             Source::AdminFile => "your choice".to_string(),
             Source::Flag | Source::BuiltIn => "not set".to_string(),
         };

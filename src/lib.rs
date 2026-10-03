@@ -19,6 +19,7 @@ pub mod fleet;
 pub mod folders;
 pub mod goal;
 pub mod guards;
+pub mod harness;
 pub mod hooks;
 pub mod identity;
 pub mod instructions;

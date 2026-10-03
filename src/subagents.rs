@@ -61,6 +61,8 @@ const MAX_NAME_CHARS: usize = 64;
 pub enum Scope {
     /// The workspace's `.incode/agents`.
     Project,
+    /// The `agents/` of the harness this run was given (`INSI_HARNESS`).
+    Harness,
     /// The operator's `~/.incode/agents`.
     User,
 }
@@ -69,6 +71,7 @@ impl Scope {
     fn as_str(self) -> &'static str {
         match self {
             Self::Project => "project",
+            Self::Harness => "harness",
             Self::User => "user",
         }
     }
@@ -163,20 +166,33 @@ impl Loaded {
     }
 }
 
-/// Every sub-agent defined for `workspace`: the project's, then the
-/// operator's that the project does not override.
+/// Every sub-agent defined for `workspace`: the project's, then the run's
+/// harness's, then the operator's — each only where an earlier one does not
+/// already define the name.
 #[must_use]
 pub fn load(workspace: &Path) -> Loaded {
-    load_from(
-        &workspace.join(PROJECT_DIR),
-        &crate::admin::AdminConfig::default_dir().join(USER_DIR),
-    )
+    let project = workspace.join(PROJECT_DIR);
+    let harness = crate::harness::dir().map(|d| d.join(crate::harness::AGENTS_DIR));
+    let user = crate::admin::AdminConfig::default_dir().join(USER_DIR);
+    let mut dirs = vec![(project.as_path(), Scope::Project)];
+    if let Some(h) = &harness {
+        dirs.push((h.as_path(), Scope::Harness));
+    }
+    dirs.push((user.as_path(), Scope::User));
+    load_dirs(&dirs)
 }
 
-/// [`load`], from two named directories.
+/// [`load`], from a project and an operator directory.
+#[cfg(test)]
 fn load_from(project: &Path, user: &Path) -> Loaded {
+    load_dirs(&[(project, Scope::Project), (user, Scope::User)])
+}
+
+/// Definitions from `dirs`, earliest first; a name already defined is
+/// shadowed, not an error.
+fn load_dirs(dirs: &[(&Path, Scope)]) -> Loaded {
     let mut loaded = Loaded::default();
-    for (dir, scope) in [(project, Scope::Project), (user, Scope::User)] {
+    for &(dir, scope) in dirs {
         for found in read_dir(dir, scope, &mut loaded.problems) {
             if loaded.find(&found.name).is_some() {
                 // The project's own wins; the operator's is shadowed, not an
@@ -779,6 +795,45 @@ mod tests {
         let note = loaded.schema_note().expect("a note");
         assert!(note.contains("- reviewer: Reads a change"), "{note}");
         assert!(note.contains("- scout: finds"), "{note}");
+    }
+
+    /// A harness's definitions sit between the project's and the operator's:
+    /// over the operator's of the same name, under the project's.
+    #[test]
+    fn a_harness_definition_sits_between_project_and_operator() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (project, harness, user) = (
+            dir.path().join("p"),
+            dir.path().join("h"),
+            dir.path().join("u"),
+        );
+        write(&project, "reviewer.md", REVIEWER);
+        write(
+            &harness,
+            "reviewer.md",
+            "---\nname: reviewer\ndescription: the harness's\n---\nh",
+        );
+        write(
+            &harness,
+            "scout.md",
+            "---\nname: scout\ndescription: the harness's scout\n---\nh",
+        );
+        write(
+            &user,
+            "scout.md",
+            "---\nname: scout\ndescription: the operator's scout\n---\nu",
+        );
+        let loaded = load_dirs(&[
+            (&project, Scope::Project),
+            (&harness, Scope::Harness),
+            (&user, Scope::User),
+        ]);
+        assert_eq!(loaded.agents.len(), 2, "{:?}", loaded.agents);
+        assert_eq!(
+            loaded.find("reviewer").map(|a| a.scope),
+            Some(Scope::Project)
+        );
+        assert_eq!(loaded.find("scout").map(|a| a.scope), Some(Scope::Harness));
     }
 
     /// A directory with too many files is read only to its bound, and says so.
