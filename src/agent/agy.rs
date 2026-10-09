@@ -209,14 +209,14 @@ impl AgyBackend {
     }
 
     /// The prompt actually sent: the harness's context, then the task, budgeted for OS limits.
-    fn full_prompt(&self, prompt: &str) -> String {
+    fn full_prompt(&self, prompt: &str) -> Result<String, AgentError> {
         let (budgeted_prompt, budgeted_context) =
-            crate::agent::budget_for_spawn(prompt, &self.system_context);
-        if budgeted_context.is_empty() {
+            crate::agent::budget_for_spawn(prompt, &self.system_context, &self.workspace)?;
+        Ok(if budgeted_context.is_empty() {
             budgeted_prompt
         } else {
             format!("{budgeted_context}\n\n{budgeted_prompt}")
-        }
+        })
     }
 
     /// Override the binary, e.g. an absolute path from agent discovery.
@@ -399,7 +399,7 @@ impl AgentBackend for AgyBackend {
         prompt: &str,
         on_event: &mut dyn FnMut(&AgentEvent),
     ) -> Result<TurnOutcome, AgentError> {
-        let sent = self.full_prompt(prompt);
+        let sent = self.full_prompt(prompt)?;
         let mut command = self.command(&sent);
         crate::agent::process_tree::prepare(&mut command);
         let mut child = command
@@ -779,11 +779,14 @@ mod tests {
     #[test]
     fn the_harness_context_is_carried_in_the_prompt_when_no_flag_exists() {
         let bare = AgyBackend::new(PathBuf::from("."));
-        assert_eq!(bare.full_prompt("do the work"), "do the work");
+        assert_eq!(
+            bare.full_prompt("do the work").expect("sent"),
+            "do the work"
+        );
 
         let briefed = AgyBackend::new(PathBuf::from("."))
             .with_system_context(vec!["the guards in force: tests/ is protected".to_string()]);
-        let sent = briefed.full_prompt("do the work");
+        let sent = briefed.full_prompt("do the work").expect("sent");
         assert!(
             sent.contains("tests/ is protected"),
             "the harness context never reached the agent: {sent}"

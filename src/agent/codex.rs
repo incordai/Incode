@@ -242,14 +242,14 @@ impl CodexBackend {
     }
 
     /// The prompt actually sent: the harness's context, then the task, budgeted for OS limits.
-    fn full_prompt(&self, prompt: &str) -> String {
+    fn full_prompt(&self, prompt: &str) -> Result<String, AgentError> {
         let (budgeted_prompt, budgeted_context) =
-            crate::agent::budget_for_spawn(prompt, &self.system_context);
-        if budgeted_context.is_empty() {
+            crate::agent::budget_for_spawn(prompt, &self.system_context, &self.workspace)?;
+        Ok(if budgeted_context.is_empty() {
             budgeted_prompt
         } else {
             format!("{budgeted_context}\n\n{budgeted_prompt}")
-        }
+        })
     }
 
     fn command(&self, prompt: &str) -> Command {
@@ -436,7 +436,7 @@ impl AgentBackend for CodexBackend {
         prompt: &str,
         on_event: &mut dyn FnMut(&AgentEvent),
     ) -> Result<TurnOutcome, AgentError> {
-        let sent = self.full_prompt(prompt);
+        let sent = self.full_prompt(prompt)?;
         // Held to the end of the turn, then removed.
         let pictures =
             ImageFiles::write(&std::mem::take(&mut self.images)).map_err(AgentError::new)?;
@@ -816,11 +816,14 @@ mod tests {
     #[test]
     fn harness_context_is_carried_in_prompt() {
         let bare = CodexBackend::new(PathBuf::from("."));
-        assert_eq!(bare.full_prompt("fix the bug"), "fix the bug");
+        assert_eq!(
+            bare.full_prompt("fix the bug").expect("sent"),
+            "fix the bug"
+        );
 
         let briefed = CodexBackend::new(PathBuf::from("."))
             .with_system_context(vec!["Guards: no writes outside src/".to_string()]);
-        let sent = briefed.full_prompt("fix the bug");
+        let sent = briefed.full_prompt("fix the bug").expect("sent");
         assert!(sent.contains("Guards: no writes outside src/"));
         assert!(sent.ends_with("fix the bug"));
     }

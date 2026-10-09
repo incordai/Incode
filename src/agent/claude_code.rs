@@ -1346,7 +1346,7 @@ impl ClaudeCodeBackend {
         on_event: &mut dyn FnMut(&AgentEvent),
     ) -> Result<TurnOutcome, AgentError> {
         let (budgeted_prompt, budgeted_context) =
-            crate::agent::budget_for_spawn(prompt, &self.system_context);
+            crate::agent::budget_for_spawn(prompt, &self.system_context, &self.workspace)?;
 
         // THE TOOLS ARE incode's. The CLI's own are switched off below and the
         // model is handed incode's toolbox through the bridge, which this
