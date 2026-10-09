@@ -77,11 +77,17 @@ struct InitBody {
 
 #[derive(Debug, Deserialize)]
 struct StepUpdate {
+    /// Which step of the turn this update belongs to: every fragment of one
+    /// reply carries the same index.
+    #[serde(default)]
+    step_index: u64,
     #[serde(default)]
     step_type: String,
-    /// The assistant's text for this step. Named `text_delta` on the wire, but
-    /// measured to arrive as the WHOLE text of a finished step rather than a
-    /// character fragment — a `DONE` step carried the complete reply.
+    /// A FRAGMENT of the assistant's text for this step, to be appended to
+    /// the ones before it. Measured on a long reply: dozens of `ACTIVE`
+    /// updates of one step, each a few words, the last one `DONE` and itself
+    /// only a fragment. A short reply fits in one update, which is how it was
+    /// once mistaken for the whole text of a finished step ([`StepText`]).
     #[serde(default)]
     text_delta: String,
     #[serde(default)]
@@ -418,6 +424,7 @@ impl AgentBackend for AgyBackend {
 
         let mut outcome: Option<TurnOutcome> = None;
         let mut usage = crate::runtime::usage::TokenUsage::default();
+        let mut reply = StepText::default();
 
         for line in BufReader::new(stdout).lines() {
             if let Some(token) = &self.cancel {
@@ -458,12 +465,7 @@ impl AgentBackend for AgyBackend {
                     }
                 }
                 Wire::StepUpdate { step_update } => {
-                    if step_update.step_type == "agent_response"
-                        && !step_update.text_delta.trim().is_empty()
-                    {
-                        on_event(&AgentEvent::TextDelta(step_update.text_delta.clone()));
-                        on_event(&AgentEvent::Text(step_update.text_delta.clone()));
-                    }
+                    reply.feed(&step_update, on_event);
                     if let Some(u) = step_update.usage {
                         usage = to_usage(&u);
                     }
@@ -489,6 +491,7 @@ impl AgentBackend for AgyBackend {
                 Wire::Other => {}
             }
         }
+        reply.finish(on_event);
 
         on_event(&AgentEvent::Usage {
             input_tokens: usage.input_tokens,
@@ -513,6 +516,41 @@ impl AgentBackend for AgyBackend {
                 status.code().unwrap_or(-1)
             ))
         })
+    }
+}
+
+/// The assistant's words for a turn, rebuilt from step updates: each
+/// fragment is shown as it arrives (`TextDelta`), and each step's whole text
+/// is said once (`Text`) when the next step begins or the stream ends.
+///
+/// Why once: a caller keeps every `Text` as a separate thing said and joins
+/// them with newlines (src/task_run.rs `show`, which builds `-t`'s result).
+/// Measured: sending each fragment as a `Text` put a newline every few words —
+/// `"issue\n": "… anim\nation …"` — and a JSON answer no longer parsed.
+#[derive(Default)]
+struct StepText {
+    step: Option<u64>,
+    text: String,
+}
+
+impl StepText {
+    fn feed(&mut self, update: &StepUpdate, on_event: &mut dyn FnMut(&AgentEvent)) {
+        if update.step_type != "agent_response" || update.text_delta.is_empty() {
+            return;
+        }
+        if self.step != Some(update.step_index) {
+            self.finish(on_event);
+            self.step = Some(update.step_index);
+        }
+        on_event(&AgentEvent::TextDelta(update.text_delta.clone()));
+        self.text.push_str(&update.text_delta);
+    }
+
+    fn finish(&mut self, on_event: &mut dyn FnMut(&AgentEvent)) {
+        let text = std::mem::take(&mut self.text);
+        if !text.trim().is_empty() {
+            on_event(&AgentEvent::Text(text));
+        }
     }
 }
 
@@ -553,6 +591,58 @@ mod tests {
 
     fn parse(line: &str) -> Wire {
         serde_json::from_str(line).expect("a wire line")
+    }
+
+    /// **A REPLY STREAMED IN FRAGMENTS IS SAID ONCE, WHOLE.** Lines shaped as
+    /// a real long reply (measured on agy, Insi's lesson writer): fragments of
+    /// one step, `ACTIVE` then `DONE`, each a few words and split inside words
+    /// and inside a JSON key. The step is one `Text`, the fragments joined byte
+    /// for byte, so its JSON parses; every fragment is still shown live as a
+    /// `TextDelta`; a later step is a `Text` of its own.
+    #[test]
+    fn a_reply_streamed_in_fragments_is_said_once_whole() {
+        let line = |index: u64, state: &str, kind: &str, text: &str| {
+            format!(
+                r#"{{"event":"step_update","step_update":{{"step_index":{index},"state":"{state}","step_type":"{kind}","text_delta":{}}}}}"#,
+                serde_json::to_string(text).expect("json")
+            )
+        };
+        let stream = [
+            line(0, "DONE", "user_input", ""),
+            line(2, "ACTIVE", "agent_response", "{\n  \"issue"),
+            line(2, "ACTIVE", "agent_response", "\": \"The agent added anim"),
+            line(
+                2,
+                "ACTIVE",
+                "agent_response",
+                "ation math\",\n  \"use\": \"Wire it",
+            ),
+            line(2, "DONE", "agent_response", " end to end.\"\n}"),
+            line(4, "DONE", "agent_response", "Done."),
+        ];
+        let mut said = Vec::new();
+        let mut deltas = 0;
+        {
+            let mut on_event = |event: &AgentEvent| match event {
+                AgentEvent::Text(text) => said.push(text.clone()),
+                AgentEvent::TextDelta(_) => deltas += 1,
+                _ => {}
+            };
+            let mut reply = StepText::default();
+            for wire in stream.iter().map(|l| parse(l)) {
+                if let Wire::StepUpdate { step_update } = wire {
+                    reply.feed(&step_update, &mut on_event);
+                }
+            }
+            reply.finish(&mut on_event);
+        }
+        assert_eq!(said.len(), 2, "{said:?}");
+        let answer: serde_json::Value =
+            serde_json::from_str(&said[0]).expect("the whole reply parses");
+        assert_eq!(answer["issue"], "The agent added animation math");
+        assert_eq!(answer["use"], "Wire it end to end.");
+        assert_eq!(said[1], "Done.");
+        assert_eq!(deltas, 5, "every fragment shown as it came");
     }
 
     /// The envelope is keyed on `event`, not `type`.
