@@ -30,7 +30,7 @@ tools — see [Limits](#limits).)
 - [Configuration](#configuration)
 - [Security notes](#security-notes)
 - [Limits](#limits)
-- [Development](#development)
+- [Development](#development) · [Contributing](#contributing) · [Licence](#licence)
 
 ---
 
@@ -964,6 +964,13 @@ The documents under `docs/` are the input the loop reads, not decoration:
 the code should read), `ASSUMPTIONS.md` (what was decided without asking),
 `RUNNER.md` (the autonomous loop), `VERIFICATION.md` (what counts as done),
 `ROADMAP.md` (what is done and what is open).
+
+## Contributing
+
+Contributions are welcome: bug reports, fixes, new providers, tools and
+platforms, and corrections to the documents. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for the checks a pull request must pass
+and how changes are written, tested and reviewed.
 
 ## Licence
 
