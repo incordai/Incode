@@ -133,6 +133,14 @@ pub struct Task {
     /// is no such branch, never "the branch is gone".
     #[serde(default)]
     pub unmerged_branch: Option<String>,
+    /// The pull request this task's work is waiting in, by URL.
+    ///
+    /// Set when a lane's work was opened for review instead of merged here
+    /// (`INCODE_LANES_AS=pr`); the task is `Blocked` until a person merges or
+    /// closes it, and `crate::reviews::settle` reads which at the
+    /// start of the next run. `None` means no review is pending.
+    #[serde(default)]
+    pub pull_request: Option<String>,
     /// The file this task must write, for work that produces information
     /// rather than code.
     ///
@@ -170,6 +178,7 @@ impl Task {
             worked_by: String::new(),
             owner_note: String::new(),
             unmerged_branch: None,
+            pull_request: None,
             deliverable: None,
         }
     }
@@ -502,6 +511,28 @@ impl Ledger {
         // it. Keeping the name would point a later reader — or a later
         // attempt — at a branch that no longer describes anything.
         task.unmerged_branch = None;
+        task.pull_request = None;
+        Ok(())
+    }
+
+    /// A lane's work opened as pull request `url` from `branch`: out of the
+    /// queue until a person merges or closes it.
+    ///
+    /// `Blocked`, because that is what it is — a decision outstanding with a
+    /// person — so nothing picks it up, its dependants stay `Pending`, and a
+    /// run that drains around it says it is waiting rather than finished. It
+    /// is NOT `Done`: the change is not in the tree the check runs over.
+    pub fn await_review(&mut self, id: &str, url: &str, branch: &str) -> Result<(), String> {
+        let task = self
+            .get_mut(id)
+            .ok_or_else(|| format!("no task `{id}` in the ledger"))?;
+        task.state = TaskState::Blocked;
+        task.note = format!(
+            "waiting for review: {url}. Merge it and run again to have it checked and \
+             finished; close it to have the task done again."
+        );
+        task.pull_request = Some(url.to_string());
+        task.unmerged_branch = Some(branch.to_string());
         Ok(())
     }
 

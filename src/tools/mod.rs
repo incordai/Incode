@@ -20,6 +20,7 @@ pub mod file_ops;
 pub mod git_context;
 pub mod pull_request;
 pub mod search;
+pub mod secret_scan;
 pub(crate) mod shell_choice;
 pub mod tool_status;
 pub mod worktree;

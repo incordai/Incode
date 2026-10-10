@@ -92,6 +92,21 @@ pub trait LaneWorkers: Sync {
     fn available(&self) -> bool {
         true
     }
+
+    /// Where pull requests are opened and read, when there is a forge.
+    ///
+    /// Read at the start of every run whenever a task is waiting on one
+    /// ([`crate::reviews::settle`]), so a review opened under `INCODE_LANES_AS=pr` is
+    /// still settled by a run without it. `None`: no forge, nothing settled.
+    fn forge(&self) -> Option<&dyn crate::tools::pull_request::Forge> {
+        None
+    }
+
+    /// Whether a lane whose check passed is opened as a pull request on
+    /// [`Self::forge`] instead of merged here.
+    fn open_for_review(&self) -> bool {
+        false
+    }
 }
 
 /// No lanes: one agent, one tree, today's behaviour.
@@ -137,6 +152,7 @@ struct LaneReports {
 /// one lane, the workspace is not a git repository, fewer than two tasks are
 /// ready, or the pool declines to supply workers. Each leaves the sequential
 /// loop exactly as it was.
+#[allow(clippy::too_many_arguments)]
 fn run_lanes_if_useful(
     ledger: &mut Ledger,
     workspace: &Path,
@@ -145,6 +161,7 @@ fn run_lanes_if_useful(
     reports: &mut LaneReports,
     budget: &mut Budget,
     cancelled: &dyn Fn() -> bool,
+    review: Option<(&dyn crate::tools::pull_request::Forge, &str)>,
 ) {
     if !reports.ready.is_empty() || cancelled() {
         return;
@@ -175,14 +192,43 @@ fn run_lanes_if_useful(
         return;
     }
 
-    let outcomes = crate::parallel::run_batch(repo_root, &batch, |lane_workspace| {
-        lanes.spawn_for(lane_workspace).unwrap_or_else(|| {
-            // The probe above said yes. A pool that then changes its mind
-            // must not take the batch down with it: this lane reports a
-            // failure and the task goes back to the queue.
-            Box::new(UnavailableWorker)
-        })
-    });
+    // Each lane's check runs in its own checkout, in the folder matching this
+    // workspace, before its work may be merged (`INCODE_LANE_CHECK=0` turns
+    // that gate off; the check after the merge runs either way).
+    let check_in =
+        crate::parallel::lane_check_wanted().then(|| crate::parallel::workspace_prefix(workspace));
+    // Opened for review rather than merged, when the run was started for
+    // that — unless the branch has commits the remote lacks, which every pull
+    // request would then carry. Asked per batch, since the run can move HEAD.
+    let landing = match review {
+        Some((forge, base)) => match crate::parallel::nothing_unpushed(repo_root, base) {
+            Ok(()) => crate::parallel::Landing::Review {
+                forge,
+                base: base.to_string(),
+            },
+            Err(why) => {
+                reports.notes.push(format!(
+                    "this batch is merged here, not opened for review: {why}"
+                ));
+                crate::parallel::Landing::Here
+            }
+        },
+        None => crate::parallel::Landing::Here,
+    };
+    let outcomes = crate::parallel::run_batch(
+        repo_root,
+        &batch,
+        check_in.as_deref(),
+        &landing,
+        |lane_workspace| {
+            lanes.spawn_for(lane_workspace).unwrap_or_else(|| {
+                // The probe above said yes. A pool that then changes its mind
+                // must not take the batch down with it: this lane reports a
+                // failure and the task goes back to the queue.
+                Box::new(UnavailableWorker)
+            })
+        },
+    );
 
     for outcome in outcomes {
         // CHARGED FOR EVERY LANE, including the ones that failed or could not
@@ -205,14 +251,18 @@ fn run_lanes_if_useful(
         reports.notes.push(outcome.merged.summary(&lane));
 
         // WHERE THE UNMERGED WORK IS, written onto the task itself so the
-        // retry can be pointed at it. Recorded only for a conflict: that is
-        // the case where a real change exists on a branch and the tree simply
-        // moved underneath it. A lane whose agent failed left no change worth
-        // reconciling, and telling the next attempt to go and merge one would
-        // send it after a branch with nothing on it.
+        // retry can be pointed at it. Recorded for a conflict — a real change
+        // on a branch, with the tree moved underneath it — and for a lane
+        // whose finished work failed its own check: a whole change the retry
+        // can read and correct rather than redo. A lane whose agent failed
+        // left no change worth reconciling, and telling the next attempt to
+        // go and merge one would send it after a branch with nothing on it.
         if let Some(entry) = ledger.get_mut_public(&outcome.task.id) {
             match &outcome.merged {
-                crate::parallel::Merged::Conflict { .. } if !outcome.branch.is_empty() => {
+                crate::parallel::Merged::Conflict { .. }
+                | crate::parallel::Merged::CheckFailed { .. }
+                    if !outcome.branch.is_empty() =>
+                {
                     entry.unmerged_branch = Some(outcome.branch.clone());
                 }
                 // Landed, so any branch remembered from an earlier round is
@@ -222,6 +272,17 @@ fn run_lanes_if_useful(
                 m if m.landed() => entry.unmerged_branch = None,
                 _ => {}
             }
+        }
+
+        // OPENED FOR REVIEW: not done and not failed. It waits on a person,
+        // out of the queue, and no report is cached — the runner must not
+        // check a tree that does not hold the change. `reviews::settle` picks
+        // it up once the pull request is merged or closed.
+        if let crate::parallel::Merged::Opened { url } = &outcome.merged {
+            if let Err(why) = ledger.await_review(&outcome.task.id, url, &outcome.branch) {
+                reports.notes.push(why);
+            }
+            continue;
         }
 
         // A LANE THAT DID NOT LAND IS A FAILED ATTEMPT, whatever the agent
@@ -1162,6 +1223,39 @@ fn work_the_ledger(
         eprintln!("{note}");
     }
 
+    // PULL REQUESTS SETTLED FIRST: a task whose review was merged since the
+    // last run is checked and finished before anything is picked, so its
+    // dependants become ready in this run rather than the next.
+    if let Some(forge) = lanes.forge() {
+        let (notes, done) = crate::reviews::settle(ledger, workspace, forge);
+        for note in notes {
+            eprintln!("{note}");
+        }
+        completed.extend(done);
+    }
+
+    // OPENED FOR REVIEW, when the operator asked for that and lanes will run.
+    // Decided once, here, so a run that cannot open pull requests says why
+    // before any lane works — and merges as it always has.
+    let review_base = match (&isolation, lanes.forge()) {
+        (crate::parallel::Isolation::Worktrees { repo_root }, Some(forge))
+            if lanes.open_for_review() && crate::parallel::requested_lanes() > 1 =>
+        {
+            match crate::parallel::review_base(repo_root, forge) {
+                Ok(base) => Some(base),
+                Err(why) => {
+                    eprintln!("Lanes will be merged here, not opened as pull requests: {why}.");
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+    let review = match (lanes.forge(), &review_base) {
+        (Some(forge), Some(base)) => Some((forge, base.as_str())),
+        _ => None,
+    };
+
     loop {
         progress.ledger(ledger);
         if cancelled() {
@@ -1201,6 +1295,7 @@ fn work_the_ledger(
             &mut lane_reports,
             budget,
             cancelled,
+            review,
         );
         for note in lane_reports.notes.drain(..) {
             crate::trace!("lanes", "{note}");

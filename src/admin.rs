@@ -56,6 +56,9 @@ pub enum Source {
     Flag,
     /// An environment variable set for this shell.
     Environment,
+    /// The harness folder this run was given (`INSI_HARNESS`), over the
+    /// admin file for this run only.
+    Harness,
     /// The admin file — the standing decision.
     AdminFile,
     /// The built-in fallback, which is a last resort and not a recommendation.
@@ -68,6 +71,7 @@ impl Source {
         match self {
             Self::Flag => "flag",
             Self::Environment => "env",
+            Self::Harness => "harness",
             Self::AdminFile => "admin file",
             Self::BuiltIn => "built-in",
         }
@@ -758,23 +762,30 @@ impl AdminConfig {
     #[must_use]
     pub fn resolve_roles(&self) -> Resolved<crate::roles::RoleTable> {
         let from_env = crate::roles::RoleTable::from_env();
+        let harness = crate::harness::routing();
+        let (roles, tiers) = crate::harness::overlay(&self.roles, &self.tiers, harness.as_ref());
         let mut table = crate::roles::RoleTable::default();
         let mut used_file = false;
+        let mut used_harness = false;
         let mut used_env = false;
 
         for role in crate::roles::KNOWN_ROLES {
             let from_env_role = from_env.candidates_for(role);
             if from_env_role.is_empty() {
-                if let Some(models) = self.roles.get(role).filter(|m| !m.is_empty()) {
+                if let Some(models) = roles.get(role).filter(|m| !m.is_empty()) {
                     // `@top` becomes the models that tier holds. A role naming a
                     // tier nobody defined is reported by `unknown_tiers`, not
                     // silently emptied.
-                    let (expanded, _) = crate::roles::expand_tiers(models, &self.tiers);
+                    let (expanded, _) = crate::roles::expand_tiers(models, &tiers);
                     table = table.with_candidates(role, expanded);
-                    used_file = true;
+                    if harness.as_ref().is_some_and(|h| h.roles.contains_key(role)) {
+                        used_harness = true;
+                    } else {
+                        used_file = true;
+                    }
                 }
             } else {
-                let (expanded, _) = crate::roles::expand_tiers(from_env_role, &self.tiers);
+                let (expanded, _) = crate::roles::expand_tiers(from_env_role, &tiers);
                 table = table.with_candidates(role, expanded);
                 used_env = true;
             }
@@ -783,12 +794,23 @@ impl AdminConfig {
         // The table's source is the strongest layer that contributed to it. Where
         // the layers are mixed, `role_source` is the per-role truth and this is
         // only a headline.
-        let source = match (used_env, used_file) {
-            (true, _) => Source::Environment,
-            (false, true) => Source::AdminFile,
-            (false, false) => Source::BuiltIn,
+        let source = match (used_env, used_harness, used_file) {
+            (true, ..) => Source::Environment,
+            (false, true, _) => Source::Harness,
+            (false, false, true) => Source::AdminFile,
+            (false, false, false) => Source::BuiltIn,
         };
         Resolved::new(table, source)
+    }
+
+    /// `roles` and `tiers` as this run uses them: the admin file's, with the
+    /// harness's over them key by key when the run was given one. Never
+    /// saved: the harness is this run's, the file is the operator's.
+    #[must_use]
+    pub fn effective_routing(
+        &self,
+    ) -> (BTreeMap<String, Vec<String>>, BTreeMap<String, Vec<String>>) {
+        crate::harness::overlay(&self.roles, &self.tiers, crate::harness::routing().as_ref())
     }
 
     /// Which layer decided one role's candidates.
@@ -803,6 +825,10 @@ impl AdminConfig {
             .is_empty()
         {
             Source::Environment
+        } else if crate::harness::routing()
+            .is_some_and(|h| h.roles.get(role).is_some_and(|m| !m.is_empty()))
+        {
+            Source::Harness
         } else if self.roles.get(role).is_some_and(|m| !m.is_empty()) {
             Source::AdminFile
         } else {

@@ -346,45 +346,39 @@ pub const MAX_PROMPT_BUDGET: usize = 12_000;
 /// Minimum context budget preserved when budgeting payload.
 pub const MIN_CONTEXT_BUDGET: usize = 4_000;
 
-/// How much of the START of an over-budget prompt is kept; the rest of the
-/// budget goes to its END, where the instruction is.
-const PROMPT_HEAD: usize = 2_000;
-
 /// Compacts / budgets prompt and system context so external agent CLI processes
 /// spawned via `Command::new` stay safely within OS command-line limits.
 ///
-/// When the total payload exceeds [`MAX_CMDLINE_PAYLOAD_LEN`], high-priority
-/// blocks (guards, standing rules, intake, asking, roles) are preserved, while
-/// large informational blocks (discovered skills catalog, auditor findings,
-/// recorder handoff) are truncated to fit the remaining budget.
-#[must_use]
-pub fn budget_for_spawn(prompt: &str, system_context: &[String]) -> (String, String) {
+/// When the total payload exceeds [`MAX_CMDLINE_PAYLOAD_LEN`], a prompt over
+/// [`MAX_PROMPT_BUDGET`] is written whole to a file in `workspace` and the
+/// agent is told to read it ([`spill`]); nothing of it is dropped. Then
+/// high-priority context blocks (guards, standing rules, intake, asking,
+/// roles) are preserved, while large informational blocks (discovered skills
+/// catalog, auditor findings, recorder handoff) are truncated to fit the
+/// remaining budget. An error only when the spill file cannot be written:
+/// the turn is not started on a prompt the agent would never see whole.
+///
+/// Called by the CLI backends that pass the prompt on a command line:
+/// `agy.rs` and `codex.rs` (`full_prompt`) and `claude_code.rs` (`run_once`).
+pub fn budget_for_spawn(
+    prompt: &str,
+    system_context: &[String],
+    workspace: &std::path::Path,
+) -> Result<(String, String), AgentError> {
     let unbudgeted_context = system_context.join("\n\n");
     let total_len = prompt.len() + unbudgeted_context.len();
     if total_len <= MAX_CMDLINE_PAYLOAD_LEN {
-        return (prompt.to_string(), unbudgeted_context);
+        return Ok((prompt.to_string(), unbudgeted_context));
     }
 
-    // Budget the prompt first
-    let prompt_budget = if prompt.len() > MAX_PROMPT_BUDGET {
-        MAX_PROMPT_BUDGET
-    } else {
-        prompt.len()
-    };
-    // THE END OF A PROMPT IS THE INSTRUCTION. Every prompt this harness
-    // assembles puts its context first and what was asked last, so cutting
-    // from the end cut exactly the part the agent was meant to act on —
-    // measured: an agent handed only the head of an 18,084-character prompt
-    // answered by asking what the task was. The middle goes instead.
-    let budgeted_prompt = if prompt.len() > prompt_budget {
-        const MARKER: &str = "\n\n[...prompt truncated for OS command line limit...]\n\n";
-        let head = crate::text::head_bytes(prompt, PROMPT_HEAD);
-        let room = prompt_budget.saturating_sub(head.len() + MARKER.len());
-        let mut from = prompt.len().saturating_sub(room);
-        while !prompt.is_char_boundary(from) {
-            from += 1;
-        }
-        format!("{head}{MARKER}{}", &prompt[from..])
+    // NO PART OF THE PROMPT IS DROPPED. It used to keep the first 2,000 and
+    // the last ~9,900 bytes and cut the middle, on the theory that the
+    // instruction is always short and last. Measured on Insi's lesson writer:
+    // its instruction comes FIRST and its prompt runs to 20 KB, so the model
+    // got the preamble's head and the tail of a diff, and answered by asking
+    // what it was meant to do — four lessons of fifteen lost.
+    let budgeted_prompt = if prompt.len() > MAX_PROMPT_BUDGET {
+        spill(prompt, workspace)?
     } else {
         prompt.to_string()
     };
@@ -394,7 +388,7 @@ pub fn budget_for_spawn(prompt: &str, system_context: &[String]) -> (String, Str
         .max(MIN_CONTEXT_BUDGET);
 
     if unbudgeted_context.len() <= context_budget {
-        return (budgeted_prompt, unbudgeted_context);
+        return Ok((budgeted_prompt, unbudgeted_context));
     }
 
     // Partition blocks by priority:
@@ -464,7 +458,40 @@ pub fn budget_for_spawn(prompt: &str, system_context: &[String]) -> (String, Str
         }
     }
 
-    (budgeted_prompt, result_blocks.join("\n\n"))
+    Ok((budgeted_prompt, result_blocks.join("\n\n")))
+}
+
+/// Write the whole of a prompt too long for a command line to the context
+/// folder in `workspace` — the folder incode's memory hooks spill their
+/// blocks to and prune (`crate::hooks::memory::CONTEXT`) — and return what the
+/// agent is told instead: where the file is, and to read all of it first.
+/// The name is the prompt's hash, so the same prompt is one file.
+fn spill(prompt: &str, workspace: &std::path::Path) -> Result<String, AgentError> {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    prompt.hash(&mut hasher);
+    let name = format!("task-{:016x}.md", hasher.finish());
+    let dir = workspace.join(crate::hooks::memory::CONTEXT);
+    let path = dir.join(&name);
+    std::fs::create_dir_all(&dir)
+        .and_then(|()| std::fs::write(&path, prompt))
+        .map_err(|e| {
+            AgentError::new(format!(
+                "the task is {} bytes, more than a command line can carry, and could not \
+                 be written to {} for the agent to read: {e}; the turn was not started",
+                prompt.len(),
+                path.display()
+            ))
+        })?;
+    Ok(format!(
+        "This task is {} bytes, more than a command line can carry, so the whole of it \
+         is in the file `{}/{name}` in your working folder ({}). Read that file in \
+         full, from its first line to its last, before doing anything else: it is the \
+         task, and what it asks is what you do.",
+        prompt.len(),
+        crate::hooks::memory::CONTEXT,
+        path.display()
+    ))
 }
 
 #[cfg(test)]
@@ -669,9 +696,14 @@ mod handover_tests {
             "<guards>no-write tests</guards>".to_string(),
             "standing rules: follow style guide".to_string(),
         ];
-        let (p, c) = budget_for_spawn(prompt, &context);
+        let dir = tempfile::tempdir().expect("dir");
+        let (p, c) = budget_for_spawn(prompt, &context, dir.path()).expect("budgeted");
         assert_eq!(p, prompt);
         assert_eq!(c, context.join("\n\n"));
+        assert!(
+            !dir.path().join(crate::hooks::memory::CONTEXT).exists(),
+            "a prompt that fits writes no file"
+        );
     }
 
     #[test]
@@ -683,45 +715,74 @@ mod handover_tests {
             "The owner's standing rules:\n1. do not delete".to_string(),
             large_skills,
         ];
-        let (p, c) = budget_for_spawn(prompt, &context);
+        let dir = tempfile::tempdir().expect("dir");
+        let (p, c) = budget_for_spawn(prompt, &context, dir.path()).expect("budgeted");
         assert_eq!(p, prompt);
         assert!(p.len() + c.len() <= MAX_CMDLINE_PAYLOAD_LEN);
         assert!(c.contains("<guards>protected</guards>"));
         assert!(c.contains("standing rules"));
     }
 
-    #[test]
-    fn budget_for_spawn_bounds_oversized_prompt() {
-        // Over this OS's limit, whichever it is: a fixed 40,000 was over the
-        // Windows limit and under the Unix one, so it tested nothing there.
-        let giant_prompt = "A".repeat(MAX_CMDLINE_PAYLOAD_LEN + 10_000);
-        let context = vec!["<guards>safe</guards>".to_string()];
-        let (p, c) = budget_for_spawn(&giant_prompt, &context);
-        assert!(p.len() + c.len() <= MAX_CMDLINE_PAYLOAD_LEN);
-        assert!(p.contains("prompt truncated for OS command line limit"));
-        assert!(c.contains("<guards>safe</guards>"));
+    /// The file an over-budget prompt was written to, read from what the
+    /// agent was told.
+    fn spilled(told: &str, workspace: &std::path::Path) -> String {
+        let at = told.find("task-").expect("names a task file");
+        let name = &told[at..at + "task-".len() + 16 + ".md".len()];
+        std::fs::read_to_string(workspace.join(crate::hooks::memory::CONTEXT).join(name))
+            .expect("the task file exists")
     }
 
-    /// **AN OVER-BUDGET PROMPT KEEPS ITS INSTRUCTION.** Context comes first
-    /// and the instruction last, so the cut is taken from the middle: an
-    /// agent once got only the head and asked what it was meant to do.
+    /// **AN OVER-BUDGET PROMPT REACHES THE AGENT WHOLE.** Both shapes a
+    /// harness sends: the instruction LAST (a task after its context) and
+    /// the instruction FIRST, then a long body (Insi's lesson writer, whose
+    /// instruction the old middle cut dropped). Each is written to a file in
+    /// full, the agent is told where it is and to read all of it, and the
+    /// command line stays within the OS limit.
     #[test]
-    fn budget_for_spawn_keeps_the_instruction_at_the_end() {
-        let prompt = format!(
-            "<guards>g</guards>\n\n{}\n\nNow do this:\n\ncreate a.txt with hi",
-            "context é ".repeat(MAX_CMDLINE_PAYLOAD_LEN / 10)
-        );
-        let context = vec!["x".repeat(20_000)];
-        let (p, c) = budget_for_spawn(&prompt, &context);
-        assert!(p.len() + c.len() <= MAX_CMDLINE_PAYLOAD_LEN);
-        assert!(p.len() <= MAX_PROMPT_BUDGET, "{}", p.len());
+    fn budget_for_spawn_spills_an_oversized_prompt_whole() {
+        let body = "context é ".repeat(MAX_CMDLINE_PAYLOAD_LEN / 10);
+        let last = format!("<guards>g</guards>\n\n{body}\n\nNow do this:\n\ncreate a.txt with hi");
+        let first =
+            format!("Write one lesson as JSON with an issue field.\n\n{body}\nVERIFIED_FIX>>>");
+        let context = vec!["<guards>safe</guards>".to_string(), "x".repeat(20_000)];
+        for prompt in [last, first] {
+            let dir = tempfile::tempdir().expect("dir");
+            let (p, c) = budget_for_spawn(&prompt, &context, dir.path()).expect("budgeted");
+            assert!(
+                p.len() + c.len() <= MAX_CMDLINE_PAYLOAD_LEN,
+                "{}",
+                p.len() + c.len()
+            );
+            assert!(
+                p.len() < 1_000,
+                "the agent is told where, not sent a cut: {p}"
+            );
+            assert!(p.contains("Read that file in full"), "{p}");
+            assert_eq!(
+                spilled(&p, dir.path()),
+                prompt,
+                "nothing of the prompt is dropped"
+            );
+            assert!(c.contains("<guards>safe</guards>"));
+        }
+    }
+
+    /// **A PROMPT THAT CANNOT BE WRITTEN DOWN IS NOT SENT AT ALL.** The
+    /// workspace is a file, so the context folder cannot be made: the turn
+    /// stops with the reason instead of starting on a prompt the agent would
+    /// never see whole.
+    #[test]
+    fn budget_for_spawn_refuses_when_the_task_file_cannot_be_written() {
+        let dir = tempfile::tempdir().expect("dir");
+        let not_a_folder = dir.path().join("plain-file");
+        std::fs::write(&not_a_folder, "x").expect("file");
+        let prompt = "y".repeat(MAX_CMDLINE_PAYLOAD_LEN + 1);
+        let why = budget_for_spawn(&prompt, &[], &not_a_folder).expect_err("refused");
+        let why = why.to_string();
         assert!(
-            p.ends_with("Now do this:\n\ncreate a.txt with hi"),
-            "{}",
-            &p[p.len() - 80..]
+            why.contains("could not be written") && why.contains("not started"),
+            "{why}"
         );
-        assert!(p.starts_with("<guards>g</guards>"));
-        assert!(p.contains("prompt truncated for OS command line limit"));
     }
 }
 

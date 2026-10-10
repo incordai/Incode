@@ -4,15 +4,20 @@
 //!
 //! Pushing publishes work and a pull request is seen by other people, so
 //! nothing here runs on its own: `/pr` is typed by the operator, at the REPL
-//! or over `--acp`, and no tool the model can call reaches it.
+//! or over `--acp`, and no tool the model can call reaches it. The one other
+//! caller is a run the operator started with `INCODE_LANES_AS=pr`, which
+//! opens each lane whose check passed as a draft pull request through
+//! [`open_onto`] — with the same refusals ([`crate::parallel::Landing`]).
 //!
 //! # What it refuses, before anything leaves the machine
 //!
 //! A branch name git would not accept, a detached HEAD, the default branch
 //! itself (that is a push, not a pull request), a current branch with
 //! uncommitted changes (they would not be in the PR the operator thinks they
-//! are opening), a branch with no commits its base lacks, and a missing
-//! `origin`. Each is refused by name and nothing is pushed.
+//! are opening), a branch with no commits its base lacks, a missing
+//! `origin`, and a branch that adds something credential-shaped
+//! ([`crate::tools::secret_scan`]). Each is refused by name and nothing is
+//! pushed.
 //!
 //! # GitHub through `gh`
 //!
@@ -56,6 +61,24 @@ pub trait Forge {
         method: MergeMethod,
         head: &str,
     ) -> Result<String, String>;
+    /// Where pull request `pr` (its URL) stands, open or not — the question
+    /// [`Self::pr_status`] cannot answer, since it sees only open ones.
+    fn review(&self, repo: &Path, pr: &str) -> Result<Review, String>;
+}
+
+/// Whether a pull request is still open, was merged, or was closed unmerged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrState {
+    Open,
+    Merged,
+    Closed,
+}
+
+/// A pull request's state and the branch it was opened onto.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Review {
+    pub state: PrState,
+    pub base: String,
 }
 
 /// How `/pr merge` lands a pull request on its base.
@@ -268,6 +291,37 @@ impl Forge for GitHubCli {
             ],
         )
     }
+
+    fn review(&self, repo: &Path, pr: &str) -> Result<Review, String> {
+        // Read back from the ledger, a file on disk: only a URL is passed on,
+        // so nothing there can reach `gh` as an option.
+        if !pr.starts_with("https://") {
+            return Err(format!("\"{pr}\" is not a pull request URL"));
+        }
+        parse_review(&Self::run(
+            repo,
+            &["pr", "view", pr, "--json", "state,baseRefName"],
+        )?)
+    }
+}
+
+/// [`Review`] from `gh pr view --json state,baseRefName`. A state other than
+/// the three GitHub documents is an error, not a guess.
+pub fn parse_review(json: &str) -> Result<Review, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| format!("gh printed unreadable JSON: {e}"))?;
+    let state = match v["state"].as_str() {
+        Some("OPEN") => PrState::Open,
+        Some("MERGED") => PrState::Merged,
+        Some("CLOSED") => PrState::Closed,
+        other => return Err(format!("gh reported a pull request state of {other:?}")),
+    };
+    let base = v["baseRefName"]
+        .as_str()
+        .filter(|b| !b.is_empty())
+        .ok_or("gh reported no base branch for the pull request")?
+        .to_string();
+    Ok(Review { state, base })
 }
 
 /// [`PrStatus`] from `gh pr view --json …`; `None` for one that is not open.
@@ -479,6 +533,32 @@ pub fn merge(
     })
 }
 
+/// Refused when what `range` adds, or its commit messages, hold something
+/// credential-shaped: pushing is publishing, and a key in a pull request
+/// has to be revoked, not just deleted. The refusal names each place and
+/// never the value.
+fn refuse_credentials(repo: &Path, range: &str) -> Result<(), String> {
+    use crate::tools::secret_scan::{scan_diff, scan_messages};
+    let diff = git(repo, &["diff", "--no-color", "--no-ext-diff", "-U0", range])?;
+    let messages = git(repo, &["log", "--format=%B", range])?;
+    let mut found = scan_diff(&diff);
+    found.extend(scan_messages(&messages));
+    if found.is_empty() {
+        return Ok(());
+    }
+    let listed: Vec<String> = found.iter().take(10).map(|f| format!("  {f}")).collect();
+    Err(format!(
+        "nothing was pushed: the branch adds what looks like a credential\n{}{}\n\
+         take it out of the history (not only the last commit), and revoke it if it is real",
+        listed.join("\n"),
+        if found.len() > listed.len() {
+            format!("\n  … and {} more", found.len() - listed.len())
+        } else {
+            String::new()
+        }
+    ))
+}
+
 fn short(sha: &str) -> &str {
     &sha[..sha.len().min(7)]
 }
@@ -486,6 +566,19 @@ fn short(sha: &str) -> &str {
 pub fn open(
     repo: &Path,
     branch: Option<&str>,
+    draft: bool,
+    forge: &dyn Forge,
+) -> Result<Opened, String> {
+    open_onto(repo, branch, None, draft, forge)
+}
+
+/// [`open`], onto `base` when given rather than the forge's default branch:
+/// a lane branched from a feature branch is opened onto that branch, or its
+/// pull request would carry every commit the feature branch has.
+pub fn open_onto(
+    repo: &Path,
+    branch: Option<&str>,
+    base: Option<&str>,
     draft: bool,
     forge: &dyn Forge,
 ) -> Result<Opened, String> {
@@ -502,7 +595,10 @@ pub fn open(
     git(repo, &["remote", "get-url", "origin"])
         .map_err(|_| "this repository has no `origin` remote to push to".to_string())?;
 
-    let base = forge.default_branch(repo)?;
+    let base = match base {
+        Some(base) => base.to_string(),
+        None => forge.default_branch(repo)?,
+    };
     if branch == base {
         return Err(format!(
             "\"{branch}\" is the default branch; a pull request needs a branch of its own \
@@ -523,6 +619,7 @@ pub fn open(
             "\"{branch}\" has no commits that {base_ref} lacks; nothing to open a pull request for"
         ));
     }
+    refuse_credentials(repo, &range)?;
 
     git(
         repo,
@@ -602,6 +699,9 @@ mod tests {
                 .borrow_mut()
                 .push((number, method, head.to_string()));
             Ok("0123456789abcdef".to_string())
+        }
+        fn review(&self, _: &Path, _: &str) -> Result<Review, String> {
+            Err("not asked in these tests".to_string())
         }
     }
 
@@ -742,6 +842,61 @@ mod tests {
         assert_eq!(parse_status(closed).expect("json"), None);
     }
 
+    /// **MERGED AND CLOSED ARE TOLD APART**, which `parse_status` cannot do:
+    /// one finishes a task, the other sends it back.
+    #[test]
+    fn a_pull_requests_state_and_base_are_read() {
+        for (state, want) in [
+            ("OPEN", PrState::Open),
+            ("MERGED", PrState::Merged),
+            ("CLOSED", PrState::Closed),
+        ] {
+            let json = format!(r#"{{"state":"{state}","baseRefName":"dev"}}"#);
+            assert_eq!(
+                parse_review(&json).expect("read"),
+                Review {
+                    state: want,
+                    base: "dev".to_string()
+                }
+            );
+        }
+        assert!(parse_review(r#"{"state":"DRAFTY","baseRefName":"dev"}"#).is_err());
+        assert!(parse_review(r#"{"state":"OPEN"}"#).is_err());
+    }
+
+    /// **A PULL REQUEST ONTO THE BRANCH IT CAME FROM** carries only its own
+    /// commit, not everything that branch has beyond the default one — and
+    /// the forge is not asked for its default branch at all.
+    #[test]
+    fn a_branch_is_opened_onto_the_base_it_is_given() {
+        let (_dir, _remote, work) = repo();
+        sh(&work, &["checkout", "-b", "dev"]);
+        commit(&work, "d.txt", "work already on dev");
+        sh(&work, &["push", "origin", "dev"]);
+        sh(&work, &["fetch", "origin"]);
+        sh(&work, &["checkout", "-b", "lane/t-1"]);
+        commit(&work, "l.txt", "the lane's change");
+        sh(&work, &["checkout", "dev"]);
+        let mut forge = forge(None);
+        forge.default = "never-asked".to_string();
+
+        let opened = open_onto(&work, Some("lane/t-1"), Some("dev"), true, &forge).expect("opened");
+        assert_eq!(opened.base, "dev");
+        let created = forge.created.borrow();
+        assert_eq!(created[0].base, "dev");
+        assert!(created[0].draft);
+        assert!(
+            created[0].body.contains("the lane's change"),
+            "{}",
+            created[0].body
+        );
+        assert!(
+            !created[0].body.contains("work already on dev"),
+            "{}",
+            created[0].body
+        );
+    }
+
     fn sh(dir: &Path, args: &[&str]) {
         let ok = Command::new("git")
             .args(args)
@@ -857,6 +1012,35 @@ mod tests {
         assert!(forge.created.borrow().is_empty());
         assert!(Command::new("git")
             .args(["rev-parse", "--verify", "--quiet", "refs/heads/empty"])
+            .current_dir(&remote)
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(false));
+    }
+
+    /// **A KEY NEVER LEAVES THE MACHINE.** A branch that adds a
+    /// credential-shaped string is refused before the push: the remote never
+    /// sees the branch, no PR is created, and the refusal names the file and
+    /// line without the value.
+    #[test]
+    fn a_branch_that_adds_a_credential_is_refused_before_the_push() {
+        let (_dir, remote, work) = repo();
+        sh(&work, &["checkout", "-b", "feature/leak"]);
+        let token = format!("ghp_{}", "Q".repeat(36));
+        commit(&work, "config.js", &format!("const t = \"{token}\";"));
+        let forge = forge(None);
+
+        let why = open(&work, None, false, &forge).expect_err("refused");
+        assert!(why.contains("config.js:1: a GitHub token"), "{why}");
+        assert!(!why.contains(&token), "the value was repeated: {why}");
+        assert!(forge.created.borrow().is_empty());
+        assert!(Command::new("git")
+            .args([
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "refs/heads/feature/leak"
+            ])
             .current_dir(&remote)
             .output()
             .map(|o| !o.status.success())

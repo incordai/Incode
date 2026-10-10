@@ -340,6 +340,7 @@ pub(crate) fn run(ctx: &RunContext<'_>, cancel: &CancelToken, watch: Watch<'_>) 
         cancel: cancel.clone(),
         opened: std::sync::atomic::AtomicUsize::new(0),
         engine,
+        review: crate::parallel::lanes_as_pull_requests(),
     };
     let outcome = work(
         &mut ledger,
@@ -575,9 +576,22 @@ pub(crate) struct CliLaneWorkers {
     /// The memory engine each lane's session is filed with, when there is
     /// one: every lane is a session of its own.
     pub engine: Option<crate::hooks::engine::Engine>,
+    /// Lanes are opened as pull requests on GitHub rather than merged here
+    /// (`INCODE_LANES_AS=pr`), read once when the run starts.
+    pub review: bool,
 }
 
 impl crate::runner::LaneWorkers for CliLaneWorkers {
+    /// GitHub through `gh`, always: a task waiting on a pull request is
+    /// settled whether or not this run opens new ones.
+    fn forge(&self) -> Option<&dyn crate::tools::pull_request::Forge> {
+        Some(&crate::tools::pull_request::GitHubCli)
+    }
+
+    fn open_for_review(&self) -> bool {
+        self.review
+    }
+
     fn spawn_for(&self, workspace: &Path) -> Option<Box<dyn crate::runner::TaskWorker + Send>> {
         let lane = self
             .opened
@@ -867,6 +881,7 @@ mod tests {
             cancel: CancelToken::new(),
             opened: std::sync::atomic::AtomicUsize::new(0),
             engine: None,
+            review: false,
         };
         let task = crate::ledger::Task::new("t-1", "r-1", "count the files").with_tier("implement");
         // The lane's own agent, as `spawn_for` makes it, on a stand-in

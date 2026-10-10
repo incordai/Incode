@@ -279,6 +279,9 @@ fn run_task_reporting(
         format!("refusing to run: the protected-path policy could not be read ({e}). Running without it would leave the check editable by the thing being judged.")
     })?;
     let sentinel = crate::guards::Sentinel::over(workspace, &guards);
+    // A harness that cannot be read stops the run too: the run would be
+    // scored as that harness while running on the defaults.
+    crate::harness::check().map_err(|e| format!("refusing to run: {e}"))?;
 
     // The memory engine's session, fired by incode: the model underneath runs
     // with no hooks of its own. One instruction is one session — it starts,
@@ -297,9 +300,11 @@ fn run_task_reporting(
     let turn = memory.prompt(instruction);
     let prompt = build_prompt(workspace, instruction, start.is_some(), turn.as_deref());
     // What rides the system context rather than the prompt: the project's
-    // own instruction files, and the engine's session-start block.
+    // own instruction files, the harness's standing instructions, and the
+    // engine's session-start block.
     let system: Vec<String> = crate::instructions::project_block(workspace)
         .into_iter()
+        .chain(crate::harness::instructions_block())
         .chain(start)
         .collect();
     let task = Task {
@@ -478,8 +483,9 @@ fn drive(
             backend.choose_model(m);
         } else {
             let admin = crate::admin::AdminConfig::load_default();
-            let plan_models = admin.roles.get("plan").cloned().unwrap_or_default();
-            let (expanded, _) = crate::roles::expand_tiers(&plan_models, &admin.tiers);
+            let (roles, tiers) = admin.effective_routing();
+            let plan_models = roles.get("plan").cloned().unwrap_or_default();
+            let (expanded, _) = crate::roles::expand_tiers(&plan_models, &tiers);
             if !expanded.is_empty() {
                 backend.set_models(&expanded);
             }

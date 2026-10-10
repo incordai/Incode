@@ -1,0 +1,60 @@
+# The gate every change passes before it merges: formatting, lints, and the
+# library and binary tests, on the three platforms incode runs on.
+#
+# `/pr merge` refuses a pull request whose checks failed or are still
+# running, so this workflow is what stands between a branch and `main`.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      # The Linux desktop backends (xcap, enigo's x11rb, AT-SPI over zbus)
+      # link against these at build time — the same set the Linux live tests
+      # were built with.
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config clang libclang-dev libwayland-dev libpipewire-0.3-dev \
+            libxcb1-dev libxcb-randr0-dev libxcb-shm0-dev libdbus-1-dev \
+            libegl-dev libgbm-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # The tests create git repositories and commit in them.
+      - run: |
+          git config --global user.email "ci@example.invalid"
+          git config --global user.name "ci"
+      - run: cargo clippy --all-targets
+      - run: cargo test --lib
+      - run: cargo test --bins
