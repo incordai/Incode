@@ -74,4 +74,5 @@ email configured.
 ## License
 
 By contributing, you agree that your contributions are licensed under the
-[MIT License](LICENSE), the license of the project.
+[Apache License, Version 2.0](LICENSE), the license of the project (section 5
+of the license).

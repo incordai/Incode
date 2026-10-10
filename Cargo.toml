@@ -8,7 +8,7 @@ name = "incord-code"
 description = "Autonomous coding harness: plans work, delegates it to an installed agent on your own subscription, and proves it was done"
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+license = "Apache-2.0"
 # The oldest toolchain this actually builds on, MEASURED rather than guessed:
 # each package in Cargo.lock is resolved to its own manifest in the registry
 # cache and read for `rust-version` there (the lock file itself records no such

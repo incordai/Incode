@@ -972,6 +972,11 @@ platforms, and corrections to the documents. See
 [CONTRIBUTING.md](CONTRIBUTING.md) for the checks a pull request must pass
 and how changes are written, tested and reviewed.
 
+Report a vulnerability privately, as [SECURITY.md](SECURITY.md) describes,
+never in a public issue. Everyone taking part follows the
+[Code of Conduct](CODE_OF_CONDUCT.md).
+
 ## Licence
 
-MIT — see [LICENSE](LICENSE).
+Apache License 2.0, copyright 2026 Incord AI. See [LICENSE](LICENSE) and
+[NOTICE](NOTICE).
