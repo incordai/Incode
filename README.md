@@ -1,4 +1,4 @@
-# Incode
+# Incode  <img src="https://github.com/user-attachments/assets/5548318d-30b0-4d60-a3a7-97269dbb5d61" width="25px" alt="incordai" />
 
 `incode` — an autonomous coding harness. It plans work, has a model do it, runs
 every tool the model calls through its own guards, and proves the work was done
