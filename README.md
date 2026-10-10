@@ -1,4 +1,4 @@
-# incode
+# Incode
 
 `incode` — an autonomous coding harness. It plans work, has a model do it, runs
 every tool the model calls through its own guards, and proves the work was done
