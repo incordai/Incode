@@ -234,6 +234,7 @@ impl AgyBackend {
 
     fn command(&self, prompt: &str) -> Command {
         let mut cmd = Command::new(&self.binary);
+        crate::agent::parent_session::detach_from_parent_session(&mut cmd);
         cmd.current_dir(&self.workspace);
         cmd.arg("--print").arg(prompt);
         cmd.arg("--output-format").arg("stream-json");
@@ -572,6 +573,18 @@ fn to_usage(wire: &WireUsage) -> crate::runtime::usage::TokenUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #3: launched from inside another agent session, a child that
+    /// inherits its variables reports that session as its own.
+    #[test]
+    fn the_cli_never_joins_the_session_that_launched_incode() {
+        let cmd = AgyBackend::new(PathBuf::from(".")).command("p");
+        assert!(
+            cmd.get_envs()
+                .any(|(k, v)| k == "CLAUDECODE" && v.is_none()),
+            "CLAUDECODE is inherited, so the child joins the parent's session"
+        );
+    }
 
     /// **AN AGENT THAT CANNOT TAKE A PICTURE HEADLESS SAYS SO, BY NAME.**
     /// `agy --help` (1.2.11) has no image flag, and its stream-json input

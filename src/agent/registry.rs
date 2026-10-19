@@ -463,7 +463,9 @@ fn find_command_path(cmd: &str) -> Option<String> {
 
 /// Run `<cmd> --version` and return the first line, capped at 80 characters.
 fn probe_version(cmd: &str, args: &[String]) -> Option<String> {
-    let out = Command::new(cmd)
+    let mut probe = Command::new(cmd);
+    crate::agent::parent_session::detach_from_parent_session(&mut probe);
+    let out = probe
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

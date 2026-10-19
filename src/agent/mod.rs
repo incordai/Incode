@@ -21,6 +21,7 @@ pub mod claude_code;
 pub mod codex;
 pub mod models;
 pub mod openai;
+pub mod parent_session;
 pub mod process_tree;
 pub mod registry;
 pub mod stderr_tail;

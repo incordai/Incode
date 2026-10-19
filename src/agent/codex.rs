@@ -261,6 +261,7 @@ impl CodexBackend {
         /// recorded nothing, and codex no longer read `~/.codex/hooks.json`.
         const HOOKS_OFF: [&str; 2] = ["--disable", "hooks"];
         let mut cmd = Command::new(&self.binary);
+        crate::agent::parent_session::detach_from_parent_session(&mut cmd);
         cmd.current_dir(&self.workspace);
 
         // WHO THIS AGENT IS ON THE TEAM CHANNEL, for the task about to run.
@@ -684,6 +685,25 @@ fn to_usage(wire: &WireUsage) -> crate::runtime::usage::TokenUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #3: launched from inside another agent session, a child that
+    /// inherits its variables reports that session as its own — on both the
+    /// fresh and the resumed spawn.
+    #[test]
+    fn the_cli_never_joins_the_session_that_launched_incode() {
+        let mut backend = CodexBackend::new(PathBuf::from("."));
+        for resumed in [false, true] {
+            if resumed {
+                backend.thread_id = Some("t-1".to_string());
+            }
+            let cmd = backend.command("p");
+            assert!(
+                cmd.get_envs()
+                    .any(|(k, v)| k == "CLAUDECODE" && v.is_none()),
+                "CLAUDECODE is inherited (resumed={resumed}), so the child joins the parent's session"
+            );
+        }
+    }
 
     fn parse(line: &str) -> Wire {
         serde_json::from_str(line).expect("a wire line")

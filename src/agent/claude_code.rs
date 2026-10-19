@@ -632,6 +632,7 @@ impl ClaudeCodeBackend {
         allowed: &[String],
     ) -> Command {
         let mut cmd = Command::new(&self.binary);
+        crate::agent::parent_session::detach_from_parent_session(&mut cmd);
         cmd.arg("-p");
         match prompt {
             Some(prompt) => {
@@ -2423,6 +2424,23 @@ pub(crate) mod tests {
             assert!(
                 envs.iter().any(|(k, v)| k == key && v == value),
                 "{key} is not set: {envs:?}"
+            );
+        }
+    }
+
+    /// **A TURN IS ITS OWN SESSION, NEVER THE ONE INCODE WAS LAUNCHED FROM.**
+    /// Issue #3: run from inside another session, every turn reported that
+    /// session's id as its own.
+    #[test]
+    fn the_cli_never_joins_the_session_that_launched_incode() {
+        let backend = ClaudeCodeBackend::new(PathBuf::from("."));
+        let (servers, allowed) = servers_for(std::path::Path::new("incode"));
+        for prompt in [Some("hi"), None] {
+            let cmd = backend.command(prompt, "", &servers, &allowed);
+            assert!(
+                cmd.get_envs()
+                    .any(|(k, v)| k == "CLAUDECODE" && v.is_none()),
+                "CLAUDECODE is inherited, so the turn joins the parent's session"
             );
         }
     }
