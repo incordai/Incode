@@ -2484,7 +2484,12 @@ mod tests {
 
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var(MEMORY_URL_ENV, format!("http://{addr}"));
-        let gate = check(Path::new("D:/anywhere/served-demo"));
+        // A complete brief is cached under the workspace, so the workspace
+        // must be somewhere this test owns. A drive-letter literal is
+        // RELATIVE on Linux and macOS, and wrote `D:/anywhere/...` into the
+        // crate itself.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let gate = check(&dir.path().join("served-demo"));
         std::env::remove_var(MEMORY_URL_ENV);
         let _ = server.join();
 
