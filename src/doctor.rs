@@ -197,19 +197,61 @@ fn check_session() -> Check {
         return check;
     }
 
-    let found = crate::agent::claude_code::profiles();
+    session_check(
+        &crate::agent::claude_code::profiles(),
+        &crate::agent::claude_code::process_env,
+        &crate::agent::claude_code::keychain_holds_login,
+        &other_agent_ready,
+    )
+}
+
+/// The drivable agent, when it is one that keeps no profile files at all, as
+/// "<name> ready (<version>)".
+fn other_agent_ready() -> Option<String> {
+    let agent = crate::agent::registry::require_drivable().ok()?;
+    (agent.protocol != crate::agent::registry::Protocol::ClaudeStreamJson).then(|| {
+        let ver = agent.version.as_deref().unwrap_or("detected");
+        format!("{} ready ({ver})", agent.display_name)
+    })
+}
+
+/// The session check over what was found, with the environment, the Keychain
+/// and the other agents passed in — so it can be tested without changing the
+/// process environment every test thread shares, or the machine's agents.
+///
+/// # Why a login outside the profile files is asked about first
+///
+/// It is the login turns actually use: `claude_code::usable_profile` leaves
+/// the CLI where it is whenever one exists, so reporting a file profile over
+/// it would describe a session no turn runs on. And a profile file is not the
+/// only way to be logged in — on macOS the login lives in the Keychain, and
+/// in CI it is a variable — so "no profile file" was reported as "every turn
+/// will fail" while every turn worked.
+fn session_check(
+    found: &[crate::agent::claude_code::Profile],
+    env: &dyn Fn(&str) -> Option<String>,
+    keychain: &dyn Fn() -> bool,
+    other_agent: &dyn Fn() -> Option<String>,
+) -> Check {
+    let outside = || crate::agent::claude_code::login_outside_profiles(env, keychain);
     if found.is_empty() {
-        if let Ok(agent) = crate::agent::registry::require_drivable() {
-            if agent.protocol != crate::agent::registry::Protocol::ClaudeStreamJson {
-                let ver = agent.version.as_deref().unwrap_or("detected");
-                return Check::ok("session", format!("{} ready ({ver})", agent.display_name));
-            }
+        if let Some(ready) = other_agent() {
+            return Check::ok("session", ready);
         }
-        return Check::warn(
-            "session",
-            "no agent profile found",
-            "Log in with the agent's own CLI. Until then every turn will fail at the first request.",
-        );
+        return match outside() {
+            Some(login) => Check::ok("session", login_detail(login)),
+            // A WARNING THAT ADMITS WHAT IT CANNOT SEE. A login can live
+            // somewhere this check does not look, and the one thing that
+            // settles it is a request the operator can make in a second.
+            None => Check::warn(
+                "session",
+                "no login file found",
+                "If `claude -p hi` works, ignore this: the login is somewhere this check cannot see. Otherwise log in with the agent's own CLI; until then every turn fails at its first request.",
+            ),
+        };
+    }
+    if let Some(login) = outside() {
+        return Check::ok("session", login_detail(login));
     }
     let live: Vec<_> = found.iter().filter(|p| p.seconds_left > 0).collect();
     let name = |p: &crate::agent::claude_code::Profile| {
@@ -220,14 +262,8 @@ fn check_session() -> Check {
     };
     match live.first() {
         None => {
-            if let Ok(agent) = crate::agent::registry::require_drivable() {
-                if agent.protocol != crate::agent::registry::Protocol::ClaudeStreamJson {
-                    let ver = agent.version.as_deref().unwrap_or("detected");
-                    return Check::ok(
-                        "session",
-                        format!("{} ready ({ver}); Claude expired", agent.display_name),
-                    );
-                }
+            if let Some(ready) = other_agent() {
+                return Check::ok("session", format!("{ready}; Claude expired"));
             }
             Check::fail(
                 "session",
@@ -257,6 +293,20 @@ fn check_session() -> Check {
                     "Turns use the live profile. Log the expired one(s) in again, or remove them, so the choice is not surprising.",
                 )
             }
+        }
+    }
+}
+
+/// What a login outside the profile files is, in the session line. Names the
+/// variable and never its value: this line is read on shared screens and
+/// pasted into issues.
+fn login_detail(login: crate::agent::claude_code::OutsideLogin) -> String {
+    match login {
+        crate::agent::claude_code::OutsideLogin::Environment(name) => {
+            format!("Claude Code: credentials from the environment ({name})")
+        }
+        crate::agent::claude_code::OutsideLogin::Keychain => {
+            "Claude Code: login in Keychain".to_string()
         }
     }
 }
@@ -490,5 +540,73 @@ mod tests {
         assert!(check.detail.contains("some-model"), "{}", check.detail);
         assert!(api_session(Some("claude-code"), &resolve).is_none());
         assert!(api_session(None, &resolve).is_none());
+    }
+
+    /// **A LOGIN IN THE ENVIRONMENT IS A SESSION**, with no profile file
+    /// anywhere. `/doctor` said "every turn will fail" to an operator whose
+    /// every turn worked, because only `.credentials.json` was looked for.
+    #[test]
+    fn a_token_in_the_environment_is_a_ready_session_without_any_profile() {
+        let env = |name: &str| (name == "CLAUDE_CODE_OAUTH_TOKEN").then(|| "x".to_string());
+        let check = session_check(&[], &env, &|| false, &|| None);
+        assert_eq!(
+            check.health,
+            Health::Ok,
+            "a variable the CLI logs in with was reported as no login: {}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("CLAUDE_CODE_OAUTH_TOKEN"),
+            "the variable is named so the operator knows which login is used: {}",
+            check.detail
+        );
+    }
+
+    /// The variable is named and its value never is: the session line ends up
+    /// on shared screens and in pasted issues.
+    #[test]
+    fn the_session_line_never_carries_a_credential() {
+        let env = |name: &str| (name == "ANTHROPIC_API_KEY").then(|| "sk-very-secret".to_string());
+        let check = session_check(&[], &env, &|| false, &|| None);
+        assert!(!check.detail.contains("very-secret"), "{}", check.detail);
+        assert!(!check.remedy.contains("very-secret"), "{}", check.remedy);
+    }
+
+    /// The Keychain login a macOS `claude login` leaves is a session too.
+    #[test]
+    fn a_keychain_login_is_a_ready_session() {
+        let check = session_check(&[], &|_| None, &|| true, &|| None);
+        assert_eq!(check.health, Health::Ok, "{}", check.detail);
+        assert!(check.detail.contains("Keychain"), "{}", check.detail);
+    }
+
+    /// With no login anywhere this check can see, it warns — and admits it
+    /// may simply not see the login, naming the one-second way to tell.
+    #[test]
+    fn no_visible_login_warns_without_claiming_every_turn_will_fail() {
+        let check = session_check(&[], &|_| None, &|| false, &|| None);
+        assert_eq!(check.health, Health::Warn);
+        assert!(check.detail.contains("no login file"), "{}", check.detail);
+        assert!(check.remedy.contains("claude -p hi"), "{}", check.remedy);
+    }
+
+    /// Expired profile files do not make a session with a working login in
+    /// the environment a failure: turns use the variable, not the files.
+    #[test]
+    fn expired_files_do_not_fail_a_session_that_logs_in_from_the_environment() {
+        let expired = [crate::agent::claude_code::Profile {
+            dir: std::path::PathBuf::from(".claude"),
+            seconds_left: -60,
+        }];
+        let env = |name: &str| (name == "CLAUDE_CODE_USE_VERTEX").then(|| "1".to_string());
+        let check = session_check(&expired, &env, &|| false, &|| None);
+        assert_eq!(check.health, Health::Ok, "{}", check.detail);
+
+        let none = session_check(&expired, &|_| None, &|| false, &|| None);
+        assert_eq!(
+            none.health,
+            Health::Fail,
+            "control: no other login, so it fails"
+        );
     }
 }

@@ -107,11 +107,14 @@ fn main() -> anyhow::Result<()> {
     // under the old names (`~/.incord-code/`, `.incord/`) is carried over.
     // stderr, never stdout: several modes speak a protocol on stdout.
     let mut migrated = Vec::new();
+    let mut created_outside = Vec::new();
     if parsed.reads_data_dir() {
         migrated.extend(incord_code::migrate::global_report());
         // The reviewers incode ships, written once into the operator's own
         // agents folder and theirs from then on.
-        migrated.extend(incord_code::subagents::seed_report());
+        let seeded = incord_code::subagents::seed_operator_folder();
+        migrated.extend(seeded.report());
+        created_outside = seeded.paths();
     }
     if let Some(workspace) = parsed.workspace() {
         migrated.extend(incord_code::migrate::project_report(workspace));
@@ -155,6 +158,7 @@ fn main() -> anyhow::Result<()> {
                     model.as_deref(),
                     format,
                     spec_gate,
+                    &created_outside,
                 )
             })?
             .map(|_| ())

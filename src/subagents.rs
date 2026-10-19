@@ -283,20 +283,49 @@ fn seed(user_dir: &Path) -> Vec<String> {
     written
 }
 
-/// [`seed`] into the operator's own folder, as the line an operator is shown
-/// when something was added.
+/// What [`seed_operator_folder`] wrote, outside any workspace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Seeded {
+    dir: PathBuf,
+    /// The definitions written, by name.
+    names: Vec<String>,
+}
+
+impl Seeded {
+    /// Every file written, as a full path.
+    ///
+    /// Paths rather than names, because the point is WHERE: these land in the
+    /// operator's home, not the workspace a run was pointed at, and a caller
+    /// reading a JSON stream should not have to know the folder layout to
+    /// find them.
+    #[must_use]
+    pub fn paths(&self) -> Vec<PathBuf> {
+        self.names
+            .iter()
+            .map(|name| self.dir.join(format!("{name}.md")))
+            .collect()
+    }
+
+    /// The line an operator is shown, when anything was written.
+    #[must_use]
+    pub fn report(&self) -> Option<String> {
+        (!self.names.is_empty()).then(|| {
+            format!(
+                "incode: added the sub-agent definition(s) {} to {} — edit or delete them \
+                 freely; incode never writes them again.",
+                self.names.join(", "),
+                self.dir.display()
+            )
+        })
+    }
+}
+
+/// [`seed`] into the operator's own folder.
 #[must_use]
-pub fn seed_report() -> Option<String> {
+pub fn seed_operator_folder() -> Seeded {
     let dir = crate::admin::AdminConfig::default_dir().join(USER_DIR);
-    let written = seed(&dir);
-    (!written.is_empty()).then(|| {
-        format!(
-            "incode: added the sub-agent definition(s) {} to {} — edit or delete them \
-             freely; incode never writes them again.",
-            written.join(", "),
-            dir.display()
-        )
-    })
+    let names = seed(&dir);
+    Seeded { dir, names }
 }
 
 /// Create `path` with `text`, refusing to replace a file that appeared since
@@ -649,6 +678,32 @@ mod tests {
             !user.join("spec-reviewer.md").exists(),
             "deleted stays deleted"
         );
+    }
+
+    /// What was seeded is reported as the files that now exist there — the
+    /// paths a `-t` run's `init` event names — and nothing on a later start.
+    #[test]
+    fn what_was_seeded_is_named_by_the_paths_it_was_written_to() {
+        let dir = tempfile::tempdir().expect("dir");
+        let user = dir.path().join("u");
+        let first = Seeded {
+            names: seed(&user),
+            dir: user.clone(),
+        };
+        let paths = first.paths();
+        assert_eq!(paths.len(), SHIPPED.len());
+        for path in &paths {
+            assert!(path.is_file(), "named but not written: {}", path.display());
+            assert!(path.starts_with(&user), "{}", path.display());
+        }
+        assert!(first.report().is_some());
+
+        let again = Seeded {
+            names: seed(&user),
+            dir: user,
+        };
+        assert!(again.paths().is_empty(), "a later start reports nothing");
+        assert!(again.report().is_none());
     }
 
     /// A file of the same name that was there first is the operator's own.

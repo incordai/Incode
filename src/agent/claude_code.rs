@@ -916,10 +916,156 @@ pub fn profiles_in(home: &std::path::Path) -> Vec<Profile> {
     found
 }
 
-/// The profile whose session is live and lasts longest, if any is.
+/// The profile whose session is live and lasts longest, if any is — and none
+/// when the agent already has a login that no profile file records.
+///
+/// # Why a login elsewhere wins over a live file
+///
+/// Pointing the CLI at a profile directory is the only lever this has, and it
+/// moves the login along with everything else. On macOS the default profile's
+/// login lives in the Keychain under a service name that changes once
+/// [`PROFILE_ENV`] names another directory, so redirecting to a leftover
+/// `.credentials.json` swapped a working login for a stale one. With a
+/// credential in the environment the redirect buys nothing — the CLI
+/// authenticates from the variable whichever directory it reads — and costs
+/// the operator's own settings for that directory.
 #[must_use]
 pub fn usable_profile() -> Option<Profile> {
-    pick_usable(profiles())
+    choose_profile(profiles(), &|| {
+        login_outside_profiles(&process_env, &keychain_holds_login)
+    })
+}
+
+/// [`pick_usable`], unless `outside` names a login the CLI would use anyway.
+///
+/// `outside` is asked only once a file profile would otherwise be chosen: the
+/// Keychain answer costs a process, and with no live file there is nothing it
+/// could change.
+fn choose_profile(
+    found: Vec<Profile>,
+    outside: &dyn Fn() -> Option<OutsideLogin>,
+) -> Option<Profile> {
+    let live = pick_usable(found)?;
+    if let Some(login) = outside() {
+        crate::trace!(
+            "agent",
+            "{} not chosen: the agent already logs in via {login:?}",
+            live.dir.display()
+        );
+        return None;
+    }
+    Some(live)
+}
+
+/// A login the agent CLI uses that is not a profile's credentials file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutsideLogin {
+    /// This variable is set. Only its NAME is carried: the value is a secret
+    /// and nothing here has a use for it.
+    Environment(&'static str),
+    /// The macOS Keychain holds the default profile's login.
+    Keychain,
+}
+
+/// Variables that carry a credential: set to anything, the CLI authenticates
+/// with them. Names measured in the 2.1.303 binary.
+///
+/// `ANTHROPIC_BASE_URL` is deliberately absent. It moves where requests go,
+/// not what authenticates them — the CLI still sends a key, a token or its
+/// login — so a base URL with no credential is exactly the state in which
+/// every turn fails, and counting it would hide that. A host that manages the
+/// provider says so with a provider switch below.
+const CREDENTIAL_ENV: [&str; 4] = [
+    "ANTHROPIC_API_KEY",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
+    "ANTHROPIC_AUTH_TOKEN",
+];
+
+/// Switches to a provider whose own credentials then authenticate the CLI.
+///
+/// Read as switches, the way the CLI reads them (measured in 2.1.303: `1`,
+/// `true`, `yes` or `on`, any case) — so `CLAUDE_CODE_USE_BEDROCK=0` is a
+/// switch that is off, not a login.
+const PROVIDER_ENV: [&str; 7] = [
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+    "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
+    "CLAUDE_CODE_USE_MANTLE",
+    "CLAUDE_CODE_USE_GATEWAY",
+];
+
+/// The Keychain service the CLI keeps the DEFAULT profile's login under.
+///
+/// Measured in 2.1.303: `"Claude Code" + "-credentials"`, with a hash of the
+/// directory appended when [`PROFILE_ENV`] names another one — which is why
+/// the Keychain is only consulted while that variable is unset.
+const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
+
+/// How long the Keychain lookup may take. A local lookup answers in
+/// milliseconds; a locked or hung keychain must not hold up a turn or a
+/// diagnosis.
+const KEYCHAIN_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The login the CLI will use that no profile file records, if there is one.
+///
+/// `env` and `keychain` are parameters so the decision can be tested without
+/// touching the process environment, which every test thread shares. The
+/// environment is read first because it is free; the Keychain costs a process.
+#[must_use]
+pub fn login_outside_profiles(
+    env: &dyn Fn(&str) -> Option<String>,
+    keychain: &dyn Fn() -> bool,
+) -> Option<OutsideLogin> {
+    let set = |name: &str| env(name).is_some_and(|v| !v.is_empty());
+    let switched_on = |name: &str| {
+        env(name).is_some_and(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+    };
+    if let Some(name) = CREDENTIAL_ENV.into_iter().find(|name| set(name)) {
+        return Some(OutsideLogin::Environment(name));
+    }
+    if let Some(name) = PROVIDER_ENV.into_iter().find(|name| switched_on(name)) {
+        return Some(OutsideLogin::Environment(name));
+    }
+    (env(PROFILE_ENV).is_none() && keychain()).then_some(OutsideLogin::Keychain)
+}
+
+/// One variable from this process's environment, as [`login_outside_profiles`]
+/// reads it.
+#[must_use]
+pub fn process_env(name: &str) -> Option<String> {
+    std::env::var_os(name).map(|v| v.to_string_lossy().into_owned())
+}
+
+/// Whether the macOS Keychain holds the default profile's login.
+///
+/// Asks for the item's EXISTENCE only: no `-w`, so the secret is never
+/// printed, and an attribute lookup does not raise the access prompt a read
+/// of the secret would. Output is discarded; the exit code is the answer.
+/// Elsewhere there is no Keychain, and the answer is no without a process.
+#[must_use]
+pub fn keychain_holds_login() -> bool {
+    if !cfg!(target_os = "macos") {
+        return false;
+    }
+    let mut cmd = Command::new("security");
+    cmd.args(["find-generic-password", "-s", KEYCHAIN_SERVICE])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    crate::agent::process_tree::prepare(&mut cmd);
+    let Ok(child) = cmd.spawn() else {
+        return false;
+    };
+    crate::tools::bash::wait_with_timeout(child, KEYCHAIN_WAIT)
+        .is_ok_and(|out| out.status.success())
 }
 
 /// The first profile with enough session left to be worth starting a turn on.
@@ -1613,6 +1759,114 @@ pub(crate) mod tests {
         assert_eq!(find_expiry(&doc), Some(1_234_567_890_123));
         let none: serde_json::Value = serde_json::from_str(r#"{"a":{"b":1}}"#).expect("parse");
         assert_eq!(find_expiry(&none), None);
+    }
+
+    /// An environment holding exactly these variables.
+    fn env_of(vars: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        move |name| {
+            vars.iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| (*v).to_string())
+        }
+    }
+
+    /// **A LOGIN THE CLI USES ANYWAY IS NEVER SWAPPED FOR A FILE PROFILE.**
+    /// Redirecting to a live `.credentials.json` moved a Keychain login out
+    /// of reach on macOS, and with a credential in the environment it changed
+    /// nothing but which settings the CLI read.
+    #[test]
+    fn a_login_outside_the_profiles_keeps_the_agent_where_it_is() {
+        let home = home_with(&[(".claude-work", Some(5.0))]);
+        let outside = || Some(OutsideLogin::Environment("CLAUDE_CODE_OAUTH_TOKEN"));
+        assert_eq!(
+            choose_profile(profiles_in(home.path()), &outside),
+            None,
+            "a live file profile replaced a login the CLI already had"
+        );
+
+        let nothing_else = || None;
+        let chosen = choose_profile(profiles_in(home.path()), &nothing_else).expect("live");
+        assert!(
+            chosen.dir.ends_with(".claude-work"),
+            "with no other login, the live profile is still the choice"
+        );
+    }
+
+    /// The Keychain costs a process, so it is not asked when no live file
+    /// profile could be chosen anyway.
+    #[test]
+    fn the_keychain_is_not_asked_when_no_profile_is_live() {
+        let home = home_with(&[(".claude", Some(-2.0))]);
+        let asked = std::cell::Cell::new(false);
+        let outside = || {
+            asked.set(true);
+            Some(OutsideLogin::Keychain)
+        };
+        assert_eq!(choose_profile(profiles_in(home.path()), &outside), None);
+        assert!(
+            !asked.get(),
+            "a process was spent on a question nobody needed"
+        );
+    }
+
+    /// A credential variable is a login, and only its NAME is reported.
+    #[test]
+    fn a_credential_in_the_environment_is_a_login_named_by_its_variable() {
+        let env = env_of(&[("CLAUDE_CODE_OAUTH_TOKEN", "x")]);
+        assert_eq!(
+            login_outside_profiles(&env, &|| false),
+            Some(OutsideLogin::Environment("CLAUDE_CODE_OAUTH_TOKEN"))
+        );
+        let empty = env_of(&[("ANTHROPIC_API_KEY", "")]);
+        assert_eq!(
+            login_outside_profiles(&empty, &|| false),
+            None,
+            "an empty variable carries no credential"
+        );
+    }
+
+    /// Provider switches are read the way the CLI reads them: `0` is off.
+    #[test]
+    fn a_provider_switch_counts_only_when_it_is_on() {
+        for on in ["1", "true", "YES", " on "] {
+            let env = move |name: &str| (name == "CLAUDE_CODE_USE_BEDROCK").then(|| on.to_string());
+            assert_eq!(
+                login_outside_profiles(&env, &|| false),
+                Some(OutsideLogin::Environment("CLAUDE_CODE_USE_BEDROCK")),
+                "`{on}` switches the provider on"
+            );
+        }
+        for off in ["0", "false", "no", ""] {
+            let env = move |name: &str| (name == "CLAUDE_CODE_USE_VERTEX").then(|| off.to_string());
+            assert_eq!(
+                login_outside_profiles(&env, &|| false),
+                None,
+                "`{off}` leaves the provider off"
+            );
+        }
+    }
+
+    /// A base URL says where requests go, not what authenticates them; on its
+    /// own it is the state in which every turn fails, and must not read as a
+    /// login.
+    #[test]
+    fn a_base_url_alone_is_not_a_login() {
+        let env = env_of(&[("ANTHROPIC_BASE_URL", "https://gateway.example")]);
+        assert_eq!(login_outside_profiles(&env, &|| false), None);
+    }
+
+    /// The default Keychain entry belongs to the default profile; once the
+    /// operator names another directory the CLI looks under another service,
+    /// so the default entry says nothing about this session.
+    #[test]
+    fn the_keychain_counts_only_for_the_default_profile() {
+        let nothing = env_of(&[]);
+        assert_eq!(
+            login_outside_profiles(&nothing, &|| true),
+            Some(OutsideLogin::Keychain)
+        );
+        let elsewhere = env_of(&[("CLAUDE_CONFIG_DIR", "/home/op/.claude-work")]);
+        assert_eq!(login_outside_profiles(&elsewhere, &|| true), None);
     }
 
     /// **The harness's project context must actually REACH the agent.** It was

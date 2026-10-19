@@ -455,6 +455,55 @@ pub struct WhenPresent {
     pub check: &'static [&'static str],
 }
 
+/// Test files that name an ecosystem when no manifest does.
+///
+/// For a language whose small projects routinely have no manifest at all:
+/// `calc.py` beside `test_calc.py` is a Python project with tests, and
+/// "nothing here names an ecosystem" sent its agent off to run them unproven.
+pub struct TestFiles {
+    /// A test file's name, as (prefix, suffix).
+    pub named: &'static [(&'static str, &'static str)],
+    /// The check, chosen from the files that were found.
+    pub check: fn(&Path, &FoundTests) -> Vec<String>,
+}
+
+/// The test files a bounded search found, relative to the workspace root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FoundTests {
+    /// With `/` between components, sorted, so a command built from them is
+    /// the same on every platform and every run.
+    pub files: Vec<String>,
+    /// False when the search stopped at its bound with directories unread:
+    /// the list is then a sample, and nothing may be built that runs only
+    /// the files on it.
+    pub complete: bool,
+}
+
+/// How many directory levels below the root are searched for test files.
+/// Three reaches `src/<package>/tests/`, the deepest place a small project
+/// conventionally keeps them.
+const TEST_SEARCH_DEPTH: usize = 3;
+
+/// Directory entries read before the search stops. A project with tests has
+/// them near the top; a tree this large without them is not a small project
+/// missing its manifest.
+const TEST_SEARCH_ENTRIES: usize = 5_000;
+
+/// Directories never searched: installed dependencies, build output and
+/// caches hold other people's tests, and running those proves nothing about
+/// this project. Hidden directories (`.git`, `.venv`, `.tox`) are skipped as
+/// well, and so is any directory holding a virtual environment's
+/// `pyvenv.cfg`, whatever it is called.
+const NOT_SEARCHED: &[&str] = &[
+    "node_modules",
+    "target",
+    "venv",
+    "__pycache__",
+    "site-packages",
+    "build",
+    "dist",
+];
+
 /// One language ecosystem, recognised from the workspace root.
 ///
 /// # Why a table, and not the chain of ifs this replaced
@@ -480,6 +529,9 @@ pub struct Ecosystem {
     /// Checked in ascending order of preference; the first whose file exists
     /// supersedes `check`.
     pub refine: &'static [WhenPresent],
+    /// Test files that name this ecosystem when nothing else in the
+    /// workspace does — see [`detected_ecosystems`] for why only then.
+    pub tests: Option<TestFiles>,
 }
 
 /// The ecosystems detection can recognise.
@@ -494,6 +546,7 @@ pub const ECOSYSTEMS: &[Ecosystem] = &[
         extensions: &[],
         check: &["cargo", "test"],
         refine: &[],
+        tests: None,
     },
     Ecosystem {
         name: "Node.js",
@@ -501,6 +554,7 @@ pub const ECOSYSTEMS: &[Ecosystem] = &[
         extensions: &[],
         check: &["npm", "test"],
         refine: &[],
+        tests: None,
     },
     Ecosystem {
         name: "Python",
@@ -508,6 +562,10 @@ pub const ECOSYSTEMS: &[Ecosystem] = &[
         extensions: &[],
         check: &["pytest"],
         refine: &[],
+        tests: Some(TestFiles {
+            named: &[("test_", ".py"), ("", "_test.py")],
+            check: python_tests_check,
+        }),
     },
     Ecosystem {
         name: "Go",
@@ -515,6 +573,7 @@ pub const ECOSYSTEMS: &[Ecosystem] = &[
         extensions: &[],
         check: &["go", "test", "./..."],
         refine: &[],
+        tests: None,
     },
     Ecosystem {
         name: "PHP",
@@ -525,6 +584,7 @@ pub const ECOSYSTEMS: &[Ecosystem] = &[
             file: "vendor/bin/phpunit",
             check: &["vendor/bin/phpunit"],
         }],
+        tests: None,
     },
     Ecosystem {
         name: "Java (Maven)",
@@ -535,6 +595,7 @@ pub const ECOSYSTEMS: &[Ecosystem] = &[
             file: "mvnw",
             check: &["./mvnw", "test"],
         }],
+        tests: None,
     },
     Ecosystem {
         name: "Gradle",
@@ -550,6 +611,7 @@ pub const ECOSYSTEMS: &[Ecosystem] = &[
             file: "gradlew",
             check: &["./gradlew", "test"],
         }],
+        tests: None,
     },
     Ecosystem {
         name: "Ruby",
@@ -560,6 +622,7 @@ pub const ECOSYSTEMS: &[Ecosystem] = &[
             file: ".rspec",
             check: &["bundle", "exec", "rspec"],
         }],
+        tests: None,
     },
     Ecosystem {
         name: ".NET",
@@ -567,6 +630,7 @@ pub const ECOSYSTEMS: &[Ecosystem] = &[
         extensions: &["sln", "csproj", "fsproj", "vbproj"],
         check: &["dotnet", "test"],
         refine: &[],
+        tests: None,
     },
     Ecosystem {
         name: "Elixir",
@@ -574,6 +638,7 @@ pub const ECOSYSTEMS: &[Ecosystem] = &[
         extensions: &[],
         check: &["mix", "test"],
         refine: &[],
+        tests: None,
     },
     Ecosystem {
         name: "Swift",
@@ -581,6 +646,7 @@ pub const ECOSYSTEMS: &[Ecosystem] = &[
         extensions: &[],
         check: &["swift", "test"],
         refine: &[],
+        tests: None,
     },
     Ecosystem {
         name: "Dart",
@@ -588,6 +654,7 @@ pub const ECOSYSTEMS: &[Ecosystem] = &[
         extensions: &[],
         check: &["dart", "test"],
         refine: &[],
+        tests: None,
     },
     Ecosystem {
         name: "CMake",
@@ -595,6 +662,7 @@ pub const ECOSYSTEMS: &[Ecosystem] = &[
         extensions: &[],
         check: &["ctest"],
         refine: &[],
+        tests: None,
     },
 ];
 
@@ -637,6 +705,12 @@ impl Ecosystem {
     /// The check for this ecosystem in this workspace.
     #[must_use]
     pub fn check_in(&self, workspace: &Path) -> Vec<String> {
+        if let Some(tests) = self.tests.as_ref().filter(|_| !self.detected_in(workspace)) {
+            let found = find_tests(workspace, tests.named);
+            if !found.files.is_empty() {
+                return (tests.check)(workspace, &found);
+            }
+        }
         let argv = self
             .refine
             .iter()
@@ -652,12 +726,228 @@ impl Ecosystem {
 /// say WHY — "two ecosystems, pick one" and "no ecosystem at all" are different
 /// problems with different fixes, and an operator told only "no check" will go
 /// looking for the wrong one.
+///
+/// # Test files count only where nothing else does
+///
+/// A manifest is a declaration; a `test_*.py` may be a helper script in a
+/// project written in something else. Counted beside the manifests, one
+/// release script would make every Rust crate that has one "two ecosystems"
+/// and take `cargo test` away from it. So test files are asked about only
+/// when no manifest names anything, which is exactly the gap they fill.
 #[must_use]
 pub fn detected_ecosystems(workspace: &Path) -> Vec<&'static Ecosystem> {
-    ECOSYSTEMS
+    let declared: Vec<&'static Ecosystem> = ECOSYSTEMS
         .iter()
         .filter(|eco| eco.detected_in(workspace))
+        .collect();
+    if !declared.is_empty() {
+        return declared;
+    }
+    ECOSYSTEMS
+        .iter()
+        .filter(|eco| {
+            eco.tests
+                .as_ref()
+                .is_some_and(|tests| !find_tests(workspace, tests.named).files.is_empty())
+        })
         .collect()
+}
+
+/// Test files named one of `named` ways, within [`TEST_SEARCH_DEPTH`] of the
+/// root and [`TEST_SEARCH_ENTRIES`] directory entries, outside
+/// [`NOT_SEARCHED`].
+fn find_tests(workspace: &Path, named: &[(&str, &str)]) -> FoundTests {
+    let mut found = FoundTests {
+        files: Vec::new(),
+        complete: true,
+    };
+    let mut budget = TEST_SEARCH_ENTRIES;
+    let mut pending: Vec<(std::path::PathBuf, usize)> = vec![(workspace.to_path_buf(), 0)];
+    while let Some((dir, depth)) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            if budget == 0 {
+                found.complete = false;
+                break;
+            }
+            budget -= 1;
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                let searched = !name.starts_with('.')
+                    && !NOT_SEARCHED.contains(&name.as_str())
+                    && !path.join("pyvenv.cfg").is_file();
+                if searched && depth < TEST_SEARCH_DEPTH {
+                    pending.push((path, depth + 1));
+                } else if searched {
+                    // Deeper than the search goes: tests may live there, so
+                    // what was found is not all there is.
+                    found.complete = false;
+                }
+            } else if kind.is_file()
+                && named.iter().any(|(prefix, suffix)| {
+                    name.len() > prefix.len() + suffix.len()
+                        && name.starts_with(prefix)
+                        && name.ends_with(suffix)
+                })
+            {
+                if let Ok(relative) = path.strip_prefix(workspace) {
+                    let parts: Vec<String> = relative
+                        .components()
+                        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                        .collect();
+                    found.files.push(parts.join("/"));
+                }
+            }
+        }
+        if budget == 0 && !pending.is_empty() {
+            found.complete = false;
+            break;
+        }
+    }
+    found.files.sort();
+    found
+}
+
+/// The interpreters tried, in order, on this platform.
+///
+/// Windows installs answer to `python` or to the `py` launcher, and the
+/// `python` on a fresh machine can be a store stub that runs nothing.
+/// Elsewhere `python` may not exist at all — Ubuntu ships only `python3`.
+const PYTHON_INTERPRETERS: &[&str] = if cfg!(windows) {
+    &["python", "py", "python3"]
+} else {
+    &["python3", "python"]
+};
+
+/// Run by each interpreter to say whether pytest is importable: exit 0 when
+/// it is, [`PYTEST_MISSING`] when the interpreter runs without it. Any other
+/// outcome — no such program, a store stub's own exit code, a hang — means
+/// this is not an interpreter that can run the tests.
+///
+/// `find_spec` locates the module without importing it, so nothing of the
+/// project's, or of pytest's, runs to answer the question.
+const PYTEST_PROBE: &str =
+    "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('pytest') else 3)";
+
+/// [`PYTEST_PROBE`]'s answer for an interpreter that runs, without pytest.
+const PYTEST_MISSING: i32 = 3;
+
+/// How long one interpreter has to answer. A cold start on a slow disk takes
+/// a second or two; a hung one must not hold up detection.
+const PYTEST_PROBE_WAIT: Duration = Duration::from_secs(10);
+
+/// What one interpreter said about pytest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pytest {
+    Importable,
+    Missing,
+    NoInterpreter,
+}
+
+/// The check for a Python project recognised from its test files alone.
+///
+/// # Why the interpreter is asked, at detection time
+///
+/// `python -m pytest` with no pytest installed fails before running a test,
+/// and the standard library's `unittest` is always there — but which of the
+/// two can run is a fact about the machine, not about any file, so it costs
+/// a process to learn. Detection runs just before the check it chooses, and
+/// beside a test suite one interpreter start is noise; a cached answer would
+/// go stale the moment the agent installs pytest. Probing also finds the
+/// interpreter that exists, which is what [`PYTHON_INTERPRETERS`] is for.
+fn python_tests_check(workspace: &Path, found: &FoundTests) -> Vec<String> {
+    python_check_with(workspace, found, &|interpreter| {
+        probe_pytest(interpreter, workspace)
+    })
+}
+
+/// [`python_tests_check`] with the probe passed in, so the choice can be
+/// tested without the machine's interpreters deciding the outcome.
+///
+/// # When `unittest` stands in for pytest
+///
+/// Only when every test file found defines a `TestCase`, and the search saw
+/// them all. `unittest` silently skips a plain `def test_…` function, and
+/// before Python 3.12 a run that found no tests exits 0 — so running it over
+/// pytest-style files would MINT PROOF from a suite that executed nothing.
+/// Otherwise the command stays `-m pytest`, which fails naming the missing
+/// module: a check that cannot run says so, and installing pytest fixes it.
+///
+/// The files are named on the command line rather than discovered, because
+/// discovery uses one pattern (`test*.py` misses `calc_test.py`) and does not
+/// enter a directory without `__init__.py`.
+fn python_check_with(
+    workspace: &Path,
+    found: &FoundTests,
+    probe: &dyn Fn(&str) -> Pytest,
+) -> Vec<String> {
+    let mut runs_without_pytest = None;
+    for &interpreter in PYTHON_INTERPRETERS {
+        match probe(interpreter) {
+            Pytest::Importable => return argv(&[interpreter, "-m", "pytest", "-q"]),
+            Pytest::Missing => {
+                runs_without_pytest.get_or_insert(interpreter);
+            }
+            Pytest::NoInterpreter => {}
+        }
+    }
+    match runs_without_pytest {
+        Some(interpreter) if found.complete && every_file_is_unittest(workspace, &found.files) => {
+            let mut command = argv(&[interpreter, "-m", "unittest"]);
+            command.extend(found.files.iter().cloned());
+            command
+        }
+        Some(interpreter) => argv(&[interpreter, "-m", "pytest", "-q"]),
+        None => argv(&[PYTHON_INTERPRETERS[0], "-m", "pytest", "-q"]),
+    }
+}
+
+/// Whether every one of `files` defines a `unittest` test case.
+///
+/// A file too large to be a test module, or unreadable, answers no: the safe
+/// reading is the one that keeps `unittest` from running.
+fn every_file_is_unittest(workspace: &Path, files: &[String]) -> bool {
+    const LARGEST_READ: u64 = 1_000_000;
+    files.iter().all(|file| {
+        let path = workspace.join(file);
+        std::fs::metadata(&path).is_ok_and(|m| m.len() <= LARGEST_READ)
+            && std::fs::read_to_string(&path).is_ok_and(|text| text.contains("TestCase"))
+    })
+}
+
+/// Ask `interpreter`, in `workspace`, whether pytest is importable.
+///
+/// Run where the check will run, so a pytest vendored into the project counts
+/// exactly as it would for the real command.
+fn probe_pytest(interpreter: &str, workspace: &Path) -> Pytest {
+    let mut cmd = std::process::Command::new(interpreter);
+    cmd.args(["-c", PYTEST_PROBE])
+        .current_dir(workspace)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    crate::agent::process_tree::prepare(&mut cmd);
+    let Ok(child) = cmd.spawn() else {
+        return Pytest::NoInterpreter;
+    };
+    match crate::tools::bash::wait_with_timeout(child, PYTEST_PROBE_WAIT)
+        .map(|out| out.status.code())
+    {
+        Ok(Some(0)) => Pytest::Importable,
+        Ok(Some(PYTEST_MISSING)) => Pytest::Missing,
+        _ => Pytest::NoInterpreter,
+    }
+}
+
+/// A command as owned strings.
+fn argv(parts: &[&str]) -> Vec<String> {
+    parts.iter().map(|s| (*s).to_string()).collect()
 }
 
 /// The check a project's own manifest implies, with nothing configured.
@@ -1400,6 +1690,215 @@ mod tests {
         assert_eq!(detected_command(dir.path()), None);
         let note = detection_note(dir.path());
         assert!(note.contains(VERIFY_COMMAND_ENV), "got: {note}");
+    }
+
+    /// Write `files` (relative paths) under `root`, creating directories.
+    fn write_files(root: &Path, files: &[(&str, &str)]) {
+        for (file, text) in files {
+            let path = root.join(file);
+            std::fs::create_dir_all(path.parent().expect("has a parent")).expect("mkdir");
+            std::fs::write(path, text).expect("write");
+        }
+    }
+
+    /// **A PYTHON PROJECT WITH TESTS AND NO MANIFEST IS A PYTHON PROJECT.**
+    /// `calc.py` beside `test_calc.py` was "nothing here names an
+    /// ecosystem", and its agent fell back to a run nothing proved.
+    #[test]
+    fn python_test_files_name_the_ecosystem_when_no_manifest_does() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        write_files(
+            dir.path(),
+            &[
+                ("calc.py", "def add(a, b): return a + b\n"),
+                ("test_calc.py", ""),
+            ],
+        );
+        let names: Vec<&str> = detected_ecosystems(dir.path())
+            .iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names, ["Python"], "the tests were not recognised");
+
+        // Which runner depends on this machine; that it runs a module of the
+        // interpreter does not.
+        let argv = detected_command(dir.path()).expect("a check for a project with tests");
+        assert_eq!(argv.get(1).map(String::as_str), Some("-m"), "{argv:?}");
+    }
+
+    /// Both naming conventions are found, below the root as well, and named
+    /// the same way on every platform.
+    #[test]
+    fn test_files_are_found_by_either_convention_and_named_portably() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        write_files(
+            dir.path(),
+            &[
+                ("calc_test.py", ""),
+                ("tests/test_io.py", ""),
+                ("conftest.py", ""),
+                ("test_.py", ""),
+            ],
+        );
+        let found = find_tests(dir.path(), &[("test_", ".py"), ("", "_test.py")]);
+        assert_eq!(found.files, ["calc_test.py", "tests/test_io.py"]);
+        assert!(found.complete, "nothing was left unread");
+    }
+
+    /// Installed dependencies, virtual environments under any name, and
+    /// hidden directories hold other people's tests.
+    #[test]
+    fn other_peoples_tests_do_not_name_the_project() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        write_files(
+            dir.path(),
+            &[
+                ("node_modules/pkg/test_a.py", ""),
+                (".venv/lib/test_b.py", ""),
+                ("env/pyvenv.cfg", "home = /usr/bin\n"),
+                ("env/lib/test_c.py", ""),
+                ("target/test_d.py", ""),
+            ],
+        );
+        assert!(
+            detected_ecosystems(dir.path()).is_empty(),
+            "a dependency's tests were taken for the project's"
+        );
+    }
+
+    /// **A HELPER SCRIPT DOES NOT MAKE A PROJECT AMBIGUOUS.** Test files are
+    /// asked about only where no manifest names anything: counted beside one,
+    /// a Rust crate with a Python release script would lose `cargo test`.
+    #[test]
+    fn a_test_script_does_not_take_the_check_from_a_manifest_project() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        write_files(
+            dir.path(),
+            &[("Cargo.toml", "x"), ("scripts/test_release.py", "")],
+        );
+        assert_eq!(
+            detected_command(dir.path()),
+            Some(vec!["cargo".to_string(), "test".to_string()])
+        );
+
+        // And two manifests are still two ecosystems, not three.
+        let two = tempfile::tempdir().expect("temp dir");
+        write_files(
+            two.path(),
+            &[
+                ("composer.json", "{}"),
+                ("package.json", "{}"),
+                ("test_x.py", ""),
+            ],
+        );
+        assert_eq!(detected_command(two.path()), None);
+        let note = detection_note(two.path());
+        assert!(note.contains("2 ecosystems"), "got: {note}");
+        assert!(!note.contains("Python"), "got: {note}");
+    }
+
+    /// A probe that answers `answers[i]` for the i-th interpreter tried.
+    fn probe_of(answers: &'static [Pytest]) -> impl Fn(&str) -> Pytest {
+        move |interpreter| {
+            PYTHON_INTERPRETERS
+                .iter()
+                .position(|i| *i == interpreter)
+                .and_then(|at| answers.get(at).copied())
+                .unwrap_or(Pytest::NoInterpreter)
+        }
+    }
+
+    /// pytest wherever an interpreter can import it — and the interpreter
+    /// is the one that exists, not the first name on the list.
+    #[test]
+    fn pytest_runs_on_the_interpreter_that_has_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let found = FoundTests {
+            files: vec!["test_calc.py".to_string()],
+            complete: true,
+        };
+        let first = python_check_with(dir.path(), &found, &probe_of(&[Pytest::Importable]));
+        assert_eq!(first, [PYTHON_INTERPRETERS[0], "-m", "pytest", "-q"]);
+
+        let second = python_check_with(
+            dir.path(),
+            &found,
+            &probe_of(&[Pytest::NoInterpreter, Pytest::Importable]),
+        );
+        assert_eq!(second, [PYTHON_INTERPRETERS[1], "-m", "pytest", "-q"]);
+    }
+
+    /// **UNITTEST STANDS IN ONLY FOR FILES IT CAN RUN.** It skips a plain
+    /// `def test_…` and, before 3.12, exits 0 having run nothing — so over
+    /// pytest-style files it would mint proof from a suite that executed
+    /// nothing. There the command stays pytest, and fails saying so.
+    #[test]
+    fn unittest_stands_in_for_pytest_only_over_test_cases() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        write_files(
+            dir.path(),
+            &[
+                (
+                    "test_calc.py",
+                    "import unittest\nclass T(unittest.TestCase): pass\n",
+                ),
+                ("tests/io_test.py", "from unittest import TestCase\n"),
+                ("test_plain.py", "def test_add():\n    assert 1 + 1 == 2\n"),
+            ],
+        );
+        let missing = probe_of(&[Pytest::Missing]);
+        let interpreter = PYTHON_INTERPRETERS[0];
+
+        let cases = FoundTests {
+            files: vec!["test_calc.py".to_string(), "tests/io_test.py".to_string()],
+            complete: true,
+        };
+        assert_eq!(
+            python_check_with(dir.path(), &cases, &missing),
+            [
+                interpreter,
+                "-m",
+                "unittest",
+                "test_calc.py",
+                "tests/io_test.py"
+            ],
+            "the test cases run without pytest, every file named"
+        );
+
+        let mixed = FoundTests {
+            files: vec!["test_calc.py".to_string(), "test_plain.py".to_string()],
+            complete: true,
+        };
+        assert_eq!(
+            python_check_with(dir.path(), &mixed, &missing),
+            [interpreter, "-m", "pytest", "-q"],
+            "a plain test function would have been skipped and the run passed"
+        );
+
+        let sample = FoundTests {
+            complete: false,
+            ..cases
+        };
+        assert_eq!(
+            python_check_with(dir.path(), &sample, &missing),
+            [interpreter, "-m", "pytest", "-q"],
+            "a partial list would leave the unread files unrun"
+        );
+    }
+
+    /// With no interpreter at all, the check still names one, so the failure
+    /// says what is missing instead of there being no check.
+    #[test]
+    fn no_interpreter_still_yields_a_check_that_says_what_is_missing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let found = FoundTests {
+            files: vec!["test_calc.py".to_string()],
+            complete: true,
+        };
+        assert_eq!(
+            python_check_with(dir.path(), &found, &probe_of(&[])),
+            [PYTHON_INTERPRETERS[0], "-m", "pytest", "-q"]
+        );
     }
 
     #[test]

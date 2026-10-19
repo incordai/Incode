@@ -247,6 +247,9 @@ pub fn emit(text: &str) {
 /// library would have — no hand-written escape codes to drift out of step with
 /// what the rest of the program draws.
 pub fn style<T: std::fmt::Display>(command: T) {
+    if !colour_on() {
+        return;
+    }
     // Inside a capture the text is what is wanted; an escape code in it would
     // reach a client that is not a terminal as noise.
     let held = CAPTURED
@@ -259,6 +262,37 @@ pub fn style<T: std::fmt::Display>(command: T) {
         return;
     }
     emit(&command.to_string());
+}
+
+/// Whether styling is written at all.
+///
+/// # Why one answer, here
+///
+/// Every colour in the program goes through [`style`], or asks this before
+/// painting a row itself, so this is the one place the answer can be wrong.
+/// It was never asked: a headless run of `printf '/doctor\n' | incode`
+/// printed `\x1b[38;5;6m` into output no terminal was reading, because an
+/// escape is an instruction to a terminal and a pipe or a file keeps it as
+/// bytes.
+///
+/// Off when stdout is not a terminal, or when `NO_COLOR` is set to anything
+/// but the empty string (no-color.org: present and non-empty). Decided once —
+/// neither changes while the process runs, and this is asked for every
+/// styled fragment of a streamed reply.
+#[must_use]
+pub fn colour_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        colour_wanted(
+            std::io::IsTerminal::is_terminal(&std::io::stdout()),
+            std::env::var_os("NO_COLOR").as_deref(),
+        )
+    })
+}
+
+/// [`colour_on`]'s decision, from what it read.
+fn colour_wanted(stdout_is_terminal: bool, no_color: Option<&std::ffi::OsStr>) -> bool {
+    stdout_is_terminal && !no_color.is_some_and(|value| !value.is_empty())
 }
 
 /// Write text followed by a newline.
@@ -452,6 +486,75 @@ mod tests {
         assert_eq!(*seen.borrow(), vec!["first ", "line", "\n"]);
         emit_line("after");
         assert_eq!(lines(), vec!["elsewhere", "after"]);
+    }
+
+    /// **NO ESCAPES WHERE NO TERMINAL IS READING, AND NONE UNDER `NO_COLOR`.**
+    /// A pipe or a file keeps a colour code as literal bytes in someone's log.
+    #[test]
+    fn colour_is_written_only_to_a_terminal_that_has_not_refused_it() {
+        let set = |v: &'static str| Some(std::ffi::OsStr::new(v));
+        assert!(colour_wanted(true, None), "a terminal gets colour");
+        assert!(
+            !colour_wanted(false, None),
+            "a pipe or a file was sent escape codes"
+        );
+        assert!(
+            !colour_wanted(true, set("1")),
+            "NO_COLOR was set and colour was written anyway"
+        );
+        assert!(
+            colour_wanted(true, set("")),
+            "an empty NO_COLOR does not opt out (no-color.org)"
+        );
+    }
+
+    /// Set only in the child process the piped-output test starts.
+    const PIPED_CHILD: &str = "INCODE_CONSOLE_PIPED_CHILD";
+
+    /// The child half: styled text written the way every coloured line is,
+    /// to a stdout that is a pipe.
+    #[test]
+    fn piped_output_child() {
+        if std::env::var_os(PIPED_CHILD).is_none() {
+            return;
+        }
+        set_mode(Mode::Direct);
+        style(crossterm::style::SetForegroundColor(
+            crossterm::style::Color::DarkCyan,
+        ));
+        emit("incode: ");
+        style(crossterm::style::ResetColor);
+        emit_line("styled line");
+        std::process::exit(0);
+    }
+
+    /// **A PIPED RUN CARRIES NO ESCAPE CODES** — through the real door, in
+    /// a process whose stdout really is a pipe, which is the only way to ask
+    /// the question the terminal check answers.
+    #[test]
+    fn a_piped_run_writes_no_escape_codes() {
+        let out = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "cli::console::tests::piped_output_child",
+                "--nocapture",
+                "--test-threads=1",
+                "-q",
+            ])
+            .env(PIPED_CHILD, "1")
+            .env_remove("NO_COLOR")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run the child");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("incode: styled line"),
+            "the child did not write its line: {stdout:?}"
+        );
+        assert!(
+            !stdout.contains('\u{1b}'),
+            "escape codes reached a pipe: {stdout:?}"
+        );
     }
 
     #[test]

@@ -182,7 +182,7 @@ impl Screen {
                 // so an escape sent separately would land on whatever the cursor
                 // was pointing at instead.
                 let painted = match text.split_once(FRAME_SLOT) {
-                    Some((before, after)) => {
+                    Some((before, after)) if crate::cli::console::colour_on() => {
                         let (verb, tail) = split_verb(after);
                         format!(
                             "{before}{}{frame}{verb}{}{tail}",
@@ -190,7 +190,7 @@ impl Screen {
                             ResetColor
                         )
                     }
-                    None => rendered.clone(),
+                    _ => rendered.clone(),
                 };
                 // WHICH BRANCH, and where. Three writers ended up on this one row
                 // and the fastest won; nothing said so, and it read as the status
@@ -221,9 +221,14 @@ impl Screen {
                 let (verb, tail) = split_verb(after);
                 let _ = execute!(io::stdout(), MoveToColumn(0));
                 print!("{before}");
-                let _ = execute!(io::stdout(), SetForegroundColor(colour));
+                let coloured = crate::cli::console::colour_on();
+                if coloured {
+                    let _ = execute!(io::stdout(), SetForegroundColor(colour));
+                }
                 print!("{frame}{verb}");
-                let _ = execute!(io::stdout(), ResetColor);
+                if coloured {
+                    let _ = execute!(io::stdout(), ResetColor);
+                }
                 print!("{tail}");
             }
             None => {

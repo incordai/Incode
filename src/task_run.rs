@@ -87,6 +87,10 @@ struct Report {
     /// Carried into the result so a caller that turned the gate off can
     /// report that it did; a run that relaxed a law must say so where it ends.
     spec_gate: crate::spec::SpecGate,
+    /// Files this run created outside the workspace before the agent started,
+    /// as full paths. Said in the first `init`, because a stderr line is the
+    /// one place a JSON consumer is guaranteed not to look.
+    created: Vec<String>,
 }
 
 impl Report {
@@ -101,6 +105,7 @@ impl Report {
             served_by: Vec::new(),
             usage: [0; 4],
             spec_gate: crate::spec::for_this_run(),
+            created: Vec::new(),
         }
     }
 
@@ -124,8 +129,13 @@ impl Report {
             "model": model,
             "incode_version": env!("CARGO_PKG_VERSION"),
         });
-        if let Some(previous) = fallback_from {
-            init["fallback_from"] = json!(previous);
+        match fallback_from {
+            Some(previous) => init["fallback_from"] = json!(previous),
+            // On the first `init` only, and always present there — empty
+            // when nothing was written — so a consumer reads one field
+            // rather than testing for it, and a fallback's `init` does not
+            // report the same files twice.
+            None => init["created"] = json!(self.created),
         }
         self.line(&init);
     }
@@ -232,12 +242,16 @@ impl Report {
 ///
 /// As [`run_task_with_model`]; and, for a JSON format, when stdout cannot be
 /// taken for it. A JSON run's `result` line says the same error.
+///
+/// `created` is what the process wrote outside the workspace before the run —
+/// the shipped sub-agent definitions on a first run — for the `init` event.
 pub fn run_task_as(
     workspace: &Path,
     instruction: &str,
     model: Option<&str>,
     format: OutputFormat,
     spec_gate: crate::spec::SpecGate,
+    created: &[std::path::PathBuf],
 ) -> Result<String, String> {
     crate::spec::set_for_this_run(spec_gate);
     if format == OutputFormat::Text {
@@ -247,6 +261,10 @@ pub fn run_task_as(
         .map_err(|e| format!("stdout could not be taken for the JSON output: {e}"))?;
     let mut report = Report::text();
     report.out = Some((claimed.output, format == OutputFormat::StreamJson));
+    report.created = created
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
     let began = std::time::Instant::now();
     let ran = run_task_reporting(workspace, instruction, model, &mut report);
     report.finish(&ran, began.elapsed());
@@ -707,9 +725,18 @@ fn show(
         AgentEvent::Usage {
             input_tokens,
             output_tokens,
-            ..
+            cache_creation_tokens,
+            cache_read_tokens,
         } => {
-            outln!("  · {input_tokens} in / {output_tokens} out");
+            outln!(
+                "  · {}",
+                usage_line(
+                    *input_tokens,
+                    *output_tokens,
+                    *cache_creation_tokens,
+                    *cache_read_tokens
+                )
+            );
         }
         AgentEvent::Quota { status, .. } => outln!("  · quota: {status}"),
         AgentEvent::ToolResult {
@@ -729,6 +756,28 @@ fn show(
         }
         AgentEvent::TextDelta(_) | AgentEvent::Thinking(_) | AgentEvent::Context { .. } => {}
     }
+}
+
+/// What a turn's tokens came to, as `158.1k in (140.2k cached) / 2.2k out`.
+///
+/// The input side counts what the cache wrote and what it served: the agent
+/// reports those apart from `input_tokens`, which on a resumed session is a
+/// few dozen while the request really carried the whole conversation. Shown
+/// without them, the line read `20 in` for a turn the budget charged 158k —
+/// the same run, two numbers, and the smaller one on screen.
+fn usage_line(input: u32, output: u32, cache_creation: u32, cache_read: u32) -> String {
+    let human = |n: u32| crate::cli::activity::human_count(u64::from(n));
+    let all_input = u64::from(input) + u64::from(cache_creation) + u64::from(cache_read);
+    let cached = if cache_read > 0 {
+        format!(" ({} cached)", human(cache_read))
+    } else {
+        String::new()
+    };
+    format!(
+        "{} in{cached} / {} out",
+        crate::cli::activity::human_count(all_input),
+        human(output)
+    )
 }
 
 /// Wrap the instruction in what the harness knows about this project.
@@ -956,6 +1005,25 @@ mod tests {
         assert!(off.ends_with("fix it"), "the instruction stays last: {off}");
     }
 
+    /// **THE TOKEN LINE COUNTS WHAT THE BUDGET COUNTS.** The numbers from the
+    /// report: the line read `20 in / 2247 out` for a turn whose request
+    /// carried 157,878 input tokens, 140,221 of them served from the cache.
+    #[test]
+    fn the_token_line_counts_cached_input_as_input() {
+        let line = usage_line(20, 2_247, 17_637, 140_221);
+        assert_eq!(
+            line, "157.9k in (140.2k cached) / 2.2k out",
+            "cache writes and reads are input the turn carried"
+        );
+    }
+
+    /// A turn with nothing from the cache says nothing about it.
+    #[test]
+    fn a_turn_with_no_cache_hits_does_not_mention_the_cache() {
+        assert_eq!(usage_line(12, 3, 0, 0), "12 in / 3 out");
+        assert_eq!(usage_line(12, 3, 900, 0), "912 in / 3 out");
+    }
+
     /// An empty instruction is refused before an agent is spawned for nothing.
     #[test]
     fn an_empty_instruction_is_refused_without_starting_anything() {
@@ -1067,6 +1135,36 @@ mod tests {
         let lines = lines_of(&path);
         assert_eq!(lines[0]["type"], "result");
         assert_eq!(lines[0]["spec_gate"], "off", "{:?}", lines[0]);
+    }
+
+    /// **WHAT A RUN WROTE OUTSIDE THE WORKSPACE IS IN ITS FIRST `init`.**
+    /// A first `-t` run adds definitions to the operator's home and said so on
+    /// stderr only, which a JSON consumer never reads. Present and empty when
+    /// nothing was written; absent from a fallback's `init`, which would
+    /// otherwise report the same files twice.
+    #[test]
+    fn the_first_init_names_the_files_written_outside_the_workspace() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("out.jsonl");
+        let mut report = Report::text();
+        report.out = Some((std::fs::File::create(&path).expect("file"), true));
+        report.created = vec!["/home/op/.incode/agents/researcher.md".to_string()];
+        report.init(Path::new("/ws"), "claude-code", None);
+        report.init(Path::new("/ws"), "other-agent", None);
+        let lines = lines_of(&path);
+        assert_eq!(
+            lines[0]["created"],
+            json!(["/home/op/.incode/agents/researcher.md"]),
+            "the file written outside the workspace was not named"
+        );
+        assert_eq!(lines[1]["fallback_from"], "claude-code");
+        assert!(lines[1].get("created").is_none(), "{}", lines[1]);
+
+        let quiet = dir.path().join("quiet.jsonl");
+        let mut report = Report::text();
+        report.out = Some((std::fs::File::create(&quiet).expect("file"), true));
+        report.init(Path::new("/ws"), "claude-code", None);
+        assert_eq!(lines_of(&quiet)[0]["created"], json!([]));
     }
 
     /// `json` is the result alone, once; a failed run's says why.

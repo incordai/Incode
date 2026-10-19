@@ -923,8 +923,7 @@ impl AgentSession {
                         on_status(&crate::cli::activity::Status {
                             activity: activity.clone(),
                             elapsed: started.elapsed().as_secs(),
-                            tokens: u64::from(turn_usage.input_tokens)
-                                + u64::from(turn_usage.output_tokens),
+                            tokens: u64::from(turn_usage.total_tokens()),
                             progress: None,
                         });
                     }
@@ -946,7 +945,9 @@ impl AgentSession {
                         on_status(&crate::cli::activity::Status {
                             activity: activity.clone(),
                             elapsed: started.elapsed().as_secs(),
-                            tokens: u64::from(*input_tokens) + u64::from(*output_tokens),
+                            // Every token the turn used, cached input
+                            // included — the number the budget charges.
+                            tokens: u64::from(turn_usage.total_tokens()),
                             progress: None,
                         });
                     }
