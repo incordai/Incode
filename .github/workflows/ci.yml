@@ -58,3 +58,11 @@ jobs:
       - run: cargo clippy --all-targets
       - run: cargo test --lib
       - run: cargo test --bins
+      # A test that writes outside its temp dir lands in the checkout — a
+      # Windows drive path is RELATIVE on Linux and macOS — and passes anyway.
+      # Only a clean tree after the run catches it.
+      - name: the tests left the checkout clean
+        shell: bash
+        run: |
+          git status --porcelain
+          test -z "$(git status --porcelain)"
