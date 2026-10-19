@@ -30,12 +30,14 @@
 //!
 //! # What this does NOT claim
 //!
-//! Shell commands are matched textually. `bash` can reach a protected file in
-//! ways no pattern catches — a variable, a glob expanded by the shell, a script
-//! that writes on its behalf. The textual check stops the direct and common
-//! forms; the real boundary for shell is the permission tier, which decides
-//! whether `bash` may run at all. Anything stronger needs a sandbox, and
+//! Shell commands are matched textually (`shell`). `bash` can reach a protected
+//! file in ways no pattern catches — a variable, a glob expanded by the shell, a
+//! script that writes on its behalf. The textual check stops the direct and
+//! common forms; the real boundary for shell is the permission tier, which
+//! decides whether `bash` may run at all. Anything stronger needs a sandbox, and
 //! pretending otherwise would be worse than saying so.
+
+mod shell;
 
 use std::path::Path;
 use std::time::Duration;
@@ -56,16 +58,37 @@ const TIMEOUT: Duration = crate::recall::WAITING_TIMEOUT;
 ///
 /// Matched against the workspace-relative path with forward slashes, so a
 /// pattern like `tests/` catches `tests/api/users.rs` and `crates/x/tests/y.rs`.
-pub const DEFAULT_PROTECTED: [&str; 12] = [
-    // Self-marking: the check that decides "done".
+/// Each shape is described at [`matches_path`].
+///
+/// Every place that protects a path reads this list through
+/// [`Guards::effective`] — the toolbox's refusal, the [`Sentinel`]'s
+/// fingerprints, the deny rules a delegated agent is handed — so a name added
+/// here is protected everywhere at once.
+pub const DEFAULT_PROTECTED: [&str; 22] = [
+    // Self-marking: the check that decides "done", in the shapes each test
+    // runner looks for. `test_` is pytest's `test_*.py` (and the same habit in
+    // C and shell suites); `conftest.py` is loaded by pytest on its own and its
+    // fixtures decide what every test sees; `__tests__/` is Jest's;
+    // `.spec.` and `_spec.` are Jasmine/Vitest's and RSpec's; `testdata/` is
+    // Go's fixtures, which a test compares against.
     "tests/",
     "test/",
     "_test.",
     ".test.",
+    "test_",
+    "conftest.py",
+    "__tests__/",
     "spec/",
+    ".spec.",
+    "_spec.",
+    "testdata/",
     // Self-marking: what CI runs, and what it is allowed to skip.
     ".github/workflows/",
     ".gitlab-ci.yml",
+    ".circleci/",
+    "Jenkinsfile",
+    "azure-pipelines.yml",
+    ".buildkite/",
     // Destructive and usually irreversible.
     "migrations/",
     // Credentials.
@@ -162,24 +185,16 @@ impl Guards {
     /// [`Self::refuse_command`] names.
     #[must_use]
     pub fn protecting_in_command(&self, command: &str) -> Option<String> {
-        // Only commands that can WRITE are worth inspecting. A `grep` or a
-        // `cat` over the tests is exactly what an agent should be doing.
-        const WRITERS: [&str; 10] = [
-            "rm ", "mv ", "cp ", "sed -i", "truncate", "tee ", "dd ", "chmod ", "> ", ">>",
-        ];
-        let lower = normalise(command);
-        if !WRITERS.iter().any(|w| lower.contains(&normalise(w))) {
-            return None;
-        }
-        // Every whitespace-separated word of the command is treated as a
-        // possible path. Cruder than the file-tool check by necessity — a shell
-        // word is not a resolved path — but it applies the same rules rather
-        // than a second, looser set that would disagree with it.
-        self.effective().into_iter().find(|fragment| {
-            lower
-                .split_whitespace()
-                .any(|word| matches_path(fragment, word.trim_matches(|c| c == '"' || c == '\'')))
-        })
+        // Only what the command WRITES is checked: a redirect target, an
+        // argument of a writer. A `grep` or a `cat` over the tests is exactly
+        // what an agent should be doing, and a document that merely mentions
+        // a test path is not a write to it. The targets are matched by the same
+        // rules as a file tool's path, not a second, looser set that would
+        // disagree with them.
+        let targets = shell::write_targets(command);
+        self.effective()
+            .into_iter()
+            .find(|fragment| targets.iter().any(|target| matches_path(fragment, target)))
     }
 
     /// Why a write to this path is refused, or `None` when it is allowed.
@@ -200,8 +215,9 @@ impl Guards {
     /// Why this shell command is refused, or `None`.
     ///
     /// Textual, and honestly limited — see the module header. It catches the
-    /// direct forms (`rm tests/x`, `> .env`, `sed -i tests/y`) and does not
-    /// pretend to catch a determined route around it.
+    /// direct forms (`rm tests/x`, `>>.env`, `sed -i tests/y`, `python -c
+    /// "open('tests/x','w')"`) and does not pretend to catch a determined route
+    /// around it.
     #[must_use]
     pub fn refuse_command(&self, command: &str) -> Option<String> {
         let matched = self.protecting_in_command(command)?;
@@ -401,12 +417,21 @@ fn normalise(path: &str) -> String {
 /// because its directory ends in the letters "test" is the kind of protection
 /// that gets switched off within a day.
 ///
-/// Three shapes, each matching what it looks like:
+/// Four shapes, each matching what it looks like:
 /// - `tests/`, `.github/workflows/` — one or more whole directory segments.
 /// - `.env`, `.gitlab-ci.yml`, `admin.json` — a file name, or a name that
 ///   starts with it (`.env.local` is still an environment file).
 /// - `_test.`, `.test.` — an infix in the file NAME only, which is how most
 ///   languages mark a test file.
+/// - `test_` — a letter first and `_` last: a PREFIX of the file name, which
+///   is how pytest marks one (`test_api.py`). A prefix and not an infix, so
+///   `latest_api.py` and `contest_entry.py` stay writable.
+///
+/// `src/testing_utils.py` is deliberately NOT matched by `test_`: pytest
+/// collects `test_*.py` and `*_test.py`, never `testing_*`, so that file is
+/// support code the tests import, not a test — protecting it would refuse
+/// ordinary work on a helper. A project whose helpers ARE part of its exam
+/// says so in `.incode/guards.json`.
 #[must_use]
 fn matches_path(fragment: &str, path: &str) -> bool {
     let path = normalise(path);
@@ -426,6 +451,10 @@ fn matches_path(fragment: &str, path: &str) -> bool {
                 .any(|window| window == wanted.as_slice());
     }
 
+    if is_name_prefix(&fragment) {
+        return file_name.starts_with(&fragment);
+    }
+
     // An infix marker, e.g. `_test.` in `users_test.go`.
     if fragment.starts_with('_') || (fragment.starts_with('.') && fragment.ends_with('.')) {
         return file_name.contains(&fragment);
@@ -438,6 +467,13 @@ fn matches_path(fragment: &str, path: &str) -> bool {
         return path == fragment || path.ends_with(&format!("/{fragment}"));
     }
     file_name == fragment || file_name.starts_with(&format!("{fragment}."))
+}
+
+/// The prefix shape of [`matches_path`], e.g. `test_`. One predicate for the
+/// matcher and for [`glob_for`], so the harness's own check and the deny rule
+/// handed to a delegated agent cannot disagree about what it covers.
+fn is_name_prefix(fragment: &str) -> bool {
+    fragment.ends_with('_') && fragment.starts_with(|c: char| c.is_ascii_alphabetic())
 }
 
 /// The files a check command names, which are the project's real exam.
@@ -999,6 +1035,7 @@ pub fn restrictions(guards: &Guards) -> Restrictions {
 /// a glob has to say which was meant:
 /// - `tests/` is a directory — everything under it, at any depth.
 /// - `_test.` is an infix on a file name — anything containing it.
+/// - `test_` is a prefix of a file name — names that start with it.
 /// - `.env` and `admin.json` are file names — at any depth.
 fn glob_for(fragment: &str) -> String {
     let trimmed = fragment.trim_end_matches('/');
@@ -1009,6 +1046,11 @@ fn glob_for(fragment: &str) -> String {
     if fragment.contains('/') {
         // Already a path, e.g. `.incode/ledger.json` or `.github/workflows/`.
         return format!("**/{trimmed}");
+    }
+    if is_name_prefix(fragment) {
+        // No wildcard in front: `**/*test_*` would deny `latest_x.py` to the
+        // delegated agent while the harness's own check allowed it.
+        return format!("**/{trimmed}*");
     }
     if fragment.starts_with('.') && !fragment.ends_with('.') {
         // A file name like `.env`.
@@ -1520,6 +1562,179 @@ mod tests {
                 "`{command}` must be refused"
             );
         }
+    }
+
+    /// **incordai/Incode#4.** `printf x >>tests/it.rs` appended to a test: the
+    /// command was split on whitespace, so `>>tests/it.rs` was one word whose
+    /// first segment was `>>tests`, and `tests/` never matched. Every route
+    /// here wrote a protected file through the Bash tool, and only the sentinel
+    /// saw it — after the fact.
+    #[test]
+    fn a_redirect_or_writer_without_a_space_still_reaches_the_guard() {
+        let guards = Guards::default();
+        for command in [
+            "printf '// guard probe\\n' >>tests/it.rs",
+            "echo x >tests/a.rs",
+            "echo x >>tests/a.rs",
+            "echo x 2>tests/a.rs",
+            "echo x &>tests/a.rs",
+            "cat <<E >tests/a.rs",
+            "cat <<E >tests/a.rs\nwhatever\nE\n",
+            r#"python3 -c "open('tests/a.rs','w').write('')""#,
+            r#"node -e "require('fs').writeFileSync('tests/a.js','')""#,
+            "perl -pi -e s/a/b/ tests/a.rs",
+            "git checkout -- tests/a.rs",
+            "git restore tests/a.rs",
+            "install -m 644 /tmp/x tests/a.rs",
+            "ln -sf /tmp/x tests/a.rs",
+            "bash -c 'rm tests/a.rs'",
+            "echo $(rm tests/a.rs)",
+            "for f in tests/*; do rm \"$f\"; done",
+            "ls tests/ | xargs rm",
+            "python3 - <<'EOF'\nopen('tests/a.rs','w').write('')\nEOF\n",
+        ] {
+            assert!(
+                guards.refuse_command(command).is_some(),
+                "`{command}` writes a protected file and must be refused"
+            );
+        }
+    }
+
+    /// **incordai/Incode#11.** A heredoc writing `docs/` was refused because
+    /// the DOCUMENT mentioned `tests/it.rs`. A path in the text being written
+    /// is data, not a target — the redirect target is what is written.
+    #[test]
+    fn a_command_that_only_mentions_a_protected_path_is_allowed() {
+        let guards = Guards::default();
+        for command in [
+            "cat > docs/a.md <<'E'\nsee tests/it.rs\nE",
+            "cat > docs/a.md <<E\nrm tests/it.rs, then > tests/x\nE\n",
+            "cat <<-E > docs/a.md\n\tsee tests/it.rs\n\tE\n",
+            r#"git commit -m "fix tests/it.rs""#,
+            r#"echo "see tests/it.rs" > docs/notes.md"#,
+            "cat tests/a.rs",
+            "grep -r foo tests/",
+            "cargo test --test a",
+            "cargo test 2>&1 | tee /tmp/out.txt",
+            "python3 -m pytest tests/",
+        ] {
+            assert!(
+                guards.refuse_command(command).is_none(),
+                "`{command}` writes nothing protected; refusing it teaches the agent to dodge the guard"
+            );
+        }
+    }
+
+    /// **incordai/Incode#5.** The defaults knew Rust, Go and JS test names and
+    /// nothing of pytest, Jest's `__tests__/`, RSpec or the other CI systems,
+    /// so in those projects the exam was writable by the candidate.
+    #[test]
+    fn the_test_and_ci_files_of_other_ecosystems_are_protected() {
+        let guards = Guards::default();
+        for protected in [
+            "test_calc.py",
+            "pkg/test_api.py",
+            "conftest.py",
+            "pkg/conftest.py",
+            "src/__tests__/a.js",
+            "app/a.spec.ts",
+            "spec/models/user_spec.rb",
+            "lib/user_spec.rb",
+            "x/testdata/in.txt",
+            "Jenkinsfile",
+            "azure-pipelines.yml",
+            ".circleci/config.yml",
+            ".buildkite/pipeline.yml",
+        ] {
+            assert!(
+                guards.refuse_write(protected).is_some(),
+                "`{protected}` is part of the exam and must not be writable"
+            );
+        }
+    }
+
+    /// The new shapes must not catch ordinary source. `test_` is a PREFIX, so
+    /// `latest.py` and `contest.py` are untouched; `testing_utils.py` is
+    /// support code by decision (see [`matches_path`]).
+    #[test]
+    fn names_that_only_resemble_a_test_stay_writable() {
+        let guards = Guards::default();
+        for allowed in [
+            "latest.py",
+            "contest.py",
+            "src/latest_api.py",
+            "inspector.ts",
+            "src/testing_utils.py",
+            "src/respec.rb",
+        ] {
+            assert!(
+                guards.refuse_write(allowed).is_none(),
+                "`{allowed}` is ordinary source and must stay writable"
+            );
+        }
+    }
+
+    /// Every default can be switched off on its own, the new ones included —
+    /// an exemption that silently failed to apply would leave a project with
+    /// no way to let its agent write the files it legitimately owns.
+    #[test]
+    fn every_default_can_be_exempted_on_its_own() {
+        let samples = [
+            ("tests/", "tests/a.rs"),
+            ("test/", "test/a.rs"),
+            ("_test.", "a_test.go"),
+            (".test.", "a.test.ts"),
+            ("test_", "test_a.py"),
+            ("conftest.py", "conftest.py"),
+            ("__tests__/", "__tests__/a.js"),
+            ("spec/", "spec/a.rb"),
+            (".spec.", "a.spec.ts"),
+            ("_spec.", "a_spec.rb"),
+            ("testdata/", "testdata/in.txt"),
+            (".github/workflows/", ".github/workflows/ci.yml"),
+            (".gitlab-ci.yml", ".gitlab-ci.yml"),
+            (".circleci/", ".circleci/config.yml"),
+            ("Jenkinsfile", "Jenkinsfile"),
+            ("azure-pipelines.yml", "azure-pipelines.yml"),
+            (".buildkite/", ".buildkite/pipeline.yml"),
+            ("migrations/", "migrations/0001.sql"),
+            (".env", ".env"),
+            (".incode/ledger.json", ".incode/ledger.json"),
+            (".incode/guards.json", ".incode/guards.json"),
+            ("admin.json", "admin.json"),
+        ];
+        assert_eq!(
+            samples.len(),
+            DEFAULT_PROTECTED.len(),
+            "a default with no sample here is a default nobody proved can be lifted"
+        );
+        for (fragment, path) in samples {
+            assert!(
+                DEFAULT_PROTECTED.contains(&fragment),
+                "`{fragment}` is not a default"
+            );
+            let lifted = Guards {
+                protected_paths: Vec::new(),
+                allow_writes_to: vec![fragment.to_string()],
+            };
+            assert_eq!(
+                Guards::default().protecting(path).as_deref(),
+                Some(fragment),
+                "`{path}` must be protected by `{fragment}` itself, or lifting it proves nothing"
+            );
+            assert!(
+                lifted.refuse_write(path).is_none(),
+                "the operator lifted `{fragment}`, so `{path}` must be writable"
+            );
+        }
+    }
+
+    /// The deny rule handed to a delegated agent covers what the harness's own
+    /// check covers, and no more: a prefix glob with a wildcard in front would
+    /// stop the agent editing `latest_api.py`.
+    #[test]
+    fn a_prefix_fragment_becomes_a_prefix_glob() {
+        assert_eq!(glob_for("test_"), "**/test_*");
     }
 
     /// An operator may switch a default off, and that is a decision they take

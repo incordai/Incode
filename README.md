@@ -643,7 +643,17 @@ In the order a call meets them:
    tool's schema runs nothing.
 2. **Guards.** Tests, CI config, migrations, `.env` files, the ledger and the
    paths in `.incode/guards.json` are refused as write targets, for every file a
-   change touches. For an agent that still runs its own tools (`codex`, `agy`),
+   change touches. The defaults (`guards::DEFAULT_PROTECTED`): `tests/`,
+   `test/`, `__tests__/`, `spec/`, `testdata/`, names containing `_test.`,
+   `.test.`, `.spec.` or `_spec.`, names starting `test_`, `conftest.py`;
+   `.github/workflows/`, `.gitlab-ci.yml`, `.circleci/`, `.buildkite/`,
+   `Jenkinsfile`, `azure-pipelines.yml`; `migrations/`; `.env*`;
+   `.incode/ledger.json`, `.incode/guards.json`, `admin.json`. Any of them can be
+   lifted with `allow_writes_to`. A shell command is refused when a redirect
+   target or the argument of a writing command (`rm`, `tee`, `sed -i`,
+   `git checkout`, a quoted path in `python -c`, ...) is protected — a command
+   that only mentions one, like a heredoc writing docs, is not. For an agent
+   that still runs its own tools (`codex`, `agy`),
    a sentinel fingerprints the protected files before and after the turn —
    detection, not prevention.
 3. **Permission mode** (`-p`):
