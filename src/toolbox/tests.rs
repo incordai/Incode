@@ -316,6 +316,47 @@ fn writing_source_without_spec_is_refused_by_toolbox() {
     assert!(refused.contains("not specified yet"), "{refused}");
 }
 
+/// **An already-scoped run writes source without the spec set** — and only
+/// the spec requirement is relaxed: the same workspace, gated, still refuses.
+#[test]
+fn with_the_spec_gate_off_source_is_written_without_the_spec_set() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let gated = toolbox(dir.path())
+        .run(
+            WRITE,
+            &json!({"path": "src/it.rs", "content": "fn main() {}"}),
+        )
+        .expect_err("on is the default, and refuses");
+    assert!(gated.contains("not specified yet"), "{gated}");
+    assert!(!dir.path().join("src/it.rs").exists());
+
+    toolbox(dir.path())
+        .with_spec_gate(crate::spec::SpecGate::Off)
+        .run(
+            WRITE,
+            &json!({"path": "src/it.rs", "content": "fn main() {}"}),
+        )
+        .expect("off: the spec set is not required");
+    assert!(dir.path().join("src/it.rs").exists());
+}
+
+/// **The guards hold with the spec gate off.** Off is about the spec set,
+/// and a protected path is refused exactly as before.
+#[test]
+fn with_the_spec_gate_off_a_protected_path_is_still_refused() {
+    let dir = tempfile::tempdir().expect("tmp");
+    std::fs::create_dir_all(dir.path().join("tests")).expect("dir");
+    let refused = toolbox(dir.path())
+        .with_spec_gate(crate::spec::SpecGate::Off)
+        .run(
+            WRITE,
+            &json!({"path": "tests/it.rs", "content": "assert!(true)"}),
+        )
+        .expect_err("a protected path is refused whatever the spec gate says");
+    assert!(refused.contains("protected"), "{refused}");
+    assert!(!dir.path().join("tests/it.rs").exists());
+}
+
 #[test]
 fn editing_a_protected_path_is_refused_too() {
     // Write and Edit both change a file; guarding one and not the other

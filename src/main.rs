@@ -63,6 +63,13 @@ OPTIONS:
                               tool_result, usage, result) | json (the result
                               object alone). In the JSON forms stdout is JSON
                               only; everything else goes to stderr
+        --spec-gate <on|off>  With -t: `off` lets this one run write source
+                              without the spec set (docs/ARCHITECTURE.md and the
+                              rest), for a task its caller already scoped; the
+                              result says \"spec_gate\":\"off\". Default on; also
+                              INCODE_SPEC_GATE=off. Guards, the sentinel and
+                              verify still hold. The REPL, /run and --acp
+                              ignore it
     -r, --resume <ID>         Continue an agent session by its id
         --add-dir <PATH>      Also work in this directory (repeatable)
     -h, --help                Print this help
@@ -113,6 +120,14 @@ fn main() -> anyhow::Result<()> {
     for line in migrated {
         eprintln!("{line}");
     }
+    if let Some(note) = ignored_spec_gate(
+        &parsed,
+        std::env::var(incord_code::spec::SpecGate::ENV)
+            .ok()
+            .as_deref(),
+    ) {
+        eprintln!("{note}");
+    }
     let config = match parsed {
         Parsed::Run(config) => config,
         Parsed::Exit(message) => {
@@ -124,13 +139,22 @@ fn main() -> anyhow::Result<()> {
             instruction,
             model,
             format,
+            spec_gate,
         } => {
+            let spec_gate = incord_code::spec::SpecGate::resolve(
+                spec_gate,
+                std::env::var(incord_code::spec::SpecGate::ENV)
+                    .ok()
+                    .as_deref(),
+            )
+            .map_err(|e| anyhow::anyhow!(e))?;
             return on_a_runtime(|| {
                 incord_code::task_run::run_task_as(
                     &workspace,
                     &instruction,
                     model.as_deref(),
                     format,
+                    spec_gate,
                 )
             })?
             .map(|_| ())
@@ -340,6 +364,9 @@ enum Parsed {
         model: Option<String>,
         /// How what happens is reported: text, or JSON for a script.
         format: incord_code::task_run::OutputFormat,
+        /// `--spec-gate`, when given. The environment is read in `main`, not
+        /// here, so parsing stays a function of the arguments alone.
+        spec_gate: Option<incord_code::spec::SpecGate>,
     },
     Exit(String),
     /// Serve what the run is doing to a local interface, and nothing else.
@@ -490,6 +517,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> anyhow::Result<Parsed> {
     let mut port: Option<u16> = None;
     let mut task: Option<String> = None;
     let mut output_format: Option<incord_code::task_run::OutputFormat> = None;
+    let mut spec_gate: Option<incord_code::spec::SpecGate> = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -554,6 +582,14 @@ fn parse_args(args: impl Iterator<Item = String>) -> anyhow::Result<Parsed> {
                     })?,
                 );
             }
+            // Refused rather than defaulted, in both spellings: the flag
+            // relaxes a law, and a typo must not decide which way.
+            "--spec-gate" => {
+                spec_gate = Some(
+                    incord_code::spec::SpecGate::parse(&next_value(&mut args, &arg)?)
+                        .map_err(|e| anyhow::anyhow!(e))?,
+                );
+            }
             // The id the agent assigned, which every session prints on the way
             // out. Promised by that message, so it has to exist.
             "-r" | "--resume" => config.resume_session = Some(next_value(&mut args, &arg)?),
@@ -587,8 +623,25 @@ fn parse_args(args: impl Iterator<Item = String>) -> anyhow::Result<Parsed> {
             "--team-channel" => {
                 team_channel = Some(std::path::PathBuf::from(next_value(&mut args, &arg)?));
             }
-            other => anyhow::bail!("unknown argument `{other}`\n\n{USAGE}"),
+            other => {
+                let Some(value) = other.strip_prefix("--spec-gate=") else {
+                    anyhow::bail!("unknown argument `{other}`\n\n{USAGE}");
+                };
+                spec_gate = Some(
+                    incord_code::spec::SpecGate::parse(value).map_err(|e| anyhow::anyhow!(e))?,
+                );
+            }
         }
+    }
+
+    // Before every mode returns: only a one-shot task honours it. The REPL,
+    // `/run` and `--acp` are where an unspecified project costs the most, and
+    // a flag they silently ignored would be believed.
+    if spec_gate.is_some() && task.is_none() {
+        anyhow::bail!(
+            "`--spec-gate` only applies with `-t`/`--task`; the REPL, /run and --acp \
+             always hold source to the spec set\n\n{USAGE}"
+        );
     }
 
     // Before everything, and alone: the agent CLI starts this with whatever
@@ -752,6 +805,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> anyhow::Result<Parsed> {
             instruction,
             model: config.model_from_flag,
             format: output_format.unwrap_or_default(),
+            spec_gate,
         });
     }
     // Only a one-shot task has an output to format; ignored anywhere else it
@@ -781,6 +835,28 @@ fn parse_args(args: impl Iterator<Item = String>) -> anyhow::Result<Parsed> {
     }
 
     Ok(Parsed::Run(Box::new(config)))
+}
+
+/// What to say when `INCODE_SPEC_GATE` is set for a session that will not
+/// honour it — the REPL (and `/run` inside it) or `--acp`.
+///
+/// Said rather than silently ignored: an operator who exported `off` for a
+/// headless caller and then opened the REPL would otherwise believe the law
+/// was off there too. The other modes edit no workspace, so they say nothing —
+/// the tool server in particular inherits the variable from every `-t` run.
+fn ignored_spec_gate(parsed: &Parsed, env: Option<&str>) -> Option<String> {
+    let value = env.map(str::trim).filter(|v| !v.is_empty())?;
+    let mode = match parsed {
+        Parsed::Run(_) => "the interactive session and /run",
+        Parsed::Acp(_) => "--acp",
+        _ => return None,
+    };
+    Some(format!(
+        "incode: {}={value} is set, but only `-t` honours it; {mode} always hold \
+         source to the spec set. Unset it, or pass `--spec-gate=off` on the `-t` \
+         run that needs it.",
+        incord_code::spec::SpecGate::ENV
+    ))
 }
 
 fn next_value(
@@ -1332,11 +1408,13 @@ mod tests {
                 workspace,
                 model,
                 format,
+                spec_gate,
             } => {
                 assert_eq!(instruction, "write the brief");
                 assert_eq!(workspace, PathBuf::from("."));
                 assert_eq!(model, None);
                 assert_eq!(format, incord_code::task_run::OutputFormat::Text);
+                assert_eq!(spec_gate, None, "no flag, so the run decides from the env");
             }
             other => panic!("--task must not start a session, got {other:?}"),
         }
@@ -1391,6 +1469,69 @@ mod tests {
         let err = parse(&["--output-format", "json"]).expect_err("no task");
         assert!(err.to_string().contains("--task"), "{err}");
         assert!(USAGE.contains("--output-format"));
+    }
+
+    /// **THE SPEC GATE IS OFF ONLY FOR A `-t` RUN THAT SAYS SO, IN EITHER
+    /// SPELLING — AND AN UNKNOWN VALUE IS AN ERROR.** A typo that fell
+    /// through would decide a law's state by accident, and the flag on a mode
+    /// that ignores it would be believed.
+    #[test]
+    fn the_spec_gate_flag_rides_a_task_and_is_refused_elsewhere() {
+        use incord_code::spec::SpecGate;
+        for (args, want) in [
+            (
+                &["-t", "x", "-w", ".", "--spec-gate=off"][..],
+                SpecGate::Off,
+            ),
+            (
+                &["-t", "x", "-w", ".", "--spec-gate", "off"][..],
+                SpecGate::Off,
+            ),
+            (&["-t", "x", "-w", ".", "--spec-gate=on"][..], SpecGate::On),
+        ] {
+            match parse(args).expect("valid") {
+                Parsed::Task { spec_gate, .. } => assert_eq!(spec_gate, Some(want), "{args:?}"),
+                other => panic!("got {other:?}"),
+            }
+        }
+        for typo in ["--spec-gate=maybe", "--spec-gate=", "--spec-gate=OFF"] {
+            let err = parse(&["-t", "x", "-w", ".", typo]).expect_err(typo);
+            assert!(err.to_string().contains("Valid: on, off"), "{err}");
+        }
+        assert!(parse(&["-t", "x", "-w", ".", "--spec-gate"]).is_err());
+        for elsewhere in [
+            &["--spec-gate=off", "-w", "."][..],
+            &["--acp", "--spec-gate=off"][..],
+        ] {
+            let err = parse(elsewhere).expect_err("no task");
+            assert!(err.to_string().contains("only applies with `-t`"), "{err}");
+        }
+        assert!(USAGE.contains("--spec-gate"));
+        assert!(USAGE.contains(SpecGate::ENV));
+    }
+
+    /// **THE ENVIRONMENT IN A MODE THAT IGNORES IT IS NAMED, NOT SILENTLY
+    /// DROPPED** — and the modes that edit nothing stay quiet, the tool server
+    /// above all, which inherits the variable from every `-t` run.
+    #[test]
+    fn a_spec_gate_the_session_ignores_is_said_on_stderr() {
+        let repl = parse(&["-w", "."]).expect("valid");
+        let note = ignored_spec_gate(&repl, Some("off")).expect("said");
+        assert!(note.contains("only `-t` honours it"), "{note}");
+        assert!(note.contains("/run"), "{note}");
+        let acp = parse(&["--acp", "-p", "read-only"]).expect("valid");
+        assert!(ignored_spec_gate(&acp, Some("off"))
+            .expect("said")
+            .contains("--acp"));
+        assert_eq!(ignored_spec_gate(&repl, None), None);
+        assert_eq!(ignored_spec_gate(&repl, Some(" ")), None);
+        let task = parse(&["-t", "x", "-w", "."]).expect("valid");
+        assert_eq!(ignored_spec_gate(&task, Some("off")), None, "-t honours it");
+        assert_eq!(
+            ignored_spec_gate(&Parsed::ToolServer, Some("off")),
+            None,
+            "the tool server edits nothing and inherits it from every -t run"
+        );
     }
 
     /// A task with no text is a mistake worth catching at the boundary.

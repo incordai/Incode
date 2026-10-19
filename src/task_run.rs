@@ -18,6 +18,11 @@
 //! given the bare instruction would rediscover all of it at the operator's
 //! expense.
 //!
+//! A caller that has already scoped the task says `--spec-gate=off`
+//! ([`crate::spec::SpecGate`]): the intake is then neither asked for in the
+//! prompt nor required at the write, for this run only, and the result line
+//! says `"spec_gate":"off"`.
+//!
 //! # What this does not do
 //!
 //! It does not run the ledger — that is `/run`, and it demands proof per task.
@@ -79,6 +84,9 @@ struct Report {
     stop_reason: Option<String>,
     served_by: Vec<String>,
     usage: [u32; 4],
+    /// Carried into the result so a caller that turned the gate off can
+    /// report that it did; a run that relaxed a law must say so where it ends.
+    spec_gate: crate::spec::SpecGate,
 }
 
 impl Report {
@@ -92,6 +100,7 @@ impl Report {
             stop_reason: None,
             served_by: Vec::new(),
             usage: [0; 4],
+            spec_gate: crate::spec::for_this_run(),
         }
     }
 
@@ -200,6 +209,7 @@ impl Report {
                 "cache_read_tokens": cache_read,
             },
             "duration_ms": u64::try_from(took.as_millis()).unwrap_or(u64::MAX),
+            "spec_gate": self.spec_gate.as_str(),
         });
         match ran {
             Ok(answer) => result["result"] = json!(answer),
@@ -212,7 +222,11 @@ impl Report {
     }
 }
 
-/// [`run_task_with_model`], reported in `format`.
+/// [`run_task_with_model`], reported in `format`, under `spec_gate`.
+///
+/// `spec_gate` is fixed for the rest of the process here, before any toolbox
+/// is built, so every toolbox the run makes — the lead agent's, a sub-agent's
+/// — decides source writes the same way ([`crate::spec::SpecGate`]).
 ///
 /// # Errors
 ///
@@ -223,7 +237,9 @@ pub fn run_task_as(
     instruction: &str,
     model: Option<&str>,
     format: OutputFormat,
+    spec_gate: crate::spec::SpecGate,
 ) -> Result<String, String> {
+    crate::spec::set_for_this_run(spec_gate);
     if format == OutputFormat::Text {
         return run_task_with_model(workspace, instruction, model);
     }
@@ -298,7 +314,22 @@ fn run_task_reporting(
     );
     let start = memory.start("startup");
     let turn = memory.prompt(instruction);
-    let prompt = build_prompt(workspace, instruction, start.is_some(), turn.as_deref());
+    let spec_gate = crate::spec::for_this_run();
+    if spec_gate == crate::spec::SpecGate::Off {
+        // The text run's record of it, and stderr's under the JSON forms,
+        // whose result line carries `spec_gate` as well.
+        outln!(
+            "  · spec gate: off for this run — the spec set is not required; \
+             the guards, the sentinel and verify still hold"
+        );
+    }
+    let prompt = build_prompt(
+        workspace,
+        instruction,
+        start.is_some(),
+        turn.as_deref(),
+        spec_gate,
+    );
     // What rides the system context rather than the prompt: the project's
     // own instruction files, the harness's standing instructions, and the
     // engine's session-start block.
@@ -712,12 +743,19 @@ fn show(
 /// it, so they are not added here too. `engine_turn` is the engine's context
 /// for this instruction, which carries the rules; with it, incode's own
 /// per-turn rules are not fetched as well.
+///
+/// With `spec_gate` off the intake is not asked for — not the brief, not the
+/// dependencies the PRD never argued for, not the spec set — and the agent is
+/// told why instead. Relaxing the refusal at the write while the prompt still
+/// asked for five documents would fix nothing: the prompt is what made a
+/// one-line fix write them.
 #[must_use]
 pub fn build_prompt(
     workspace: &Path,
     instruction: &str,
     engine_started: bool,
     engine_turn: Option<&str>,
+    spec_gate: crate::spec::SpecGate,
 ) -> String {
     let admin = crate::admin::AdminConfig::load_default();
     let mut parts = Vec::new();
@@ -744,25 +782,29 @@ pub fn build_prompt(
         parts.push(block);
     }
 
-    // The intake gate. An incomplete brief makes completing it the first job —
-    // not a refusal, and not something to discover halfway through.
-    let gate = crate::brief::check(workspace);
-    if let Some(task) = gate.intake_task() {
-        parts.push(format!("<intake>\n{task}\n</intake>"));
-    }
-    if let crate::brief::Gate::Ready(ref brief) = gate {
-        if let Some(note) =
-            crate::research::intake_note(&crate::research::unvetted(workspace, &brief.prd))
-        {
+    if spec_gate == crate::spec::SpecGate::Off {
+        parts.push(crate::spec::GATE_OFF_NOTE.to_string());
+    } else {
+        // The intake gate. An incomplete brief makes completing it the first
+        // job — not a refusal, and not something to discover halfway through.
+        let gate = crate::brief::check(workspace);
+        if let Some(task) = gate.intake_task() {
+            parts.push(format!("<intake>\n{task}\n</intake>"));
+        }
+        if let crate::brief::Gate::Ready(ref brief) = gate {
+            if let Some(note) =
+                crate::research::intake_note(&crate::research::unvetted(workspace, &brief.prd))
+            {
+                parts.push(note);
+            }
+        }
+
+        // The documents the loop reads. Named here rather than left to the
+        // model to remember, because a PRD alone produces a project nobody can
+        // route work across consistently.
+        if let Some(note) = crate::spec::intake_note(workspace) {
             parts.push(note);
         }
-    }
-
-    // The documents the loop reads. Named here rather than left to the model to
-    // remember, because a PRD alone produces a project nobody can route work
-    // across consistently.
-    if let Some(note) = crate::spec::intake_note(workspace) {
-        parts.push(note);
     }
 
     if admin.plugins.auditor && !engine_started {
@@ -844,7 +886,13 @@ mod tests {
         // is about ORDER rather than about what any one service returned.
         std::env::set_var(crate::brief::MEMORY_URL_ENV, "http://127.0.0.1:1");
         let dir = tempfile::tempdir().expect("temp dir");
-        let prompt = build_prompt(dir.path(), "write the PRD", false, None);
+        let prompt = build_prompt(
+            dir.path(),
+            "write the PRD",
+            false,
+            None,
+            crate::spec::SpecGate::On,
+        );
         std::env::remove_var(crate::brief::MEMORY_URL_ENV);
 
         assert!(prompt.ends_with("write the PRD"), "got: {prompt}");
@@ -860,10 +908,52 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         std::env::set_var(crate::brief::MEMORY_URL_ENV, "http://127.0.0.1:1");
         let dir = tempfile::tempdir().expect("temp dir");
-        let prompt = build_prompt(dir.path(), "do the thing", false, None);
+        let prompt = build_prompt(
+            dir.path(),
+            "do the thing",
+            false,
+            None,
+            crate::spec::SpecGate::On,
+        );
         std::env::remove_var(crate::brief::MEMORY_URL_ENV);
 
         assert!(prompt.contains("do the thing"));
+    }
+
+    /// **WITH THE SPEC GATE OFF, THE PROMPT DOES NOT ASK FOR THE SPEC SET.**
+    /// The prompt is what made a one-line fix write five documents first;
+    /// relaxing only the refusal at the write would have changed nothing.
+    /// The same workspace, gated, is still told to write them.
+    #[test]
+    fn with_the_spec_gate_off_the_prompt_does_not_ask_for_the_spec_set() {
+        let _guard = crate::brief::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var(crate::brief::MEMORY_URL_ENV, "http://127.0.0.1:1");
+        let dir = tempfile::tempdir().expect("temp dir");
+        let on = build_prompt(dir.path(), "fix it", false, None, crate::spec::SpecGate::On);
+        let off = build_prompt(
+            dir.path(),
+            "fix it",
+            false,
+            None,
+            crate::spec::SpecGate::Off,
+        );
+        std::env::remove_var(crate::brief::MEMORY_URL_ENV);
+
+        assert!(on.contains("spec document(s) are missing"), "{on}");
+        assert!(on.contains("WRITING SOURCE CODE IS REFUSED"), "{on}");
+        assert!(on.contains("<intake>"), "{on}");
+
+        for asked in [
+            "spec document(s) are missing",
+            "WRITING SOURCE CODE IS REFUSED",
+            "<intake>",
+        ] {
+            assert!(!off.contains(asked), "`{asked}` is still asked for: {off}");
+        }
+        assert!(off.contains(crate::spec::GATE_OFF_NOTE), "{off}");
+        assert!(off.ends_with("fix it"), "the instruction stays last: {off}");
     }
 
     /// An empty instruction is refused before an agent is spawned for nothing.
@@ -961,6 +1051,22 @@ mod tests {
         assert_eq!(result["agent_session_id"], "agent-conv");
         assert_eq!(result["stop_reason"], "end_turn");
         assert_eq!(result["usage"]["cache_read_tokens"], 7);
+        assert_eq!(result["spec_gate"], "on", "the default, said: {result}");
+    }
+
+    /// **THE RESULT SAYS WHEN THE SPEC GATE WAS OFF**, so a caller that
+    /// relaxed it — Insi, a script — can report that it did.
+    #[test]
+    fn the_result_line_carries_the_spec_gate() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("out.json");
+        let mut report = Report::text();
+        report.spec_gate = crate::spec::SpecGate::Off;
+        report.out = Some((std::fs::File::create(&path).expect("file"), false));
+        a_turn(&mut report);
+        let lines = lines_of(&path);
+        assert_eq!(lines[0]["type"], "result");
+        assert_eq!(lines[0]["spec_gate"], "off", "{:?}", lines[0]);
     }
 
     /// `json` is the result alone, once; a failed run's says why.

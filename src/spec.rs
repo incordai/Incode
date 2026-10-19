@@ -300,6 +300,116 @@ pub fn refuse_source_write(workspace: &Path, path: &str) -> Option<String> {
     ))
 }
 
+/// Whether this run holds source to the spec set.
+///
+/// # Why there is an off at all
+///
+/// `incode -t` is also driven by callers that have already scoped the work —
+/// Insi hands a worker one line to fix in a fresh worktree. With the gate on,
+/// every such run on a repository without the set first wrote all five
+/// documents, guessed because nobody could be asked, and only then the fix:
+/// measured at 130–170k tokens and 27–36 s a task, paid again per worktree.
+///
+/// # Why it is per run and never a setting
+///
+/// The gate is a law of the product, not a preference. Off is said for ONE
+/// `-t` run — `--spec-gate=off` or [`SpecGate::ENV`] — and held only in that
+/// process ([`set_for_this_run`]); `admin.json` cannot set it, because a
+/// standing setting would turn the law off for every future run without
+/// anyone saying so on that run. The REPL, `/run` and `--acp` never honour it:
+/// they are where an unspecified project costs the most.
+///
+/// Only the spec requirement is relaxed. The protected paths, the sentinel
+/// and the verify law (verified only by a zero exit) hold either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SpecGate {
+    #[default]
+    On,
+    Off,
+}
+
+impl SpecGate {
+    /// The environment variable a `-t` run reads when no flag says.
+    pub const ENV: &'static str = "INCODE_SPEC_GATE";
+
+    /// `on` or `off`, and nothing else.
+    ///
+    /// # Errors
+    ///
+    /// Any other value. A typo that fell through to either answer would be
+    /// believed, and falling through to `off` would switch a law off by accident.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim() {
+            "on" => Ok(Self::On),
+            "off" => Ok(Self::Off),
+            other => Err(format!(
+                "unknown spec gate `{other}`. Valid: on, off (`--spec-gate=off` or \
+                 {}=off, for an already-scoped `-t` task)",
+                Self::ENV
+            )),
+        }
+    }
+
+    /// The flag's answer, else the environment's, else on.
+    ///
+    /// A set but malformed environment value is an error even when the flag
+    /// decides: it is a typo in what the operator thinks is in force.
+    /// An empty one counts as unset, as `INCODE_*` variables do elsewhere.
+    ///
+    /// # Errors
+    ///
+    /// The environment value is neither `on` nor `off`.
+    pub fn resolve(flag: Option<Self>, env: Option<&str>) -> Result<Self, String> {
+        let from_env = match env.map(str::trim).filter(|v| !v.is_empty()) {
+            Some(value) => Some(Self::parse(value).map_err(|e| format!("{}: {e}", Self::ENV))?),
+            None => None,
+        };
+        Ok(flag.or(from_env).unwrap_or_default())
+    }
+
+    /// As the result line and the flag spell it.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::On => "on",
+            Self::Off => "off",
+        }
+    }
+}
+
+/// The gate this process runs under, once a `-t` run said.
+///
+/// Process state rather than an argument because every toolbox a run builds —
+/// the lead agent's, a sub-agent's, the API route's — must agree, and they are
+/// built in places the run's arguments do not reach. A `OnceLock` and not an
+/// environment variable: an environment is inherited by the agent CLI and by
+/// every command the model runs, so a nested `incode` would quietly start
+/// with the law off.
+static RUN_GATE: std::sync::OnceLock<SpecGate> = std::sync::OnceLock::new();
+
+/// Fix the gate for the rest of this process. Called once, by the `-t` run,
+/// before any toolbox exists; a second call changes nothing.
+pub fn set_for_this_run(gate: SpecGate) {
+    let _ = RUN_GATE.set(gate);
+}
+
+/// The gate in force: what [`set_for_this_run`] fixed, else on.
+#[must_use]
+pub fn for_this_run() -> SpecGate {
+    RUN_GATE.get().copied().unwrap_or_default()
+}
+
+/// What an agent is told instead of the intake when the gate is off.
+///
+/// Said rather than left silent: an agent that reads no intake may still
+/// remember the house habit of writing the set first, and the measured cost of
+/// this issue was exactly that habit.
+pub const GATE_OFF_NOTE: &str = "<spec-gate>\nThe spec gate is OFF for this run: \
+    the task is already scoped by whoever sent it. Do not write the PRD, the brief \
+    or the project's spec documents, and do not ask for them — do the instruction \
+    below, and only that. Protected paths are still refused, and nothing counts as \
+    verified without a check that exits zero.\n</spec-gate>";
+
 /// Whether a path is source code rather than documentation or configuration.
 #[must_use]
 pub fn is_source(path: &str) -> bool {
@@ -1367,6 +1477,51 @@ mod tests {
                 .collect(),
         );
         assert_eq!(kept.len(), MEMORY_LEADS as usize);
+    }
+
+    /// **An unknown spec gate is an error, never a fallthrough.** A typo that
+    /// landed on `off` would switch a law off by accident; one that landed on
+    /// `on` would leave a caller believing it was off.
+    #[test]
+    fn an_unknown_spec_gate_value_is_refused_not_guessed() {
+        assert_eq!(SpecGate::parse("on"), Ok(SpecGate::On));
+        assert_eq!(SpecGate::parse("off"), Ok(SpecGate::Off));
+        for typo in ["maybe", "OFF", "false", "0", ""] {
+            let why = SpecGate::parse(typo).expect_err(typo);
+            assert!(why.contains("Valid: on, off"), "{why}");
+        }
+    }
+
+    /// **On unless a run says otherwise, and the flag decides over the
+    /// environment** — while a malformed environment is still named.
+    #[test]
+    fn the_spec_gate_is_on_unless_this_run_says_off() {
+        assert_eq!(SpecGate::resolve(None, None), Ok(SpecGate::On));
+        assert_eq!(SpecGate::resolve(None, Some("  ")), Ok(SpecGate::On));
+        assert_eq!(SpecGate::resolve(None, Some("off")), Ok(SpecGate::Off));
+        assert_eq!(
+            SpecGate::resolve(Some(SpecGate::On), Some("off")),
+            Ok(SpecGate::On)
+        );
+        assert_eq!(
+            SpecGate::resolve(Some(SpecGate::Off), None),
+            Ok(SpecGate::Off)
+        );
+        let why = SpecGate::resolve(Some(SpecGate::Off), Some("maybe")).expect_err("typo");
+        assert!(why.contains(SpecGate::ENV), "{why}");
+        // Nothing in a test process set it, so every toolbox here is gated.
+        assert_eq!(for_this_run(), SpecGate::On);
+    }
+
+    /// **The verify law does not lean on the spec set.** With the gate off
+    /// there is no `docs/VERIFICATION.md`, and the check still comes from the
+    /// operator or the manifest — `verify` never reads that document.
+    #[test]
+    fn the_check_is_found_without_the_spec_set() {
+        let dir = project(&[("Cargo.toml", "[package]\nname = \"x\"\n")]);
+        assert_eq!(missing(dir.path()).len(), SPEC_SET.len());
+        let argv = crate::verify::detected_command(dir.path()).expect("from the manifest");
+        assert_eq!(argv[0], "cargo", "{argv:?}");
     }
 
     #[test]

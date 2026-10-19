@@ -189,7 +189,8 @@ researches the rest, and writes:
 | `docs/VERIFICATION.md` | The command that proves each roadmap item |
 | `docs/ASSUMPTIONS.md` | Every choice made without asking, with its reason — and the only place decisions are written; no ADR files |
 
-Writing source is refused until they exist. The roadmap then starts with
+Writing source is refused until they exist — except in a `-t` run its caller
+marked already scoped with `--spec-gate=off` ([Modes](#modes)). The roadmap then starts with
 **`s1 Create the layout`**: the generator is run in the project's root as
 ordinary work (every check runs from the root), and the item
 counts as done only when its check in `docs/VERIFICATION.md` — the stack's build
@@ -231,6 +232,7 @@ agreeing what "done" means.
 | `incode -t "<text>"` | One instruction, then exit. Needs no API credential. |
 | `incode -t "<text>" --output-format stream-json` | The same, printing one JSON event per line: `init`, `text`, `thinking`, `tool_use`, `tool_result`, `usage`, `result`. stdout carries JSON only; everything else goes to stderr. |
 | `incode -t "<text>" --output-format json` | The same, printing only the final `result` object. |
+| `incode -t "<text>" --spec-gate=off` | The same, for a task its caller has already scoped: this run may write source without the [spec set](#a-new-project), and the prompt does not ask for it (nor for the brief). Also `INCODE_SPEC_GATE=off`; an unknown value is an error. The result line says `"spec_gate":"off"` (`"on"` otherwise), and a text run says so as it starts. The guards, the sentinel and verify still hold. Only `-t` honours it — the REPL, `/run` and `--acp` always require the spec set, and say so on stderr when the variable is set — and `admin.json` cannot set it. |
 | `incode --acp` | incode as an Agent Client Protocol agent on stdin/stdout, for an editor or app. Takes `-p` (`read-only`, `workspace-write`, `danger-full-access`), `-m` and `--no-env-filter`; each `session/new` names its own workspace. |
 | `incode --serve [--port N]` | A local viewer on `127.0.0.1` for what a run in this workspace is doing. Reads, plus two writes behind a per-run token in `.incode/serve.token`: stop the running `/run`, and answer an agent's question. |
 | `incode --admin` | Print the resolved settings and which layer decided each. |
@@ -866,6 +868,7 @@ Environment variables:
 | `INCODE_ROLE_<ROLE>` | That role's ordered candidates, comma-separated |
 | `INCODE_BUDGET_TOKENS` | The token ceiling for a run |
 | `INCODE_VERIFY_CMD` | The check command |
+| `INCODE_SPEC_GATE` | `off` lets one `-t` run write source without the spec set (as `--spec-gate=off`); read by `-t` only |
 | `INCODE_CHECK_CMD` | What `Diagnostics` runs |
 | `INCODE_LANES` | Parallel `/run` lanes (needs git; at most 8) |
 | `INCODE_SANDBOX` · `INCODE_SANDBOX_NETWORK` | The sandbox mode · the network switch |

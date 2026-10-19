@@ -420,6 +420,12 @@ pub struct Toolbox {
     /// singles out as the worst, because everything keeps working and nothing is
     /// protected. Held as an error, it refuses the write instead.
     guards: Result<crate::guards::Guards, String>,
+    /// Whether a source write waits for the spec set. Taken from the run
+    /// ([`crate::spec::for_this_run`]) when the toolbox is built, so every
+    /// toolbox of a `-t --spec-gate=off` run agrees and every other mode's is
+    /// on. The tool server runs nothing itself, so this toolbox, in the parent,
+    /// is where the agent CLI's writes are decided too.
+    spec_gate: crate::spec::SpecGate,
     /// How many agents deep this one is. Zero is the one the operator started.
     depth: u8,
     /// The conversations subagents opened, so the session record holds the tree
@@ -524,6 +530,7 @@ impl Toolbox {
             workspace: workspace.to_path_buf(),
             filter_env,
             guards: crate::guards::Guards::load(workspace),
+            spec_gate: crate::spec::for_this_run(),
             depth: 0,
             children: Mutex::new(Vec::new()),
             checkpoints: None,
@@ -551,6 +558,15 @@ impl Toolbox {
             sandbox: crate::sandbox::SandboxPolicy::OFF,
             sandbox_grant: crate::sandbox::SessionGrant::default(),
         }
+    }
+
+    /// This toolbox under `gate`, for a test: production takes the run's
+    /// ([`crate::spec::for_this_run`]), which a test process must not set.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_spec_gate(mut self, gate: crate::spec::SpecGate) -> Self {
+        self.spec_gate = gate;
+        self
     }
 
     /// Confine the model's shell commands to `policy` from now on — see
@@ -1095,6 +1111,11 @@ impl Toolbox {
         // The intake gate is about this workspace's own specification, so
         // it does not reach into an added directory.
         if self.root_for_path(path) != self.workspace.as_path() {
+            return None;
+        }
+        // After the guards, never before: off relaxes the spec requirement
+        // alone, and a protected path is refused above whatever the run said.
+        if self.spec_gate == crate::spec::SpecGate::Off {
             return None;
         }
         crate::spec::refuse_source_write(&self.workspace, path).map(|why| Refusal {

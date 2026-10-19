@@ -768,6 +768,85 @@ mod tests {
         );
     }
 
+    /// Set only in the child process the spec-gate test starts.
+    const SPEC_GATE_CHILD: &str = "INCODE_SPEC_GATE_BRIDGE_CHILD";
+
+    /// The child half: a process whose run said `--spec-gate=off`, as
+    /// `task_run` says it, then a source write from the agent CLI's side of
+    /// the bridge into a workspace with no spec set. Prints what came back.
+    #[test]
+    fn spec_gate_off_bridge_child() {
+        let Some(ws) = std::env::var_os(SPEC_GATE_CHILD) else {
+            return;
+        };
+        let ws = std::path::PathBuf::from(ws);
+        crate::spec::set_for_this_run(crate::spec::SpecGate::Off);
+        let (bridge, rx) = open(None);
+        // Built the way a backend builds it: nothing passes the gate in.
+        let parent = parent_loop(Toolbox::new(&ws, true), rx);
+        let mut server = server_for(&bridge);
+        let got = mcp(
+            &mut server,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"Write","arguments":{"path":"src/fix.rs","content":"fn fixed() {}"}}}"#,
+        );
+        println!("BRIDGE-ANSWER {got}");
+        drop(bridge);
+        drop(server);
+        let _ = parent.join();
+        std::process::exit(0);
+    }
+
+    /// **A `-t --spec-gate=off` RUN'S AGENT CLI WRITES SOURCE THROUGH THE
+    /// TOOL SERVER.** The tool server is a separate process the CLI starts,
+    /// and it runs nothing: the write is decided by the parent's toolbox. So
+    /// the off state must reach the toolboxes the run builds — not the tool
+    /// server's environment — and this proves it does, end to end, in a
+    /// process of its own because the run's gate is process state.
+    #[test]
+    fn a_run_with_the_spec_gate_off_writes_source_through_the_tool_server() {
+        let ws = tempfile::tempdir().expect("ws");
+        let out = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "tool_bridge::tests::spec_gate_off_bridge_child",
+                "--nocapture",
+                "--test-threads=1",
+                "-q",
+            ])
+            .env(SPEC_GATE_CHILD, ws.path())
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run the child");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stdout.contains("BRIDGE-ANSWER"),
+            "the child did not run: {stdout}\n{stderr}"
+        );
+        assert!(
+            !stdout.contains("not specified yet"),
+            "the write was refused by the spec gate: {stdout}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(ws.path().join("src/fix.rs")).unwrap_or_default(),
+            "fn fixed() {}",
+            "{stdout}\n{stderr}"
+        );
+        // And in this process, which no run set, the same write is refused.
+        let (bridge, rx) = open(None);
+        let parent = parent_loop(Toolbox::new(ws.path(), true), rx);
+        let mut server = server_for(&bridge);
+        let got = mcp(
+            &mut server,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"Write","arguments":{"path":"src/other.rs","content":"x"}}}"#,
+        );
+        assert_eq!(got["result"]["isError"], true, "{got}");
+        assert!(got.to_string().contains("not specified yet"), "{got}");
+        drop(bridge);
+        drop(server);
+        let _ = parent.join();
+    }
+
     /// **THE MODEL GETS THE PICTURE; INCODE SHOWS A PLACEHOLDER.** A tool
     /// that answers with an image, through the bridge: the MCP result the CLI
     /// receives carries an `image` block with the PNG, and the result event
