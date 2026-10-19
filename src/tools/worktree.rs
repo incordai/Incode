@@ -331,44 +331,91 @@ fn slugify(name: &str) -> String {
     }
 }
 
-/// Generate a short random hash (3 chars, alphanumeric).
+/// Width of the part of [`short_hash`] that tells processes apart. Fixed, so
+/// the counter after it can never shift into it: six base-36 characters are
+/// about 2.2 billion values, which keeps two runs sharing a `worktrees/`
+/// directory — whose kept lane branches outlive the run that made them — from
+/// meeting by chance, where four (1.7 million) gives a fleet of a hundred runs
+/// a fraction of a percent.
+const PROCESS_PART: usize = 6;
+
+/// The counter is padded to two characters only so a run's names line up
+/// for their first 1,296; past that it grows a character rather than
+/// wrapping, because wrapping would repeat a name.
+const COUNTER_PART: usize = 2;
+
 /// A suffix that makes a worktree name unique.
 ///
-/// # Why the clock alone is not enough
+/// # Within one process, unique by construction
 ///
-/// This was `nanos % 46656` — three characters from the clock and nothing
-/// else. Two worktrees created in the same tick got the SAME name, and the
-/// second `git worktree add` failed on a path that already existed.
+/// The suffix is a fixed-width part chosen once per process, followed by
+/// this process's own counter written out in full. Two calls in the same
+/// process differ in the counter, and because the part before it is a fixed
+/// width the counter cannot run into it — so no two names from one process
+/// can be equal, however many threads ask in the same clock tick.
 ///
-/// Nothing hit it while worktrees were created one at a time by a person
-/// typing a command. [`crate::parallel`] opens one per lane in a tight loop,
-/// and several runs can share a `worktrees/` directory — two projects under
-/// one parent, or a test suite — at which point a 46,656-value clock hash
-/// collides readily. It was caught as an intermittent lane-test failure, and
-/// the same collision is available to two real runs.
+/// # Between processes, separated by chance, and it says so
 ///
-/// So the suffix carries three things that cannot all repeat: the process,
-/// a counter within it, and the clock.
+/// The leading part is a hash of the process id and the clock at the first
+/// call. Two runs sharing a `worktrees/` directory meet only if those hashes
+/// agree to all [`PROCESS_PART`] characters.
+///
+/// # What this replaced
+///
+/// First `nanos % 46656`, which gave two lanes opened in the same tick the
+/// same name. Then the counter, the pid and the clock were ADDED into one
+/// seed and 30 bits of it printed: counter `c` at time `t` and counter `c+1`
+/// at `t-31` produced the same seed, and 1 name in 1600 collided in roughly
+/// two runs out of five of the concurrency test below — while the comment
+/// here claimed repeats were impossible. A nanosecond clock meets that often;
+/// Windows' 100 ns clock only when the counters are 100 apart, which is why
+/// it passed where it was written. Adding the counter into the clock is what
+/// lost it; it has to survive verbatim.
 fn short_hash() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
     static NEXT: AtomicU64 = AtomicU64::new(0);
+    static PROCESS: OnceLock<String> = OnceLock::new();
 
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64;
-    let seed = u64::from(std::process::id())
-        .wrapping_mul(1_000_003)
-        .wrapping_add(NEXT.fetch_add(1, Ordering::Relaxed).wrapping_mul(31))
-        .wrapping_add(nanos);
+    let process = PROCESS.get_or_init(|| {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        let mixed = splitmix64((u64::from(std::process::id()) << 32) ^ nanos);
+        base36(mixed % 36u64.pow(PROCESS_PART as u32), PROCESS_PART)
+    });
+    let counter = NEXT.fetch_add(1, Ordering::Relaxed);
+    format!("{process}{}", base36(counter, COUNTER_PART))
+}
 
-    let chars = b"0123456789abcdefghijklmnopqrstuvwxyz";
-    // Six characters rather than three: the counter and pid make repeats
-    // impossible within a machine, and the extra width keeps two MACHINES
-    // sharing a directory over a network from meeting often.
-    (0..6)
-        .map(|i| chars[((seed >> (i * 5)) % 36) as usize] as char)
-        .collect()
+/// SplitMix64's finaliser: neighbouring pids and clock readings land far
+/// apart, so the few characters kept from it are not just the clock's low
+/// digits, which two runs started together would share.
+fn splitmix64(x: u64) -> u64 {
+    let mut z = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// `value` in lowercase base 36, zero-padded to at least `width` characters.
+/// Lowercase alphanumerics only, because the result goes into a branch name
+/// and a directory name on case-insensitive filesystems.
+fn base36(mut value: u64, width: usize) -> String {
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut out = Vec::new();
+    loop {
+        out.push(DIGITS[(value % 36) as usize]);
+        value /= 36;
+        if value == 0 {
+            break;
+        }
+    }
+    while out.len() < width {
+        out.push(b'0');
+    }
+    out.iter().rev().map(|&b| b as char).collect()
 }
 
 fn unix_now() -> u64 {
@@ -437,11 +484,38 @@ mod tests {
         assert_eq!(slugify("bug/fix#123"), "bug-fix-123");
     }
 
+    /// The suffix lands in a branch name and a directory name. It is at least
+    /// the process part plus a padded counter, and longer once the counter
+    /// outgrows its padding — never shorter, and never anything git or a
+    /// case-insensitive filesystem would read differently.
     #[test]
-    fn short_hash_format() {
+    fn a_name_suffix_is_lowercase_alphanumeric_and_at_least_its_fixed_width() {
         let h = short_hash();
-        assert_eq!(h.len(), 6);
-        assert!(h.chars().all(|c| c.is_alphanumeric()));
+        assert!(
+            h.len() >= PROCESS_PART + COUNTER_PART,
+            "`{h}` is shorter than the process part plus the padded counter"
+        );
+        assert!(
+            h.chars()
+                .all(|c| c.is_ascii_digit() || c.is_ascii_lowercase()),
+            "`{h}` must be lowercase base 36 to be safe in a branch and a path"
+        );
+    }
+
+    /// The counter has to come through verbatim, at whatever length it
+    /// reaches: a padded counter that was truncated, or a process part that
+    /// was not fixed-width, would let the 1297th name repeat an earlier one.
+    #[test]
+    fn base36_pads_short_values_and_never_truncates_long_ones() {
+        assert_eq!(base36(0, 2), "00", "zero still fills its width");
+        assert_eq!(base36(35, 2), "0z");
+        assert_eq!(base36(36, 2), "10");
+        assert_eq!(
+            base36(36 * 36, 2),
+            "100",
+            "a value wider than the padding must keep every digit"
+        );
+        assert_eq!(base36(u64::MAX, 1), "3w5e11264sgsf");
     }
 
     /// **TWO WORKTREES MADE BACK TO BACK MUST NOT SHARE A NAME.**
