@@ -68,12 +68,91 @@ EXIT:
 fn main() -> ExitCode {
     incord_sandbox::enter_if_requested();
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    // On Windows the sandbox is the Linux one, inside WSL2: forward there,
+    // unless asked to run natively (environment and wall clock only).
+    #[cfg(windows)]
+    if std::env::var_os("SBX_NATIVE").is_none() {
+        return windows_forward::forward(&args);
+    }
     match real_main(args) {
         Ok(code) => ExitCode::from(u8::try_from(code.clamp(0, 255)).unwrap_or(1)),
         Err(e) => {
             eprintln!("sbx: {e}");
             ExitCode::from(EXIT_SANDBOX as u8)
         }
+    }
+}
+
+/// `sbx.exe` on Windows: the same command, run by the Linux `sbx` inside
+/// WSL2, where Landlock and seccomp do the confining.
+#[cfg(windows)]
+mod windows_forward {
+    use std::ffi::OsString;
+    use std::process::{Command, ExitCode};
+
+    use incord_sandbox::wslpath::{to_wsl, translate_args};
+
+    /// Where the installer puts the Linux `sbx` inside WSL.
+    const IN_WSL: &str = "$HOME/.local/bin/sbx";
+
+    const SETUP: &str = "sbx on Windows runs its sandbox inside WSL2.\n\
+        Set it up once (PowerShell, from the incode folder):\n\
+        \x20   powershell -ExecutionPolicy Bypass -File scripts\\install-windows.ps1\n\
+        Or set SBX_NATIVE=1 to run without WSL (environment and time limit only: \
+        files and network are NOT confined).";
+
+    pub fn forward(args: &[OsString]) -> ExitCode {
+        match run(args) {
+            Ok(code) => ExitCode::from(u8::try_from(code.clamp(0, 255)).unwrap_or(1)),
+            Err(e) => {
+                eprintln!("sbx: {e}");
+                ExitCode::from(125)
+            }
+        }
+    }
+
+    fn run(args: &[OsString]) -> Result<i32, String> {
+        let args: Vec<String> = args
+            .iter()
+            .map(|a| {
+                a.to_str()
+                    .map(str::to_string)
+                    .ok_or("an argument is not valid UTF-8")
+            })
+            .collect::<Result<_, _>>()?;
+        let args = translate_args(&args)?;
+        let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+        let cwd = to_wsl(&cwd.display().to_string()).ok_or_else(|| {
+            format!(
+                "the current folder {} has no path inside WSL; run from a drive folder",
+                cwd.display()
+            )
+        })?;
+        let mut cmd = Command::new("wsl.exe");
+        if let Some(distro) = std::env::var_os("SBX_WSL_DISTRO") {
+            cmd.arg("-d").arg(distro);
+        }
+        cmd.arg("--cd")
+            .arg(&cwd)
+            .arg("-e")
+            .arg("sh")
+            .arg("-c")
+            .arg(format!(
+                "[ -x \"{IN_WSL}\" ] || {{ echo 'sbx is not installed inside WSL' >&2; exit 126; }}; \
+                 exec \"{IN_WSL}\" \"$@\""
+            ))
+            .arg("sbx")
+            .args(&args);
+        let status = cmd
+            .status()
+            .map_err(|e| format!("cannot start wsl.exe ({e}).\n{SETUP}"))?;
+        let code = status.code().unwrap_or(1);
+        // wsl.exe itself fails with -1 (no WSL, no distribution); the
+        // command's own codes pass through.
+        if code < 0 || code == 126 {
+            eprintln!("{SETUP}");
+        }
+        Ok(code)
     }
 }
 

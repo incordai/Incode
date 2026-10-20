@@ -166,10 +166,36 @@ An unknown key is an error, so a misspelt `wirte` can't silently do nothing.
 
 ## Windows: run it inside WSL2
 
-On Windows, run `sbx` inside WSL2, where the Linux sandbox applies
-unchanged: Landlock, seccomp, the git protection and `sbx mcp`. Build it in
-your distribution (`cargo build --release -p incord-sandbox`) and check
-`sbx doctor`, which says it found WSL.
+On Windows the sandbox is the Linux one, running inside WSL2: Landlock,
+seccomp, the git protection and `sbx mcp` all apply unchanged.
+
+**Setup, once** (PowerShell, from the incode folder):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install-windows.ps1
+```
+
+It:
+1. installs WSL2 and Ubuntu if they're missing (asks first, one
+   administrator prompt, usually a restart, then run it again);
+2. builds the Linux `sbx` inside WSL2 at `~/.local/bin/sbx`;
+3. builds `sbx.exe` and adds it to your PATH;
+4. runs `sbx doctor`.
+
+**`sbx.exe` forwards into WSL2.**
+- Every command it gets (`run`, `check`, `doctor`, `mcp`) is passed to the
+  Linux `sbx` with `wsl.exe`, from the same folder.
+- Paths are translated: `C:\work\app` becomes `/mnt/c/work/app`, and
+  `\\wsl$\Ubuntu\home\me` becomes `/home/me`.
+- Output, input and the exit code pass straight through, so `sbx mcp` works
+  for agents on Windows too.
+- **Choosing a distribution:** `SBX_WSL_DISTRO` picks one other than the
+  default.
+- **Without WSL:** `sbx.exe` refuses with the setup steps instead of running
+  unconfined. `SBX_NATIVE=1` runs natively anyway, with only the
+  environment and time limit, and files and network not confined.
+- **Windows environment variables don't reach WSL** unless listed in
+  `WSLENV` (for example `WSLENV=ANTHROPIC_API_KEY`).
 
 WSL2 adds one way out that plain Linux doesn't have: starting a Windows
 program (`cmd.exe`, `powershell.exe`, any `.exe` under `/mnt/c`), which

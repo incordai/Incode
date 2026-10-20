@@ -173,6 +173,18 @@ install -m755 target/release/incode ~/.local/bin/incode
 Copy-Item target\release\incode.exe $env:USERPROFILE\.local\bin\
 ```
 
+**On Windows, also set up the sandbox** (`sbx`, which runs inside WSL2):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install-windows.ps1
+```
+
+It installs WSL2 if it's missing (asks first; needs administrator rights
+once and usually a restart, then run it again). It then builds `sbx` inside
+WSL2 and puts `sbx.exe` on your PATH. `sbx.exe` forwards every command into
+WSL2, where the Linux sandbox confines it. macOS and Linux need no extra
+step.
+
 Each Outline language is a default cargo feature (`lang-rust`, `lang-ts`,
 `lang-python`, `lang-go`, `lang-js`); build with `--no-default-features` and a
 subset to drop grammars. Screen capture for computer use is the default

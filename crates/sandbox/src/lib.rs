@@ -38,6 +38,7 @@ pub mod protect;
 pub mod proxy;
 pub mod seatbelt;
 pub mod server;
+pub mod wslpath;
 
 #[cfg(target_os = "linux")]
 mod linux;
