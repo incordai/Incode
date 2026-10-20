@@ -1583,6 +1583,9 @@ mod tests {
     /// The requested count is read from the environment and clamped.
     #[test]
     fn the_requested_count_falls_back_to_one() {
+        let _env = crate::brief::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::remove_var(LANES_ENV);
         assert_eq!(
             requested_lanes(),
