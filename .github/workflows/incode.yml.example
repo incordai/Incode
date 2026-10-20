@@ -1,0 +1,54 @@
+# Example workflow for the incode GitHub Action. Copy it to
+# .github/workflows/incode.yml in your repository and add the secret
+# ANTHROPIC_API_KEY (or change `api_key`, `api_key_env`, `api_url` and
+# `api_format` for another provider). See docs/github-action.md.
+name: incode
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  issues:
+    types: [opened, assigned]
+  pull_request:
+    types: [opened, ready_for_review]
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  # Answer `@incode ...` on issues, issue comments and review comments.
+  respond:
+    if: >-
+      github.event_name != 'pull_request' && (
+        contains(github.event.comment.body, '@incode') ||
+        contains(github.event.issue.body, '@incode')
+      )
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: incordai/incode/.github/actions/incode@main
+        with:
+          mode: comment
+          api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          model: ${{ vars.INCODE_MODEL }}
+          # allowed_tools: Read,Grep,Glob,Edit,Write,Bash
+
+  # Review every pull request when it is opened.
+  review:
+    if: github.event_name == 'pull_request' && !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: incordai/incode/.github/actions/incode@main
+        with:
+          mode: review
+          api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          model: ${{ vars.INCODE_MODEL }}

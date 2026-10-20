@@ -392,6 +392,26 @@ fn connect_ext_tools(workspace: &Path) -> std::sync::Arc<crate::toolbox::Session
     tools
 }
 
+/// Where an unattended run is told which of incode's tools the model may use
+/// on the API route, as a comma-separated list (`Read,Grep,Glob`). Unset or
+/// blank offers them all. A CI job sets it; an agent CLI brings its own tools
+/// and is not narrowed by it.
+pub const ALLOWED_TOOLS_ENV: &str = "INCODE_ALLOWED_TOOLS";
+
+fn allowed_tools() -> Option<Vec<String>> {
+    parse_allowed_tools(&std::env::var(ALLOWED_TOOLS_ENV).unwrap_or_default())
+}
+
+fn parse_allowed_tools(raw: &str) -> Option<Vec<String>> {
+    let names: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(str::to_string)
+        .collect();
+    (!names.is_empty()).then_some(names)
+}
+
 /// One instruction, as it is handed to each agent that might run it.
 struct Task<'a> {
     workspace: &'a Path,
@@ -505,7 +525,8 @@ fn drive(
                         .with_sandbox(
                             crate::admin::AdminConfig::load_default()
                                 .sandbox_policy(crate::permissions::PermissionMode::WorkspaceWrite),
-                        ),
+                        )
+                        .with_tool_allowlist(allowed_tools()),
                     ),
                     named,
                 )
@@ -878,6 +899,16 @@ pub fn build_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_allowed_tools_are_a_comma_separated_list_or_all() {
+        assert_eq!(parse_allowed_tools(""), None);
+        assert_eq!(parse_allowed_tools(" , "), None);
+        assert_eq!(
+            parse_allowed_tools("Read, Grep,,Glob "),
+            Some(vec!["Read".into(), "Grep".into(), "Glob".into()])
+        );
+    }
 
     /// **AN UNANSWERED DECISION MUST NOT READ AS PROSE.**
     ///

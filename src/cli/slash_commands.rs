@@ -1,4 +1,4 @@
-//! Slash commands — /help, /status, /compact, /tools, /skills, /mcp, /model, /clear, /sessions, /resume.
+//! Slash commands — /help, /status, /compact, /review, /tools, /skills, /mcp, /model, /clear, /sessions, /resume.
 
 use crate::cli::render;
 use crate::tools::tool_status::ToolStatusCache;
@@ -14,7 +14,10 @@ use crate::{out, outln};
 pub enum SlashCommand {
     Help,
     Status,
-    Compact,
+    /// Summarise the conversation now, steered by the optional instructions.
+    Compact(Option<String>),
+    /// Review the change against a base (default: where the branch forked).
+    Review(Option<String>),
     /// The tools incode runs, or with an argument the external tools:
     /// `add <name>…`, `update [name]`, `remove <name>`.
     Tools(Option<String>),
@@ -98,7 +101,8 @@ impl SlashCommand {
         Some(match cmd.as_str() {
             "/help" | "/h" | "/?" | "/" => Self::Help,
             "/status" | "/s" => Self::Status,
-            "/compact" => Self::Compact,
+            "/compact" => Self::Compact(arg.filter(|a| !a.is_empty())),
+            "/review" => Self::Review(arg.filter(|a| !a.is_empty())),
             "/undo" | "/u" => Self::Undo,
             "/rewind" => match arg.as_deref().map(str::parse::<usize>) {
                 Some(Ok(turns)) if turns > 0 => Self::Rewind(turns),
@@ -194,7 +198,11 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/status", "Session info, token usage, model"),
     (
         "/compact",
-        "Say where context is managed — the agent compacts its own",
+        "Summarise older turns now [instructions] (API route; a CLI agent compacts its own)",
+    ),
+    (
+        "/review",
+        "Review the change against [base] (default: where the branch forked)",
     ),
     (
         "/undo",
@@ -1680,7 +1688,22 @@ mod tests {
     fn parses_slash_commands() {
         assert_eq!(SlashCommand::parse("/help"), Some(SlashCommand::Help));
         assert_eq!(SlashCommand::parse("/status"), Some(SlashCommand::Status));
-        assert_eq!(SlashCommand::parse("/compact"), Some(SlashCommand::Compact));
+        assert_eq!(
+            SlashCommand::parse("/compact"),
+            Some(SlashCommand::Compact(None))
+        );
+        assert_eq!(
+            SlashCommand::parse("/compact keep the API notes"),
+            Some(SlashCommand::Compact(Some("keep the API notes".into())))
+        );
+        assert_eq!(
+            SlashCommand::parse("/review"),
+            Some(SlashCommand::Review(None))
+        );
+        assert_eq!(
+            SlashCommand::parse("/review origin/main"),
+            Some(SlashCommand::Review(Some("origin/main".into())))
+        );
         assert_eq!(
             SlashCommand::parse("/tools"),
             Some(SlashCommand::Tools(None))
