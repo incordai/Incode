@@ -715,6 +715,7 @@ mod tests {
             mode,
             network: crate::sandbox::SandboxNetwork::Allow,
             named: true,
+            engine: crate::sandbox::SandboxEngine::Builtin,
         };
         let shell = crate::tools::shell_choice::for_sandbox(&crate::sandbox::Sandbox::new(
             policy,
@@ -760,6 +761,7 @@ mod tests {
             mode: crate::sandbox::SandboxMode::WorkspaceWrite,
             network: crate::sandbox::SandboxNetwork::Allow,
             named: true,
+            engine: crate::sandbox::SandboxEngine::Builtin,
         };
         let began = Instant::now();
         let sandbox = crate::sandbox::Sandbox::new(policy, vec![live.dir.clone()])

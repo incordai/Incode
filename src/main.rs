@@ -82,6 +82,10 @@ OPTIONS:
 ";
 
 fn main() -> anyhow::Result<()> {
+    // The sbx engine's helper (`incode __sbx-enter ...`): confine this
+    // process and exec the command, before any thread starts. Returns at once
+    // for every other invocation.
+    incord_sandbox::enter_if_requested();
     // BEFORE ANYTHING ELSE, and before any thread starts: this mode applies the
     // OS sandbox to THIS process and then execs the command, and an early
     // Landlock ruleset binds only the thread that set it. On success it never

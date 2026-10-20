@@ -923,6 +923,30 @@ confined only when named; the operator's own `/bg` jobs at the REPL are never
 sandboxed. Where a mode cannot be applied, the command runs unconfined and the
 trace says which.
 
+**The engine**: `admin.json` `sandbox_engine` or `INCODE_SANDBOX_ENGINE`,
+`builtin` (the default: everything above) or `sbx`, which confines the same
+commands with [`sbx`](#sbx-the-same-sandbox-for-any-agent) instead, with the
+same mode and network switch, and adds:
+
+- `sandbox_allow_hosts` (or `INCODE_SANDBOX_ALLOW_HOSTS`, comma-separated): the
+  only hosts a command may reach, through a proxy sbx runs for it;
+- on Linux, a seccomp filter against terminal injection, `io_uring` and vsock;
+- `.git/hooks` and `.git/config` in each writable root put back as they were
+  when a command ends, so a planted hook never runs;
+- the variables that redirect git, attach to the agent session or inject a
+  library stripped; a private temp directory per command.
+
+```json
+{ "sandbox_engine": "sbx", "sandbox_allow_hosts": ["crates.io", "static.crates.io", "github.com"] }
+```
+
+Linux and macOS run it inside incode. Windows runs `sbx.exe` (installed beside
+`incode.exe`), natively or inside WSL2 as `sandbox_backend` (or
+`INCODE_SANDBOX_BACKEND`) says: `native`, `wsl` or `auto`; under `wsl` the
+command runs in WSL's `sh`. What a machine cannot enforce is named in the
+trace and `/doctor`; a run sbx cannot start at all is refused, not run
+unconfined.
+
 ### `sbx`: the same sandbox for any agent
 
 `crates/sandbox` builds `sbx`, a standalone sandbox that doesn't depend on
@@ -1138,6 +1162,7 @@ and `--admin` prints which layer decided each value.
 | `browser_bin` · `pdf_renderer` | For development, a headless browser executable that wins over the installed one · which program `RenderPdf` uses |
 | `sandbox` | `off` · `workspace-write` · `read-only`; unset follows the permission mode |
 | `sandbox_network` | `allow` (default) · `deny` — see [the OS sandbox](#the-os-sandbox) |
+| `sandbox_engine` · `sandbox_allow_hosts` · `sandbox_backend` | `builtin` (default) · `sbx`; under sbx, the hosts a command may reach and, on Windows, `native` · `wsl` · `auto` — see [the OS sandbox](#the-os-sandbox) |
 | `hooks` (also `desktop_hooks`) | Your `pre_tool_use` / `post_tool_use` commands, run for every tool. The event is JSON on stdin; exit 2 on a pre-tool command denies; bounded at 10 s |
 | `desktop_limits` | The desktop's limits, each optional: `max_actions_per_minute` (120), `heartbeat_deadline_secs` (30), `tree_depth` (12), `tree_max_elements` (400), `journal_max_bytes` (262144), `xvfb_start_timeout_secs` (10), `clipboard_timeout_secs` (5), `accessibility_call_timeout_ms` (1000), `paste_restore_delay_ms` (500, how long the pasted text stays on the clipboard before the old one is put back), `settle_ms` (300, the pause before a `screenshot_after`), `max_scroll_steps` (50, wheel steps in one `scroll`), `tree_max_visited` (4000, elements one tree walk may visit), and `blocked_apps` (application names, matched case-insensitively as a part of the name, added to the built-in password managers: 1Password, Bitwarden, LastPass, Dashlane, KeePass, NordPass, Proton Pass, Enpass, RoboForm, Keeper). The first two are safety limits and may only be lowered; zero and unknown keys are refused, and the desktop does not start on a malformed admin.json |
 | `desktop_display` | Linux computer use: `":N"` drives a running X display; `"xvfb"` or `"xvfb:1280x800"` starts a private Xvfb for the desktop server's lifetime (default 1920x1080). Unset refuses rather than using `$DISPLAY`. `paste_text` needs `xclip` or `xsel`; `ui_tree` needs a D-Bus session with at-spi2-core |
