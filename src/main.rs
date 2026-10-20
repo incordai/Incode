@@ -16,6 +16,8 @@ incode — autonomous coding harness
 
 USAGE:
     incode [OPTIONS]
+    incode update [--check]   Install the latest release over this program
+                              (sha256 checked); --check only reports it
 
 OPTIONS:
     -m, --model <NAME>        Model to use (or set INCODE_MODEL)
@@ -260,6 +262,14 @@ fn main() -> anyhow::Result<()> {
             }
             return Ok(());
         }
+        Parsed::Update { check_only } => {
+            // No runtime around it: the HTTP helpers bring their own when none
+            // is ambient, as for `--install-tools`.
+            let said = incord_code::self_update::run(check_only)
+                .map_err(|why| anyhow::anyhow!("incode update: {why}"))?;
+            println!("{said}");
+            return Ok(());
+        }
         Parsed::ToolServer => {
             // stdout is the protocol channel; this process prints nothing
             // else there, and runs no tool itself.
@@ -455,6 +465,12 @@ enum Parsed {
     /// Install every tool `admin.json` `tools` names, then exit.
     InstallTools,
 
+    /// `incode update`: replace this program with the latest release, or with
+    /// `--check` only say whether there is one.
+    Update {
+        check_only: bool,
+    },
+
     /// Be an Agent Client Protocol agent on stdio.
     ///
     /// Carries the config for the flags that apply to every session it opens
@@ -522,6 +538,21 @@ fn parse_args(args: impl Iterator<Item = String>) -> anyhow::Result<Parsed> {
     let mut task: Option<String> = None;
     let mut output_format: Option<incord_code::task_run::OutputFormat> = None;
     let mut spec_gate: Option<incord_code::spec::SpecGate> = None;
+
+    // A subcommand, not a flag, as `claude update` and the like are: only in
+    // first place, and it takes nothing but its own `--check`.
+    if args.peek().map(String::as_str) == Some("update") {
+        args.next();
+        let mut check_only = false;
+        for arg in args {
+            match arg.as_str() {
+                "--check" => check_only = true,
+                "-h" | "--help" => return Ok(Parsed::Exit(USAGE.to_string())),
+                other => anyhow::bail!("unknown argument `{other}` for `incode update`\n\n{USAGE}"),
+            }
+        }
+        return Ok(Parsed::Update { check_only });
+    }
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -1236,6 +1267,7 @@ mod tests {
             | Parsed::TeamMcp { .. }
             | Parsed::ToolServer
             | Parsed::InstallTools
+            | Parsed::Update { .. }
             | Parsed::Acp(_) => {
                 panic!("expected a runnable config")
             }
@@ -1542,6 +1574,22 @@ mod tests {
     #[test]
     fn a_task_flag_without_text_is_rejected() {
         assert!(parse(&["--task"]).is_err());
+    }
+
+    #[test]
+    fn update_is_a_subcommand_with_one_flag() {
+        assert!(matches!(
+            parse(&["update"]).expect("valid"),
+            Parsed::Update { check_only: false }
+        ));
+        assert!(matches!(
+            parse(&["update", "--check"]).expect("valid"),
+            Parsed::Update { check_only: true }
+        ));
+        assert!(parse(&["update", "--force"]).is_err());
+        assert!(parse(&["update", "-t", "x"]).is_err());
+        // Only in first place: elsewhere it is not a flag incode knows.
+        assert!(parse(&["--admin", "update"]).is_err());
     }
 
     #[test]

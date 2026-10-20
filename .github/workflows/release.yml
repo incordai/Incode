@@ -1,0 +1,118 @@
+# Release binaries for a version tag.
+#
+# Pushing `v1.2.3` builds `incode` and `sbx` for every platform below, packs
+# each pair as `incode-<target>.tar.gz` (`.zip` on Windows), and publishes them
+# on a GitHub Release with a `SHA256SUMS` beside them. `scripts/install.sh`,
+# `scripts/install.ps1` and `incode update` all read exactly these names, so a
+# rename here is a rename there.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The oldest supported Ubuntu, not the latest: the binary links the
+          # glibc it was built against, and an older one runs on more systems.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          # A native ARM runner, so the desktop stack's C libraries need no
+          # cross toolchain.
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+          # One macOS runner builds both: Xcode's SDK targets either arch.
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      # The same set ci.yml installs: the Linux desktop backends (xcap,
+      # enigo's x11rb, AT-SPI over zbus) link against these at build time.
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config clang libclang-dev libwayland-dev libpipewire-0.3-dev \
+            libxcb1-dev libxcb-randr0-dev libxcb-shm0-dev libdbus-1-dev \
+            libegl-dev libgbm-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} -p incord-code -p incord-sandbox
+      # A flat archive: the two programs and the licence, no folder around
+      # them. `incode update` looks for the programs at the top.
+      #
+      # The files are NAMED rather than archived as `.`: a `./` entry names
+      # no file, and incode's unpacker refuses an archive that holds one.
+      # COPYFILE_DISABLE stops macOS tar adding `._*` metadata entries.
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          COPYFILE_DISABLE: "1"
+        run: |
+          set -euo pipefail
+          stage="$(mktemp -d)"
+          bin="target/${{ matrix.target }}/release"
+          cp "$bin/incode" "$bin/sbx" LICENSE NOTICE README.md "$stage/"
+          mkdir -p dist
+          tar -C "$stage" -czf "dist/incode-${{ matrix.target }}.tar.gz" \
+            incode sbx LICENSE NOTICE README.md
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $stage = New-Item -ItemType Directory -Path (Join-Path $env:RUNNER_TEMP "stage")
+          $bin = "target/${{ matrix.target }}/release"
+          Copy-Item "$bin/incode.exe", "$bin/sbx.exe", LICENSE, NOTICE, README.md $stage
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path (Join-Path $stage "*") -DestinationPath "dist/incode-${{ matrix.target }}.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: incode-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: incode-*
+          merge-multiple: true
+      # One line per archive, `<sha256>  <name>` — the `sha256sum` format,
+      # which the installers and `incode update` parse.
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum incode-* > SHA256SUMS
+          cat SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          # A tag with a hyphen (`v1.2.0-rc.1`) is a pre-release, which
+          # GitHub's `releases/latest` — and so every installer — skips.
+          prerelease: ${{ contains(github.ref_name, '-') }}

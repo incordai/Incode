@@ -157,6 +157,31 @@ The design is in `docs/ARCHITECTURE.md`; the tool layer is its §5a and §5b.
 
 ## Install
 
+Prebuilt `incode` (and `sbx`, the [standalone sandbox](crates/sandbox)) for
+Linux (x86_64, aarch64; glibc), macOS (Intel, Apple silicon) and Windows
+(x86_64) are published on each GitHub release. The install scripts fetch the
+latest one, check it against the release's `SHA256SUMS`, and install it:
+
+```sh
+# Linux / macOS — into ~/.local/bin (or $INCODE_INSTALL_DIR)
+curl -fsSL https://raw.githubusercontent.com/incordai/incode/main/scripts/install.sh | sh
+```
+
+```powershell
+# Windows — into %LOCALAPPDATA%\incode\bin, added to your user PATH
+irm https://raw.githubusercontent.com/incordai/incode/main/scripts/install.ps1 | iex
+```
+
+Set `INCODE_VERSION=v0.2.0` to pin a release instead of the latest. Once
+installed, `incode update --check` says whether a newer release exists, and
+`incode update` installs it in place (sha256-checked; `sbx` is updated too when
+it sits beside `incode`). The Linux binary is built with the default
+`desktop-capture` feature, so it needs the shared libraries of the capture
+stack (`libgbm`, `libwayland-client`, `libxcb`) present at run time; on a
+server without them, build from source without that feature.
+
+### From source
+
 ```sh
 git clone <this repo> incord-code
 cd incord-code
@@ -260,6 +285,7 @@ agreeing what "done" means.
 | `incode --admin` | Print the resolved settings and which layer decided each. |
 | `incode --desktop-stop` | Halt the desktop driving this workspace. |
 | `incode --install-tools` | Download, check and unpack every [external tool](#external-tools) in `admin.json`, then exit (non-zero if any was not installed). |
+| `incode update [--check]` | Install the latest release over this program, checked against its `SHA256SUMS` (see [Install](#install)); `--check` only reports whether there is one. |
 | `incode --tool-server` | Internal. Started by the agent CLI that incode launched; offers incode's tools over MCP and runs nothing itself. |
 | `incode --desktop-mcp` | Internal. The desktop tools' executor, started by incode's toolbox. |
 | `incode --team-mcp --team-channel <p>` | Internal. The team channel as an MCP server, for `codex`. |
