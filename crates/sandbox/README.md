@@ -132,6 +132,47 @@ An unknown key is an error, so a misspelt `wirte` can't silently do nothing.
 | 126 / 127 | the command could not be run / found |
 | 128 + n | it was killed by signal n |
 
+## Sandboxes as a service: `sbx mcp`
+
+`sbx mcp` is an MCP server (stdio) that lets an agent work in sandboxes:
+create one, write scripts and files into it, run them, read what they
+produced, and delete it. Any agent that speaks MCP can use it: Claude Code,
+Codex, incode, or your own.
+
+```json
+{ "mcpServers": { "sbx": { "command": "sbx", "args": ["mcp", "--net", "proxy", "--allow-host", "pypi.org", "--allow-host", "*.pythonhosted.org"] } } }
+```
+
+| Tool | What it does |
+|---|---|
+| `sandbox_create` | A private folder. Network `deny` unless the agent asks for `proxy` with hosts (or `allow`) within the server's limits. |
+| `sandbox_write_file` | Write a script or file, creating folders; `executable` sets 755. |
+| `sandbox_run` | Run `command` (argv) or `script` (text, run with `interpreter`, default `sh`) with optional `stdin`, `cwd` and `timeout_secs`. Returns `exit_code`, `stdout`, `stderr` (64 KB each), `timed_out` and `network_refused`. |
+| `sandbox_read_file` / `sandbox_list` | Read results back (256 KB at most). |
+| `sandbox_info` | The folder, network and limits, and what this machine enforces. |
+| `sandbox_destroy` | Delete it. |
+
+The operator sets the ceilings when starting the server (`--net`,
+`--allow-host`, `--max-wall`, `--policy` for environment and limits). An
+agent can ask for less, never more, and a request above a ceiling is refused
+rather than quietly lowered.
+
+By default every sandbox gets:
+- no network;
+- an empty environment apart from `PATH`, `HOME` and the other
+  essentials, so no host secrets;
+- 4 GB of memory and 1 GB files per process;
+- 120 seconds a run (at most 600).
+
+Every run is confined to its sandbox's folder. When a run ends, everything
+it started is killed, so nothing keeps running in the background.
+
+The server itself is not confined, so the file tools only accept relative
+paths with no `..`, and refuse any path through a symlink (each part is
+checked). This stops a script from planting a link that would lead the
+server out of the sandbox. Sandboxes are removed when the server stops,
+unless `--keep` is given.
+
 ## Using it from Rust
 
 ```rust
@@ -156,6 +197,7 @@ holds the proxy and the temp directory.
 ## Tests
 
 `cargo test -p incord-sandbox` runs:
+- `tests/mcp.rs`: `sbx mcp` driven over stdio like an agent drives it. It writes a script, runs it and reads its result; tries escapes (writing outside, the network, host secrets, a planted symlink, `..`, absolute paths); checks the time limit and background cleanup, the limits on what an agent may ask for, and that sandboxes are removed on exit;
 - the unit tests (policy, environment, allowlist, Seatbelt profile);
 - on Linux, escape tests through the real binary: writes outside the root,
   symlinks, hard links, renames, `/proc/self/root`, child processes, reading

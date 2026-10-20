@@ -36,6 +36,7 @@ pub mod limits;
 pub mod policy;
 pub mod proxy;
 pub mod seatbelt;
+pub mod server;
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -573,6 +574,119 @@ impl Sandbox {
             decisions: guard.decisions(),
         })
     }
+}
+
+/// A command's result with what it printed, kept up to a limit.
+#[derive(Debug)]
+pub struct Captured {
+    pub outcome: Outcome,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    /// Bytes printed in all, including what was cut.
+    pub stdout_total: u64,
+    pub stderr_total: u64,
+}
+
+impl Sandbox {
+    /// Run `program args` in `cwd` with `stdin` fed in, keep the first
+    /// `max_output` bytes of each output stream, and wait for it.
+    ///
+    /// For a server running commands on someone else's behalf: no signal is
+    /// forwarded (the server's own signals are its own), and when the command
+    /// has its own process group (a wall-clock limit is set) the whole group
+    /// is killed once the command ends, so nothing it left running in the
+    /// background outlives the run.
+    ///
+    /// # Errors
+    /// As [`Self::command`], or when the command cannot be started.
+    pub fn run_captured(
+        &self,
+        program: impl AsRef<std::ffi::OsStr>,
+        args: &[OsString],
+        cwd: &Path,
+        stdin: Option<&[u8]>,
+        max_output: usize,
+    ) -> Result<Captured, String> {
+        use std::process::Stdio;
+        let (mut cmd, guard) = self.command(program, args, cwd)?;
+        cmd.stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+        let wall = self.policy.limits.wall_secs.map(Duration::from_secs);
+        let own_group = guard.own_group;
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("cannot start the helper: {e}"))?;
+        let out = child.stdout.take().map(|s| drain(s, max_output));
+        let err = child.stderr.take().map(|s| drain(s, max_output));
+        if let (Some(input), Some(mut pipe)) = (stdin, child.stdin.take()) {
+            let input = input.to_vec();
+            std::thread::spawn(move || {
+                use std::io::Write;
+                let _ = pipe.write_all(&input);
+            });
+        }
+        let pid = child.id();
+        let (status, timed_out) = wait(child, wall, own_group)?;
+        if own_group {
+            kill_group(pid);
+        }
+        let collect = |h: Option<std::thread::JoinHandle<(Vec<u8>, u64)>>| {
+            h.and_then(|h| h.join().ok()).unwrap_or_default()
+        };
+        let (stdout, stdout_total) = collect(out);
+        let (stderr, stderr_total) = collect(err);
+        Ok(Captured {
+            outcome: Outcome {
+                status,
+                timed_out,
+                decisions: guard.decisions(),
+            },
+            stdout,
+            stderr,
+            stdout_total,
+            stderr_total,
+        })
+    }
+}
+
+/// Read a stream to its end on its own thread, keeping the first `max` bytes
+/// and counting the rest.
+fn drain(
+    mut stream: impl std::io::Read + Send + 'static,
+    max: usize,
+) -> std::thread::JoinHandle<(Vec<u8>, u64)> {
+    std::thread::spawn(move || {
+        let mut kept = Vec::new();
+        let mut total = 0u64;
+        let mut buf = [0u8; 8192];
+        while let Ok(n) = stream.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            total += n as u64;
+            let room = max.saturating_sub(kept.len());
+            kept.extend_from_slice(&buf[..n.min(room)]);
+        }
+        (kept, total)
+    })
+}
+
+/// Kill a process group the sandbox created, whatever is left in it.
+fn kill_group(pid: u32) {
+    #[cfg(unix)]
+    if let Ok(pid) = i32::try_from(pid) {
+        // SAFETY: signalling a process group this crate created.
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = pid;
 }
 
 /// The enforcement of `policy` on this machine.

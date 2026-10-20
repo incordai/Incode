@@ -4,6 +4,7 @@
 //! sbx run [options] -- <command> [args...]
 //! sbx check [options]          what this machine would enforce of the policy
 //! sbx doctor                   what this machine can enforce at all
+//! sbx mcp [options]            sandboxes as an MCP server an agent drives
 //! ```
 
 use std::ffi::OsString;
@@ -21,6 +22,17 @@ USAGE:
     sbx run   [OPTIONS] -- <COMMAND> [ARGS...]
     sbx check [OPTIONS]      print what this machine enforces of the policy (JSON with --json)
     sbx doctor               print what this machine can enforce at all
+    sbx mcp   [MCP OPTIONS]  serve sandboxes over MCP (stdio): an agent creates one,
+                             writes scripts into it, runs them, reads the results
+
+MCP OPTIONS (the ceilings; an agent can ask for less, never more):
+        --root <DIR>         where sandboxes live (default: <temp>/sbx-mcp-<pid>)
+        --net <MODE>         most network a sandbox may have: deny (default) | proxy | allow
+        --allow-host <HOST>  with --net proxy: a host sandboxes may name (repeatable)
+        --max-wall <SECS>    longest one run may take (default 600)
+    -p, --policy <FILE>      base policy (environment, limits) every sandbox starts from
+        --keep               leave sandboxes on disk when the server stops
+        --best-effort        run even if part of the policy cannot be enforced here
 
 POLICY (a file, then flags on top of it):
     -p, --policy <FILE>      TOML (or .json) policy file
@@ -103,6 +115,7 @@ fn real_main(args: Vec<OsString>) -> Result<i32, String> {
             Ok(if e.gaps().is_empty() { 0 } else { 1 })
         }
         "run" => run(parse(&args[1..])?),
+        "mcp" => mcp(&args[1..]),
         other => Err(format!("unknown command `{other}` (try `sbx --help`)")),
     }
 }
@@ -129,6 +142,67 @@ fn run(o: Options) -> Result<i32, String> {
         }
     }
     Ok(outcome.code())
+}
+
+fn mcp(args: &[OsString]) -> Result<i32, String> {
+    use incord_sandbox::server::{Ceilings, Server};
+    let mut root: Option<PathBuf> = None;
+    let mut ceilings = Ceilings::new(PathBuf::new());
+    let mut i = 0;
+    let value = |i: usize| -> Result<String, String> {
+        args.get(i)
+            .and_then(|v| v.to_str())
+            .map(str::to_string)
+            .ok_or_else(|| "a value is missing after an option".to_string())
+    };
+    while i < args.len() {
+        let flag = args[i].to_str().unwrap_or("");
+        match flag {
+            "--root" => {
+                i += 1;
+                root = Some(PathBuf::from(value(i)?));
+            }
+            "--net" => {
+                i += 1;
+                let v = value(i)?;
+                ceilings.network =
+                    NetMode::parse(&v).ok_or(format!("--net: unknown mode `{v}`"))?;
+            }
+            "--allow-host" => {
+                i += 1;
+                ceilings.hosts.push(value(i)?);
+            }
+            "--max-wall" => {
+                i += 1;
+                let v = value(i)?;
+                ceilings.max_wall_secs = v
+                    .parse()
+                    .ok()
+                    .filter(|n| *n > 0)
+                    .ok_or(format!("--max-wall: `{v}` is not a positive number"))?;
+            }
+            "-p" | "--policy" => {
+                i += 1;
+                ceilings.base = Policy::load(&PathBuf::from(value(i)?))?;
+            }
+            "--keep" => ceilings.keep = true,
+            "--best-effort" => ceilings.best_effort = true,
+            other => return Err(format!("sbx mcp: unknown option `{other}`")),
+        }
+        i += 1;
+    }
+    if !ceilings.hosts.is_empty() && ceilings.network == NetMode::Deny {
+        ceilings.network = NetMode::Proxy;
+    }
+    let root = root
+        .unwrap_or_else(|| std::env::temp_dir().join(format!("sbx-mcp-{}", std::process::id())));
+    std::fs::create_dir_all(&root).map_err(|e| format!("{}: {e}", root.display()))?;
+    ceilings.root = std::fs::canonicalize(&root).map_err(|e| e.to_string())?;
+    let stdin = std::io::stdin();
+    Server::new(ceilings)
+        .serve(stdin.lock(), std::io::stdout().lock())
+        .map_err(|e| format!("mcp: {e}"))?;
+    Ok(0)
 }
 
 fn parse(args: &[OsString]) -> Result<Options, String> {
