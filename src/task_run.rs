@@ -200,6 +200,31 @@ impl Report {
         }
     }
 
+    /// What the run's tokens came to, as a `TokenUsage`.
+    fn spent(&self) -> crate::runtime::usage::TokenUsage {
+        let [input, output, cache_creation, cache_read] = self.usage;
+        crate::runtime::usage::TokenUsage {
+            input_tokens: input,
+            output_tokens: output,
+            cache_creation_input_tokens: cache_creation,
+            cache_read_input_tokens: cache_read,
+        }
+    }
+
+    /// Estimated dollars, or `None` for a model the price table does not know.
+    fn cost_usd(&self) -> Option<f64> {
+        self.spent().estimate_cost_usd(self.model.as_deref())
+    }
+
+    /// The text run's closing summary, or `None` when nothing was reported.
+    fn cost_line(&self) -> Option<String> {
+        let spent = self.spent();
+        if spent.total_tokens() == 0 {
+            return None;
+        }
+        Some(spent.summary_line(self.model.as_deref()))
+    }
+
     /// The last line: what the run came to, as one object.
     fn finish(&mut self, ran: &Result<String, String>, took: std::time::Duration) {
         let [input, output, cache_creation, cache_read] = self.usage;
@@ -218,6 +243,9 @@ impl Report {
                 "cache_creation_tokens": cache_creation,
                 "cache_read_tokens": cache_read,
             },
+            // Null for a model the price table does not know: a guessed
+            // figure would be read as a bill.
+            "cost_usd": self.cost_usd(),
             "duration_ms": u64::try_from(took.as_millis()).unwrap_or(u64::MAX),
             "spec_gate": self.spec_gate.as_str(),
         });
@@ -255,7 +283,14 @@ pub fn run_task_as(
 ) -> Result<String, String> {
     crate::spec::set_for_this_run(spec_gate);
     if format == OutputFormat::Text {
-        return run_task_with_model(workspace, instruction, model);
+        let mut report = Report::text();
+        let ran = run_task_reporting(workspace, instruction, model, &mut report);
+        // The run's spend, once, at the end: the per-event lines above it are
+        // each one request, and the question afterwards is what it all cost.
+        if let Some(line) = report.cost_line() {
+            outln!("  · {line}");
+        }
+        return ran;
     }
     let claimed = crate::acp_agent::stdio::claim()
         .map_err(|e| format!("stdout could not be taken for the JSON output: {e}"))?;
@@ -1150,6 +1185,11 @@ mod tests {
         assert_eq!(result["agent_session_id"], "agent-conv");
         assert_eq!(result["stop_reason"], "end_turn");
         assert_eq!(result["usage"]["cache_read_tokens"], 7);
+        // sonnet: 10 in at $3, 3 out at $15, 7 cache reads at $0.30, per million.
+        let cost = result["cost_usd"]
+            .as_f64()
+            .expect("a priced model has a cost");
+        assert!((cost - 77.1e-6).abs() < 1e-12, "{cost}");
         assert_eq!(result["spec_gate"], "on", "the default, said: {result}");
     }
 

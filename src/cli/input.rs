@@ -137,6 +137,15 @@ impl LineEditor {
         }
     }
 
+    /// Emacs- or vi-style editing, as rustyline provides it.
+    pub fn set_editing_mode(&mut self, mode: super::keys::EditingMode) {
+        use rustyline::config::Configurer;
+        self.editor.set_edit_mode(match mode {
+            super::keys::EditingMode::Emacs => rustyline::EditMode::Emacs,
+            super::keys::EditingMode::Vi => rustyline::EditMode::Vi,
+        });
+    }
+
     /// Read one line from the user. Returns `None` on Ctrl-C / Ctrl-D / EOF.
     pub fn readline(&mut self, prompt: &str) -> Option<String> {
         match self.editor.readline(prompt) {

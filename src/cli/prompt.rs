@@ -106,6 +106,7 @@ impl Prompter for Terminal {
             what(ask),
             ask.reason
         ));
+        crate::cli::notify::waiting_for_input(&format!("{} needs your confirmation", what(ask)));
         let _raw = Raw::on();
         loop {
             match next_key(settled) {
@@ -132,6 +133,7 @@ impl Prompter for Terminal {
 
     fn choose(&self, questions: &[Question]) -> Option<Vec<Answer>> {
         let lease = PromptLease::begin();
+        crate::cli::notify::waiting_for_input("incode has a question for you");
         let _raw = Raw::on();
         let mut answers = Vec::with_capacity(questions.len());
         for question in questions {
