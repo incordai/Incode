@@ -58,8 +58,8 @@ jobs:
       - run: cargo clippy --all-targets
       - run: cargo test --lib
       - run: cargo test --bins
-      # The standalone sandbox (`sbx`). Its escape tests are Linux-only and
-      # skip, saying so, on a kernel without Landlock.
+      # The standalone sandbox (`sbx`). Its escape tests run on Linux and
+      # macOS, and skip, saying so, where the OS cannot enforce what they check.
       - run: cargo clippy -p incord-sandbox --all-targets -- -D warnings
       - run: cargo test -p incord-sandbox
       # A test that writes outside its temp dir lands in the checkout — a

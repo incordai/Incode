@@ -14,8 +14,8 @@
 //! parent (sbx, or your program)          helper (same binary, re-executed)
 //!   private temp dir                       setrlimit
 //!   allowlisting proxy (network=proxy)     Landlock restrict_self (Linux)
-//!   environment computed                   exec(command)  ── confined from here on
-//!   wall-clock timer, process group
+//!   environment computed                   seccomp socket filter (Linux, network)
+//!   wall-clock timer, process group        exec(command)  ── confined from here on
 //! ```
 //!
 //! On macOS the helper runs under `sandbox-exec` with a generated Seatbelt
@@ -27,7 +27,7 @@
 //!
 //! | | filesystem | network | limits |
 //! |---|---|---|---|
-//! | Linux | Landlock (5.13+) | Landlock TCP (6.7+) | setrlimit + wall |
+//! | Linux | Landlock (5.13+) | Landlock TCP (6.7+) + seccomp | setrlimit + wall |
 //! | macOS | Seatbelt | Seatbelt | setrlimit + wall |
 //! | Windows | not yet (see incode's ACL sandbox) | not yet | wall only |
 
@@ -39,6 +39,8 @@ pub mod seatbelt;
 
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "linux")]
+mod seccomp;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -244,6 +246,17 @@ fn enter(args: &[OsString]) -> Result<Never, EnterError> {
             return Err(sandbox_err(format!("Landlock: {e}")));
         }
         eprintln!("sbx: Landlock not applied (best effort): {e}");
+    }
+    // After Landlock, before exec: Landlock confines TCP, this refuses the
+    // sockets Landlock does not see (UDP, raw, ...). See `seccomp`.
+    #[cfg(target_os = "linux")]
+    if spec.net_mode != NetMode::Allow {
+        if let Err(e) = seccomp::restrict_sockets() {
+            if spec.strict {
+                return Err(sandbox_err(format!("seccomp: {e}")));
+            }
+            eprintln!("sbx: seccomp not applied (best effort): {e}");
+        }
     }
 
     #[cfg(unix)]

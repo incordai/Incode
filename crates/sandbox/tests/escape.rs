@@ -8,7 +8,7 @@
 #![cfg(target_os = "linux")]
 
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, UdpSocket};
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -223,6 +223,105 @@ fn network_deny_refuses_connect_and_bind_even_on_loopback() {
     let out = text(&o);
     assert!(!out.contains("connected"), "{out}");
     assert!(!out.contains("bound"), "{out}");
+}
+
+/// Tries UDP to `port` (plain and with the type's flag bits set), a raw and
+/// a packet socket, and a Unix socket pair; prints one line per attempt.
+fn socket_probe(port: u16) -> String {
+    format!(
+        r#"python3 -c '
+import socket
+def t(name, f):
+    try:
+        f(); print(name, "ok")
+    except OSError as e:
+        print(name, "refused", e.errno)
+def udp(flags):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM | flags)
+    s.sendto(b"escaped", ("127.0.0.1", {port}))
+t("udp", lambda: udp(0))
+t("udp-flags", lambda: udp(socket.SOCK_NONBLOCK | socket.SOCK_CLOEXEC))
+t("raw", lambda: socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_UDP))
+t("packet", lambda: socket.socket(socket.AF_PACKET, socket.SOCK_RAW))
+t("unix", lambda: socket.socketpair())
+'"#
+    )
+}
+
+/// What arrived on `listener` within a short wait.
+fn received(listener: &UdpSocket) -> usize {
+    listener
+        .set_read_timeout(Some(Duration::from_millis(300)))
+        .expect("timeout");
+    let mut n = 0;
+    let mut buf = [0u8; 64];
+    while listener.recv(&mut buf).is_ok() {
+        n += 1;
+    }
+    n
+}
+
+#[test]
+fn udp_raw_and_packet_sockets_are_refused_under_deny_and_proxy() {
+    require!(landlock_net(), "the network (Landlock ABI v4 and seccomp)");
+    let d = dirs();
+    let listener = UdpSocket::bind(("127.0.0.1", 0)).expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let script = socket_probe(port);
+    for flags in [&["--net", "deny"][..], &["--allow-host", "example.com"][..]] {
+        let o = sh(&d.ws, flags, &script);
+        let out = text(&o);
+        // EACCES is the filter's answer; without it, root could open raw
+        // and packet sockets and UDP would be sent.
+        for line in ["udp refused 13", "udp-flags refused 13", "raw refused 13"] {
+            assert!(out.contains(line), "{flags:?}: no `{line}`: {out}");
+        }
+        assert!(out.contains("packet refused 13"), "{flags:?}: {out}");
+        assert!(out.contains("unix ok"), "Unix sockets stay: {out}");
+        assert_eq!(received(&listener), 0, "{flags:?}: UDP got out: {out}");
+    }
+}
+
+#[test]
+fn a_udp_socket_works_when_the_network_is_allowed() {
+    let d = dirs();
+    let listener = UdpSocket::bind(("127.0.0.1", 0)).expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let o = sh(&d.ws, &["--net", "allow"], &socket_probe(port));
+    let out = text(&o);
+    assert!(out.contains("udp ok"), "{out}");
+    assert!(out.contains("udp-flags ok"), "{out}");
+    assert_eq!(received(&listener), 2, "{out}");
+}
+
+#[test]
+fn dns_lookups_fail_under_deny() {
+    require!(landlock_net(), "the network (Landlock ABI v4 and seccomp)");
+    // A lookup a local daemon answers over a Unix socket is not network
+    // access sbx can see (README, known limits); this checks plain DNS.
+    let nss = std::fs::read_to_string("/etc/nsswitch.conf").unwrap_or_default();
+    let hosts = nss
+        .lines()
+        .find(|l| l.trim_start().starts_with("hosts:"))
+        .unwrap_or("");
+    if hosts.contains("resolve") || Path::new("/var/run/nscd/socket").exists() {
+        eprintln!("SKIPPED: names resolve through a local daemon here ({hosts})");
+        return;
+    }
+    let d = dirs();
+    // example.com is in no /etc/hosts; the control shows DNS works at all.
+    let lookup = "getent hosts example.com";
+    let control = sh(&d.ws, &["--net", "allow"], lookup);
+    if !control.status.success() {
+        eprintln!(
+            "SKIPPED: this machine cannot resolve names: {}",
+            text(&control)
+        );
+        return;
+    }
+    let o = sh(&d.ws, &["--net", "deny"], lookup);
+    assert!(!o.status.success(), "resolved under deny: {}", text(&o));
+    assert!(o.stdout.is_empty(), "{}", text(&o));
 }
 
 #[test]

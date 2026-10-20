@@ -61,8 +61,8 @@ An unknown key is an error, so a misspelt `wirte` can't silently do nothing.
 |---|---|---|---|
 | filesystem: write | Landlock (5.13+) | Seatbelt | **not yet** |
 | filesystem: `deny_read` | Landlock | Seatbelt | **not yet** |
-| network: `deny` | Landlock TCP (6.7+) | Seatbelt | **not yet** |
-| network: `proxy` | Landlock: TCP only to the proxy's port | Seatbelt: outbound only to the proxy | **not yet** |
+| network: `deny` | Landlock TCP (6.7+) + seccomp for every other socket | Seatbelt | **not yet** |
+| network: `proxy` | Landlock: TCP only to the proxy's port; seccomp as for `deny` | Seatbelt: outbound only to the proxy | **not yet** |
 | limits | `setrlimit` + wall clock | `setrlimit` + wall clock | wall clock |
 | environment | yes | yes | yes |
 
@@ -71,6 +71,24 @@ An unknown key is an error, so a misspelt `wirte` can't silently do nothing.
   can't be widened again (`no_new_privs` is set).
 - **A private temp directory.** Each run gets one (`TMPDIR`, `TMP`,
   `TEMP`), removed afterwards. The shared `/tmp` is not writable.
+- **Sockets Landlock does not see.** Landlock covers TCP only. Under `deny`
+  and `proxy` a seccomp filter makes `socket()` fail (`EACCES`) for anything
+  but Unix sockets, netlink and plain TCP: UDP, ICMP, raw and packet
+  sockets, SCTP and MPTCP (Landlock's TCP rules do not apply to them: an
+  MPTCP connect got through `deny` on Linux 6.18), and other families such
+  as `AF_VSOCK`.
+  - So under `deny`, DNS is blocked too: a lookup fails. Under `proxy` the
+    command never needed DNS; the proxy resolves names.
+  - Netlink stays: `getaddrinfo` and `ip` read the machine's addresses and
+    routes through it. A command can see the host's interfaces; changing
+    them needs a capability it does not have, and nothing sent on netlink
+    leaves the machine.
+  - `io_uring`, which can open sockets past a seccomp filter, is refused
+    (`EPERM`; runtimes fall back). On x86-64 the 32-bit syscall entry points
+    are filtered as well.
+  - The filter knows x86-64 and aarch64. On any other architecture none is
+    installed, the network is reported **not enforced**, and strict mode
+    refuses.
 - **The proxy.** `proxy` mode runs an allowlisting HTTP proxy in the
   unconfined parent and points the command at it (`HTTP(S)_PROXY`).
   - It sees host names, not content: TLS is tunnelled with `CONNECT`.
@@ -95,8 +113,10 @@ An unknown key is an error, so a misspelt `wirte` can't silently do nothing.
     caller's own group kill reaches it.
 
 **Known limits:**
-- Landlock does not cover UDP. Under `deny`, DNS still works. Under
-  `proxy`, the command doesn't need DNS, but it could still send UDP.
+- A name lookup a local daemon answers over a Unix socket still works
+  under `deny`: with `nss-resolve` (systemd-resolved) or `nscd` in
+  `/etc/nsswitch.conf`, the name reaches the resolver and the answer comes
+  back. Plain `files dns` setups fail the lookup.
 - Landlock matches network ports, not addresses. Under `proxy` the command
   could connect to *any* host on the proxy's (random, high) port.
 - On macOS the profile is generated and unit-tested, but this crate's
@@ -139,8 +159,12 @@ holds the proxy and the temp directory.
 - the unit tests (policy, environment, allowlist, Seatbelt profile);
 - on Linux, escape tests through the real binary: writes outside the root,
   symlinks, hard links, renames, `/proc/self/root`, child processes, reading
-  a hidden path, connecting and binding under `deny`, bypassing the proxy,
-  the wall limit and `SIGKILL` cleanup, limits and exit codes.
+  a hidden path, connecting and binding under `deny`, UDP and raw sockets
+  and DNS under `deny` and `proxy`, bypassing the proxy, the wall limit and
+  `SIGKILL` cleanup, limits and exit codes;
+- on macOS, the same escapes against Seatbelt where they apply (writes,
+  symlinks, children, read-only, `deny_read`, TCP under `deny`, the proxy,
+  the environment, the wall limit).
 
 Each escape test skips, and says so, on a kernel that cannot enforce what
 it checks.

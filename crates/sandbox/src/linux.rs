@@ -14,9 +14,10 @@
 //! - v4 (6.7): TCP `bind` and `connect`, by port (not by address).
 //! - v5 (6.10): device ioctls.
 //!
-//! UDP is not covered by any ABI. Under `network = "deny"` that leaves UDP
-//! (and so DNS) open; under `proxy` it leaves UDP open too, but the proxy
-//! resolves names itself, so the command never needs it.
+//! UDP is not covered by any ABI, nor is any socket that is not TCP. Under
+//! `network = "deny"` or `"proxy"` a seccomp filter (`seccomp.rs`) refuses
+//! to create those sockets, so UDP, and with it DNS, is closed too. Under
+//! `proxy` the command never needed DNS: the proxy resolves names itself.
 
 use std::path::{Path, PathBuf};
 
@@ -76,22 +77,30 @@ pub(crate) fn fs_status(mode: FsMode) -> Status {
 }
 
 pub(crate) fn net_status(mode: NetMode) -> Status {
-    match mode {
-        NetMode::Allow => Status::NotRequested,
-        _ if !net_supported() => Status::NotEnforced(
-            "this kernel's Landlock predates ABI v4 (Linux 6.7), the first to cover TCP".into(),
-        ),
-        NetMode::Deny => Status::Enforced(
-            "Landlock ABI v4: every TCP bind and connect refused, loopback included \
-             (UDP is not covered)"
-                .into(),
-        ),
-        NetMode::Proxy => Status::Enforced(
-            "Landlock ABI v4: TCP connect only to the proxy's port; binds refused \
-             (Landlock matches ports, not addresses; UDP is not covered)"
-                .into(),
-        ),
+    if mode == NetMode::Allow {
+        return Status::NotRequested;
     }
+    if !net_supported() {
+        return Status::NotEnforced(
+            "this kernel's Landlock predates ABI v4 (Linux 6.7), the first to cover TCP".into(),
+        );
+    }
+    // Landlock alone leaves UDP open, so without the filter the policy is
+    // not what it says: a gap, refused in strict mode.
+    let sockets = match crate::seccomp::status() {
+        Status::Enforced(how) => how,
+        gap => return gap,
+    };
+    Status::Enforced(match mode {
+        NetMode::Proxy => format!(
+            "Landlock ABI v4: TCP connect only to the proxy's port, binds refused \
+             (Landlock matches ports, not addresses); {sockets}"
+        ),
+        _ => format!(
+            "Landlock ABI v4: every TCP bind and connect refused, loopback included; \
+             {sockets} (DNS included)"
+        ),
+    })
 }
 
 fn abi_number(abi: ABI) -> u8 {
