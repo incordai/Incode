@@ -210,6 +210,12 @@ pub struct AdminConfig {
     /// cmd.exe, and never the WSL launcher.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shell: Option<String>,
+    /// Whose tools a codex model runs: `own` (the default — codex's, watched
+    /// afterwards by the Sentinel) or `incode` (incode's toolbox through the
+    /// tool bridge, codex's own switched off) — see
+    /// [`crate::agent::codex::CodexTools`]. `INCODE_CODEX_TOOLS` wins over it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_tools: Option<String>,
     /// The capability ladder, named by the operator.
     ///
     /// A tier is a list of models that can do the same JOB — `"top"` might hold
@@ -992,6 +998,36 @@ impl AdminConfig {
         }
     }
 
+    /// Whose tools a codex model runs, and where that was decided: the
+    /// environment, then the settings, then `own`. A word nobody uses is
+    /// `own` from the built-in layer — the route that has run live — and is
+    /// reported as such rather than guessed at.
+    #[must_use]
+    pub fn resolve_codex_tools(&self) -> Resolved<crate::agent::codex::CodexTools> {
+        self.resolve_codex_tools_with(
+            std::env::var(crate::agent::codex::CODEX_TOOLS_ENV)
+                .ok()
+                .as_deref(),
+        )
+    }
+
+    /// [`Self::resolve_codex_tools`] with the environment's value passed in,
+    /// so a test drives every layer without setting a variable that the
+    /// backend tests running beside it read.
+    fn resolve_codex_tools_with(
+        &self,
+        env: Option<&str>,
+    ) -> Resolved<crate::agent::codex::CodexTools> {
+        use crate::agent::codex::CodexTools;
+        if let Some(tools) = env.and_then(CodexTools::parse) {
+            return Resolved::new(tools, Source::Environment);
+        }
+        match self.codex_tools.as_deref().and_then(CodexTools::parse) {
+            Some(tools) => Resolved::new(tools, Source::AdminFile),
+            None => Resolved::new(CodexTools::Own, Source::BuiltIn),
+        }
+    }
+
     /// The check that decides whether work is finished, and where it came from.
     #[must_use]
     pub fn resolve_verify(&self, workspace: &Path) -> Option<Resolved<Vec<String>>> {
@@ -1086,6 +1122,13 @@ impl AdminConfig {
             )),
         }
 
+        let codex_tools = self.resolve_codex_tools();
+        out.push_str(&format!(
+            "  codex tools    {}  <- {}\n",
+            codex_tools.value.as_str(),
+            codex_tools.source.as_str()
+        ));
+
         // Every one of these is optional. Saying which are OFF is the point: a
         // harness quietly doing less looks exactly like one doing nothing.
         let off = self.plugins.disabled();
@@ -1155,6 +1198,7 @@ mod tests {
         std::env::remove_var(crate::config::MODEL_ENV);
         std::env::remove_var(crate::budget::BUDGET_ENV);
         std::env::remove_var(crate::verify::VERIFY_COMMAND_ENV);
+        std::env::remove_var(crate::agent::codex::CODEX_TOOLS_ENV);
         for role in crate::roles::KNOWN_ROLES {
             std::env::remove_var(format!(
                 "{}{}",
@@ -1512,6 +1556,7 @@ mod tests {
             sandbox_backend: Some("wsl".to_string()),
             // The Bash tool's shell, which the owner may pin on Windows.
             shell: Some("C:/Program Files/Git/bin/bash.exe".to_string()),
+            codex_tools: Some("incode".to_string()),
             // The ladder has to survive the file too — a tier an operator
             // writes and cannot read back is a setting that does not exist.
             tiers: BTreeMap::from([(
@@ -1608,6 +1653,72 @@ mod tests {
         assert_eq!(env.mode, SandboxMode::ReadOnly);
         assert!(env.named, "the environment names it too");
         assert_eq!(admin.resolve_sandbox_network().source, Source::Environment);
+        clear_env();
+    }
+
+    /// **CODEX KEEPS ITS OWN TOOLS UNLESS SOMEONE SAID OTHERWISE.** Unset is
+    /// `own`; the settings switch it to `incode`; the environment wins over
+    /// the settings; a word nobody uses is `own` from the built-in layer,
+    /// never a guess at what was meant.
+    #[test]
+    fn codex_tools_resolve_like_the_other_settings() {
+        use crate::agent::codex::CodexTools;
+        let unset = AdminConfig::default();
+        assert_eq!(
+            unset.resolve_codex_tools_with(None),
+            Resolved::new(CodexTools::Own, Source::BuiltIn)
+        );
+
+        let admin = AdminConfig {
+            codex_tools: Some("incode".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            admin.resolve_codex_tools_with(None),
+            Resolved::new(CodexTools::Incode, Source::AdminFile)
+        );
+        let parsed: AdminConfig =
+            serde_json::from_str(r#"{"codex_tools":"incode"}"#).expect("admin.json");
+        assert_eq!(parsed, admin, "the admin.json spelling");
+
+        let typo = AdminConfig {
+            codex_tools: Some("bridged".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            typo.resolve_codex_tools_with(None),
+            Resolved::new(CodexTools::Own, Source::BuiltIn)
+        );
+
+        assert_eq!(
+            admin.resolve_codex_tools_with(Some("own")),
+            Resolved::new(CodexTools::Own, Source::Environment)
+        );
+        assert_eq!(
+            unset.resolve_codex_tools_with(Some(" Incode ")),
+            Resolved::new(CodexTools::Incode, Source::Environment)
+        );
+        // An unusable value in the environment is no answer: the settings speak.
+        assert_eq!(
+            admin.resolve_codex_tools_with(Some("")).source,
+            Source::AdminFile
+        );
+    }
+
+    /// The report names the choice and who made it.
+    #[test]
+    fn the_report_says_whose_tools_codex_runs() {
+        let _guard = lock();
+        clear_env();
+        let admin = AdminConfig {
+            codex_tools: Some("incode".to_string()),
+            ..Default::default()
+        };
+        let report = admin.report(Path::new("."), None);
+        assert!(
+            report.contains("codex tools    incode  <- admin file"),
+            "{report}"
+        );
         clear_env();
     }
 

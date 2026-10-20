@@ -17,6 +17,18 @@
 //!
 //! It showed up as something worse, and more useful: **this agent cannot
 //! express the policy at all.** See [`AgyBackend::enforces`].
+//!
+//! # Why it is not driven over the tool bridge
+//!
+//! The Claude route, and codex with `codex_tools: "incode"`, run every tool call
+//! in incode's toolbox ([`crate::tool_bridge`]). That needs two things of the CLI
+//! for ONE run: a way to switch its own tools off, and a way to hand it an MCP
+//! server. `agy --help` (1.2.11) has neither — no flag removes or restricts a
+//! built-in tool, and MCP servers are added only by `agy mcp add`, which writes
+//! the operator's persistent configuration rather than this spawn's. Without the
+//! first, the bridge would be one more tool beside `run_command` and
+//! `write_to_file`, refusing nothing. So agy keeps its own tools, and the
+//! Sentinel stays its check.
 
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;

@@ -326,7 +326,8 @@ pub fn not_enforced_by(agent: &str, allowed: &[String]) -> String {
     );
     format!(
         "allowed-tools ({}) was NOT enforced this turn: {agent} runs its own tools, which \
-         incode cannot refuse. It binds on the API route and Claude Code.",
+         incode cannot refuse. It binds on the API route, Claude Code, and codex with \
+         codex_tools \"incode\".",
         allowed.join(", ")
     )
 }

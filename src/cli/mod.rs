@@ -1600,22 +1600,16 @@ fn backend_for_protocol(
                 // this whole split exists to prevent.
                 .with_system_context(system_prompt.to_vec()),
         ),
-        Some(crate::agent::Protocol::CodexJson) => {
-            let mut backend = crate::agent::codex::CodexBackend::new(workspace.to_path_buf())
-                .with_binary(binary.to_string())
-                .with_system_context(system_prompt.to_vec());
-
-            // Codex spells registration as `-c key=value` TOML overrides rather
-            // than a JSON flag — verified from `codex mcp add --help`, whose own
-            // example passes an array.
-            let overrides =
-                mcp_overrides_for(desktop, std::env::current_exe().ok(), workspace, mode);
-            if !overrides.is_empty() {
-                backend = backend.with_mcp_overrides(overrides);
-            }
-
-            Box::new(backend)
-        }
+        Some(crate::agent::Protocol::CodexJson) => Box::new(codex_backend(
+            workspace,
+            binary,
+            system_prompt,
+            desktop,
+            mode,
+            crate::admin::AdminConfig::load_default()
+                .resolve_codex_tools()
+                .value,
+        )),
         _ => {
             let mut backend =
                 crate::agent::claude_code::ClaudeCodeBackend::new(workspace.to_path_buf())
@@ -1641,6 +1635,56 @@ fn backend_for_protocol(
             }
 
             Box::new(backend)
+        }
+    }
+}
+
+/// The codex backend, on its own tools or on incode's ([`crate::agent::codex::CodexTools`]).
+///
+/// The choice is an argument, not read here, for the reason
+/// [`run_backend_with_desktop`] takes the desktop switch: a test can then
+/// build both routes in one process and reach the lines of each.
+fn codex_backend(
+    workspace: &Path,
+    binary: &str,
+    system_prompt: &[String],
+    desktop: bool,
+    mode: crate::permissions::PermissionMode,
+    tools: crate::agent::codex::CodexTools,
+) -> crate::agent::codex::CodexBackend {
+    let backend = crate::agent::codex::CodexBackend::new(workspace.to_path_buf())
+        .with_binary(binary.to_string())
+        .with_system_context(system_prompt.to_vec());
+    match tools {
+        // Codex as a model only. The toolbox gets what the Claude route's
+        // does — the engine's guard before each call, the operator's own
+        // commands around each, the OS sandbox on its shell — and the desktop
+        // and the team channel are toolbox tools reached through the bridge,
+        // so no server of their own is registered beside it.
+        crate::agent::codex::CodexTools::Incode => {
+            let mut backend = backend
+                .with_tools(tools)
+                .with_engine(crate::hooks::engine::Engine::locate())
+                .with_code_edits(crate::toolbox::CodeEdits::locate())
+                .with_operator_hooks(crate::hooks::HookRunner::from_settings())
+                .with_sandbox(sandbox_for(mode));
+            if let Some(setup) = desktop_setup_for(desktop, std::env::current_exe().ok(), workspace)
+            {
+                backend = backend.with_desktop(setup);
+            }
+            backend
+        }
+        crate::agent::codex::CodexTools::Own => {
+            // Codex spells registration as `-c key=value` TOML overrides rather
+            // than a JSON flag — verified from `codex mcp add --help`, whose own
+            // example passes an array.
+            let overrides =
+                mcp_overrides_for(desktop, std::env::current_exe().ok(), workspace, mode);
+            if overrides.is_empty() {
+                backend
+            } else {
+                backend.with_mcp_overrides(overrides)
+            }
         }
     }
 }
@@ -2069,6 +2113,55 @@ mod tests {
             "handed a desktop nobody asked for: {quiet}"
         );
         assert!(quiet.contains("mcp_servers.team."), "got: {quiet}");
+    }
+
+    /// **`codex_tools: "incode"` MAKES CODEX A MODEL ON incode's TOOLBOX**: its
+    /// calls run here (so allowed-tools and the permission rules bind and the
+    /// "not enforced" notice stops), the desktop is the toolbox's, and the
+    /// one server handed over is the bridge — no team or desktop server
+    /// beside it. And `own` is the codex route as it was.
+    #[test]
+    fn the_codex_setting_picks_whose_tools_codex_runs() {
+        use crate::agent::codex::CodexTools;
+        use crate::agent::AgentBackend as _;
+        let bridged = codex_backend(
+            Path::new("."),
+            "codex",
+            &[],
+            true,
+            ORDINARY,
+            CodexTools::Incode,
+        );
+        assert!(bridged.runs_tools_here());
+        assert_eq!(bridged.enforces(), crate::guards::Enforcement::EVERYTHING);
+        let tools = bridged.offered_tools();
+        for tool in ["Read", "Write", "Bash", "screenshot", "team_ask"] {
+            assert!(tools.iter().any(|t| t == tool), "{tool}: {tools:?}");
+        }
+        let config = bridged.mcp_config().expect("the bridge is handed over");
+        assert!(
+            config.contains("mcp_servers.incode.args=[\"--tool-server\"]"),
+            "{config}"
+        );
+        assert!(
+            !config.contains("mcp_servers.team.") && !config.contains("mcp_servers.desktop."),
+            "a server beside the bridge: {config}"
+        );
+
+        let own = codex_backend(
+            Path::new("."),
+            "codex",
+            &[],
+            true,
+            ORDINARY,
+            CodexTools::Own,
+        );
+        assert!(!own.runs_tools_here());
+        assert_eq!(own.enforces(), crate::guards::Enforcement::NOTHING);
+        assert!(own.offered_tools().is_empty());
+        let config = own.mcp_config().expect("team and desktop");
+        assert!(config.contains("mcp_servers.desktop.command="), "{config}");
+        assert!(!config.contains("mcp_servers.incode."), "{config}");
     }
 
     /// A Windows path must survive TOML's escape rules.
