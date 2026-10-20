@@ -894,13 +894,40 @@ impl CliApp {
                             session.quota(),
                         );
                     }
-                    SlashCommand::Compact => {
-                        // The agent compacts its own transcript — it owns the
-                        // conversation now, and a second compactor here would be
-                        // summarising a copy it does not have.
-                        render::print_info(
-                            "The agent manages its own context and compacts it automatically. Use /clear to start a fresh session.",
-                        );
+                    // On the API route the conversation is incode's, so it is
+                    // compacted here; an agent CLI compacts its own transcript,
+                    // and a second compactor would be summarising a copy it
+                    // does not have.
+                    SlashCommand::Compact(instructions) => {
+                        match session.compact(instructions.as_deref().unwrap_or("")) {
+                            Some(Ok(done)) => render::print_info(&done),
+                            Some(Err(why)) => render::print_error(&format!(
+                                "The conversation was not compacted: {why}"
+                            )),
+                            None => render::print_info(
+                                "The agent manages its own context and compacts it automatically. Use /clear to start a fresh session.",
+                            ),
+                        }
+                    }
+                    SlashCommand::Review(base) => {
+                        match crate::review::collect(&workspace, base.as_deref()) {
+                            Ok(change) if change.is_empty() => render::print_info(&format!(
+                                "No changes to review against {}.",
+                                change.base
+                            )),
+                            Ok(change) => {
+                                let ask = crate::review::prompt(&change);
+                                if let Err(e) = one_turn_with_context(
+                                    &mut session,
+                                    &workspace,
+                                    &ask,
+                                    Vec::new(),
+                                ) {
+                                    render::print_error(&e);
+                                }
+                            }
+                            Err(why) => render::print_error(&why),
+                        }
                     }
                     SlashCommand::Tools(arg) => {
                         // The tools incode runs itself for the current agent,

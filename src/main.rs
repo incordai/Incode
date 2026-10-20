@@ -18,6 +18,7 @@ USAGE:
     incode [OPTIONS]
     incode update [--check]   Install the latest release over this program
                               (sha256 checked); --check only reports it
+    incode review [--base <REF>] [-p]   Review the current change (see `incode review -h`)
 
 OPTIONS:
     -m, --model <NAME>        Model to use (or set INCODE_MODEL)
@@ -98,6 +99,28 @@ fn main() -> anyhow::Result<()> {
                 let code = incord_code::sandbox::run_windows_helper(&raw[1..])?;
                 std::process::exit(code);
             }
+        }
+    }
+    // `incode review`: a subcommand with its own few flags, read by the
+    // module that runs it.
+    {
+        let raw: Vec<String> = std::env::args().skip(1).collect();
+        if raw.first().map(String::as_str) == Some("review") {
+            let args =
+                incord_code::review::Args::parse(&raw[1..]).map_err(|e| anyhow::anyhow!(e))?;
+            if args.help {
+                println!("{}", incord_code::review::USAGE);
+                return Ok(());
+            }
+            return on_a_runtime(|| {
+                incord_code::review::run(
+                    &args.workspace,
+                    args.base.as_deref(),
+                    args.model.as_deref(),
+                    args.print_only,
+                )
+            })?
+            .map_err(|e| anyhow::anyhow!(e));
         }
     }
     // NOTE: the crate emits `tracing` events (MCP connection failures, tool

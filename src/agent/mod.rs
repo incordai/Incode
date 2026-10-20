@@ -19,6 +19,7 @@ pub mod api;
 pub mod catalogue;
 pub mod claude_code;
 pub mod codex;
+pub mod compact;
 pub mod models;
 pub mod openai;
 pub mod parent_session;
@@ -1000,6 +1001,16 @@ pub trait AgentBackend {
     /// Begin a new conversation, forgetting the current one.
     fn clear_session(&mut self) {}
 
+    /// Summarise the older part of the conversation into one message, now,
+    /// with the operator's `instructions` steering the summary (`/compact`).
+    ///
+    /// `None` when this backend does not hold its conversation — an agent CLI
+    /// compacts its own, inside its own process. `Some(Ok(_))` says what was
+    /// done; `Some(Err(_))` why it could not be.
+    fn compact(&mut self, _instructions: &str) -> Option<Result<String, String>> {
+        None
+    }
+
     /// How much the backend may do without asking.
     fn set_permission_mode(&mut self, _mode: &str) {}
 
@@ -1164,6 +1175,10 @@ impl AgentBackend for Box<dyn AgentBackend> {
 
     fn clear_session(&mut self) {
         (**self).clear_session();
+    }
+
+    fn compact(&mut self, instructions: &str) -> Option<Result<String, String>> {
+        (**self).compact(instructions)
     }
 
     fn set_permission_mode(&mut self, mode: &str) {

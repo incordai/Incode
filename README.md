@@ -22,6 +22,7 @@ tools — see [Limits](#limits).)
 - [Modes](#modes)
 - [Choosing agents and models](#choosing-agents-and-models)
 - [Commands inside a session](#commands-inside-a-session)
+- [Code review and GitHub](#code-review-and-github)
 - [Tools](#tools)
 - [Computer use](#computer-use)
 - [Safety](#safety)
@@ -418,6 +419,12 @@ a vendor is built into incode: these are ordinary entries you write.
   service that refuses the field.
 - `api_version`: the `anthropic-version` header the `anthropic` format sends.
   Unset, `2023-06-01`, the value that format documents.
+- `context_window` (tokens, default 200000; 0 never compacts on its own): an
+  API route's conversation lives in incode, so incode keeps it inside the
+  window. Past 80% of it, the older turns are summarised by the same model into
+  one message and the last two turns are kept verbatim (a tool call is never
+  parted from its result). `/compact [instructions]` does it now, steered by
+  what you ask the summary to keep. A CLI agent compacts its own transcript.
 - `/model <id>` switches to any model the service offers; `/models` lists them.
 
 ### CLI agents
@@ -482,6 +489,8 @@ it sets; any other `id` adds an agent.
 | `/rewind <n>` | Put the files back as they were n changed turns ago |
 | `/diff [file] [rev]` | Unified diff of a file or the workspace against older code |
 | `/plan` · `/act` | Read-only mode · workspace-write mode |
+| `/review [base]` | Review the change against `base` (default: where the branch forked from origin's default branch) — see [below](#code-review-and-github) |
+| `/compact [instructions]` | Summarise the older turns now (API route); a CLI agent compacts its own |
 | `/image <path>` | Send a PNG or JPEG with the next message |
 | `/clear` · `/save` · `/sessions` · `/resume <id>` | Session handling |
 | `/remember <text>` · `/memories <query>` · `/forget <ref> [confirm]` | The shared long-term memory |
@@ -492,8 +501,26 @@ it sets; any other `id` adds an agent.
 | `/pr merge [branch] [--squash\|--rebase]` | Merge that branch's open pull request (a merge commit by default; the branch is kept). Only as reviewed: refused for a draft, a conflict, a failing or still-running check, or when the PR's head is not your local branch's tip — and GitHub is told that head, so nothing pushed afterwards can ride along. Says so when no checks ran at all |
 | `/add-dir <path>` | Also work in this directory — guards and undo extend to it too |
 | `/tools add <name>` · `/tools update [name]` · `/tools remove <name>` | Install, update or remove an [external tool](#external-tools) (also over `--acp`) |
-| `/tools` · `/mcp` · `/env` · `/compact` | Information screens (`/tools` also lists the external tools and what is installed) |
+| `/tools` · `/mcp` · `/env` | Information screens (`/tools` also lists the external tools and what is installed) |
 | `/quit` | Exit |
+
+## Code review and GitHub
+
+`incode review` (and `/review` in a session) hands the model the change and
+one job: report correctness bugs first, then security problems, then
+simplifications, each cited as `path:line` — or say "No issues found."
+
+```sh
+incode review                     # the branch since it forked from origin's default branch, plus uncommitted and untracked work
+incode review --base v0.3.0       # against any ref
+incode review -p > review.md      # findings only on stdout; progress on stderr
+```
+
+The same machinery runs in CI: [`.github/actions/incode`](.github/actions/incode/action.yml)
+answers `@incode` mentions on issues and pull requests (posting the reply and
+pushing any change to a new branch), or reviews each pull request as it opens.
+Setup, inputs and the safety defaults are in
+[docs/github-action.md](docs/github-action.md).
 
 ## Tools
 

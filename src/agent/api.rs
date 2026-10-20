@@ -219,6 +219,10 @@ pub struct Settings {
     /// The catalogue id this route is chosen by: a configured model's name,
     /// or a provider agent's `<provider>/<agent>` — see [`super::models`].
     pub route: String,
+    /// The model's context window in tokens. Past
+    /// [`super::compact::THRESHOLD_PERCENT`] of it the older turns are
+    /// summarised; zero never compacts on its own.
+    pub context_window: u64,
 }
 
 impl Default for Settings {
@@ -238,6 +242,7 @@ impl Default for Settings {
             prompt_cache: true,
             api_version: DEFAULT_API_VERSION.to_string(),
             route: String::new(),
+            context_window: super::compact::DEFAULT_CONTEXT_WINDOW,
         }
     }
 }
@@ -866,6 +871,114 @@ impl ApiBackend {
         self
     }
 
+    /// The real transport for this route, once the key may travel to it.
+    ///
+    /// Checked on the way out, so no request from this backend — a turn or a
+    /// compaction — skips it.
+    fn http(&self) -> Result<Http, AgentError> {
+        // The key goes only where it cannot be read on the way: https, or
+        // plain http to this machine — the rule every other key here is held
+        // to.
+        super::catalogue::key_may_travel_to(&self.settings.endpoint).map_err(|why| {
+            AgentError::new(format!(
+                "the request to {} was not sent: {why}",
+                self.settings.route
+            ))
+        })?;
+        Ok(Http {
+            endpoint: self.settings.endpoint.clone(),
+            key: self.settings.key.clone(),
+            format: self.settings.format,
+            auth: self.settings.auth,
+            timeout: Duration::from_secs(self.settings.timeout_secs),
+            api_version: self.settings.api_version.clone(),
+            retries: self.settings.max_retries,
+            prompt_cache: self.settings.prompt_cache,
+        })
+    }
+
+    /// Summarise all but the last `keep_turns` turns into one message — see
+    /// [`super::compact`]. `Ok(None)` when there was nothing older to fold.
+    ///
+    /// # Errors
+    ///
+    /// When the summary request fails or comes back empty. The conversation
+    /// is left exactly as it was: a failed compaction loses nothing.
+    pub fn compact_with(
+        &mut self,
+        transport: &dyn Transport,
+        instructions: &str,
+        keep_turns: usize,
+    ) -> Result<Option<super::compact::Compacted>, String> {
+        use super::compact;
+        let Some(cut) = compact::split_point(&self.messages, keep_turns) else {
+            return Ok(None);
+        };
+        let definitions = self.tools.definitions();
+        let before = compact::estimate_tokens(&self.system, &self.messages, &definitions);
+        let ask =
+            compact::summary_request(&compact::transcript(&self.messages[..cut]), instructions);
+        let mut body = request_body(
+            &self.settings.model,
+            compact::SUMMARIZER_SYSTEM,
+            &[json!({"role": "user", "content": ask})],
+            &[],
+        );
+        // No tools: the summariser writes, it does not act.
+        if let Some(fields) = body.as_object_mut() {
+            fields.remove("tools");
+        }
+        body["max_tokens"] = json!(self.settings.max_tokens);
+        let reply = parse_reply(&transport.send(&body)?)?;
+        if reply.text.trim().is_empty() {
+            return Err("the model returned an empty summary, so nothing was compacted".into());
+        }
+        if !reply.model.is_empty() && !self.served_by.contains(&reply.model) {
+            self.served_by.push(reply.model.clone());
+        }
+        let kept = self.messages.split_off(cut);
+        let kept_len = kept.len();
+        let summarised = self.messages.len();
+        self.messages = compact::rebuild(&reply.text, kept);
+        let after = compact::estimate_tokens(&self.system, &self.messages, &definitions);
+        Ok(Some(compact::Compacted {
+            summarised,
+            kept: kept_len,
+            tokens_before: before,
+            tokens_after: after,
+        }))
+    }
+
+    /// Compact before a request that would otherwise near the window.
+    ///
+    /// A failure is reported and the request goes ahead as it would have:
+    /// the service may still take it, and if not it says so itself.
+    fn compact_if_near_window(
+        &mut self,
+        transport: &dyn Transport,
+        definitions: &[Value],
+        on_event: &mut dyn FnMut(&AgentEvent),
+    ) {
+        let estimate = super::compact::estimate_tokens(&self.system, &self.messages, definitions);
+        if !super::compact::over_threshold(estimate, self.settings.context_window) {
+            return;
+        }
+        match self.compact_with(transport, "", super::compact::KEEP_TURNS) {
+            Ok(Some(done)) => {
+                crate::trace!("compact", "{}", done.describe());
+                // Shown apart from the reply, and never heard by the
+                // transcript or the stop hook: it is the harness speaking.
+                on_event(&AgentEvent::Thinking(format!(
+                    "[context near the {}-token window] {}",
+                    self.settings.context_window,
+                    done.describe()
+                )));
+            }
+            Ok(None) => {}
+            Err(why) => crate::trace!("compact", "automatic compaction failed: {why}"),
+        }
+    }
+
     /// Run a turn against a given transport.
     ///
     /// Separate from [`AgentBackend::run_turn`] so the loop — which holds every
@@ -901,6 +1014,7 @@ impl ApiBackend {
                     served_by: self.served_by.clone(),
                 });
             }
+            self.compact_if_near_window(transport, &definitions, on_event);
             let mut body = request_body(
                 &self.settings.model,
                 &self.system,
@@ -1236,26 +1350,19 @@ impl AgentBackend for ApiBackend {
         prompt: &str,
         on_event: &mut dyn FnMut(&AgentEvent),
     ) -> Result<TurnOutcome, AgentError> {
-        // The key goes only where it cannot be read on the way: https, or
-        // plain http to this machine — the rule every other key here is held
-        // to. Checked on the way out, so no route to this backend skips it.
-        super::catalogue::key_may_travel_to(&self.settings.endpoint).map_err(|why| {
-            AgentError::new(format!(
-                "the request to {} was not sent: {why}",
-                self.settings.route
-            ))
-        })?;
-        let transport = Http {
-            endpoint: self.settings.endpoint.clone(),
-            key: self.settings.key.clone(),
-            format: self.settings.format,
-            auth: self.settings.auth,
-            timeout: Duration::from_secs(self.settings.timeout_secs),
-            api_version: self.settings.api_version.clone(),
-            retries: self.settings.max_retries,
-            prompt_cache: self.settings.prompt_cache,
-        };
+        let transport = self.http()?;
         self.run_turn_with(&transport, prompt, on_event)
+    }
+
+    fn compact(&mut self, instructions: &str) -> Option<Result<String, String>> {
+        let ran = self
+            .http()
+            .map_err(|e| e.to_string())
+            .and_then(|transport| self.compact_with(&transport, instructions, 0));
+        Some(ran.map(|done| match done {
+            Some(done) => done.describe(),
+            None => "Nothing to compact yet: the conversation is empty.".to_string(),
+        }))
     }
 
     fn session_id(&self) -> Option<&str> {
@@ -1785,6 +1892,125 @@ mod tests {
             "the first turn must still be in the conversation: {said:?}"
         );
         assert!(said.contains(&"second"), "{said:?}");
+    }
+
+    /// **NEAR THE WINDOW, THE OLDER TURNS BECOME A SUMMARY**: the model is
+    /// asked for one, with no tools, and the next request carries it in place
+    /// of what it summarised.
+    #[test]
+    fn a_conversation_near_the_window_is_compacted_before_the_request() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let transport = Canned::new(&[&said("one"), &said("THE SUMMARY"), &said("two")]);
+        let mut agent = backend(dir.path());
+        // Every request is "near" a one-token window.
+        agent.settings.context_window = 1;
+        agent
+            .run_turn_with(&transport, "first", &mut |_| {})
+            .expect("turn one");
+        let mut notes = Vec::new();
+        agent
+            .run_turn_with(&transport, "second", &mut |e| {
+                if let AgentEvent::Thinking(note) = e {
+                    notes.push(note.clone());
+                }
+            })
+            .expect("turn two");
+
+        let sent = transport.sent.borrow();
+        assert_eq!(sent.len(), 3, "turn, summary, turn");
+        let summary_request = &sent[1];
+        assert!(summary_request.get("tools").is_none());
+        assert_eq!(
+            summary_request["system"],
+            json!(super::super::compact::SUMMARIZER_SYSTEM)
+        );
+        assert!(summary_request["messages"][0]["content"]
+            .as_str()
+            .expect("text")
+            .contains("first"));
+
+        let messages = sent[2]["messages"].as_array().expect("messages");
+        let opening = messages[0]["content"].as_str().expect("the summary");
+        assert!(opening.contains("THE SUMMARY"), "{opening}");
+        let prompts: Vec<&str> = messages
+            .iter()
+            .filter(|m| m["role"] == "user")
+            .filter_map(|m| m["content"].as_str())
+            .collect();
+        assert!(!prompts.contains(&"first"), "summarised away: {prompts:?}");
+        assert_eq!(prompts.last(), Some(&"second"));
+        assert_eq!(notes.len(), 1, "the compaction is said once: {notes:?}");
+    }
+
+    #[test]
+    fn a_window_of_zero_never_compacts_on_its_own() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let transport = Canned::new(&[&said("one"), &said("two")]);
+        let mut agent = backend(dir.path());
+        agent.settings.context_window = 0;
+        for prompt in ["first", "second"] {
+            agent
+                .run_turn_with(&transport, prompt, &mut |_| {})
+                .expect("turn");
+        }
+        assert_eq!(transport.sent.borrow().len(), 2);
+    }
+
+    /// `/compact <instructions>`: everything is folded, steered by what the
+    /// operator asked, and the conversation carries on from the summary.
+    #[test]
+    fn compacting_by_hand_folds_everything_and_carries_the_instructions() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let transport = Canned::new(&[
+            &asked_for("t1", "Read", json!({"path": "missing.rs"})),
+            &said("read it"),
+            &said("THE SUMMARY"),
+            &said("carrying on"),
+        ]);
+        let mut agent = backend(dir.path());
+        agent
+            .run_turn_with(&transport, "first", &mut |_| {})
+            .expect("turn one");
+        let done = agent
+            .compact_with(&transport, "keep the file names", 0)
+            .expect("compacts")
+            .expect("there was something to compact");
+        assert_eq!(done.summarised, 4);
+        assert_eq!(done.kept, 0);
+        assert_eq!(
+            agent.messages.len(),
+            2,
+            "the summary and its acknowledgement"
+        );
+        agent
+            .run_turn_with(&transport, "second", &mut |_| {})
+            .expect("turn two");
+
+        let sent = transport.sent.borrow();
+        let asked = sent[2]["messages"][0]["content"].as_str().expect("text");
+        assert!(asked.contains("keep the file names"));
+        assert!(asked.contains("[called Read"));
+        let roles: Vec<&str> = sent[3]["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .filter_map(|m| m["role"].as_str())
+            .collect();
+        assert_eq!(roles, ["user", "assistant", "user"]);
+    }
+
+    #[test]
+    fn a_failed_compaction_loses_nothing() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let transport = Canned::new(&[&said("one")]);
+        let mut agent = backend(dir.path());
+        agent
+            .run_turn_with(&transport, "first", &mut |_| {})
+            .expect("turn one");
+        let before = agent.messages.clone();
+        // The canned transport has run out of replies: the request fails.
+        assert!(agent.compact_with(&transport, "", 0).is_err());
+        assert_eq!(agent.messages, before);
     }
 
     #[test]

@@ -408,6 +408,12 @@ pub struct ApiModel {
     /// [`crate::agent::api::DEFAULT_API_VERSION`]; the chat format sends none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_version: Option<String>,
+    /// The model's context window in tokens. Past 80% of it the older turns
+    /// are summarised into one message. Unset is
+    /// [`crate::agent::compact::DEFAULT_CONTEXT_WINDOW`]; 0 never compacts
+    /// on its own (`/compact` still does).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
 }
 
 /// Which program `RenderPdf` prints with — see `toolbox::pdf`.
@@ -1414,6 +1420,7 @@ mod tests {
                 prompt_cache: Some(false),
                 auth: Some(crate::agent::api::KeyHeader::Bearer),
                 api_version: Some("2099-01-01".to_string()),
+                context_window: Some(1_000_000),
             }],
             // The search provider too, holding its key variable's NAME only.
             web_search: Some(SearchProvider {

@@ -1,0 +1,305 @@
+# incode as a GitHub Action.
+#
+# Two modes:
+#
+# - `comment` (default): run when an issue, an issue comment or a pull
+#   request review comment mentions the trigger phrase (`@incode`). The text
+#   and the issue / pull request it was written on become one `incode -t`
+#   instruction; the answer is posted back as a comment, and any change the
+#   model made is pushed to a new branch whose link is in that comment.
+# - `review`: run `incode review` on a pull request and post the findings.
+#
+# The model is reached over its API with a key the workflow passes in; the
+# action writes a one-entry admin.json for it in a private INCODE_DIR, so
+# nothing on the runner is configured beyond this job. See
+# docs/github-action.md for a ready-made workflow.
+name: incode
+description: Answer @incode mentions on issues and pull requests, or review a pull request, with incode.
+author: incordai
+
+inputs:
+  mode:
+    description: "`comment` (answer @incode mentions) or `review` (review the pull request)."
+    required: false
+    default: comment
+  api_key:
+    description: >-
+      The model API key, passed from a secret: `${{ secrets.ANTHROPIC_API_KEY }}`.
+      A composite action cannot read secrets by name, so the value comes in
+      here and is exported only as the variable named by `api_key_env`.
+    required: true
+  api_key_env:
+    description: The environment variable name the key is exported as for incode (the admin.json `key_env`).
+    required: false
+    default: ANTHROPIC_API_KEY
+  api_url:
+    description: The model endpoint — `.../v1/messages` or `.../chat/completions`.
+    required: false
+    default: https://api.anthropic.com/v1/messages
+  api_format:
+    description: "`anthropic` (messages) or `openai` (chat completions)."
+    required: false
+    default: anthropic
+  model:
+    description: The model id to ask for, as the endpoint names it.
+    required: true
+  context_window:
+    description: The model's context window in tokens; incode compacts the conversation past 80% of it. Blank keeps incode's default.
+    required: false
+    default: ""
+  allowed_tools:
+    description: >-
+      Comma-separated incode tools the model may use (e.g. `Read,Grep,Glob`).
+      Blank offers all of them in `comment` mode and `Read,Grep,Glob` in
+      `review` mode.
+    required: false
+    default: ""
+  trigger_phrase:
+    description: What a comment must contain for `comment` mode to act on it.
+    required: false
+    default: "@incode"
+  allowed_associations:
+    description: >-
+      Comma-separated author associations allowed to trigger a run. The run
+      holds your API key and a write token, so a stranger's comment should not
+      start one.
+    required: false
+    default: OWNER,MEMBER,COLLABORATOR
+  push:
+    description: In `comment` mode, push the model's changes (if any) to a new branch.
+    required: false
+    default: "true"
+  base:
+    description: In `review` mode, the ref to review against. Blank uses the pull request's base branch.
+    required: false
+    default: ""
+  incode_version:
+    description: The incode release to install (a tag such as `v0.2.0`), or `latest`.
+    required: false
+    default: latest
+  github_token:
+    description: Token for `gh` to comment and for `git` to push.
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  skipped:
+    description: "`true` when the event did not ask for incode (no trigger phrase, or an author not allowed)."
+    value: ${{ steps.gate.outputs.skip }}
+  branch:
+    description: The branch the changes were pushed to, when there were any.
+    value: ${{ steps.publish.outputs.branch }}
+
+runs:
+  using: composite
+  steps:
+    # Everything from the event is read from the event file by jq and passed
+    # through files and environment variables, never spliced into a script:
+    # a comment is untrusted text.
+    - id: gate
+      name: Decide whether this event is for incode
+      shell: bash
+      env:
+        MODE: ${{ inputs.mode }}
+        TRIGGER: ${{ inputs.trigger_phrase }}
+        ALLOWED: ${{ inputs.allowed_associations }}
+      run: |
+        set -euo pipefail
+        event="$GITHUB_EVENT_PATH"
+        number=$(jq -r '.issue.number // .pull_request.number // empty' "$event")
+        if [ -z "$number" ]; then
+          echo "incode: this event names no issue or pull request; nothing to do."
+          echo "skip=true" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        echo "number=$number" >> "$GITHUB_OUTPUT"
+        if [ "$MODE" = "review" ]; then
+          if [ "$(jq -r '.pull_request.number // empty' "$event")" = "" ]; then
+            echo "incode: review mode runs on pull_request events."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        # The text that asks: the comment, or the issue itself when it was
+        # opened or edited.
+        jq -r '.comment.body // .issue.body // ""' "$event" > "$RUNNER_TEMP/incode-request.txt"
+        association=$(jq -r '.comment.author_association // .issue.author_association // "NONE"' "$event")
+        if ! grep -qiF -- "$TRIGGER" "$RUNNER_TEMP/incode-request.txt"; then
+          echo "incode: no '$TRIGGER' in the text; nothing to do."
+          echo "skip=true" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        if ! printf '%s' ",$ALLOWED," | grep -qiF -- ",$association,"; then
+          echo "incode: the author's association ($association) is not one of: $ALLOWED."
+          echo "skip=true" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        echo "skip=false" >> "$GITHUB_OUTPUT"
+
+    - name: Install incode
+      if: steps.gate.outputs.skip != 'true'
+      shell: bash
+      env:
+        INCODE_VERSION: ${{ inputs.incode_version }}
+        INCODE_INSTALL_DIR: ${{ runner.temp }}/incode-bin
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+        # The installer that ships beside this action when the action is used
+        # from the incode repository; the published one otherwise.
+        local_installer="$ACTION_PATH/../../../scripts/install.sh"
+        if [ -f "$local_installer" ]; then
+          sh "$local_installer"
+        else
+          curl --proto '=https' --tlsv1.2 -fsSL \
+            https://raw.githubusercontent.com/incordai/incode/main/scripts/install.sh | sh
+        fi
+        echo "$INCODE_INSTALL_DIR" >> "$GITHUB_PATH"
+
+    - name: Configure the model
+      if: steps.gate.outputs.skip != 'true'
+      shell: bash
+      env:
+        API_KEY: ${{ inputs.api_key }}
+        KEY_ENV: ${{ inputs.api_key_env }}
+        API_URL: ${{ inputs.api_url }}
+        API_FORMAT: ${{ inputs.api_format }}
+        MODEL: ${{ inputs.model }}
+        CONTEXT_WINDOW: ${{ inputs.context_window }}
+        MODE: ${{ inputs.mode }}
+        ALLOWED_TOOLS: ${{ inputs.allowed_tools }}
+      run: |
+        set -euo pipefail
+        if [ -z "$API_KEY" ]; then
+          echo "::error::incode: api_key is empty — pass it from a secret."
+          exit 1
+        fi
+        case "$KEY_ENV" in
+          *[!A-Za-z0-9_]* | "" ) echo "::error::incode: api_key_env must be a variable name."; exit 1 ;;
+        esac
+        echo "::add-mask::$API_KEY"
+        incode_dir="$RUNNER_TEMP/incode-home"
+        mkdir -p "$incode_dir"
+        # One API route, named `ci`, holding the key's variable NAME only.
+        jq -n \
+          --arg url "$API_URL" --arg format "$API_FORMAT" \
+          --arg key_env "$KEY_ENV" --arg model "$MODEL" \
+          --arg window "$CONTEXT_WINDOW" \
+          '{agent: "ci",
+            api_models: [({name: "ci", format: $format, url: $url,
+                           key_env: $key_env, model: $model}
+                          + (if $window == "" then {} else {context_window: ($window | tonumber)} end))]}' \
+          > "$incode_dir/admin.json"
+        {
+          echo "INCODE_DIR=$incode_dir"
+          echo "INCODE_AGENT=ci"
+          echo "$KEY_ENV=$API_KEY"
+        } >> "$GITHUB_ENV"
+        tools="$ALLOWED_TOOLS"
+        if [ -z "$tools" ] && [ "$MODE" = "review" ]; then
+          tools="Read,Grep,Glob"
+        fi
+        if [ -n "$tools" ]; then
+          echo "INCODE_ALLOWED_TOOLS=$tools" >> "$GITHUB_ENV"
+        fi
+
+    - name: Review the pull request
+      if: steps.gate.outputs.skip != 'true' && inputs.mode == 'review'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        BASE: ${{ inputs.base }}
+        NUMBER: ${{ steps.gate.outputs.number }}
+      run: |
+        set -euo pipefail
+        base="$BASE"
+        if [ -z "$base" ]; then
+          base_ref=$(jq -r '.pull_request.base.ref' "$GITHUB_EVENT_PATH")
+          git fetch --no-tags origin "$base_ref"
+          base="origin/$base_ref"
+        fi
+        out="$RUNNER_TEMP/incode-review.md"
+        if ! incode review --base "$base" -p > "$out"; then
+          echo "incode could not finish the review; see the workflow log." > "$out"
+        fi
+        {
+          echo "### incode review"
+          echo
+          cat "$out"
+        } > "$RUNNER_TEMP/incode-comment.md"
+        gh pr comment "$NUMBER" --body-file "$RUNNER_TEMP/incode-comment.md"
+
+    - name: Answer the mention
+      if: steps.gate.outputs.skip != 'true' && inputs.mode != 'review'
+      shell: bash
+      run: |
+        set -euo pipefail
+        event="$GITHUB_EVENT_PATH"
+        prompt="$RUNNER_TEMP/incode-prompt.txt"
+        {
+          echo "You were mentioned on GitHub in $GITHUB_REPOSITORY ($GITHUB_EVENT_NAME)."
+          echo "The repository is checked out in the current directory."
+          echo
+          if [ "$(jq -r '(.issue.pull_request // .pull_request) != null' "$event")" = "true" ]; then
+            echo "It is on pull request #$(jq -r '.issue.number // .pull_request.number' "$event"):"
+          else
+            echo "It is on issue #$(jq -r '.issue.number' "$event"):"
+          fi
+          echo "Title: $(jq -r '.issue.title // .pull_request.title // ""' "$event")"
+          echo
+          echo "<description>"
+          jq -r '.issue.body // .pull_request.body // ""' "$event"
+          echo "</description>"
+          if [ "$(jq -r '.comment.path // empty' "$event")" != "" ]; then
+            echo
+            echo "The comment is on $(jq -r '.comment.path' "$event") line $(jq -r '.comment.line // .comment.original_line // "?"' "$event"):"
+            echo "<diff_hunk>"
+            jq -r '.comment.diff_hunk // ""' "$event"
+            echo "</diff_hunk>"
+          fi
+          echo
+          echo "<request author=\"$(jq -r '.comment.user.login // .issue.user.login // "someone"' "$event")\">"
+          cat "$RUNNER_TEMP/incode-request.txt"
+          echo "</request>"
+          echo
+          echo "Do what the request asks. If it asks for a code change, make it in the"
+          echo "working tree (do not commit or push; that is done for you). Your final"
+          echo "message is posted as the reply on GitHub, so make it a complete answer:"
+          echo "what you found or changed, and anything left for a person to do."
+        } > "$prompt"
+        result="$RUNNER_TEMP/incode-result.json"
+        incode -t "$(cat "$prompt")" --spec-gate off --output-format json > "$result" || true
+        jq -r 'if .result then .result else "incode could not finish: " + (.error // "see the workflow log") end' \
+          "$result" > "$RUNNER_TEMP/incode-reply.md" 2>/dev/null \
+          || echo "incode did not report a result; see the workflow log." > "$RUNNER_TEMP/incode-reply.md"
+
+    - id: publish
+      name: Push changes and reply
+      if: steps.gate.outputs.skip != 'true' && inputs.mode != 'review'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        PUSH: ${{ inputs.push }}
+        NUMBER: ${{ steps.gate.outputs.number }}
+      run: |
+        set -euo pipefail
+        reply="$RUNNER_TEMP/incode-reply.md"
+        if [ "$PUSH" = "true" ] && [ -n "$(git status --porcelain)" ]; then
+          branch="incode/$NUMBER-$GITHUB_RUN_ID"
+          git config user.name "incode[bot]"
+          git config user.email "incode[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add -A
+          git commit -q -m "incode: changes for #$NUMBER" -m "Requested in $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/issues/$NUMBER"
+          git push -q origin "$branch"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          {
+            echo
+            echo "---"
+            echo "Changes pushed to [\`$branch\`]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/tree/$branch)."
+            echo "[Open a pull request]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/compare/$branch?expand=1)."
+          } >> "$reply"
+        fi
+        gh issue comment "$NUMBER" --body-file "$reply"

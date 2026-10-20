@@ -459,6 +459,13 @@ impl AgentSession {
         self.backend.api_route()
     }
 
+    /// Compact the lead's conversation now — see
+    /// [`crate::agent::AgentBackend::compact`]. `None` when the lead is an
+    /// agent CLI, which compacts its own.
+    pub fn compact(&mut self, instructions: &str) -> Option<Result<String, String>> {
+        self.backend.compact(instructions)
+    }
+
     /// Start a fresh agent session on the next turn.
     ///
     /// Really cleared: the id is dropped, so the next turn does not resume the
