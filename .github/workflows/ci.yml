@@ -84,6 +84,17 @@ jobs:
       # The standalone sandbox (`sbx`). Its escape tests run on Linux and
       # macOS, and skip, saying so, where the OS cannot enforce what they check.
       - run: cargo clippy -p incord-sandbox --all-targets -- -D warnings
+      # Network deny natively on Windows (layer 2): the offline account and
+      # its firewall filters. The runner is an administrator. Without this
+      # the Windows network tests skip, saying so.
+      - name: sbx setup-windows
+        if: runner.os == 'Windows'
+        run: cargo run -p incord-sandbox --bin sbx -- setup-windows
+      - name: sbx doctor (after setup-windows)
+        if: runner.os == 'Windows'
+        env:
+          SBX_BACKEND: native
+        run: cargo run -p incord-sandbox --bin sbx -- doctor
       - run: cargo test -p incord-sandbox
       # A test that writes outside its temp dir lands in the checkout — a
       # Windows drive path is RELATIVE on Linux and macOS — and passes anyway.

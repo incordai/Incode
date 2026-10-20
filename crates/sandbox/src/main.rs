@@ -24,6 +24,11 @@ USAGE:
     sbx doctor               print what this machine can enforce at all
     sbx mcp   [MCP OPTIONS]  serve sandboxes over MCP (stdio): an agent creates one,
                              writes scripts into it, runs them, reads the results
+    sbx setup-windows [--read <DIR>]... [--proxy-ports <LO-HI>] | --remove
+                             Windows, as administrator, once: network deny and proxy
+                             natively (an offline account the firewall cuts off).
+                             --read lets that account read a folder (a toolchain);
+                             --remove undoes all of it
 
 MCP OPTIONS (the ceilings; an agent can ask for less, never more):
         --root <DIR>         where sandboxes live (default: <temp>/sbx-mcp-<pid>)
@@ -121,7 +126,10 @@ mod windows_backend {
         };
         let sub = args.first().and_then(|a| a.to_str()).unwrap_or("");
         if backend == Backend::Wsl
-            && !matches!(sub, "" | "-h" | "--help" | "help" | "-V" | "--version")
+            && !matches!(
+                sub,
+                "" | "-h" | "--help" | "help" | "-V" | "--version" | "setup-windows"
+            )
         {
             return Some(forward(args));
         }
@@ -201,6 +209,19 @@ mod windows_backend {
                 }
             ),
             Err(e) => println!("  [no  ] backend        {e}"),
+        }
+        match incord_sandbox::windows::offline_setup() {
+            Ok(r) => println!(
+                "  [ok  ] offline user   {} and its firewall filters are set up (sbx setup-windows): \
+                 network deny and proxy run natively (proxy ports {}-{})",
+                incord_sandbox::windows::offline::ACCOUNT,
+                r.proxy_ports.0,
+                r.proxy_ports.1
+            ),
+            Err(why) => println!(
+                "  [no  ] offline user   {why}; for network deny natively, run `sbx setup-windows` \
+                 as administrator"
+            ),
         }
         match wsl_ready() {
             Ok(()) => println!(
@@ -311,6 +332,7 @@ fn real_main(args: Vec<OsString>) -> Result<i32, String> {
         }
         "run" => run(parse(&args[1..])?),
         "mcp" => mcp(&args[1..]),
+        "setup-windows" => setup_windows(&args[1..]),
         other => Err(format!("unknown command `{other}` (try `sbx --help`)")),
     }
 }
@@ -340,6 +362,42 @@ fn run(o: Options) -> Result<i32, String> {
         }
     }
     Ok(outcome.code())
+}
+
+/// `sbx setup-windows`: see [`incord_sandbox::windows::offline`].
+fn setup_windows(args: &[OsString]) -> Result<i32, String> {
+    let args: Vec<String> = args
+        .iter()
+        .map(|a| {
+            a.to_str()
+                .map(str::to_string)
+                .ok_or_else(|| "an argument is not valid Unicode".to_string())
+        })
+        .collect::<Result<_, _>>()?;
+    let parsed = incord_sandbox::windows::offline::parse_setup_args(&args)?;
+    #[cfg(windows)]
+    {
+        for line in incord_sandbox::windows::setup_windows(&parsed)? {
+            println!("sbx setup-windows: {line}");
+        }
+        if parsed.remove {
+            println!("sbx setup-windows: removed; network deny now needs WSL2 again");
+        } else {
+            println!(
+                "sbx setup-windows: done; `sbx run --net deny ...` now runs natively (see `sbx doctor`)"
+            );
+        }
+        Ok(0)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = parsed;
+        Err(
+            "setup-windows is for Windows only: it sets up network deny for the native \
+             Windows sandbox"
+                .to_string(),
+        )
+    }
 }
 
 fn mcp(args: &[OsString]) -> Result<i32, String> {
