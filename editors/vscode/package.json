@@ -1,0 +1,117 @@
+{
+  "name": "incode",
+  "displayName": "incode",
+  "description": "Chat with incode from VS Code over the Agent Client Protocol (incode --acp).",
+  "version": "0.1.0",
+  "publisher": "incordai",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/incordai/Incode",
+    "directory": "editors/vscode"
+  },
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "AI",
+    "Chat"
+  ],
+  "main": "./out/src/extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "incode",
+          "title": "incode",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "incode": [
+        {
+          "type": "webview",
+          "id": "incode.chat",
+          "name": "Chat"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "incode.openChat",
+        "title": "Open Chat",
+        "category": "incode"
+      },
+      {
+        "command": "incode.newSession",
+        "title": "New Session",
+        "category": "incode"
+      },
+      {
+        "command": "incode.sendSelection",
+        "title": "Send Selection to Chat",
+        "category": "incode"
+      },
+      {
+        "command": "incode.restart",
+        "title": "Restart Agent",
+        "category": "incode"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "incode.sendSelection",
+          "when": "editorHasSelection",
+          "group": "incode"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "incode.newSession",
+          "when": "view == incode.chat",
+          "group": "navigation"
+        },
+        {
+          "command": "incode.restart",
+          "when": "view == incode.chat"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "incode",
+      "properties": {
+        "incode.path": {
+          "type": "string",
+          "default": "incode",
+          "markdownDescription": "Path to the `incode` binary. A bare name is looked up on `PATH`.",
+          "scope": "machine-overridable"
+        },
+        "incode.args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "markdownDescription": "Extra arguments passed after `--acp`, e.g. `[\"-p\", \"read-only\"]` or `[\"-m\", \"<model>\"]`.",
+          "scope": "machine-overridable"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile",
+    "test": "node --test --test-timeout=150000 --test-reporter=spec \"out/test/**/*.test.js\"",
+    "package": "npx --yes @vscode/vsce@3 package --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "~1.90.0",
+    "typescript": "~5.6.3"
+  }
+}

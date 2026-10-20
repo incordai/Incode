@@ -144,7 +144,13 @@ fn main() -> anyhow::Result<()> {
     // errors) but no subscriber is installed, so they currently go nowhere.
     // Installing one needs a new dependency, which is a decision to take
     // deliberately rather than as a side effect of adding this entry point.
-    let parsed = parse_args(std::env::args().skip(1))?;
+    let parsed = match parse_args(std::env::args().skip(1)) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            json_failure(std::env::args().skip(1), &e.to_string());
+            return Err(e);
+        }
+    };
     // Before anything reads `~/.incode/` or a project's `.incode/`: state left
     // under the old names (`~/.incord-code/`, `.incord/`) is carried over.
     // stderr, never stdout: several modes speak a protocol on stdout.
@@ -185,6 +191,7 @@ fn main() -> anyhow::Result<()> {
             model,
             format,
             spec_gate,
+            permission_mode,
         } => {
             let spec_gate = incord_code::spec::SpecGate::resolve(
                 spec_gate,
@@ -192,7 +199,10 @@ fn main() -> anyhow::Result<()> {
                     .ok()
                     .as_deref(),
             )
-            .map_err(|e| anyhow::anyhow!(e))?;
+            .map_err(|e| {
+                json_failure(std::env::args().skip(1), &e);
+                anyhow::anyhow!(e)
+            })?;
             // `-t "/name args"` runs the operator's custom command, held to
             // its `allowed-tools`.
             let task = incord_code::custom_commands::expand_task(&workspace, instruction, model);
@@ -201,10 +211,13 @@ fn main() -> anyhow::Result<()> {
                     &workspace,
                     &task.instruction,
                     task.model.as_deref(),
-                    &task.allowed_tools,
                     format,
                     spec_gate,
-                    &created_outside,
+                    &incord_code::task_run::RunOptions {
+                        command_tools: &task.allowed_tools,
+                        permission_mode,
+                        created: &created_outside,
+                    },
                 )
             })?
             .map(|_| ())
@@ -421,6 +434,35 @@ fn on_a_runtime<T>(work: impl FnOnce() -> T) -> anyhow::Result<T> {
 }
 
 /// What the arguments asked for.
+/// A `-t --output-format json|stream-json` run that fails before it starts
+/// still ends with the one result object a script reads, on stdout: without
+/// it the script sees no JSON at all, only an exit code and stderr. The
+/// message is the error's first paragraph (the usage text after it is for a
+/// person).
+fn json_failure(args: impl Iterator<Item = String>, error: &str) {
+    if let Some(line) = json_failure_line(args, error) {
+        println!("{line}");
+    }
+}
+
+fn json_failure_line(args: impl Iterator<Item = String>, error: &str) -> Option<String> {
+    let args: Vec<String> = args.collect();
+    let is_task = args.iter().any(|a| a == "-t" || a == "--task");
+    let json = args.iter().enumerate().any(|(i, a)| {
+        let value = match a.strip_prefix("--output-format=") {
+            Some(v) => Some(v),
+            None if a == "--output-format" => args.get(i + 1).map(String::as_str),
+            None => None,
+        };
+        matches!(value, Some("json" | "stream-json"))
+    });
+    if !(is_task && json) {
+        return None;
+    }
+    let message = error.split("\n\n").next().unwrap_or(error).trim();
+    Some(serde_json::json!({"type": "result", "is_error": true, "error": message}).to_string())
+}
+
 #[derive(Debug)]
 enum Parsed {
     Run(Box<IncordCodeConfig>),
@@ -434,6 +476,10 @@ enum Parsed {
         /// `--spec-gate`, when given. The environment is read in `main`, not
         /// here, so parsing stays a function of the arguments alone.
         spec_gate: Option<incord_code::spec::SpecGate>,
+        /// `-p`, when given: what every candidate agent may do. Unset, the run
+        /// keeps its default (workspace-write, or `INCODE_PERMISSION_MODE` on
+        /// a CLI agent).
+        permission_mode: Option<incord_code::PermissionMode>,
     },
     Exit(String),
     /// Serve what the run is doing to a local interface, and nothing else.
@@ -595,6 +641,8 @@ fn parse_args(args: impl Iterator<Item = String>) -> anyhow::Result<Parsed> {
     let mut task: Option<String> = None;
     let mut output_format: Option<incord_code::task_run::OutputFormat> = None;
     let mut spec_gate: Option<incord_code::spec::SpecGate> = None;
+    // Whether `-p` was given, so a task applies it rather than the default.
+    let mut permission_named = false;
 
     // A subcommand, not a flag, as `claude update` and the like are: only in
     // first place, and it takes nothing but its own `--check`.
@@ -647,6 +695,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> anyhow::Result<Parsed> {
                     );
                 }
                 config.permission_mode = value;
+                permission_named = true;
             }
             "--check-findings" => check_findings = Some(next_value(&mut args, &arg)?),
             "--admin" => admin_only = true,
@@ -903,6 +952,9 @@ fn parse_args(args: impl Iterator<Item = String>) -> anyhow::Result<Parsed> {
             model: config.model_from_flag,
             format: output_format.unwrap_or_default(),
             spec_gate,
+            permission_mode: permission_named
+                .then(|| PermissionMode::parse(&config.permission_mode))
+                .flatten(),
         });
     }
     // Only a one-shot task has an output to format; ignored anywhere else it
@@ -1518,14 +1570,51 @@ mod tests {
                 model,
                 format,
                 spec_gate,
+                permission_mode,
             } => {
                 assert_eq!(instruction, "write the brief");
+                assert_eq!(permission_mode, None, "no -p, so the run's default");
                 assert_eq!(workspace, PathBuf::from("."));
                 assert_eq!(model, None);
                 assert_eq!(format, incord_code::task_run::OutputFormat::Text);
                 assert_eq!(spec_gate, None, "no flag, so the run decides from the env");
             }
             other => panic!("--task must not start a session, got {other:?}"),
+        }
+    }
+
+    /// **A SCRIPT THAT ASKED FOR JSON GETS JSON, EVEN WHEN THE RUN NEVER
+    /// STARTS.** Only for `-t` with a JSON format; the usage text is left
+    /// out of the message.
+    #[test]
+    fn a_task_that_fails_to_start_still_answers_in_json() {
+        let args = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let line = json_failure_line(
+            args(&["-t", "x", "--output-format", "json", "-w", "/nope"]).into_iter(),
+            "workspace `/nope` is not a directory\n\nUSAGE: ...",
+        )
+        .expect("json asked for");
+        let v: serde_json::Value = serde_json::from_str(&line).expect("json");
+        assert_eq!(v["type"], "result");
+        assert_eq!(v["is_error"], true);
+        assert_eq!(v["error"], "workspace `/nope` is not a directory");
+        assert!(json_failure_line(
+            args(&["-t", "x", "--output-format=stream-json"]).into_iter(),
+            "e"
+        )
+        .is_some());
+        assert!(json_failure_line(args(&["-t", "x"]).into_iter(), "e").is_none());
+        assert!(json_failure_line(args(&["--output-format", "json"]).into_iter(), "e").is_none());
+    }
+
+    /// **`-p` WITH `-t` IS APPLIED, NOT IGNORED.**
+    #[test]
+    fn a_task_carries_the_permission_mode_it_was_given() {
+        match parse(&["-t", "look", "-w", ".", "-p", "read-only"]).expect("valid") {
+            Parsed::Task {
+                permission_mode, ..
+            } => assert_eq!(permission_mode, Some(incord_code::PermissionMode::ReadOnly)),
+            other => panic!("-t must run a task, got {other:?}"),
         }
     }
 

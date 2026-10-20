@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "incode_sdk"
+version = "0.1.0"
+description = "Drive the incode coding agent from Python: one-shot tasks and ACP sessions"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+dependencies = []
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: POSIX",
+    "Typing :: Typed",
+]
+
+[tool.setuptools]
+packages = ["incode_sdk"]
+
+[tool.setuptools.package-data]
+incode_sdk = ["py.typed"]

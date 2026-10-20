@@ -538,7 +538,8 @@ Prices for `/cost`, the status line and `-t --output-format json` (`cost_usd`) a
 
 `incode review` (and `/review` in a session) hands the model the change and
 one job: report correctness bugs first, then security problems, then
-simplifications, each cited as `path:line` — or say "No issues found."
+simplifications, each cited as `path:line` — or say "No issues found." It
+runs read-only: the agent may read the code and run nothing that writes.
 
 ```sh
 incode review                     # the branch since it forked from origin's default branch, plus uncommitted and untracked work
@@ -1352,10 +1353,14 @@ The full list is in `docs/ROADMAP.md`.
 ## Development
 
 ```sh
-cargo test                          # about 1,900 tests (1,878 library, 46 binary)
+scripts/test-all.sh                 # everything CI runs, and the SDKs and editor extension
+cargo test                          # about 2,100 tests (library and binary)
 cargo clippy --all-targets -- -D warnings
 cargo fmt
 ```
+
+[TESTING.md](TESTING.md) lists every suite, the Windows check, the live tests
+that are off by default and what is worth trying by hand.
 
 The documents under `docs/` are the input the loop reads, not decoration:
 `PRD.md` (what and why), `ARCHITECTURE.md` (the shape), `CONVENTIONS.md` (how

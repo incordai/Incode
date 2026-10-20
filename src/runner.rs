@@ -2380,6 +2380,9 @@ mod tests {
     /// the runner still decided.
     #[test]
     fn two_ready_tasks_are_worked_in_parallel_and_both_land() {
+        let _env = crate::brief::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let Some((_guard, root)) = a_repo() else {
             return;
         };
@@ -2493,6 +2496,9 @@ mod tests {
     /// and the run must not report plain success.
     #[test]
     fn a_lane_that_could_not_merge_is_not_recorded_as_finished() {
+        let _env = crate::brief::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let Some((_guard, root)) = a_repo() else {
             return;
         };
@@ -2772,6 +2778,9 @@ mod tests {
     /// task the retry is given names it.
     #[test]
     fn a_conflicted_lane_tells_the_retry_where_its_work_is() {
+        let _env = crate::brief::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let Some((_guard, root)) = a_repo() else {
             return;
         };
@@ -2963,6 +2972,9 @@ mod tests {
     /// and believes in it.
     #[test]
     fn what_a_lane_spends_is_charged_to_the_run() {
+        let _env = crate::brief::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let Some((_guard, root)) = a_repo() else {
             return;
         };
@@ -3001,6 +3013,9 @@ mod tests {
     /// nobody's run alters shape because they upgraded.
     #[test]
     fn a_single_lane_never_creates_a_worktree() {
+        let _env = crate::brief::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let Some((_guard, root)) = a_repo() else {
             return;
         };

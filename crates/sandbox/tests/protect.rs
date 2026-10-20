@@ -48,7 +48,13 @@ fn a_planted_hook_and_config_are_put_back_after_the_run() {
         repo.join("work.txt").exists(),
         "ordinary work stays: {stderr}"
     );
-    assert!(stderr.contains("protected path changed"), "{stderr}");
+    // Linux puts the paths back after the run and says so; macOS's profile
+    // refuses the writes outright, so there is nothing to put back.
+    if cfg!(target_os = "macos") {
+        assert!(stderr.contains("Operation not permitted"), "{stderr}");
+    } else {
+        assert!(stderr.contains("protected path changed"), "{stderr}");
+    }
 
     // Opted out, the change stays.
     Command::new(env!("CARGO_BIN_EXE_sbx"))

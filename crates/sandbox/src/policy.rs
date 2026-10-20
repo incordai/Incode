@@ -370,7 +370,8 @@ mod tests {
     #[test]
     fn the_documented_example_parses() {
         let doc = include_str!("policy.rs")
-            .split("//! ```toml\n")
+            // Not `toml\n`: a Windows checkout has CRLF line endings.
+            .split("//! ```toml")
             .nth(1)
             .and_then(|rest| rest.split("//! ```").next())
             .expect("the module docs carry an example");
