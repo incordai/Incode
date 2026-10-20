@@ -80,6 +80,11 @@ pub(super) struct HttpLink {
     messages: Receiver<String>,
     /// The POSTs still running, stopped when the link is dropped.
     running: Vec<tokio::task::AbortHandle>,
+    /// Signalled when the last notification's POST has finished: the next
+    /// POST waits for it, so a server never sees `tools/list` before the
+    /// `notifications/initialized` sent ahead of it. Requests themselves may
+    /// still overlap one another.
+    after_notification: Option<tokio::sync::oneshot::Receiver<()>>,
     /// The OAuth token for this server, when it has one to send.
     auth: Option<Arc<TokenSource>>,
     /// Who this is, for the messages it causes: `MCP server `memory``.
@@ -125,6 +130,7 @@ impl HttpLink {
             tx,
             messages,
             running: Vec::new(),
+            after_notification: None,
             auth: None,
             what: what.to_string(),
         })
@@ -178,7 +184,20 @@ impl Link for HttpLink {
         let out = self.tx.clone();
         let what = self.what.clone();
         self.running.retain(|task| !task.is_finished());
+        let wait_for = self.after_notification.take();
+        let (done, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let done = if id.is_none() {
+            self.after_notification = Some(done_rx);
+            Some(done)
+        } else {
+            None
+        };
         let task = crate::runtime::http::SHARED_RUNTIME.spawn(async move {
+            // Dropped when this task ends, however it ends: that is the signal.
+            let _done = done;
+            if let Some(earlier) = wait_for {
+                let _ = earlier.await;
+            }
             let had_session = lock(&session).is_some();
             let answered = match send_authorized(&build, auth.as_deref()).await {
                 Ok(response) => {
