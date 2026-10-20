@@ -58,6 +58,10 @@ jobs:
       - run: cargo clippy --all-targets
       - run: cargo test --lib
       - run: cargo test --bins
+      # The standalone sandbox (`sbx`). Its escape tests run on Linux and
+      # macOS, and skip, saying so, where the OS cannot enforce what they check.
+      - run: cargo clippy -p incord-sandbox --all-targets -- -D warnings
+      - run: cargo test -p incord-sandbox
       # A test that writes outside its temp dir lands in the checkout — a
       # Windows drive path is RELATIVE on Linux and macOS — and passes anyway.
       # Only a clean tree after the run catches it.

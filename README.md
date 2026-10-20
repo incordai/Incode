@@ -740,6 +740,26 @@ confined only when named; the operator's own `/bg` jobs at the REPL are never
 sandboxed. Where a mode cannot be applied, the command runs unconfined and the
 trace says which.
 
+### `sbx`: the same sandbox for any agent
+
+`crates/sandbox` builds `sbx`, a standalone sandbox that doesn't depend on
+incode. It runs any command, whether an agent CLI, a test suite or Insi's
+workers, under one policy file:
+- writable roots, plus paths hidden even from reading (`deny_read`);
+- network `allow`, `deny`, or an allowlisting proxy by host name;
+- the agent-session and `GIT_DIR` variables stripped;
+- CPU, memory, file-size and wall-clock limits.
+
+It refuses a policy the machine cannot enforce in full instead of running
+with less. To confine a whole incode run:
+
+```sh
+sbx run -w . -w ~/.claude -w ~/.claude.json -w ~/.incode --wall 1800 -- incode -t "…"
+```
+
+Details, the policy format and what each OS enforces are in
+[`crates/sandbox/README.md`](crates/sandbox/README.md).
+
 ## Incord Memory integration
 
 Every part is optional and fails open, except the owner channel, which fails
