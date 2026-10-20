@@ -815,7 +815,7 @@ fn clone(url: &str, dest: &Path) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "`{url}` is not a folder, and git could not clone it: {}",
+            "git could not clone `{url}`: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         ))
     }
