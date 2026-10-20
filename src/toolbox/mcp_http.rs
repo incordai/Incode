@@ -22,6 +22,15 @@
 //! The headers are sent as given and written nowhere else: not to the trace,
 //! not into a message. Neither is the address, which can carry a key too.
 //!
+//! # OAuth
+//!
+//! A server from incode's own configuration may carry a
+//! [`crate::mcp_oauth::TokenSource`]: its token goes as `Authorization:
+//! Bearer` on every request, refreshed before it is sent once it has expired,
+//! and a `401` is answered by renewing it and sending the request once more. A
+//! server still refusing — or one with no token at all — fails the request
+//! with the command that logs in (`incode mcp login <name>`).
+//!
 //! # A failure costs one request
 //!
 //! An unreachable server, an HTTP error, or an answer that is refused or cannot
@@ -34,11 +43,12 @@ use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, CONTENT_TYPE};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 
 use super::mcp_client::{Link, MAX_LINE_BYTES};
+use crate::mcp_oauth::TokenSource;
 
 /// The header a server names its session in, and that carries it back.
 const SESSION_HEADER: &str = "mcp-session-id";
@@ -70,6 +80,8 @@ pub(super) struct HttpLink {
     messages: Receiver<String>,
     /// The POSTs still running, stopped when the link is dropped.
     running: Vec<tokio::task::AbortHandle>,
+    /// The OAuth token for this server, when it has one to send.
+    auth: Option<Arc<TokenSource>>,
     /// Who this is, for the messages it causes: `MCP server `memory``.
     what: String,
 }
@@ -113,8 +125,15 @@ impl HttpLink {
             tx,
             messages,
             running: Vec::new(),
+            auth: None,
             what: what.to_string(),
         })
+    }
+
+    /// The same link, sending `auth`'s bearer token on every request.
+    pub(super) fn with_auth(mut self, auth: TokenSource) -> Self {
+        self.auth = Some(Arc::new(auth));
+        self
     }
 
     /// The headers one request carries: the client's, then the protocol's
@@ -141,17 +160,33 @@ impl Link for HttpLink {
             .ok()
             .and_then(|message| message.get("id").cloned())
             .filter(|id| !id.is_null());
-        let request = client
-            .post(&self.url)
-            .headers(self.request_headers())
-            .timeout(self.cap)
-            .body(line.to_string());
+        let (url, headers, cap, body) = (
+            self.url.clone(),
+            self.request_headers(),
+            self.cap,
+            line.to_string(),
+        );
+        let build = move || {
+            client
+                .post(&url)
+                .headers(headers.clone())
+                .timeout(cap)
+                .body(body.clone())
+        };
         let session = Arc::clone(&self.session);
+        let auth = self.auth.clone();
         let out = self.tx.clone();
         let what = self.what.clone();
         self.running.retain(|task| !task.is_finished());
         let task = crate::runtime::http::SHARED_RUNTIME.spawn(async move {
-            let Err(why) = post(request, &session, &out, id.as_ref()).await else {
+            let had_session = lock(&session).is_some();
+            let answered = match send_authorized(&build, auth.as_deref()).await {
+                Ok(response) => {
+                    read_answer(response, had_session, &session, &out, id.as_ref()).await
+                }
+                Err(why) => Err(why),
+            };
+            let Err(why) = answered else {
                 return;
             };
             match id {
@@ -193,6 +228,14 @@ impl Drop for HttpLink {
         };
         let mut headers = self.headers.clone();
         headers.insert(SESSION_HEADER, session);
+        if let Some(bearer) = self
+            .auth
+            .as_ref()
+            .and_then(|auth| auth.held_now())
+            .and_then(|token| crate::mcp_oauth::bearer_header(&token))
+        {
+            headers.insert(AUTHORIZATION, bearer);
+        }
         let request = client.delete(&self.url).headers(headers).timeout(END_BOUND);
         drop(crate::runtime::http::SHARED_RUNTIME.spawn(async move {
             let _ = request.send().await;
@@ -225,21 +268,56 @@ fn deliver(value: Value, out: &Sender<String>, id: Option<&Value>) -> bool {
     replied
 }
 
-/// One POST, and every message its answer carries sent to `out`. `id` is the
+/// `request` with `token` as its bearer, when there is one.
+fn with_bearer(request: reqwest::RequestBuilder, token: Option<&str>) -> reqwest::RequestBuilder {
+    match token.and_then(crate::mcp_oauth::bearer_header) {
+        Some(bearer) => request.header(AUTHORIZATION, bearer),
+        None => request,
+    }
+}
+
+/// Send the request `build` makes, with `auth`'s token when there is one. A
+/// `401` renews the token and sends it once more; refused again, it fails
+/// with the command that logs in.
+async fn send_authorized(
+    build: &(dyn Fn() -> reqwest::RequestBuilder + Send + Sync),
+    auth: Option<&TokenSource>,
+) -> Result<reqwest::Response, String> {
+    // `without_url`: the address can carry a key of its own.
+    let reached = |e: reqwest::Error| format!("it could not be reached: {}", e.without_url());
+    let Some(auth) = auth else {
+        return build().send().await.map_err(reached);
+    };
+    let token = auth.current().await;
+    let first = with_bearer(build(), token.as_deref())
+        .send()
+        .await
+        .map_err(reached)?;
+    if first.status() != StatusCode::UNAUTHORIZED {
+        return Ok(first);
+    }
+    drop(first);
+    let renewed = auth.renew(token.as_deref()).await?;
+    let second = with_bearer(build(), Some(&renewed))
+        .send()
+        .await
+        .map_err(reached)?;
+    if second.status() == StatusCode::UNAUTHORIZED {
+        return Err(auth.refused());
+    }
+    Ok(second)
+}
+
+/// One POST's answer, every message it carries sent to `out`. `id` is the
 /// request's own when it is one: a request whose reply the answer does not
-/// carry has failed.
-async fn post(
-    request: reqwest::RequestBuilder,
+/// carry has failed. `had_session` is whether the request carried a session.
+async fn read_answer(
+    mut response: reqwest::Response,
+    had_session: bool,
     session: &Mutex<Option<HeaderValue>>,
     out: &Sender<String>,
     id: Option<&Value>,
 ) -> Result<(), String> {
-    let had_session = lock(session).is_some();
-    // `without_url`: the address can carry a key of its own.
-    let mut response = request
-        .send()
-        .await
-        .map_err(|e| format!("it could not be reached: {}", e.without_url()))?;
     let status = response.status();
     if let Some(named) = response.headers().get(SESSION_HEADER) {
         let mut named = named.clone();
@@ -491,6 +569,7 @@ pub(crate) mod tests {
             transport: Transport::Http {
                 url: url.to_string(),
                 headers: vec![(TOKEN_HEADER.to_string(), TOKEN.to_string())],
+                oauth: None,
             },
         }
     }

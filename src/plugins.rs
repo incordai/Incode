@@ -363,6 +363,7 @@ impl Plugin {
                 crate::toolbox::Transport::Http {
                     url: self.fill(url),
                     headers: pairs(def.get("headers")),
+                    oauth: None,
                 }
             } else if let Some(command) = def.get("command").and_then(serde_json::Value::as_str) {
                 crate::toolbox::Transport::Stdio {

@@ -60,7 +60,7 @@ fn entries_become_specs_with_variables_expanded() {
     }
     let docs = file.servers["docs"].to_spec("docs", &lookup).expect("spec");
     match docs.transport {
-        Transport::Http { url, headers } => {
+        Transport::Http { url, headers, .. } => {
             assert_eq!(url, "https://mcp.example.com/mcp", "the default applies");
             assert_eq!(headers[0].1, "Bearer d0c");
         }

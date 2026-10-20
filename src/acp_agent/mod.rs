@@ -869,6 +869,7 @@ fn server_specs(servers: &[acp::McpServer]) -> (Vec<crate::toolbox::ServerSpec>,
                         .iter()
                         .map(|header| (header.name.clone(), header.value.clone()))
                         .collect(),
+                    oauth: None,
                 },
             }),
             acp::McpServer::Sse(sse) => said.push(format!(

@@ -95,10 +95,13 @@ pub(crate) enum Transport {
         args: Vec<String>,
         env: Vec<(String, String)>,
     },
-    /// An MCP endpoint over Streamable HTTP, and the headers to send it.
+    /// An MCP endpoint over Streamable HTTP, and the headers to send it —
+    /// and, for a server from incode's own configuration, where its OAuth
+    /// token is kept ([`crate::mcp_oauth`]).
     Http {
         url: String,
         headers: Vec<(String, String)>,
+        oauth: Option<crate::mcp_oauth::Binding>,
     },
 }
 
@@ -116,9 +119,10 @@ impl std::fmt::Debug for Transport {
                 .field("args", args)
                 .field("env", &names(env))
                 .finish(),
-            Self::Http { headers, .. } => f
+            Self::Http { headers, oauth, .. } => f
                 .debug_struct("Http")
                 .field("headers", &names(headers))
+                .field("oauth", &oauth.is_some())
                 .finish_non_exhaustive(),
         }
     }
@@ -379,8 +383,18 @@ fn start(
         }
         // Each POST is capped at the longest a call may take; `McpClient`
         // bounds each request more tightly where it must.
-        Transport::Http { url, headers } => {
-            Box::new(HttpLink::connect(url, headers, CALL_BOUND, &what)?)
+        Transport::Http {
+            url,
+            headers,
+            oauth,
+        } => {
+            let link = HttpLink::connect(url, headers, CALL_BOUND, &what)?;
+            match oauth {
+                Some(binding) => {
+                    Box::new(link.with_auth(crate::mcp_oauth::TokenSource::new(binding, url)))
+                }
+                None => Box::new(link),
+            }
         }
     };
     let mut client = McpClient::open(link, &what, bound)?;
@@ -750,6 +764,7 @@ pub(crate) mod tests {
             transport: Transport::Http {
                 url: "https://example.test/mcp?key=k3y".to_string(),
                 headers: vec![("authorization".to_string(), "Bearer s3cret".to_string())],
+                oauth: None,
             },
         };
         let shown = format!("{http:?}");
