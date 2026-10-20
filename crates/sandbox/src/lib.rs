@@ -669,9 +669,15 @@ impl Sandbox {
                 grant.push(real(cwd));
             }
             grant.push(temp.path.clone());
-            let account = offline.as_ref().map(|ready| windows::acl::OfflineGrant {
-                user: ready.sid.clone(),
-                reads: windows::offline_reads(&grant, &real(cwd), &real(&helper)),
+            let account = offline.as_ref().map(|ready| {
+                let reads = windows::offline_reads(&grant, &real(cwd), &real(&helper));
+                windows::acl::OfflineGrant {
+                    user: ready.sid.clone(),
+                    // PowerShell lists the current folder's parent to start
+                    // in it at all.
+                    parents: windows::offline_parents(&grant, &reads, &real(cwd)),
+                    reads,
+                }
             });
             match windows::acl::Lease::acquire(&grant, account) {
                 Ok(lease) => Some(lease),

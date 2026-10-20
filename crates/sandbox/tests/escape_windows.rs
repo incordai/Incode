@@ -914,6 +914,110 @@ fn concurrent_deny_runs_share_a_root_and_cannot_write_each_others() {
     assert!(!icacls(&d.ws).contains(OFFLINE), "{}", icacls(&d.ws));
 }
 
+/// The account's ACE lines in `icacls` output.
+fn offline_aces(icacls: &str) -> Vec<String> {
+    icacls
+        .lines()
+        .filter(|l| l.contains(OFFLINE))
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn powershell_under_network_deny_starts_in_the_current_folder() {
+    // PowerShell sets its first location by looking the current folder up
+    // in its parent; as the offline account, with no right to list a parent
+    // under the user's profile, it was left at `C:\` and relative paths
+    // went there. The run lets the account list that one parent, by one ACE
+    // that reaches nothing beneath it, for the run only.
+    if !needs_offline("powershell_under_network_deny_starts_in_the_current_folder") {
+        return;
+    }
+    let d = dirs();
+    let parent = d.ws.parent().expect("parent").to_path_buf();
+    let sibling = parent.join("sibling.txt");
+    std::fs::write(&sibling, "x").expect("sibling");
+    let child = base(&d.ws)
+        .args([
+            "run",
+            "--net",
+            "deny",
+            "-w",
+            ".",
+            "--",
+            "powershell",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "(Get-Location).Path; [Environment]::CurrentDirectory; \
+             Set-Content -Path rel.txt -Value x; \
+             $deadline = (Get-Date).AddSeconds(60); \
+             while (-not (Test-Path go.txt) -and (Get-Date) -lt $deadline) \
+             { Start-Sleep -Milliseconds 200 }",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("sbx");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !d.ws.join("rel.txt").exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // During the run: the parent carries the account's ACE, explicit and
+    // inherited by nothing; nothing beside the workspace got one.
+    let during = icacls(&parent);
+    let aces = offline_aces(&during);
+    let on_parent = aces.len();
+    let not_inherited = aces
+        .iter()
+        .all(|l| !l.contains("(OI)") && !l.contains("(CI)") && !l.contains("(I)"));
+    let sibling_during = icacls(&sibling);
+    let out_during = icacls(&d.out);
+    std::fs::write(d.ws.join("go.txt"), "go").expect("go");
+    let o = child.wait_with_output().expect("sbx ends");
+    let printed = text(&o);
+
+    let ws = d.ws.to_string_lossy().to_lowercase();
+    let lines: Vec<String> = String::from_utf8_lossy(&o.stdout)
+        .lines()
+        .map(|l| l.trim().to_lowercase())
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert_eq!(
+        lines.first(),
+        Some(&ws),
+        "Get-Location is the workspace: {printed}"
+    );
+    assert_eq!(
+        lines.get(1),
+        Some(&ws),
+        "the process's current directory is the workspace: {printed}"
+    );
+    assert!(
+        d.ws.join("rel.txt").exists(),
+        "a relative path lands in the workspace: {printed}"
+    );
+    assert_eq!(on_parent, 1, "one ACE on the parent: {during}");
+    assert!(not_inherited, "the parent's ACE inherits: {during}");
+    assert!(
+        offline_aces(&sibling_during).is_empty(),
+        "a file beside the workspace got the account's ACE: {sibling_during}"
+    );
+    assert!(
+        offline_aces(&out_during).is_empty(),
+        "a folder beside the workspace got the account's ACE: {out_during}"
+    );
+    // After the run, the parent's ACE is gone, and nothing was left beside.
+    let after = icacls(&parent);
+    assert!(
+        offline_aces(&after).is_empty(),
+        "the parent's ACE outlived the run: {after}"
+    );
+    assert!(offline_aces(&icacls(&sibling)).is_empty());
+    assert!(offline_aces(&icacls(&d.out)).is_empty());
+    assert!(offline_aces(&icacls(&d.ws)).is_empty());
+}
+
 #[test]
 fn proxy_lets_only_the_allowlist_through_natively() {
     if !needs_offline("proxy_lets_only_the_allowlist_through") || curl().is_none() {

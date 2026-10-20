@@ -210,11 +210,16 @@ pub struct GrantRecord {
     /// Paths only the offline account is granted, for reading: the current
     /// folder, the helper program.
     pub reads: Vec<PathBuf>,
+    /// Folders the offline account may only list, by one ACE on the folder
+    /// itself and nothing beneath it: the current folder's parent
+    /// ([`offline_parents`]). Records written before this field have none.
+    pub parents: Vec<PathBuf>,
 }
 
 impl GrantRecord {
-    /// The record's text: `sid`, a `root` per root, then `user` and a `read`
-    /// per read path when the offline account takes part.
+    /// The record's text: `sid`, a `root` per root, then `user`, a `read`
+    /// per read path and a `parent` per listed folder when the offline
+    /// account takes part.
     #[must_use]
     pub fn to_text(&self) -> String {
         let mut text = format!("sid {}\n", self.sid);
@@ -226,6 +231,9 @@ impl GrantRecord {
         }
         for read in &self.reads {
             text.push_str(&format!("read {}\n", read.display()));
+        }
+        for parent in &self.parents {
+            text.push_str(&format!("parent {}\n", parent.display()));
         }
         text
     }
@@ -243,6 +251,7 @@ impl GrantRecord {
                 Some(("root", v)) => record.roots.push(PathBuf::from(v)),
                 Some(("user", v)) if offline::is_sid(v) => record.user = Some(v.to_string()),
                 Some(("read", v)) => record.reads.push(PathBuf::from(v)),
+                Some(("parent", v)) => record.parents.push(PathBuf::from(v)),
                 _ => {}
             }
         }
@@ -366,6 +375,70 @@ pub fn offline_reads(roots: &[PathBuf], cwd: &Path, helper: &Path) -> Vec<PathBu
         .filter(|p| !held(p))
         .map(Path::to_path_buf)
         .collect()
+}
+
+/// The folders the offline account must be able to LIST (and only list)
+/// for a run starting in `cwd`: the current folder's parent, unless it is a
+/// drive or share root (`Users` may list those already, and they are never
+/// re-ACLed) or a root or read folder already holds it (and so grants more).
+///
+/// Why: Windows PowerShell (and pwsh) sets its first location by
+/// normalising the process's current directory, and the FileSystem
+/// provider's `NormalizeRelativePath` looks the folder up in its parent
+/// (`Directory.EnumerateFiles(parent, leaf)`, then `EnumerateDirectories`)
+/// to get its exact case. That enumeration needs `FILE_LIST_DIRECTORY` on
+/// the parent. The offline account has none on a folder under the user's
+/// profile, the lookup throws `UnauthorizedAccessException`, startup
+/// swallows it, and PowerShell is left at the drive root: `Set-Content
+/// rel.txt` writes `C:\rel.txt`. Nothing else is needed: traversal is
+/// `SeChangeNotifyPrivilege`'s (kept in the command's token), and the
+/// folder's own attributes come from its own read grant.
+#[must_use]
+pub fn offline_parents(roots: &[PathBuf], reads: &[PathBuf], cwd: &Path) -> Vec<PathBuf> {
+    let Some(parent) = parent_of(&cwd.to_string_lossy()) else {
+        return Vec::new();
+    };
+    // Absolute and not a drive or share root.
+    if refuse_broad(&parent, None).is_err() {
+        return Vec::new();
+    }
+    let held = roots
+        .iter()
+        .chain(reads)
+        .any(|r| holds(&r.to_string_lossy(), &parent));
+    if held {
+        return Vec::new();
+    }
+    vec![PathBuf::from(parent)]
+}
+
+/// Whether `path` is one of `parents` (as Windows compares paths): another
+/// live run still needs the account to list it.
+#[must_use]
+pub fn is_listed(path: &Path, parents: &[PathBuf]) -> bool {
+    let key = path_key(&path.to_string_lossy());
+    parents
+        .iter()
+        .any(|p| path_key(&p.to_string_lossy()) == key)
+}
+
+/// `path`'s parent folder, Windows-style on every platform (the pure parts
+/// are tested on Linux, where `Path::parent` does not split on `\`): the
+/// text before the last separator, a bare `C:` given back its `\`. `None`
+/// for a path with no separator.
+fn parent_of(path: &str) -> Option<String> {
+    let trimmed = path.trim_end_matches(['\\', '/']);
+    let cut = trimmed.rfind(['\\', '/'])?;
+    let parent = &trimmed[..cut];
+    if parent.is_empty() || parent.ends_with(['\\', '/']) {
+        // `\\server` and the like: no folder to grant.
+        return None;
+    }
+    Some(if parent.ends_with(':') {
+        format!("{parent}\\")
+    } else {
+        parent.to_string()
+    })
 }
 
 // ---- Starting the command: the program and its command line. ----
@@ -613,7 +686,9 @@ mod tests {
             roots,
             user: Some("S-1-5-21-1-2-3-1009".into()),
             reads: vec![PathBuf::from(r"C:\proj"), PathBuf::from(r"C:\bin\sbx.exe")],
+            parents: vec![PathBuf::from(r"C:\Users\me\src")],
         };
+        assert!(offline.to_text().ends_with("parent C:\\Users\\me\\src\n"));
         assert_eq!(GrantRecord::parse(&offline.to_text()), Some(offline));
         assert!(GrantRecord::parse("sid S-1-1-0\nroot C:\\w\n").is_none());
         assert!(GrantRecord::parse(&format!("sid {SID_PREFIX}\n")).is_none());
@@ -621,6 +696,84 @@ mod tests {
         // A malformed user is dropped, not trusted.
         let odd = GrantRecord::parse(&format!("sid {}\nuser everyone\n", session_sid(5)));
         assert_eq!(odd.and_then(|r| r.user), None);
+    }
+
+    #[test]
+    fn a_record_from_before_the_parent_lines_still_parses() {
+        let text = format!(
+            "sid {}\nroot C:\\w\nuser S-1-5-21-1-2-3-1009\nread C:\\bin\\sbx.exe\n",
+            session_sid(7)
+        );
+        let record = GrantRecord::parse(&text).expect("parses");
+        assert_eq!(record.reads, [PathBuf::from(r"C:\bin\sbx.exe")]);
+        assert!(record.parents.is_empty());
+        // And written back, it is the same text: nothing new appears.
+        assert_eq!(record.to_text(), text);
+    }
+
+    #[test]
+    fn the_account_lists_the_current_folders_parent_and_nothing_more() {
+        let none: [PathBuf; 0] = [];
+        let ws = Path::new(r"C:\Users\me\AppData\Local\Temp\.tmpAb\ws");
+        // The parent only: no grandparent, no drive root.
+        assert_eq!(
+            offline_parents(&[ws.to_path_buf()], &none, ws),
+            [PathBuf::from(r"C:\Users\me\AppData\Local\Temp\.tmpAb")]
+        );
+        // As `canonicalize` spells it, and with a trailing separator.
+        assert_eq!(
+            offline_parents(&none, &none, Path::new(r"\\?\C:\Users\me\src\proj\")),
+            [PathBuf::from(r"\\?\C:\Users\me\src")]
+        );
+        // A folder at the top of a drive or share: its parent is a root,
+        // which `Users` lists already and is never re-ACLed.
+        for top in [
+            r"C:\proj",
+            r"\\?\C:\proj",
+            r"D:\",
+            r"\\srv\share\proj",
+            r"\\?\UNC\srv\share\proj",
+            r"\\srv\share",
+            "proj",
+        ] {
+            assert_eq!(offline_parents(&none, &none, Path::new(top)), none, "{top}");
+        }
+        // Deeper on a share, the share's folder is listed.
+        assert_eq!(
+            offline_parents(&none, &none, Path::new(r"\\srv\share\team\proj")),
+            [PathBuf::from(r"\\srv\share\team")]
+        );
+        // A root or read folder that holds the parent already grants more
+        // (`Modify` or `RX`, inherited, both list): nothing to add.
+        let sub = Path::new(r"C:\w\proj\sub");
+        assert_eq!(
+            offline_parents(&[PathBuf::from(r"C:\W\Proj")], &none, sub),
+            none
+        );
+        assert_eq!(offline_parents(&[PathBuf::from(r"C:\w")], &none, sub), none);
+        assert_eq!(
+            offline_parents(&none, &[PathBuf::from(r"c:\w\proj")], sub),
+            none
+        );
+        // A root beside it, or inside the current folder, does not.
+        assert_eq!(
+            offline_parents(
+                &[PathBuf::from(r"C:\w\proj\subway"), sub.join("x")],
+                &none,
+                sub
+            ),
+            [PathBuf::from(r"C:\w\proj")]
+        );
+    }
+
+    #[test]
+    fn a_listed_parent_is_kept_while_another_run_lists_it() {
+        let others = [PathBuf::from(r"C:\Users\me\src"), PathBuf::from(r"D:\x")];
+        assert!(is_listed(Path::new(r"c:\users\ME\src\"), &others));
+        assert!(is_listed(Path::new(r"\\?\C:\Users\me\src"), &others));
+        assert!(!is_listed(Path::new(r"C:\Users\me\src\proj"), &others));
+        assert!(!is_listed(Path::new(r"C:\Users\me"), &others));
+        assert!(!is_listed(Path::new(r"C:\Users\me\src"), &[]));
     }
 
     #[test]

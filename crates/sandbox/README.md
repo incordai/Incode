@@ -307,7 +307,12 @@ What changes for the command:
   starts in, the `sbx` program, its private temp directory), plus folders
   granted with `--read`. A toolchain installed under your profile
   (`.cargo`, `.rustup`, a per-user Python or Node) needs `--read` once.
-  Narrower than without network deny, never wider.
+  Narrower than without network deny, never wider. One more right: the
+  account may *list* the folder the current folder is in (names, no
+  contents), by one ACE on that folder alone that nothing beneath it
+  inherits, for the run. PowerShell needs it: it looks its starting folder
+  up in the parent, and without it starts at `C:\` (so `Set-Content x.txt`
+  wrote `C:\x.txt`).
 - **Writes** need both the account (the token's normal check) and the run's
   private SID (its restricted check), so each root gets an ACE for each.
   Another run's command, also the account but with another run SID, cannot

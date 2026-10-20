@@ -20,6 +20,20 @@
 //! and leaves read access when another only reads it
 //! ([`super::offline::still_needed`]).
 //!
+//! # Network deny: listing the current folder's parent
+//!
+//! PowerShell finds its first location by looking the current folder up in
+//! its parent, which needs the right to list the parent
+//! ([`super::offline_parents`] says why). So the account also gets one ACE
+//! on the parent: `FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES |
+//! FILE_TRAVERSE | SYNCHRONIZE`, no inheritance flags, written to that one
+//! folder through its handle (`SetKernelObjectSecurity`, which, unlike
+//! `SetNamedSecurityInfoW` and `SetSecurityInfo`, never walks the children
+//! to re-propagate). It shows the command the names in the parent, not
+//! their contents, and reaches nothing beneath it. It is shared like the
+//! account's other ACEs: removed (that exact ACE, nothing else) when no
+//! other live run lists the same parent.
+//!
 //! # A crash leaves the ACE behind: the sweep
 //!
 //! Every grant is written down before it is made, in
@@ -43,28 +57,37 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_FILE_NOT_FOUND, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Security::Authorization::{
-    GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W,
-    GRANT_ACCESS, NO_MULTIPLE_TRUSTEE, REVOKE_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_SID,
-    TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+    GetNamedSecurityInfoW, GetSecurityInfo, SetEntriesInAclW, SetNamedSecurityInfoW,
+    EXPLICIT_ACCESS_W, GRANT_ACCESS, NO_MULTIPLE_TRUSTEE, REVOKE_ACCESS, SE_FILE_OBJECT,
+    TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
 };
 use windows_sys::Win32::Security::{
-    GetSecurityDescriptorControl, ACE_FLAGS, ACL, DACL_SECURITY_INFORMATION, NO_INHERITANCE,
-    OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED,
-    SUB_CONTAINERS_AND_OBJECTS_INHERIT, UNPROTECTED_DACL_SECURITY_INFORMATION,
+    AclSizeInformation, AddAccessAllowedAceEx, AddAce, EqualSid, GetAce, GetAclInformation,
+    GetLengthSid, GetSecurityDescriptorControl, InitializeAcl, InitializeSecurityDescriptor,
+    SetKernelObjectSecurity, SetSecurityDescriptorControl, SetSecurityDescriptorDacl,
+    ACCESS_ALLOWED_ACE, ACE_FLAGS, ACE_HEADER, ACL, ACL_REVISION, ACL_SIZE_INFORMATION,
+    DACL_SECURITY_INFORMATION, NO_INHERITANCE, OWNER_SECURITY_INFORMATION,
+    PROTECTED_DACL_SECURITY_INFORMATION, SECURITY_DESCRIPTOR, SE_DACL_AUTO_INHERITED,
+    SE_DACL_PROTECTED, SUB_CONTAINERS_AND_OBJECTS_INHERIT, UNPROTECTED_DACL_SECURITY_INFORMATION,
 };
+use windows_sys::Win32::Storage::FileSystem::{READ_CONTROL, WRITE_DAC};
 use windows_sys::Win32::System::Threading::{
     CreateMutexW, OpenMutexW, ReleaseMutex, WaitForSingleObject, SYNCHRONIZATION_SYNCHRONIZE,
 };
 
 use super::offline::{still_needed, Need};
 use super::token::{last_error, sid, sid_to_string, wide, LocalPtr, OwnedHandle};
-use super::{fold_nested, is_session_sid, refuse_broad, session_sid, GrantRecord};
+use super::{fold_nested, is_listed, is_session_sid, refuse_broad, session_sid, GrantRecord};
 
 /// The rights granted on a root: `icacls`'s `M` (read, write, execute,
 /// delete).
 const MODIFY: u32 = 0x0013_01BF;
 /// The rights granted on a read path: `icacls`'s `RX`.
 const READ_EXECUTE: u32 = 0x0012_00A9;
+/// The rights on the current folder's parent: `FILE_LIST_DIRECTORY |
+/// FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE`. Names and
+/// attributes of what is in it; no file's contents, no ACL, no write.
+const LIST_ONLY: u32 = 0x0010_00A1;
 
 /// How long a grant or revoke waits for another process changing an ACL at
 /// the same moment. Propagation over a very large tree takes tens of
@@ -79,6 +102,9 @@ pub(crate) struct OfflineGrant {
     /// Paths it is granted for reading only (the current folder when it is
     /// not inside a root, the helper program).
     pub reads: Vec<PathBuf>,
+    /// Folders it may only list, by an ACE on the folder alone: the current
+    /// folder's parent ([`super::offline_parents`]).
+    pub parents: Vec<PathBuf>,
 }
 
 /// One run's grant on its roots. Dropping it revokes them.
@@ -89,6 +115,7 @@ pub(crate) struct Lease {
     /// dropping the lease takes back.
     roots: Vec<PathBuf>,
     reads: Vec<PathBuf>,
+    parents: Vec<PathBuf>,
     /// The named mutex that tells a later sweep this run is alive.
     _alive: OwnedHandle,
 }
@@ -125,7 +152,7 @@ impl Lease {
             }
         }
         let roots = fold_nested(roots);
-        let (user, reads) = match offline {
+        let (user, reads, parents) = match offline {
             Some(o) => {
                 for read in o.reads.iter().filter(|r| r.is_dir()) {
                     refuse_broad(&read.to_string_lossy(), profile.as_deref()).map_err(|e| {
@@ -140,9 +167,17 @@ impl Lease {
                 // `Users` already or not this run's to open up. If it is not
                 // readable, starting the command says so.
                 let reads = o.reads.into_iter().filter(|r| may_change_acl(r)).collect();
-                (Some(o.user), reads)
+                // The same for a parent: one this process may not re-ACL is
+                // not the user's (a folder of the system's), and is listable
+                // by `Users` already or not this run's to open up.
+                let parents = o
+                    .parents
+                    .into_iter()
+                    .filter(|p| p.is_dir() && may_change_acl(p))
+                    .collect();
+                (Some(o.user), reads, parents)
             }
-            None => (None, Vec::new()),
+            None => (None, Vec::new(), Vec::new()),
         };
         let dir = records_dir();
         std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -155,10 +190,12 @@ impl Lease {
                 roots: roots.clone(),
                 user,
                 reads: reads.clone(),
+                parents: parents.clone(),
             },
             path: dir.join(format!("{rid}.grant")),
             roots: Vec::new(),
             reads: Vec::new(),
+            parents: Vec::new(),
             _alive: alive,
         };
         // Written down BEFORE anything is granted, so a crash at any point
@@ -175,7 +212,7 @@ impl Lease {
                     .record
                     .user
                 {
-                    Some(user) => change(root, user, Change::Grant(MODIFY)),
+                    Some(user) => grant_account(root, user, MODIFY),
                     None => Ok(()),
                 });
             if let Err(e) = granted {
@@ -188,12 +225,24 @@ impl Lease {
         if let Some(user) = lease.record.user.clone() {
             for read in &reads {
                 lease.reads.push(read.clone());
-                change(read, &user, Change::Grant(READ_EXECUTE)).map_err(|e| {
+                grant_account(read, &user, READ_EXECUTE).map_err(|e| {
                     format!(
                         "could not let the offline account read {}: {e}",
                         read.display()
                     )
                 })?;
+            }
+            // Not a confinement matter: without it the run goes on, and
+            // only PowerShell's starting location suffers, so say so.
+            for parent in &parents {
+                lease.parents.push(parent.clone());
+                if let Err(e) = set_list(parent, &user, true) {
+                    eprintln!(
+                        "sbx: could not let the offline account list {} ({e}); PowerShell \
+                         may start at the drive root instead of the current folder",
+                        parent.display()
+                    );
+                }
             }
         }
         Ok(lease)
@@ -248,8 +297,18 @@ impl Drop for Lease {
                     }
                 }
             }
+            for parent in self.parents.iter().filter(|p| p.exists()) {
+                if let Err(e) = release_list(parent, user, &others) {
+                    eprintln!(
+                        "sbx: could not take back the offline account's listing of {} ({e}); \
+                         the next run sweeps it",
+                        parent.display()
+                    );
+                    stuck.parents.push(parent.clone());
+                }
+            }
         }
-        if stuck.roots.is_empty() && stuck.reads.is_empty() {
+        if stuck.roots.is_empty() && stuck.reads.is_empty() && stuck.parents.is_empty() {
             let _ = std::fs::remove_file(&self.path);
         } else {
             let _ = std::fs::write(&self.path, stuck.to_text());
@@ -259,27 +318,65 @@ impl Drop for Lease {
 
 /// Take back the account's ACE on `path`, as far as no other live run
 /// (`others`) still needs it.
-fn release_account(
-    path: &Path,
-    user: &str,
-    others: &[(Vec<PathBuf>, Vec<PathBuf>)],
-) -> Result<(), String> {
-    match still_needed(path, others) {
-        Need::Modify => Ok(()),
+fn release_account(path: &Path, user: &str, others: &Others) -> Result<(), String> {
+    let _lock = AclLock::take()?;
+    match still_needed(path, &others.grants) {
+        Need::Modify => return Ok(()),
         Need::Read => {
             change(path, user, Change::Revoke)?;
-            change(path, user, Change::Grant(READ_EXECUTE))
+            change(path, user, Change::Grant(READ_EXECUTE))?;
         }
-        Need::None => change(path, user, Change::Revoke),
+        Need::None => change(path, user, Change::Revoke)?,
     }
+    // The revoke took every ACE of the account's, a listing ACE another live
+    // run put on this folder too: put that back.
+    if is_listed(path, &others.parents) {
+        set_list(path, user, true)?;
+    }
+    Ok(())
 }
 
-/// What every other live run granted the offline account: (roots, reads).
-fn live_account_grants(own: &Path) -> Vec<(Vec<PathBuf>, Vec<PathBuf>)> {
+/// Take back the account's listing ACE on `parent`, unless another live run
+/// lists it too. Only that exact ACE goes: an ACE of another run's that
+/// grants the folder as a root or read path stays.
+fn release_list(parent: &Path, user: &str, others: &Others) -> Result<(), String> {
+    if is_listed(parent, &others.parents) {
+        return Ok(());
+    }
+    set_list(parent, user, false).map(|_| ())
+}
+
+/// Grant the account `rights` on `path`, inherited beneath a folder. A
+/// listing ACE already on the folder (another run's parent) is taken off
+/// first and put back after: `SetEntriesInAclW` may merge a grant into an
+/// ACE the trustee already has, and merged into that one the grant would
+/// not be inherited.
+fn grant_account(path: &Path, user: &str, rights: u32) -> Result<(), String> {
+    let _lock = AclLock::take()?;
+    let listed = path.is_dir() && set_list(path, user, false)?;
+    change(path, user, Change::Grant(rights))?;
+    if listed {
+        set_list(path, user, true)?;
+    }
+    Ok(())
+}
+
+/// What every other live run granted the offline account.
+#[derive(Default)]
+struct Others {
+    /// Each run's (roots, reads).
+    grants: Vec<(Vec<PathBuf>, Vec<PathBuf>)>,
+    /// Every folder some run lets it list.
+    parents: Vec<PathBuf>,
+}
+
+/// What every other live run granted the offline account.
+fn live_account_grants(own: &Path) -> Others {
+    let mut others = Others::default();
     let Ok(entries) = std::fs::read_dir(records_dir()) else {
-        return Vec::new();
+        return others;
     };
-    entries
+    for record in entries
         .flatten()
         .map(|e| e.path())
         .filter(|p| p != own)
@@ -287,8 +384,11 @@ fn live_account_grants(own: &Path) -> Vec<(Vec<PathBuf>, Vec<PathBuf>)> {
         .filter(|(rid, _)| is_alive(*rid))
         .filter_map(|(_, p)| GrantRecord::parse(&std::fs::read_to_string(p).ok()?))
         .filter(|r| r.user.is_some())
-        .map(|r| (r.roots, r.reads))
-        .collect()
+    {
+        others.grants.push((record.roots, record.reads));
+        others.parents.extend(record.parents);
+    }
+    others
 }
 
 /// Let the offline account read `path` (a folder and all beneath it, or one
@@ -312,7 +412,6 @@ pub(crate) fn revoke(path: &Path, user: &str) -> Result<(), String> {
 /// (as its owner, an administrator, or by an explicit grant).
 fn may_change_acl(path: &Path) -> bool {
     use std::os::windows::fs::OpenOptionsExt;
-    const WRITE_DAC: u32 = 0x0004_0000;
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
     std::fs::OpenOptions::new()
         .access_mode(WRITE_DAC)
@@ -461,6 +560,11 @@ fn sweep(dir: &Path) {
                         clean = false;
                     }
                 }
+                for p in record.parents.iter().filter(|p| p.exists()) {
+                    if release_list(p, user, &others).is_err() {
+                        clean = false;
+                    }
+                }
             }
         }
         if clean {
@@ -586,6 +690,172 @@ fn change(path: &Path, sid_text: &str, change: Change) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Add (`add`) or remove the account's listing ACE on the folder `path`
+/// alone: an allow ACE of exactly [`LIST_ONLY`] with no ACE flags. Whether
+/// the DACL changed (`false`: the ACE was there already, or not there to
+/// remove).
+///
+/// The DACL is read and written through one handle with the low-level
+/// `SetKernelObjectSecurity`, which stores the DACL on this one object and,
+/// unlike `SetNamedSecurityInfoW` and `SetSecurityInfo`, does not walk the
+/// folder's children to re-propagate inheritance (slow on a big folder, and
+/// a failure on any child the user may not re-ACL). Nothing needs
+/// propagating: the ACE inherits to nothing, and every other ACE (inherited
+/// ones included, with their flags) and the DACL's protection and
+/// auto-inherited bits are written back as they were. The new ACE goes after
+/// the explicit deny ACEs, where an allow ACE belongs in canonical order.
+/// Removing takes off only an ACE that matches exactly, so no other grant of
+/// the account's on the folder (as another run's root or read path) is
+/// touched.
+fn set_list(path: &Path, sid_text: &str, add: bool) -> Result<bool, String> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+    const ACCESS_DENIED_ACE_TYPE: u8 = 1;
+    const ACCESS_DENIED_OBJECT_ACE_TYPE: u8 = 6;
+    const ACCESS_DENIED_CALLBACK_ACE_TYPE: u8 = 10;
+    const ACCESS_DENIED_CALLBACK_OBJECT_ACE_TYPE: u8 = 12;
+    const INHERITED_ACE: u8 = 0x10;
+    const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
+
+    let _lock = AclLock::take()?;
+    let trustee = sid(sid_text)?;
+    let folder = std::fs::OpenOptions::new()
+        .access_mode(READ_CONTROL | WRITE_DAC)
+        .share_mode(7) // read, write, delete: never in anyone's way
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS) // a folder opens too
+        .open(path)
+        .map_err(|e| format!("opening {} to change its ACL: {e}", path.display()))?;
+    let handle: HANDLE = folder.as_raw_handle();
+    // SAFETY: every pointer passed lives to the end of the block (`folder`'s
+    // handle, `trustee`, the returned descriptor and the DACL inside it, the
+    // new ACL's buffer and the descriptor built on the stack); each ACE read
+    // is inside the DACL `GetAce` returned it from, and is read only as far
+    // as its header says; each call's result is checked.
+    unsafe {
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut descriptor: *mut core::ffi::c_void = std::ptr::null_mut();
+        let err = GetSecurityInfo(
+            handle,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut descriptor,
+        );
+        if err != 0 {
+            return Err(format!(
+                "reading the ACL of {} failed with error {err}",
+                path.display()
+            ));
+        }
+        let descriptor = LocalPtr(descriptor);
+        if dacl.is_null() {
+            // No DACL: everyone may do anything already.
+            return Ok(false);
+        }
+        let mut control: u16 = 0;
+        let mut sd_revision: u32 = 0;
+        if GetSecurityDescriptorControl(descriptor.0, &mut control, &mut sd_revision) == 0 {
+            return Err(last_error("GetSecurityDescriptorControl"));
+        }
+        let mut info = ACL_SIZE_INFORMATION::default();
+        if GetAclInformation(
+            dacl,
+            (&raw mut info).cast(),
+            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        ) == 0
+        {
+            return Err(last_error("GetAclInformation"));
+        }
+        // ACCESS_ALLOWED_ACE ends in the SID's first DWORD.
+        let ace_size =
+            std::mem::size_of::<ACCESS_ALLOWED_ACE>() as u32 - 4 + GetLengthSid(trustee.0);
+        let size = info.AclBytesInUse + if add { ace_size } else { 0 };
+        let mut buffer = vec![0u32; size.div_ceil(4) as usize];
+        let new: *mut ACL = buffer.as_mut_ptr().cast();
+        let revision = u32::from((*dacl).AclRevision).max(ACL_REVISION);
+        if InitializeAcl(new, size, revision) == 0 {
+            return Err(last_error("InitializeAcl"));
+        }
+        let mut changed = false;
+        let mut placed = !add;
+        for index in 0..info.AceCount {
+            let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
+            if GetAce(dacl, index, &mut ace) == 0 {
+                return Err(last_error("GetAce"));
+            }
+            let header = *ace.cast::<ACE_HEADER>();
+            let ours = header.AceType == ACCESS_ALLOWED_ACE_TYPE
+                && header.AceFlags == 0
+                && (*ace.cast::<ACCESS_ALLOWED_ACE>()).Mask == LIST_ONLY
+                && EqualSid(
+                    (&raw mut (*ace.cast::<ACCESS_ALLOWED_ACE>()).SidStart).cast(),
+                    trustee.0,
+                ) != 0;
+            if ours {
+                if add {
+                    return Ok(false);
+                }
+                changed = true;
+                continue;
+            }
+            let explicit_deny = header.AceFlags & INHERITED_ACE == 0
+                && matches!(
+                    header.AceType,
+                    ACCESS_DENIED_ACE_TYPE
+                        | ACCESS_DENIED_OBJECT_ACE_TYPE
+                        | ACCESS_DENIED_CALLBACK_ACE_TYPE
+                        | ACCESS_DENIED_CALLBACK_OBJECT_ACE_TYPE
+                );
+            if !placed && !explicit_deny {
+                if AddAccessAllowedAceEx(new, revision, 0, LIST_ONLY, trustee.0) == 0 {
+                    return Err(last_error("AddAccessAllowedAceEx"));
+                }
+                placed = true;
+                changed = true;
+            }
+            if AddAce(new, revision, u32::MAX, ace, u32::from(header.AceSize)) == 0 {
+                return Err(last_error("AddAce"));
+            }
+        }
+        if !placed {
+            if AddAccessAllowedAceEx(new, revision, 0, LIST_ONLY, trustee.0) == 0 {
+                return Err(last_error("AddAccessAllowedAceEx"));
+            }
+            changed = true;
+        }
+        if !changed {
+            return Ok(false);
+        }
+        let mut sd: SECURITY_DESCRIPTOR = std::mem::zeroed();
+        let psd: *mut core::ffi::c_void = (&raw mut sd).cast();
+        if InitializeSecurityDescriptor(psd, SECURITY_DESCRIPTOR_REVISION) == 0 {
+            return Err(last_error("InitializeSecurityDescriptor"));
+        }
+        if SetSecurityDescriptorDacl(psd, 1, new, 0) == 0 {
+            return Err(last_error("SetSecurityDescriptorDacl"));
+        }
+        let kept = SE_DACL_AUTO_INHERITED | SE_DACL_PROTECTED;
+        if SetSecurityDescriptorControl(psd, kept, control & kept) == 0 {
+            return Err(last_error("SetSecurityDescriptorControl"));
+        }
+        if SetKernelObjectSecurity(handle, DACL_SECURITY_INFORMATION, psd) == 0 {
+            return Err(format!(
+                "setting the ACL of {}: {}",
+                path.display(),
+                last_error("SetKernelObjectSecurity")
+            ));
+        }
+        drop(descriptor);
+    }
+    Ok(true)
 }
 
 /// The cross-process lock around an ACL change, released on drop. A
