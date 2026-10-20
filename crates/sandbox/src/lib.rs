@@ -402,6 +402,9 @@ pub struct Sandbox {
     policy: Policy,
     helper: Option<PathBuf>,
     strict: bool,
+    /// The environment the policy's `[env]` rules start from. Default: this
+    /// process's own.
+    base_env: Option<Vec<(OsString, OsString)>>,
 }
 
 /// Everything a running command needs kept alive: the proxy and the private
@@ -487,7 +490,18 @@ impl Sandbox {
             policy,
             helper: None,
             strict: true,
+            base_env: None,
         }
+    }
+
+    /// Start the command's environment from `vars` instead of this process's
+    /// own, for a caller that filters it first. The policy's `[env]` rules
+    /// still apply on top, and the run's own variables (the temp directory,
+    /// the proxy) are still added.
+    #[must_use]
+    pub fn inherit_from(mut self, vars: Vec<(OsString, OsString)>) -> Self {
+        self.base_env = Some(vars);
+        self
     }
 
     /// The binary re-executed as the helper. Default: the current executable,
@@ -604,7 +618,11 @@ impl Sandbox {
         if let Some(p) = &proxy {
             extra.extend(p.client_env());
         }
-        let mut environment = env::compute(&self.policy.env, std::env::vars_os(), &extra);
+        let inherited = match &self.base_env {
+            Some(vars) => vars.clone(),
+            None => std::env::vars_os().collect(),
+        };
+        let mut environment = env::compute(&self.policy.env, inherited, &extra);
         if block_interop {
             environment.retain(|(k, _)| k != "WSL_INTEROP");
         }

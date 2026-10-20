@@ -174,15 +174,27 @@ impl Shell {
     /// command line.
     #[cfg(windows)]
     fn windows_args(&self, script: &str) -> Vec<String> {
+        // Only the script, last, is quoted: the flags before it never need it.
+        let mut args = self.args(script);
+        if let Some(last) = args.last_mut() {
+            *last = quote_windows(last);
+        }
+        args
+    }
+
+    /// The arguments that run `script` in this shell, unquoted, for a launcher
+    /// that quotes them itself (`sbx.exe`). On Windows, PowerShell gets
+    /// `-Command` and ONE argument: it parses its command line by the C
+    /// runtime's rules, so the script arrives as written (measured with
+    /// quotes, backslashes, `&|<>^%` and non-ASCII). Not `-EncodedCommand`:
+    /// with it, Windows PowerShell writes its error stream as CLIXML. Output
+    /// is UTF-8 (the OEM code page otherwise), and progress is off.
+    #[must_use]
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) fn args(&self, script: &str) -> Vec<String> {
         match self.flavor {
-            Flavor::Posix => vec!["-c".to_string(), quote_windows(script)],
+            Flavor::Posix => vec!["-c".to_string(), script.to_string()],
             Flavor::PowerShell => {
-                // `-Command` and ONE quoted argument: PowerShell parses its
-                // command line by the C runtime's rules, so the script arrives
-                // as written (measured with quotes, backslashes, `&|<>^%` and
-                // non-ASCII). Not `-EncodedCommand`: with it, Windows
-                // PowerShell writes its error stream as CLIXML. Output is
-                // UTF-8 (the OEM code page otherwise), and progress is off.
                 let whole = format!(
                     "$ProgressPreference='SilentlyContinue'; \
                      [Console]::OutputEncoding=[System.Text.Encoding]::UTF8; {script}"
@@ -191,7 +203,7 @@ impl Shell {
                     "-NoProfile".to_string(),
                     "-NonInteractive".to_string(),
                     "-Command".to_string(),
-                    quote_windows(&whole),
+                    whole,
                 ]
             }
         }
@@ -817,6 +829,7 @@ mod tests {
                 mode: SandboxMode::ReadOnly,
                 network: SandboxNetwork::Allow,
                 named: false,
+                engine: crate::sandbox::SandboxEngine::Builtin,
             },
             Vec::new(),
         );

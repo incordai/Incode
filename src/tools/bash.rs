@@ -54,7 +54,14 @@ pub fn execute_bash_watched(
         crate::trace!("sandbox", "{}", sandbox.note());
     }
     let shell = super::shell_choice::for_sandbox(sandbox).map_err(|why| anyhow::anyhow!(why))?;
-    let mut child = sandbox.wrap(&shell, command);
+    let env = filter_env.then(super::env_filter::filtered_env);
+    // `_keep` holds what the sbx engine needs until the command exits.
+    let crate::sandbox::Wrapped {
+        command: mut child,
+        keep: _keep,
+    } = sandbox
+        .wrap(&shell, command, env.as_ref())
+        .map_err(|why| anyhow::anyhow!(why))?;
 
     // Nothing is typed into a tool's command: its stdin is the null device,
     // so one that waits for input sees end of input at once instead of
@@ -64,13 +71,6 @@ pub fn execute_bash_watched(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-
-    if filter_env {
-        child.env_clear();
-        for (key, value) in super::env_filter::filtered_env() {
-            child.env(key, value);
-        }
-    }
 
     crate::agent::process_tree::prepare(&mut child);
     let spawned = child.spawn().context("failed to spawn shell")?;

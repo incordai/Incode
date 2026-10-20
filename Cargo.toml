@@ -43,6 +43,12 @@ rust-version = "1.88"
 name = "incode"
 path = "src/main.rs"
 
+# Runs the sbx engine for real: its binary is sbx's helper, so it has its own
+# `main` (see the file).
+[[test]]
+name = "sbx_engine"
+harness = false
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -77,6 +83,11 @@ base64 = "0.22"
 # NOTE: it turns on serde_json's `preserve_order` for the whole crate (feature
 # unification), so a `serde_json::Map` keeps insertion order instead of sorting.
 agent-client-protocol-schema = { version = "=1.9.1", default-features = false }
+# The standalone sandbox in this workspace (`crates/sandbox`), as the `sbx`
+# engine for shell commands: `sandbox_engine: "sbx"`. A path dependency, so
+# no new package; it adds the seccomp filter, the host-allowlist proxy and the
+# `.git` protection the built-in engine lacks.
+incord-sandbox = { path = "crates/sandbox" }
 
 # CLI-specific
 rustyline = { version = "15", features = ["derive"] }

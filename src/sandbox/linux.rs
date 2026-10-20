@@ -173,6 +173,7 @@ mod tests {
                 mode: SandboxMode::WorkspaceWrite,
                 network: SandboxNetwork::Allow,
                 named: false,
+                engine: crate::sandbox::SandboxEngine::Builtin,
             },
             &[PathBuf::from("/ws")],
             "echo hi",

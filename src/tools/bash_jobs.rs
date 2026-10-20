@@ -118,6 +118,9 @@ pub struct BashJob {
     /// What the job's shell started, so a kill ends the command and not just
     /// the shell around it.
     tree: crate::agent::process_tree::Tree,
+    /// The sbx engine's proxy, temp directory and `.git` snapshot, released
+    /// (and any `.git` change undone) as soon as the job is seen to end.
+    sandbox: Option<crate::sandbox::sbx::Keep>,
 }
 
 impl BashJob {
@@ -150,11 +153,13 @@ impl BashJob {
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
                 self.readers.clear();
+                self.sandbox = None;
             }
             Ok(None) => {}
             Err(_) => {
                 self.finished = true;
                 self.exit_code = Some(-1);
+                self.sandbox = None;
             }
         }
     }
@@ -235,20 +240,19 @@ impl BashJobManager {
         // is the Bash tool's own, chosen for the sandbox.
         let shell =
             super::shell_choice::for_sandbox(sandbox).map_err(|why| anyhow::anyhow!(why))?;
-        let mut cmd_builder = sandbox.wrap(&shell, command);
+        let env = self.env_filter_enabled.then(env_filter::filtered_env);
+        let crate::sandbox::Wrapped {
+            command: mut cmd_builder,
+            keep,
+        } = sandbox
+            .wrap(&shell, command, env.as_ref())
+            .map_err(|why| anyhow::anyhow!(why))?;
 
         cmd_builder
             .current_dir(workspace)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-
-        if self.env_filter_enabled {
-            cmd_builder.env_clear();
-            for (key, value) in env_filter::filtered_env() {
-                cmd_builder.env(key, value);
-            }
-        }
 
         crate::agent::process_tree::prepare(&mut cmd_builder);
         let mut child = cmd_builder
@@ -281,6 +285,7 @@ impl BashJobManager {
             stderr,
             readers,
             tree,
+            sandbox: Some(keep),
         });
         Ok(id)
     }

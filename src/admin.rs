@@ -190,6 +190,20 @@ pub struct AdminConfig {
     /// reports. `INCODE_SANDBOX_NETWORK` wins over it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_network: Option<String>,
+    /// What confines the commands: `builtin` (the default) or `sbx`, the
+    /// standalone sandbox — see [`crate::sandbox::sbx`].
+    /// `INCODE_SANDBOX_ENGINE` wins over it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_engine: Option<String>,
+    /// Under the sbx engine: the only hosts a command may reach, when the
+    /// network is not denied. Empty leaves it open.
+    /// `INCODE_SANDBOX_ALLOW_HOSTS` (comma-separated) wins over it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sandbox_allow_hosts: Vec<String>,
+    /// Under the sbx engine on Windows: `native`, `wsl` or `auto` (the
+    /// default). `INCODE_SANDBOX_BACKEND` wins over it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_backend: Option<String>,
     /// The shell the `Bash` tool runs commands in on Windows, as a path or a
     /// program on `PATH` — see `tools::shell_choice`. `INCODE_SHELL` wins over
     /// it. Unset, Git for Windows' bash is used, then PowerShell; never
@@ -956,6 +970,25 @@ impl AdminConfig {
             mode: mode.value,
             network: self.resolve_sandbox_network().value,
             named: mode.source != Source::BuiltIn,
+            engine: self.resolve_sandbox_engine().value,
+        }
+    }
+
+    /// What confines the commands, and where that was decided: the
+    /// environment, then the settings, then `builtin`.
+    #[must_use]
+    pub fn resolve_sandbox_engine(&self) -> Resolved<crate::sandbox::SandboxEngine> {
+        let named = |raw: &str| crate::sandbox::SandboxEngine::parse(raw.trim());
+        if let Some(engine) = std::env::var(crate::sandbox::SANDBOX_ENGINE_ENV)
+            .ok()
+            .as_deref()
+            .and_then(named)
+        {
+            return Resolved::new(engine, Source::Environment);
+        }
+        match self.sandbox_engine.as_deref().and_then(named) {
+            Some(engine) => Resolved::new(engine, Source::AdminFile),
+            None => Resolved::new(crate::sandbox::SandboxEngine::Builtin, Source::BuiltIn),
         }
     }
 
@@ -1117,6 +1150,7 @@ mod tests {
         std::env::remove_var(DATA_DIR_ENV);
         std::env::remove_var(crate::sandbox::SANDBOX_ENV);
         std::env::remove_var(crate::sandbox::SANDBOX_NETWORK_ENV);
+        std::env::remove_var(crate::sandbox::SANDBOX_ENGINE_ENV);
         std::env::remove_var(AGENT_ENV);
         std::env::remove_var(crate::config::MODEL_ENV);
         std::env::remove_var(crate::budget::BUDGET_ENV);
@@ -1473,6 +1507,9 @@ mod tests {
             pdf_renderer: Some(PdfRenderer::Browser),
             sandbox: Some("read-only".to_string()),
             sandbox_network: Some("deny".to_string()),
+            sandbox_engine: Some("sbx".to_string()),
+            sandbox_allow_hosts: vec!["crates.io".to_string()],
+            sandbox_backend: Some("wsl".to_string()),
             // The Bash tool's shell, which the owner may pin on Windows.
             shell: Some("C:/Program Files/Git/bin/bash.exe".to_string()),
             // The ladder has to survive the file too — a tier an operator
@@ -1571,6 +1608,43 @@ mod tests {
         assert_eq!(env.mode, SandboxMode::ReadOnly);
         assert!(env.named, "the environment names it too");
         assert_eq!(admin.resolve_sandbox_network().source, Source::Environment);
+        clear_env();
+    }
+
+    /// The engine: `builtin` unless named, the settings name it, the
+    /// environment wins, and a word nobody uses is the built-in default.
+    #[test]
+    fn the_sandbox_engine_resolves_like_the_other_settings() {
+        use crate::permissions::PermissionMode as P;
+        use crate::sandbox::{SandboxEngine, SANDBOX_ENGINE_ENV};
+        let _guard = lock();
+        clear_env();
+        let unset = AdminConfig::default();
+        assert_eq!(
+            unset.sandbox_policy(P::WorkspaceWrite).engine,
+            SandboxEngine::Builtin
+        );
+
+        let admin = AdminConfig {
+            sandbox_engine: Some("sbx".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            admin.sandbox_policy(P::WorkspaceWrite).engine,
+            SandboxEngine::Sbx
+        );
+        assert_eq!(admin.resolve_sandbox_engine().source, Source::AdminFile);
+
+        let typo = AdminConfig {
+            sandbox_engine: Some("bubblewrap".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(typo.resolve_sandbox_engine().value, SandboxEngine::Builtin);
+        assert_eq!(typo.resolve_sandbox_engine().source, Source::BuiltIn);
+
+        std::env::set_var(SANDBOX_ENGINE_ENV, "builtin");
+        assert_eq!(admin.resolve_sandbox_engine().value, SandboxEngine::Builtin);
+        assert_eq!(admin.resolve_sandbox_engine().source, Source::Environment);
         clear_env();
     }
 

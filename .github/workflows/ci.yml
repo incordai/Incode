@@ -58,6 +58,9 @@ jobs:
       - run: cargo clippy --all-targets
       - run: cargo test --lib
       - run: cargo test --bins
+      # incode's commands under `sandbox_engine = "sbx"`, for real (Linux;
+      # it says it skipped elsewhere).
+      - run: cargo test --test sbx_engine
       # The standalone sandbox (`sbx`). Its escape tests run on Linux and
       # macOS, and skip, saying so, where the OS cannot enforce what they check.
       - run: cargo clippy -p incord-sandbox --all-targets -- -D warnings

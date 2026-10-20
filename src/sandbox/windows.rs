@@ -519,6 +519,7 @@ mod tests {
             mode,
             network: SandboxNetwork::Allow,
             named,
+            engine: crate::sandbox::SandboxEngine::Builtin,
         }
     }
 

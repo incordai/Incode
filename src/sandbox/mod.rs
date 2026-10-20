@@ -71,6 +71,7 @@ use crate::tools::shell_choice::Shell;
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+pub mod sbx;
 #[cfg(windows)]
 pub mod windows;
 
@@ -81,6 +82,43 @@ pub const SANDBOX_ENV: &str = "INCODE_SANDBOX";
 /// Names the network setting (`allow` or `deny`), ahead of `admin.json`
 /// `sandbox_network`.
 pub const SANDBOX_NETWORK_ENV: &str = "INCODE_SANDBOX_NETWORK";
+
+/// Names the engine (`builtin` or `sbx`), ahead of `admin.json`
+/// `sandbox_engine`.
+pub const SANDBOX_ENGINE_ENV: &str = "INCODE_SANDBOX_ENGINE";
+
+/// What confines the commands: incode's own code in this module, or the
+/// standalone sandbox ([`sbx`]), which adds a host allowlist, a seccomp
+/// filter, `.git` protection and a scrubbed environment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SandboxEngine {
+    /// This module's Landlock, Seatbelt and Windows token — the default.
+    #[default]
+    Builtin,
+    /// `crates/sandbox`, in-process on Linux and macOS, `sbx.exe` on Windows.
+    Sbx,
+}
+
+impl SandboxEngine {
+    /// The word the setting and the trace use.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Builtin => "builtin",
+            Self::Sbx => "sbx",
+        }
+    }
+
+    /// The engine named, or `None` for a word nobody uses.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "builtin" => Some(Self::Builtin),
+            "sbx" => Some(Self::Sbx),
+            _ => None,
+        }
+    }
+}
 
 /// Whether a sandboxed command may use the network.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -126,6 +164,8 @@ pub struct SandboxPolicy {
     /// only when named: it changes the roots' ACL for the session, which is a
     /// cost the operator has to have asked for.
     pub named: bool,
+    /// What confines the commands.
+    pub engine: SandboxEngine,
 }
 
 impl SandboxPolicy {
@@ -134,6 +174,7 @@ impl SandboxPolicy {
         mode: SandboxMode::Off,
         network: SandboxNetwork::Allow,
         named: false,
+        engine: SandboxEngine::Builtin,
     };
 }
 
@@ -199,6 +240,15 @@ pub struct Sandbox {
     grant: Option<windows::acl::Grant>,
 }
 
+/// A command [`Sandbox::wrap`] made, and what must outlive it.
+pub(crate) struct Wrapped {
+    /// Set the working directory and the pipes, then spawn it.
+    pub command: Command,
+    /// Kept until the command exits: the sbx engine's proxy, temp directory
+    /// and `.git` snapshot (nothing under the built-in engine).
+    pub keep: sbx::Keep,
+}
+
 /// What a session's sandbox holds for as long as the session lasts. Only
 /// Windows workspace-write holds anything — the ACE granted on each root to the
 /// session's private SID ([`windows::acl`]) — and dropping this revokes it. Owned
@@ -253,7 +303,7 @@ impl Sandbox {
         #[cfg(windows)]
         {
             let mut this = self;
-            if windows::needs_grant(this.policy) {
+            if this.policy.engine == SandboxEngine::Builtin && windows::needs_grant(this.policy) {
                 this.grant = Some(session.hold(&this.roots)?);
             }
             Ok(this)
@@ -268,17 +318,42 @@ impl Sandbox {
     /// The command to spawn for one shell `command`, confined to this
     /// sandbox where the platform can, and left unconfined where it cannot —
     /// [`Self::note`] says which. The caller still sets the working
-    /// directory, the environment and the pipes.
+    /// directory and the pipes, and keeps [`Wrapped::keep`] alive until the
+    /// command exits.
     ///
     /// `shell` is the Bash tool's shell ([`crate::tools::shell_choice`]) —
-    /// used unchanged when the sandbox is off or cannot apply.
-    #[must_use]
-    pub(crate) fn wrap(&self, shell: &Shell, command: &str) -> Command {
-        if self.is_off() {
-            return plain(shell, command);
+    /// used unchanged when the sandbox is off or cannot apply. `env`, when
+    /// given, is the whole environment the command starts with (incode's
+    /// filtered one); the sbx engine adds its own variables to it.
+    ///
+    /// # Errors
+    ///
+    /// Only under the sbx engine, when sbx cannot start the run. The command
+    /// must then NOT run: running it unconfined is what the operator chose
+    /// sbx to prevent.
+    pub(crate) fn wrap(
+        &self,
+        shell: &Shell,
+        command: &str,
+        env: Option<&std::collections::HashMap<String, String>>,
+    ) -> Result<Wrapped, String> {
+        if !self.is_off() && self.policy.engine == SandboxEngine::Sbx {
+            let (command, keep) = sbx::wrap(self.policy, &self.roots, shell, command, env)?;
+            return Ok(Wrapped { command, keep });
         }
-        self.wrap_confined(shell, command)
-            .unwrap_or_else(|| plain(shell, command))
+        let mut command = if self.is_off() {
+            plain(shell, command)
+        } else {
+            self.wrap_confined(shell, command)
+                .unwrap_or_else(|| plain(shell, command))
+        };
+        if let Some(env) = env {
+            command.env_clear().envs(env);
+        }
+        Ok(Wrapped {
+            command,
+            keep: sbx::Keep::default(),
+        })
     }
 
     /// One line for the trace and for `/doctor`: what the sandbox is doing to
@@ -286,6 +361,9 @@ impl Sandbox {
     /// then the network when `deny` was asked for.
     #[must_use]
     pub fn note(&self) -> String {
+        if !self.is_off() && self.policy.engine == SandboxEngine::Sbx {
+            return sbx::note(self.policy, &self.roots);
+        }
         let mode = self.policy.mode;
         let files = if mode == SandboxMode::Off {
             "sandbox off: shell commands run unconfined".to_string()
@@ -321,6 +399,11 @@ impl Sandbox {
     pub fn posix_shell_runs(&self) -> bool {
         #[cfg(windows)]
         {
+            if self.policy.engine == SandboxEngine::Sbx {
+                // sbx.exe's native backend restricts the token the same way;
+                // under WSL the command runs in WSL's own `sh`.
+                return self.is_off() || sbx::settings().backend.as_deref() == Some("wsl");
+            }
             !windows::applies(self.policy, windows::needs_grant(self.policy))
         }
         #[cfg(not(windows))]
@@ -727,7 +810,10 @@ mod tests {
             PathBuf::from("sh"),
             crate::tools::shell_choice::Flavor::Posix,
         );
-        let cmd = sandbox.wrap(&shell, "echo hi");
+        let cmd = sandbox
+            .wrap(&shell, "echo hi", None)
+            .expect("wrapped")
+            .command;
         assert!(sandbox.note().contains("off"));
         // The program is the shell itself, not a wrapper.
         assert_eq!(cmd.get_program().to_string_lossy(), "sh");
@@ -752,6 +838,7 @@ mod tests {
             mode,
             network,
             named: true,
+            engine: crate::sandbox::SandboxEngine::Builtin,
         }
     }
 
