@@ -1160,20 +1160,34 @@ mod tests {
             let screen = crate::desktop::screen_info().expect("screen");
             let bounds = screen.virtual_bounds().expect("a desktop");
 
+            let on_desktop = |r: Rect| {
+                r.x <= bounds.x + bounds.width
+                    && r.x + r.width >= bounds.x
+                    && r.y <= bounds.y + bounds.height
+                    && r.y + r.height >= bounds.y
+            };
             for e in &tree.elements {
                 assert!(
                     e.rect.width > 0 && e.rect.height > 0,
                     "kept an empty: {e:?}"
                 );
-                // On the virtual desktop, which is what proves these are
-                // physical pixels rather than some window-local space. Its
-                // rectangle, not its centre: a window wider than a small
-                // screen (a CI runner's 1024 pixels) has buttons only partly
-                // on it, whose centres fall off the edge.
-                let r = e.rect;
+                // Within a desktop's size of the desktop: screen pixels, not
+                // garbage. Not every element is ON it — a window wider than a
+                // small screen (a CI runner's 1024 pixels) has controls past
+                // the edge, which UI Automation still reports.
                 assert!(
-                    r.x <= bounds.x + bounds.width + 1 && r.x + r.width >= bounds.x - 1,
-                    "element {e:?} is not on the desktop {bounds:?}"
+                    e.rect.x >= bounds.x - bounds.width
+                        && e.rect.x <= bounds.x + 2 * bounds.width
+                        && e.rect.y >= bounds.y - bounds.height
+                        && e.rect.y <= bounds.y + 2 * bounds.height,
+                    "element {e:?} is nowhere near the desktop {bounds:?}"
+                );
+            }
+            // And the window is on the desktop: the same space the mouse uses.
+            if !tree.elements.is_empty() {
+                assert!(
+                    tree.elements.iter().any(|e| on_desktop(e.rect)),
+                    "no element of the focused window is on the desktop {bounds:?}"
                 );
             }
         }
