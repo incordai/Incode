@@ -486,13 +486,13 @@ fn parse(text: &str, path: &Path, scope: Scope) -> Result<AgentDef, String> {
 
 /// One front-matter value: a scalar, or a list.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Field {
+pub(crate) enum Field {
     One(String),
     Many(Vec<String>),
 }
 
 /// The front matter and the body, when the text opens with `---`.
-fn split_front_matter(text: &str) -> Option<(&str, &str)> {
+pub(crate) fn split_front_matter(text: &str) -> Option<(&str, &str)> {
     let rest = text
         .strip_prefix("---\r\n")
         .or_else(|| text.strip_prefix("---\n"))?;
@@ -507,7 +507,7 @@ fn split_front_matter(text: &str) -> Option<(&str, &str)> {
 }
 
 /// `key: value` lines, and `- item` lines under a key with no value.
-fn parse_fields(front: &str) -> Result<Vec<(String, Field)>, String> {
+pub(crate) fn parse_fields(front: &str) -> Result<Vec<(String, Field)>, String> {
     let mut fields: Vec<(String, Field)> = Vec::new();
     for raw in front.lines() {
         let line = raw.trim_end();

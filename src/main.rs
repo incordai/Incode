@@ -16,6 +16,11 @@ incode — autonomous coding harness
 
 USAGE:
     incode [OPTIONS]
+    incode update [--check]   Install the latest release over this program
+                              (sha256 checked); --check only reports it
+    incode review [--base <REF>] [-p]   Review the current change (see `incode review -h`)
+    incode plugin list | add <git-url | path> [--project] | remove <name> [--project]
+    incode mcp <list|get|add|remove|approve> ...   (see `incode mcp help`)
 
 OPTIONS:
     -m, --model <NAME>        Model to use (or set INCODE_MODEL)
@@ -98,6 +103,39 @@ fn main() -> anyhow::Result<()> {
             }
         }
     }
+    // `incode review`: a subcommand with its own few flags, read by the
+    // module that runs it.
+    {
+        let raw: Vec<String> = std::env::args().skip(1).collect();
+        if raw.first().map(String::as_str) == Some("review") {
+            let args =
+                incord_code::review::Args::parse(&raw[1..]).map_err(|e| anyhow::anyhow!(e))?;
+            if args.help {
+                println!("{}", incord_code::review::USAGE);
+                return Ok(());
+            }
+            return on_a_runtime(|| {
+                incord_code::review::run(
+                    &args.workspace,
+                    args.base.as_deref(),
+                    args.model.as_deref(),
+                    args.print_only,
+                )
+            })?
+            .map_err(|e| anyhow::anyhow!(e));
+        }
+    }
+    // `incode plugin ...` manages plugin folders and runs nothing else.
+    {
+        let raw: Vec<String> = std::env::args().skip(1).collect();
+        if raw.first().map(String::as_str) == Some("plugin") {
+            let workspace = std::env::current_dir()?;
+            let said =
+                incord_code::plugins::cli(&raw[1..], &workspace).map_err(|e| anyhow::anyhow!(e))?;
+            println!("{}", said.trim_end());
+            return Ok(());
+        }
+    }
     // NOTE: the crate emits `tracing` events (MCP connection failures, tool
     // errors) but no subscriber is installed, so they currently go nowhere.
     // Installing one needs a new dependency, which is a decision to take
@@ -151,6 +189,9 @@ fn main() -> anyhow::Result<()> {
                     .as_deref(),
             )
             .map_err(|e| anyhow::anyhow!(e))?;
+            // `-t "/name args"` runs the operator's custom command.
+            let (instruction, model) =
+                incord_code::custom_commands::expand_task(&workspace, instruction, model);
             return on_a_runtime(|| {
                 incord_code::task_run::run_task_as(
                     &workspace,
@@ -248,6 +289,15 @@ fn main() -> anyhow::Result<()> {
             // moves the standard handles before anything is printed.
             return incord_code::acp_agent::run_stdio(*config);
         }
+        Parsed::Mcp(args) => {
+            let workspace = std::env::current_dir()?;
+            let data_dir = incord_code::admin::AdminConfig::default_dir();
+            match incord_code::mcp_config::command(&args, &workspace, &data_dir) {
+                Ok(said) => println!("{said}"),
+                Err(why) => anyhow::bail!("{why}"),
+            }
+            return Ok(());
+        }
         Parsed::InstallTools => {
             let (lines, all) = incord_code::ext_tools::install_all(
                 &incord_code::admin::AdminConfig::default_dir(),
@@ -258,6 +308,14 @@ fn main() -> anyhow::Result<()> {
             if !all {
                 anyhow::bail!("not every configured tool is installed");
             }
+            return Ok(());
+        }
+        Parsed::Update { check_only } => {
+            // No runtime around it: the HTTP helpers bring their own when none
+            // is ambient, as for `--install-tools`.
+            let said = incord_code::self_update::run(check_only)
+                .map_err(|why| anyhow::anyhow!("incode update: {why}"))?;
+            println!("{said}");
             return Ok(());
         }
         Parsed::ToolServer => {
@@ -455,6 +513,15 @@ enum Parsed {
     /// Install every tool `admin.json` `tools` names, then exit.
     InstallTools,
 
+    /// `incode update`: replace this program with the latest release, or with
+    /// `--check` only say whether there is one.
+    Update {
+        check_only: bool,
+    },
+    /// `incode mcp …`: list, show, add, remove or approve the MCP servers of
+    /// `.mcp.json` and `~/.incode/mcp.json` ([`incord_code::mcp_config`]).
+    Mcp(Vec<String>),
+
     /// Be an Agent Client Protocol agent on stdio.
     ///
     /// Carries the config for the flags that apply to every session it opens
@@ -491,6 +558,7 @@ impl Parsed {
                 | Self::DesktopMcp { .. }
                 | Self::InstallTools
                 | Self::ToolServer
+                | Self::Mcp(_)
         )
     }
 }
@@ -522,6 +590,26 @@ fn parse_args(args: impl Iterator<Item = String>) -> anyhow::Result<Parsed> {
     let mut task: Option<String> = None;
     let mut output_format: Option<incord_code::task_run::OutputFormat> = None;
     let mut spec_gate: Option<incord_code::spec::SpecGate> = None;
+
+    // A subcommand, not a flag, as `claude update` and the like are: only in
+    // first place, and it takes nothing but its own `--check`.
+    if args.peek().map(String::as_str) == Some("update") {
+        args.next();
+        let mut check_only = false;
+        for arg in args {
+            match arg.as_str() {
+                "--check" => check_only = true,
+                "-h" | "--help" => return Ok(Parsed::Exit(USAGE.to_string())),
+                other => anyhow::bail!("unknown argument `{other}` for `incode update`\n\n{USAGE}"),
+            }
+        }
+        return Ok(Parsed::Update { check_only });
+    }
+    // A subcommand, not a flag: everything after it is its own.
+    if args.peek().map(String::as_str) == Some("mcp") {
+        args.next();
+        return Ok(Parsed::Mcp(args.collect()));
+    }
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -1117,6 +1205,16 @@ mod tests {
         assert!(USAGE.contains("--install-tools"));
     }
 
+    /// `incode mcp …` is a subcommand: what follows is its own, flags too.
+    #[test]
+    fn mcp_is_a_subcommand_that_keeps_its_arguments() {
+        match parse(&["mcp", "add", "-e", "K=V", "fs", "--", "npx", "-y"]).expect("valid") {
+            Parsed::Mcp(args) => assert_eq!(args, ["add", "-e", "K=V", "fs", "--", "npx", "-y"]),
+            other => panic!("expected Mcp, got {other:?}"),
+        }
+        assert!(USAGE.contains("incode mcp"));
+    }
+
     /// It must not care about the workspace.
     ///
     /// An MCP client launches this process with whatever cwd it happens to
@@ -1236,6 +1334,8 @@ mod tests {
             | Parsed::TeamMcp { .. }
             | Parsed::ToolServer
             | Parsed::InstallTools
+            | Parsed::Update { .. }
+            | Parsed::Mcp(_)
             | Parsed::Acp(_) => {
                 panic!("expected a runnable config")
             }
@@ -1542,6 +1642,22 @@ mod tests {
     #[test]
     fn a_task_flag_without_text_is_rejected() {
         assert!(parse(&["--task"]).is_err());
+    }
+
+    #[test]
+    fn update_is_a_subcommand_with_one_flag() {
+        assert!(matches!(
+            parse(&["update"]).expect("valid"),
+            Parsed::Update { check_only: false }
+        ));
+        assert!(matches!(
+            parse(&["update", "--check"]).expect("valid"),
+            Parsed::Update { check_only: true }
+        ));
+        assert!(parse(&["update", "--force"]).is_err());
+        assert!(parse(&["update", "-t", "x"]).is_err());
+        // Only in first place: elsewhere it is not a flag incode knows.
+        assert!(parse(&["--admin", "update"]).is_err());
     }
 
     #[test]

@@ -19,9 +19,12 @@
 //! ```
 //!
 //! On macOS the helper runs under `sandbox-exec` with a generated Seatbelt
-//! profile instead of Landlock. The helper is the calling binary re-executed
-//! with a private first argument, so a program that embeds this library must
-//! call [`enter_if_requested`] first thing in `main`.
+//! profile instead of Landlock. On Windows, which has no `exec`, the parent
+//! grants the writable roots to a private per-run SID first, and the helper
+//! starts the command under a write-restricted token, in a job object, and
+//! stays to supervise it (see [`windows`]). The helper is the calling binary
+//! re-executed with a private first argument, so a program that embeds this
+//! library must call [`enter_if_requested`] first thing in `main`.
 //!
 //! # Platforms
 //!
@@ -29,18 +32,26 @@
 //! |---|---|---|---|
 //! | Linux | Landlock (5.13+) | Landlock TCP (6.7+) + seccomp | setrlimit + wall |
 //! | macOS | Seatbelt | Seatbelt | setrlimit + wall |
-//! | Windows | not yet (see incode's ACL sandbox) | not yet | wall only |
+//! | Windows | write-restricted token + ACL grant (writes only; no `deny_read`) | not enforced (WSL2: see [`backend`]) | job object + wall |
 
+pub mod backend;
 pub mod env;
 pub mod limits;
 pub mod policy;
+pub mod protect;
 pub mod proxy;
 pub mod seatbelt;
+pub mod server;
+pub mod wslpath;
+
+pub mod windows;
 
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
 mod seccomp;
+#[cfg(target_os = "linux")]
+pub mod wsl;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -131,6 +142,10 @@ pub struct EnterSpec {
     pub roots: Vec<PathBuf>,
     #[serde(default)]
     pub deny_read: Vec<PathBuf>,
+    /// Paths whose writes Seatbelt refuses (macOS); on Linux they are
+    /// restored after the run instead ([`protect`]).
+    #[serde(default)]
+    pub protected: Vec<PathBuf>,
     pub temp: PathBuf,
     pub net_mode: NetMode,
     pub proxy_port: Option<u16>,
@@ -141,6 +156,14 @@ pub struct EnterSpec {
     /// SIGKILL, which nothing can forward) the whole group dies with it.
     #[serde(default)]
     pub supervise: bool,
+    /// Windows: the run's private SID, granted on its writable roots and
+    /// temp directory; the helper restricts the command's token to it.
+    #[serde(default)]
+    pub sid: Option<String>,
+    /// Windows: the parent's process id. The helper watches it and ends the
+    /// command's job if the parent dies (there is no parent-death signal).
+    #[serde(default)]
+    pub parent_pid: Option<u32>,
 }
 
 /// Call first thing in `main` of any program that embeds this library. When
@@ -199,9 +222,9 @@ fn enter(args: &[OsString]) -> Result<Never, EnterError> {
         .get(2)
         .ok_or_else(|| sandbox_err("helper started without a command"))?;
     let program_args = &args[3..];
-    // Nothing in the spec is enforced by the helper off Unix yet: the parent
-    // already refused (strict) or reported (best effort) every gap.
-    #[cfg(not(unix))]
+    // Off Unix and Windows nothing in the spec is enforced by the helper: the
+    // parent already refused (strict) or reported (best effort) every gap.
+    #[cfg(not(any(unix, windows)))]
     let _ = &spec;
 
     // If the parent dies (SIGKILL included, which nothing can forward), the
@@ -247,15 +270,23 @@ fn enter(args: &[OsString]) -> Result<Never, EnterError> {
         }
         eprintln!("sbx: Landlock not applied (best effort): {e}");
     }
-    // After Landlock, before exec: Landlock confines TCP, this refuses the
-    // sockets Landlock does not see (UDP, raw, ...). See `seccomp`.
+    // After Landlock, before exec: refuse terminal input injection, vsock and
+    // io_uring whenever anything is confined, and under deny/proxy also the
+    // sockets Landlock does not see (UDP, raw, ...). See `seccomp`. Only the
+    // socket layer is part of the network policy, so only it is fatal in
+    // strict mode; with the filesystem alone, an architecture without a
+    // filter is skipped quietly and a kernel refusal is reported.
     #[cfg(target_os = "linux")]
-    if spec.net_mode != NetMode::Allow {
-        if let Err(e) = seccomp::restrict_sockets() {
-            if spec.strict {
-                return Err(sandbox_err(format!("seccomp: {e}")));
+    {
+        let network = spec.net_mode != NetMode::Allow;
+        let fs = spec.fs_mode != FsMode::Off && seccomp::available();
+        if network || fs {
+            if let Err(e) = seccomp::install(network) {
+                if spec.strict && network {
+                    return Err(sandbox_err(format!("seccomp: {e}")));
+                }
+                eprintln!("sbx: seccomp not applied (best effort): {e}");
             }
-            eprintln!("sbx: seccomp not applied (best effort): {e}");
         }
     }
 
@@ -263,6 +294,16 @@ fn enter(args: &[OsString]) -> Result<Never, EnterError> {
     if spec.supervise {
         supervise(program, program_args, parent);
     }
+    // No exec on Windows: the helper starts the command confined, in a job,
+    // and stays to pass its exit code on.
+    #[cfg(windows)]
+    {
+        match windows::enter(&spec, program, program_args) {
+            Ok(code) => std::process::exit(code),
+            Err((message, code)) => Err(EnterError { message, code }),
+        }
+    }
+    #[cfg(not(windows))]
     exec(program, program_args)
 }
 
@@ -338,9 +379,9 @@ fn exec(program: &OsString, args: &[OsString]) -> Result<Never, EnterError> {
     })
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn exec(program: &OsString, args: &[OsString]) -> Result<Never, EnterError> {
-    // No exec on Windows: run it and pass its exit code on.
+    // No exec here: run it and pass its exit code on.
     let status = Command::new(program)
         .args(args)
         .status()
@@ -367,8 +408,14 @@ pub struct Sandbox {
 /// temp directory. Dropped after the command exits.
 pub struct Guard {
     proxy: Option<proxy::Proxy>,
+    /// Windows: the run's ACL grant on its roots and temp directory, revoked
+    /// when dropped. Declared before `temp` so it drops first, while the
+    /// temp directory still exists to be revoked.
+    #[cfg(windows)]
+    _lease: Option<windows::acl::Lease>,
     temp: TempDir,
     pub enforcement: Enforcement,
+    protected: Option<protect::Snapshot>,
     /// Whether the command runs in its own process group (only with a
     /// wall-clock limit and a non-terminal stdin); kill `-pid` to stop it all.
     pub own_group: bool,
@@ -381,6 +428,16 @@ impl Guard {
         self.proxy
             .as_ref()
             .map(proxy::Proxy::decisions)
+            .unwrap_or_default()
+    }
+
+    /// Put back whatever the command changed under the protected paths
+    /// (`fs.protect_git`), and say what. Call once the command has exited.
+    #[must_use]
+    pub fn restore_protected(&self) -> Vec<String> {
+        self.protected
+            .as_ref()
+            .map(protect::Snapshot::restore)
             .unwrap_or_default()
     }
 
@@ -397,6 +454,8 @@ pub struct Outcome {
     pub status: ExitStatus,
     pub timed_out: bool,
     pub decisions: Vec<proxy::Decision>,
+    /// Protected paths the command changed, which were put back.
+    pub restored: Vec<String>,
 }
 
 impl Outcome {
@@ -480,9 +539,51 @@ impl Sandbox {
             ));
         }
         let roots = self.policy.resolved_roots(cwd)?;
-        let deny_read = self.policy.resolved_deny_read(cwd, &roots)?;
+        #[allow(unused_mut)]
+        let mut deny_read = self.policy.resolved_deny_read(cwd, &roots)?;
+        // Inside WSL2 a Windows program started from the sandbox would run
+        // outside it altogether: hide the interop interpreter and sockets.
+        #[cfg(target_os = "linux")]
+        let block_interop = self.policy.fs.mode != FsMode::Off
+            && self.policy.fs.block_wsl_interop
+            && wsl::detected();
+        #[cfg(not(target_os = "linux"))]
+        let block_interop = false;
+        #[cfg(target_os = "linux")]
+        if block_interop {
+            for p in wsl::interop_paths() {
+                if !deny_read.contains(&p) && !roots.iter().any(|r| p.starts_with(r)) {
+                    deny_read.push(p);
+                }
+            }
+        }
+        let protected = (self.policy.fs.mode == FsMode::WorkspaceWrite
+            && self.policy.fs.protect_git)
+            .then(|| protect::Snapshot::take(protect::git_paths(&roots)));
         let temp = TempDir::new()?;
-        let own_group = self.policy.limits.wall_secs.is_some() && !stdin_is_terminal();
+        // Windows has no process groups: the helper's job object does that.
+        let own_group =
+            cfg!(unix) && self.policy.limits.wall_secs.is_some() && !stdin_is_terminal();
+        // Windows: grant the writable roots and the temp directory to a
+        // private SID for this run, before the helper restricts the
+        // command's token to it. A grant that fails refuses the run in
+        // strict mode; best effort runs it with the writes unconfined, and
+        // says so.
+        #[cfg(windows)]
+        let lease = if self.policy.fs.mode == FsMode::Off {
+            None
+        } else {
+            let mut grant = roots.clone();
+            grant.push(temp.path.clone());
+            match windows::acl::Lease::acquire(&grant) {
+                Ok(lease) => Some(lease),
+                Err(e) if self.strict => return Err(e),
+                Err(e) => {
+                    eprintln!("sbx: writes not confined (best effort): {e}");
+                    None
+                }
+            }
+        };
 
         let proxy = if self.policy.network.mode == NetMode::Proxy {
             let allowlist = proxy::Allowlist::new(
@@ -503,18 +604,30 @@ impl Sandbox {
         if let Some(p) = &proxy {
             extra.extend(p.client_env());
         }
-        let environment = env::compute(&self.policy.env, std::env::vars_os(), &extra);
+        let mut environment = env::compute(&self.policy.env, std::env::vars_os(), &extra);
+        if block_interop {
+            environment.retain(|(k, _)| k != "WSL_INTEROP");
+        }
 
         let spec = EnterSpec {
             fs_mode: self.policy.fs.mode,
             roots: roots.clone(),
             deny_read,
+            protected: protected
+                .as_ref()
+                .map(|s| s.paths().to_vec())
+                .unwrap_or_default(),
             temp: temp.path.clone(),
             net_mode: self.policy.network.mode,
             proxy_port: proxy.as_ref().map(proxy::Proxy::port),
             limits: self.policy.limits.clone(),
             strict: self.strict,
             supervise: own_group,
+            #[cfg(windows)]
+            sid: lease.as_ref().map(|l| l.sid().to_string()),
+            #[cfg(not(windows))]
+            sid: None,
+            parent_pid: Some(std::process::id()),
         };
         let helper = match &self.helper {
             Some(h) => h.clone(),
@@ -539,8 +652,11 @@ impl Sandbox {
             cmd,
             Guard {
                 proxy,
+                #[cfg(windows)]
+                _lease: lease,
                 temp,
                 enforcement,
+                protected,
                 own_group,
             },
         ))
@@ -571,7 +687,137 @@ impl Sandbox {
             status,
             timed_out,
             decisions: guard.decisions(),
+            restored: guard.restore_protected(),
         })
+    }
+}
+
+/// A command's result with what it printed, kept up to a limit.
+#[derive(Debug)]
+pub struct Captured {
+    pub outcome: Outcome,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    /// Bytes printed in all, including what was cut.
+    pub stdout_total: u64,
+    pub stderr_total: u64,
+}
+
+impl Sandbox {
+    /// Run `program args` in `cwd` with `stdin` fed in, keep the first
+    /// `max_output` bytes of each output stream, and wait for it.
+    ///
+    /// For a server running commands on someone else's behalf: no signal is
+    /// forwarded (the server's own signals are its own), and when the command
+    /// has its own process group (a wall-clock limit is set) the whole group
+    /// is killed once the command ends, so nothing it left running in the
+    /// background outlives the run.
+    ///
+    /// # Errors
+    /// As [`Self::command`], or when the command cannot be started.
+    pub fn run_captured(
+        &self,
+        program: impl AsRef<std::ffi::OsStr>,
+        args: &[OsString],
+        cwd: &Path,
+        stdin: Option<&[u8]>,
+        max_output: usize,
+    ) -> Result<Captured, String> {
+        use std::process::Stdio;
+        let (mut cmd, guard) = self.command(program, args, cwd)?;
+        cmd.stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+        let wall = self.policy.limits.wall_secs.map(Duration::from_secs);
+        let own_group = guard.own_group;
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("cannot start the helper: {e}"))?;
+        let out = child.stdout.take().map(|s| drain(s, max_output));
+        let err = child.stderr.take().map(|s| drain(s, max_output));
+        if let (Some(input), Some(mut pipe)) = (stdin, child.stdin.take()) {
+            let input = input.to_vec();
+            std::thread::spawn(move || {
+                use std::io::Write;
+                let _ = pipe.write_all(&input);
+            });
+        }
+        let pid = child.id();
+        let (status, timed_out) = wait(child, wall, own_group)?;
+        if own_group {
+            kill_group(pid);
+        }
+        let collect = |h: Option<std::thread::JoinHandle<(Vec<u8>, u64)>>| {
+            h.and_then(|h| h.join().ok()).unwrap_or_default()
+        };
+        let (stdout, stdout_total) = collect(out);
+        let (stderr, stderr_total) = collect(err);
+        Ok(Captured {
+            outcome: Outcome {
+                status,
+                timed_out,
+                decisions: guard.decisions(),
+                restored: guard.restore_protected(),
+            },
+            stdout,
+            stderr,
+            stdout_total,
+            stderr_total,
+        })
+    }
+}
+
+/// Read a stream to its end on its own thread, keeping the first `max` bytes
+/// and counting the rest.
+fn drain(
+    mut stream: impl std::io::Read + Send + 'static,
+    max: usize,
+) -> std::thread::JoinHandle<(Vec<u8>, u64)> {
+    std::thread::spawn(move || {
+        let mut kept = Vec::new();
+        let mut total = 0u64;
+        let mut buf = [0u8; 8192];
+        while let Ok(n) = stream.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            total += n as u64;
+            let room = max.saturating_sub(kept.len());
+            kept.extend_from_slice(&buf[..n.min(room)]);
+        }
+        (kept, total)
+    })
+}
+
+/// Kill a process group the sandbox created, whatever is left in it.
+fn kill_group(pid: u32) {
+    #[cfg(unix)]
+    if let Ok(pid) = i32::try_from(pid) {
+        // SAFETY: signalling a process group this crate created.
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = pid;
+}
+
+/// `path` as commands expect to see it. On Windows `canonicalize` returns
+/// `\\?\C:\...`, which `cmd.exe` refuses as a working folder and which
+/// does not accept `/`; this gives back `C:\...`. Elsewhere, unchanged.
+#[must_use]
+pub fn plain_path(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        PathBuf::from(windows::strip_verbatim(&path.to_string_lossy()))
+    }
+    #[cfg(not(windows))]
+    {
+        path
     }
 }
 
@@ -579,7 +825,7 @@ impl Sandbox {
 #[must_use]
 pub fn enforcement(policy: &Policy) -> Enforcement {
     Enforcement {
-        filesystem: fs_status(policy.fs.mode),
+        filesystem: fs_status(&policy.fs),
         network: net_status(policy.network.mode),
         limits: limits::status(&policy.limits),
         environment: Status::Enforced(environment_summary(&policy.env)),
@@ -605,13 +851,19 @@ fn environment_summary(e: &policy::Env) -> String {
 }
 
 #[cfg(target_os = "linux")]
-fn fs_status(mode: FsMode) -> Status {
-    linux::fs_status(mode)
+fn fs_status(fs: &policy::Fs) -> Status {
+    match linux::fs_status(fs.mode) {
+        Status::Enforced(how) if wsl::detected() => Status::Enforced(format!(
+            "{how}; WSL: starting Windows programs is blocked (interop interpreter and \
+             sockets hidden, WSL_INTEROP removed, vsock refused)"
+        )),
+        other => other,
+    }
 }
 
 #[cfg(target_os = "macos")]
-fn fs_status(mode: FsMode) -> Status {
-    match mode {
+fn fs_status(fs: &policy::Fs) -> Status {
+    match fs.mode {
         FsMode::Off => Status::NotRequested,
         _ if Path::new(seatbelt::SANDBOX_EXEC).exists() => {
             Status::Enforced("Seatbelt (sandbox-exec)".into())
@@ -620,9 +872,14 @@ fn fs_status(mode: FsMode) -> Status {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn fs_status(mode: FsMode) -> Status {
-    match mode {
+#[cfg(windows)]
+fn fs_status(fs: &policy::Fs) -> Status {
+    windows::fs_status(fs)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn fs_status(fs: &policy::Fs) -> Status {
+    match fs.mode {
         FsMode::Off => Status::NotRequested,
         _ => {
             Status::NotEnforced("no filesystem sandbox is implemented for this platform yet".into())
@@ -647,7 +904,12 @@ fn net_status(mode: NetMode) -> Status {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(windows)]
+fn net_status(mode: NetMode) -> Status {
+    windows::net_status(mode)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn net_status(mode: NetMode) -> Status {
     match mode {
         NetMode::Allow => Status::NotRequested,
@@ -672,10 +934,14 @@ fn wrap_platform(helper: &Path, spec: &EnterSpec, roots: &[PathBuf]) -> Command 
         cmd.arg("-D")
             .arg(format!("DR{i}={}", real(hidden).display()));
     }
+    for (i, kept) in spec.protected.iter().enumerate() {
+        cmd.arg("-D").arg(format!("PR{i}={}", real(kept).display()));
+    }
     cmd.arg("-p").arg(seatbelt::profile(
         spec.fs_mode,
         roots.len(),
         spec.deny_read.len(),
+        spec.protected.len(),
         spec.net_mode,
         spec.proxy_port,
     ));
@@ -812,7 +1078,8 @@ impl TempDir {
             let path = base.join(name);
             match create_private_dir(&path) {
                 Ok(()) => {
-                    let path = std::fs::canonicalize(&path).unwrap_or(path);
+                    // Plain, not `\\?\C:\...`: many tools cannot use that as TEMP.
+                    let path = plain_path(std::fs::canonicalize(&path).unwrap_or(path));
                     return Ok(Self { path });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,

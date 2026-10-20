@@ -24,6 +24,7 @@ pub fn profile(
     fs: FsMode,
     roots: usize,
     deny_read: usize,
+    protected: usize,
     net: NetMode,
     proxy_port: Option<u16>,
 ) -> String {
@@ -40,6 +41,10 @@ pub fn profile(
              (literal \"/dev/dtracehelper\") (regex #\"^/dev/fd/[0-9]+$\") \
              (regex #\"^/dev/ttys[0-9]+$\"))"
         ));
+        // Last match wins: these come after the root's allow.
+        for i in 0..protected {
+            p.push_str(&format!(" (deny file-write* (subpath (param \"PR{i}\")))"));
+        }
         for i in 0..deny_read {
             p.push_str(&format!(" (deny file-read* (subpath (param \"DR{i}\")))"));
         }
@@ -70,7 +75,7 @@ mod tests {
 
     #[test]
     fn workspace_write_denies_then_allows_the_roots() {
-        let p = profile(FsMode::WorkspaceWrite, 2, 0, NetMode::Allow, None);
+        let p = profile(FsMode::WorkspaceWrite, 2, 0, 0, NetMode::Allow, None);
         let deny = p.find("(deny file-write*").expect("deny");
         let allow = p.find("(allow file-write*").expect("allow");
         assert!(deny < allow, "the deny comes first: {p}");
@@ -80,24 +85,24 @@ mod tests {
 
     #[test]
     fn read_only_has_only_the_temp_dir_and_sinks() {
-        let p = profile(FsMode::ReadOnly, 0, 0, NetMode::Allow, None);
+        let p = profile(FsMode::ReadOnly, 0, 0, 0, NetMode::Allow, None);
         assert!(!p.contains("WS0"));
         assert!(p.contains("(param \"TMP\")"));
     }
 
     #[test]
     fn proxy_allows_exactly_the_proxy_port() {
-        let p = profile(FsMode::Off, 0, 0, NetMode::Proxy, Some(41234));
+        let p = profile(FsMode::Off, 0, 0, 0, NetMode::Proxy, Some(41234));
         assert!(p.contains("(deny network*)"));
         assert!(p.contains("(remote ip \"localhost:41234\")"));
         assert!(!p.contains("file-write"));
-        let deny = profile(FsMode::Off, 0, 0, NetMode::Deny, None);
+        let deny = profile(FsMode::Off, 0, 0, 0, NetMode::Deny, None);
         assert!(!deny.contains("remote ip"));
     }
 
     #[test]
     fn deny_read_comes_after_the_allow_default() {
-        let p = profile(FsMode::ReadOnly, 0, 2, NetMode::Allow, None);
+        let p = profile(FsMode::ReadOnly, 0, 2, 0, NetMode::Allow, None);
         let allow = p.find("(allow default)").expect("allow");
         let deny = p
             .find("(deny file-read* (subpath (param \"DR0\")))")
@@ -107,9 +112,20 @@ mod tests {
     }
 
     #[test]
+    fn protected_paths_are_denied_after_the_root_is_allowed() {
+        let p = profile(FsMode::WorkspaceWrite, 1, 0, 2, NetMode::Allow, None);
+        let allow = p.find("(allow file-write*").expect("allow");
+        let deny = p
+            .find("(deny file-write* (subpath (param \"PR0\")))")
+            .expect("PR0");
+        assert!(allow < deny, "{p}");
+        assert!(p.contains("(param \"PR1\")"));
+    }
+
+    #[test]
     fn parentheses_balance() {
         for net in [NetMode::Allow, NetMode::Deny, NetMode::Proxy] {
-            let p = profile(FsMode::WorkspaceWrite, 3, 2, net, Some(1));
+            let p = profile(FsMode::WorkspaceWrite, 3, 2, 0, net, Some(1));
             let open = p.matches('(').count();
             let close = p.matches(')').count();
             assert_eq!(open, close, "{p}");

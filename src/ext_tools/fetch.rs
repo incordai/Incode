@@ -138,8 +138,14 @@ pub(crate) fn resolve_github(
 }
 
 /// One GET, following redirects under the address rule, bounded in time and
-/// size. `Err` names what went wrong, never a header.
-fn get_bounded(url: &str, accept: &str, bound: Duration, cap: usize) -> Result<Vec<u8>, String> {
+/// size. `Err` names what went wrong, never a header. Also `incode update`'s
+/// release lookup ([`crate::self_update`]).
+pub(crate) fn get_bounded(
+    url: &str,
+    accept: &str,
+    bound: Duration,
+    cap: usize,
+) -> Result<Vec<u8>, String> {
     let url = url.to_string();
     let accept = accept.to_string();
     crate::runtime::http::run_async(async move {

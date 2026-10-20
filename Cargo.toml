@@ -150,6 +150,10 @@ tungstenite = { version = "=0.30.0", default-features = false, features = ["hand
 # drops `xattr`, so it brings only filetime beside it (see ARCHITECTURE.md,
 # "External tools").
 sha2 = "=0.10.9"
+# The managed settings file (`/etc/incode/managed.toml`, src/permissions/
+# managed.rs). NO NEW PACKAGE: toml 1.x is already resolved in Cargo.lock for
+# the workspace's own `crates/sandbox`, which declares it the same way.
+toml = "1"
 flate2 = "=1.1.10"
 tar = { version = "=0.4.46", default-features = false }
 

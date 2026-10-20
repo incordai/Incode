@@ -52,7 +52,12 @@ pub const MACHINE_LOCAL: &[&str] = &[
 
 /// What stays tracked: the files the owner approves. Named in the file's
 /// header so a reader knows the omission is deliberate.
-pub const SHARED: &[&str] = &["contracts.json", "guards.json", "agents/*.md"];
+pub const SHARED: &[&str] = &[
+    "contracts.json",
+    "guards.json",
+    "settings.json",
+    "agents/*.md",
+];
 
 /// The file as first written.
 fn fresh_text() -> String {

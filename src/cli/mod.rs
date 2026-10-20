@@ -6,8 +6,10 @@ pub mod console;
 pub mod edits;
 pub mod footer;
 pub mod input;
+pub mod keys;
 pub mod logo;
 pub mod markdown;
+pub mod notify;
 pub mod paint;
 pub mod panel;
 pub mod prompt;
@@ -15,6 +17,8 @@ pub mod render;
 pub(crate) mod run_ledger;
 pub(crate) mod run_memory;
 pub mod slash_commands;
+pub mod statusline;
+mod ux;
 pub mod viewport;
 
 use crate::{out, outln};
@@ -93,8 +97,32 @@ impl CliApp {
 /// listed them — and say which configured tools are not installed. What
 /// became of each server is traced, never printed over the prompt.
 fn connect_ext_tools(prepared: &Prepared) {
-    let (specs, said) =
+    let (mut specs, mut said) =
         crate::ext_tools::session_servers(&prepared.admin.tools, &prepared.incode_dir);
+    let (plugin_specs, plugin_said) = crate::plugins::session_servers(&prepared.workspace);
+    specs.extend(plugin_specs);
+    said.extend(plugin_said);
+    // `.mcp.json` and `~/.incode/mcp.json`. A project's server not yet
+    // approved is put to the person at the terminal, before the prompt.
+    let at_terminal = std::io::IsTerminal::is_terminal(&std::io::stdin())
+        && std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let ask = |name: &str, entry: &crate::mcp_config::ServerEntry| {
+        render::print_info(&format!(
+            "This project's {} wants to start the MCP server `{name}`: {}",
+            crate::mcp_config::PROJECT_FILE,
+            entry.summary()
+        ));
+        out!("Start it now and remember the approval? [y/N] ");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer).is_ok()
+            && matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+    };
+    let asker: Option<crate::mcp_config::Asker<'_>> = if at_terminal { Some(&ask) } else { None };
+    let (from_files, about_files) =
+        crate::mcp_config::session_servers(&prepared.workspace, &prepared.incode_dir, asker);
+    specs.extend(from_files);
+    said.extend(about_files);
     for line in said {
         render::print_info(&line);
     }
@@ -750,6 +778,9 @@ impl CliApp {
             });
         }
         let mut editor = LineEditor::new(Some(history_path));
+        // Notifications, the status line, vi mode and key bindings.
+        let mut ux = ux::Ux::start(&admin, &incode_dir, footer.as_mut(), &mut editor);
+        ux.refresh_status(footer.as_mut(), &session, &workspace, git_context.as_ref());
         // The session's own jobs: `/bg` and the model's background `Bash`
         // share one table, so `/jobs` shows both and the stop hook waits on
         // both.
@@ -781,6 +812,14 @@ impl CliApp {
         // agent only names its session after the first one.
         let mut session_record: Option<crate::session::Record> = None;
 
+        // The operator's own slash commands, the project's and the plugins'.
+        // A built-in always wins; a typed custom command becomes the turn.
+        let custom_commands = crate::custom_commands::Registry::load(&workspace);
+        for warning in &custom_commands.warnings {
+            render::print_info(&format!("warning: {warning}"));
+        }
+        custom_commands.publish_menu();
+
         while let Some(line) = match footer {
             Some(ref mut f) => f.read_line(),
             None => editor.readline("You: "),
@@ -788,6 +827,10 @@ impl CliApp {
             if line.is_empty() {
                 continue;
             }
+            let line = match custom_commands.expand_line(&line) {
+                Some(expanded) => crate::custom_commands::announce(&expanded),
+                None => line,
+            };
 
             // Check for slash commands
             if let Some(cmd) = SlashCommand::parse(&line) {
@@ -831,6 +874,7 @@ impl CliApp {
                     SlashCommand::Links(target) => {
                         slash_commands::handle_links(&session.roots(), target.as_deref());
                     }
+                    SlashCommand::Permissions => slash_commands::handle_permissions(&workspace),
                     SlashCommand::Guards => {
                         slash_commands::handle_guards(&workspace);
                     }
@@ -883,6 +927,8 @@ impl CliApp {
                         slash_commands::handle_roles(arg.as_deref(), &incode_dir);
                     }
                     SlashCommand::Help => slash_commands::handle_help(),
+                    SlashCommand::Cost => ux::print_cost(&session),
+                    SlashCommand::Vim => ux.toggle_vim(footer.as_mut(), &mut editor),
                     SlashCommand::Status => {
                         slash_commands::handle_agent_status(
                             &display_model,
@@ -894,13 +940,40 @@ impl CliApp {
                             session.quota(),
                         );
                     }
-                    SlashCommand::Compact => {
-                        // The agent compacts its own transcript — it owns the
-                        // conversation now, and a second compactor here would be
-                        // summarising a copy it does not have.
-                        render::print_info(
-                            "The agent manages its own context and compacts it automatically. Use /clear to start a fresh session.",
-                        );
+                    // On the API route the conversation is incode's, so it is
+                    // compacted here; an agent CLI compacts its own transcript,
+                    // and a second compactor would be summarising a copy it
+                    // does not have.
+                    SlashCommand::Compact(instructions) => {
+                        match session.compact(instructions.as_deref().unwrap_or("")) {
+                            Some(Ok(done)) => render::print_info(&done),
+                            Some(Err(why)) => render::print_error(&format!(
+                                "The conversation was not compacted: {why}"
+                            )),
+                            None => render::print_info(
+                                "The agent manages its own context and compacts it automatically. Use /clear to start a fresh session.",
+                            ),
+                        }
+                    }
+                    SlashCommand::Review(base) => {
+                        match crate::review::collect(&workspace, base.as_deref()) {
+                            Ok(change) if change.is_empty() => render::print_info(&format!(
+                                "No changes to review against {}.",
+                                change.base
+                            )),
+                            Ok(change) => {
+                                let ask = crate::review::prompt(&change);
+                                if let Err(e) = one_turn_with_context(
+                                    &mut session,
+                                    &workspace,
+                                    &ask,
+                                    Vec::new(),
+                                ) {
+                                    render::print_error(&e);
+                                }
+                            }
+                            Err(why) => render::print_error(&why),
+                        }
                     }
                     SlashCommand::Tools(arg) => {
                         // The tools incode runs itself for the current agent,
@@ -1198,9 +1271,12 @@ impl CliApp {
             // that moment, from the table `/bg` and the model share.
             // Context, checkpoint, turn and streaming all live in one place
             // now, shared with the one-shot path above so the two cannot drift.
+            let turn_began = std::time::Instant::now();
             if let Err(e) = run_one_turn(&mut session, &workspace, &augmented_input, &line) {
                 render::print_error(&e);
             }
+            notify::turn_finished(turn_began.elapsed());
+            ux.refresh_status(footer.as_mut(), &session, &workspace, git_context.as_ref());
 
             if let Some(f) = footer.as_mut() {
                 f.set_session(footer::Session {

@@ -189,7 +189,11 @@ pub fn load(root: &Path) -> (Skillset, Source) {
     let fetched = crate::rules::get_within(&skills_url(), SESSION_TIMEOUT)
         .ok()
         .and_then(|body| parse(&body).ok());
-    choose(fetched, root)
+    let (mut set, source) = choose(fetched, root);
+    // Plugins' skills are folders like any installed one, read from disk
+    // rather than the store, so they are added after the cache is written.
+    set.discovered.extend(crate::plugins::session_skills());
+    (set, source)
 }
 
 /// The block to put in front of the model for this session, if there is one.

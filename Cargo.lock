@@ -2021,6 +2021,7 @@ dependencies = [
  "tar",
  "tempfile",
  "tokio",
+ "toml",
  "tracing",
  "tree-sitter",
  "tree-sitter-go",
@@ -2049,6 +2050,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "toml",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

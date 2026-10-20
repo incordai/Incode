@@ -1021,6 +1021,7 @@ mod tests {
             prompt_cache: None,
             auth: None,
             api_version: None,
+            context_window: None,
         };
         let catalogue = Catalogue::assemble_with(
             vec![local("claude-code", Protocol::ClaudeStreamJson)],

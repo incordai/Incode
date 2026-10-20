@@ -1,4 +1,4 @@
-//! Slash commands — /help, /status, /compact, /tools, /skills, /mcp, /model, /clear, /sessions, /resume.
+//! Slash commands — /help, /status, /compact, /review, /tools, /skills, /mcp, /model, /clear, /sessions, /resume.
 
 use crate::cli::render;
 use crate::tools::tool_status::ToolStatusCache;
@@ -14,7 +14,10 @@ use crate::{out, outln};
 pub enum SlashCommand {
     Help,
     Status,
-    Compact,
+    /// Summarise the conversation now, steered by the optional instructions.
+    Compact(Option<String>),
+    /// Review the change against a base (default: where the branch forked).
+    Review(Option<String>),
     /// The tools incode runs, or with an argument the external tools:
     /// `add <name>…`, `update [name]`, `remove <name>`.
     Tools(Option<String>),
@@ -45,6 +48,8 @@ pub enum SlashCommand {
     Doctor,
     /// What the agent is not allowed to write.
     Guards,
+    /// The settings' allow / ask / deny rules in force.
+    Permissions,
     /// Also work in another directory.
     AddDir(Option<String>),
     /// What else touches this file.
@@ -72,6 +77,10 @@ pub enum SlashCommand {
     /// Send a picture with the next message.
     Image(String),
     Env,
+    /// Tokens and estimated dollars for this session, per model.
+    Cost,
+    /// Switch between vi and emacs editing.
+    Vim,
     Quit,
     /// A REAL command, typed without what it needs. Carries the usage line.
     ///
@@ -98,7 +107,10 @@ impl SlashCommand {
         Some(match cmd.as_str() {
             "/help" | "/h" | "/?" | "/" => Self::Help,
             "/status" | "/s" => Self::Status,
-            "/compact" => Self::Compact,
+            "/compact" => Self::Compact(arg.filter(|a| !a.is_empty())),
+            "/review" => Self::Review(arg.filter(|a| !a.is_empty())),
+            "/cost" => Self::Cost,
+            "/vim" => Self::Vim,
             "/undo" | "/u" => Self::Undo,
             "/rewind" => match arg.as_deref().map(str::parse::<usize>) {
                 Some(Ok(turns)) if turns > 0 => Self::Rewind(turns),
@@ -107,6 +119,7 @@ impl SlashCommand {
             "/agents" => Self::Agents,
             "/doctor" | "/dr" => Self::Doctor,
             "/guards" | "/g" => Self::Guards,
+            "/permissions" | "/perms" => Self::Permissions,
             "/add-dir" => Self::AddDir(arg),
             "/links" | "/l" => Self::Links(arg),
             "/run" => Self::Run,
@@ -192,9 +205,15 @@ impl SlashCommand {
 pub const COMMANDS: &[(&str, &str)] = &[
     ("/help", "Show this help message"),
     ("/status", "Session info, token usage, model"),
+    ("/cost", "Tokens and estimated cost, per model"),
+    ("/vim", "Toggle vi editing for the input box"),
     (
         "/compact",
-        "Say where context is managed — the agent compacts its own",
+        "Summarise older turns now [instructions] (API route; a CLI agent compacts its own)",
+    ),
+    (
+        "/review",
+        "Review the change against [base] (default: where the branch forked)",
     ),
     (
         "/undo",
@@ -215,6 +234,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
     (
         "/guards",
         "Show the paths the agent is not allowed to write",
+    ),
+    (
+        "/permissions",
+        "Show the allow / ask / deny rules in force, and where each came from",
     ),
     (
         "/add-dir <path>",
@@ -447,6 +470,14 @@ pub fn handle_help() {
     for (cmd, desc) in COMMANDS {
         outln!("  {cmd:<20} {desc}");
     }
+    let custom = crate::custom_commands::menu();
+    if !custom.is_empty() {
+        outln!();
+        render::print_header("Custom Commands");
+        for (cmd, desc) in custom {
+            outln!("  {cmd:<20} {desc}");
+        }
+    }
     outln!();
 }
 
@@ -492,13 +523,16 @@ pub fn skills_lines(set: &crate::skills::Skillset, source: crate::skills::Source
         crate::skills::Source::Cache(age) => out.push(format!(
             "  The skill store did not answer — this is what it last said, {age}s ago."
         )),
-        crate::skills::Source::Nothing => {
+        crate::skills::Source::Nothing if set.is_empty() => {
             out.push(
                 "  The skill store did not answer and nothing was kept. This session is \
                  running without skills."
                     .to_string(),
             );
             return out;
+        }
+        crate::skills::Source::Nothing => {
+            out.push("  The skill store did not answer; only plugin skills are listed.".to_string())
         }
     }
 
@@ -825,6 +859,21 @@ pub fn handle_doctor(workspace: &std::path::Path) {
 /// A guard nobody can see is a guard nobody can check — and this one decides
 /// whether the thing being judged can edit its own exam, so it is worth being
 /// able to read without opening a JSON file.
+pub fn handle_permissions(workspace: &std::path::Path) {
+    render::print_header("Permission rules (deny > ask > allow > mode)");
+    let rules = crate::permissions::rules::PermissionRules::load(workspace);
+    let lines = rules.describe();
+    if lines.is_empty() {
+        outln!("  None. Add `permissions` to ~/.incode/admin.json or .incode/settings.json.");
+    }
+    for line in lines {
+        outln!("  {line}");
+    }
+    for warning in rules.warnings() {
+        render::print_error(warning);
+    }
+}
+
 pub fn handle_guards(workspace: &std::path::Path) {
     render::print_header("Protected paths");
     match crate::guards::Guards::load(workspace) {
@@ -1680,7 +1729,22 @@ mod tests {
     fn parses_slash_commands() {
         assert_eq!(SlashCommand::parse("/help"), Some(SlashCommand::Help));
         assert_eq!(SlashCommand::parse("/status"), Some(SlashCommand::Status));
-        assert_eq!(SlashCommand::parse("/compact"), Some(SlashCommand::Compact));
+        assert_eq!(
+            SlashCommand::parse("/compact"),
+            Some(SlashCommand::Compact(None))
+        );
+        assert_eq!(
+            SlashCommand::parse("/compact keep the API notes"),
+            Some(SlashCommand::Compact(Some("keep the API notes".into())))
+        );
+        assert_eq!(
+            SlashCommand::parse("/review"),
+            Some(SlashCommand::Review(None))
+        );
+        assert_eq!(
+            SlashCommand::parse("/review origin/main"),
+            Some(SlashCommand::Review(Some("origin/main".into())))
+        );
         assert_eq!(
             SlashCommand::parse("/tools"),
             Some(SlashCommand::Tools(None))

@@ -293,6 +293,38 @@ pub struct AdminConfig {
         skip_serializing_if = "crate::desktop::limits::DesktopLimits::is_empty"
     )]
     pub desktop_limits: crate::desktop::limits::DesktopLimits,
+
+    /// How the REPL says a long turn finished or that it is waiting on you:
+    /// `auto` (the default: OSC 9 where the terminal is known to show it, a
+    /// bell otherwise), `bell`, `desktop`, or `off`. See [`crate::cli::notify`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify: Option<String>,
+    /// A shell command run on each notification, with `INCODE_EVENT`
+    /// (`done` | `input`) and `INCODE_MESSAGE` in its environment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify_command: Option<String>,
+    /// How long a turn must run before its end is worth a notification.
+    /// Default 10 seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify_after_secs: Option<u64>,
+    /// A shell command whose first line of output replaces the facts on the
+    /// input box's rule. It reads the session as JSON on stdin. See
+    /// [`crate::cli::statusline`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub statusline_command: Option<String>,
+    /// `emacs` (the default) or `vi`: how the input box edits. `/vim`
+    /// toggles it for the session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editing_mode: Option<String>,
+    /// Per-command permission rules — `allow`, `ask`, `deny` lists of `Tool`
+    /// or `Tool(specifier)` — applied to every tool call the toolbox runs.
+    /// Unioned with the managed and project rules; deny beats ask beats allow.
+    /// See [`crate::permissions::rules`].
+    #[serde(
+        default,
+        skip_serializing_if = "crate::permissions::rules::RuleLists::is_empty"
+    )]
+    pub permissions: crate::permissions::rules::RuleLists,
 }
 
 /// One service that serves API agents and lists them on request.
@@ -408,6 +440,12 @@ pub struct ApiModel {
     /// [`crate::agent::api::DEFAULT_API_VERSION`]; the chat format sends none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_version: Option<String>,
+    /// The model's context window in tokens. Past 80% of it the older turns
+    /// are summarised into one message. Unset is
+    /// [`crate::agent::compact::DEFAULT_CONTEXT_WINDOW`]; 0 never compacts
+    /// on its own (`/compact` still does).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
 }
 
 /// Which program `RenderPdf` prints with — see `toolbox::pdf`.
@@ -1414,6 +1452,7 @@ mod tests {
                 prompt_cache: Some(false),
                 auth: Some(crate::agent::api::KeyHeader::Bearer),
                 api_version: Some("2099-01-01".to_string()),
+                context_window: Some(1_000_000),
             }],
             // The search provider too, holding its key variable's NAME only.
             web_search: Some(SearchProvider {
@@ -1468,6 +1507,17 @@ mod tests {
                 max_actions_per_minute: Some(60),
                 tree_depth: Some(20),
                 ..Default::default()
+            },
+            notify: Some("desktop".to_string()),
+            notify_command: Some("say \"$INCODE_MESSAGE\"".to_string()),
+            notify_after_secs: Some(30),
+            statusline_command: Some("~/.incode/statusline.sh".to_string()),
+            editing_mode: Some("vi".to_string()),
+            // The permission rules, or a `/roles` save would drop them.
+            permissions: crate::permissions::rules::RuleLists {
+                allow: vec!["Bash(npm test:*)".to_string()],
+                ask: vec!["Bash(git push:*)".to_string()],
+                deny: vec!["Read(.env)".to_string()],
             },
         };
         admin.save(dir.path()).expect("saves");

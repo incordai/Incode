@@ -33,7 +33,7 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen,
 };
 
-use super::slash_commands::{command_name, COMMANDS};
+use super::slash_commands::command_name;
 
 /// Start of a synchronized update — the terminal shows nothing until the end.
 const SYNC_BEGIN: &str = "\x1b[?2026h";
@@ -172,6 +172,16 @@ pub struct Footer {
     /// A hundred-line paste in a one-line box hides everything else that was
     /// typed. The box shows `[paste #1 +100 lines]`; the agent gets the paste.
     pastes: Vec<String>,
+    /// Emacs-style (the default) or vi-style editing.
+    editing: super::keys::EditingMode,
+    /// In vi mode, whether keys insert text (otherwise they are commands).
+    vi_insert: bool,
+    /// The first key of a two-key vi command (`dd`, `cc`).
+    vi_pending: Option<char>,
+    /// The operator's own key bindings, consulted before the built-in keys.
+    keymap: super::keys::Keymap,
+    /// The operator's status line, shown on the rule in place of `session`.
+    status_line: Option<String>,
 }
 
 impl Footer {
@@ -230,6 +240,11 @@ impl Footer {
             menu_hidden: false,
             session: Session::default(),
             pastes: Vec::new(),
+            editing: super::keys::EditingMode::Emacs,
+            vi_insert: true,
+            vi_pending: None,
+            keymap: super::keys::Keymap::default(),
+            status_line: None,
         };
         footer.draw();
         Some(footer)
@@ -240,6 +255,9 @@ impl Footer {
         self.line.clear();
         self.caret = 0;
         self.browsing = None;
+        // Every line starts out typing, in vi mode as in any other.
+        self.vi_insert = true;
+        self.vi_pending = None;
         self.refresh_menu();
         self.draw();
 
@@ -323,6 +341,88 @@ impl Footer {
             self.session = session;
             self.draw();
         }
+    }
+
+    /// Choose emacs- or vi-style editing.
+    pub fn set_editing_mode(&mut self, mode: super::keys::EditingMode) {
+        self.editing = mode;
+        self.vi_insert = true;
+        self.vi_pending = None;
+        self.draw();
+    }
+
+    /// The operator's key bindings.
+    pub fn set_keymap(&mut self, keymap: super::keys::Keymap) {
+        self.keymap = keymap;
+    }
+
+    /// The operator's status line; `None` shows the built-in facts.
+    pub fn set_status_line(&mut self, line: Option<String>) {
+        if self.status_line != line {
+            self.status_line = line;
+            self.draw();
+        }
+    }
+
+    /// Whether vi normal mode is reading keys as commands.
+    fn vi_normal(&self) -> bool {
+        self.editing == super::keys::EditingMode::Vi && !self.vi_insert
+    }
+
+    /// Run a bound action. `Some(_)` ends the read, as in [`Self::on_key`].
+    #[allow(clippy::option_option)]
+    fn run_action(&mut self, action: super::keys::Action) -> Option<Option<String>> {
+        use super::keys::Action;
+        match action {
+            Action::ClearLine => {
+                self.line.clear();
+                self.caret = 0;
+            }
+            Action::KillToStart => {
+                self.line.drain(..self.caret);
+                self.caret = 0;
+            }
+            Action::KillToEnd => self.line.truncate(self.caret),
+            Action::DeleteWord => self.delete_word_before(),
+            Action::LineStart => self.caret = 0,
+            Action::LineEnd => self.caret = self.line.len(),
+            Action::CharLeft => self.caret = self.caret.saturating_sub(1),
+            Action::CharRight => self.caret = (self.caret + 1).min(self.line.len()),
+            Action::WordLeft => self.caret = super::keys::word_left(&self.line, self.caret),
+            Action::WordRight => self.caret = super::keys::word_right(&self.line, self.caret),
+            Action::HistoryPrev => self.recall_history(true),
+            Action::HistoryNext => self.recall_history(false),
+            Action::Newline => {
+                self.line.insert(self.caret, '\n');
+                self.caret += 1;
+                self.menu_hidden = true;
+            }
+            Action::Complete => self.complete(),
+            Action::Submit => return self.submit(),
+        }
+        self.refresh_menu();
+        None
+    }
+
+    /// A key in vi normal mode. `None` when the key is not a vi command and
+    /// should be handled as usual (Enter, arrows, Ctrl keys).
+    #[allow(clippy::option_option)]
+    fn on_vi_key(&mut self, code: KeyCode, mods: KeyModifiers) -> Option<Option<Option<String>>> {
+        use super::keys::ViOutcome;
+        let KeyCode::Char(ch) = code else {
+            return None;
+        };
+        if mods.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+            return None;
+        }
+        match super::keys::vi_normal(&mut self.line, &mut self.caret, &mut self.vi_pending, ch) {
+            ViOutcome::Insert => self.vi_insert = true,
+            ViOutcome::HistoryPrev => self.recall_history(true),
+            ViOutcome::HistoryNext => self.recall_history(false),
+            ViOutcome::Normal | ViOutcome::Ignored => {}
+        }
+        self.refresh_menu();
+        Some(None)
     }
 
     /// Take a pasted block, showing a marker when it is too long to display.
@@ -458,6 +558,14 @@ impl Footer {
     #[allow(clippy::option_option)]
     fn on_key(&mut self, code: KeyCode, mods: KeyModifiers) -> Option<Option<String>> {
         let ctrl = mods.contains(KeyModifiers::CONTROL);
+        if let Some(action) = self.keymap.lookup(code, mods) {
+            return self.run_action(action);
+        }
+        if self.vi_normal() {
+            if let Some(done) = self.on_vi_key(code, mods) {
+                return done;
+            }
+        }
         match code {
             KeyCode::Char('c') if ctrl => return Some(None),
             KeyCode::Char('d') if ctrl && self.line.is_empty() => return Some(None),
@@ -527,6 +635,13 @@ impl Footer {
                 );
             }
             KeyCode::Esc if self.menu_open() => self.menu_hidden = true,
+            // Insert mode ends on Esc, and the caret steps back onto the
+            // character it was after, as vi's does.
+            KeyCode::Esc if self.editing == super::keys::EditingMode::Vi && self.vi_insert => {
+                self.vi_insert = false;
+                self.vi_pending = None;
+                self.caret = self.caret.saturating_sub(1);
+            }
             KeyCode::Tab => self.complete(),
             // A newline rather than a submit. Terminals disagree about which of
             // these they send, so all three are accepted; Alt-Enter is the one
@@ -540,26 +655,31 @@ impl Footer {
                 self.caret += 1;
                 self.menu_hidden = true;
             }
-            KeyCode::Enter => {
-                // A command is CHOSEN from the menu, not typed out in full. The
-                // highlighted entry is what runs; the half-typed prefix on the
-                // line is not a command and would only be rejected.
-                let text = if self.menu_open() {
-                    self.menu.get(self.selected).map(|name| (*name).to_string())
-                } else {
-                    None
-                }
-                .unwrap_or_else(|| self.line.iter().collect::<String>().trim().to_string());
-                if text.is_empty() {
-                    return None;
-                }
-                // The box showed a marker; the agent gets the whole paste.
-                return Some(Some(self.expand_pastes(&text)));
-            }
+            KeyCode::Enter => return self.submit(),
             _ => return None,
         }
         self.refresh_menu();
         None
+    }
+
+    /// What Enter does: the line (or the chosen command), or `None` to keep
+    /// editing an empty line.
+    #[allow(clippy::option_option)]
+    fn submit(&self) -> Option<Option<String>> {
+        // A command is CHOSEN from the menu, not typed out in full. The
+        // highlighted entry is what runs; the half-typed prefix on the
+        // line is not a command and would only be rejected.
+        let text = if self.menu_open() {
+            self.menu.get(self.selected).map(|name| (*name).to_string())
+        } else {
+            None
+        }
+        .unwrap_or_else(|| self.line.iter().collect::<String>().trim().to_string());
+        if text.is_empty() {
+            return None;
+        }
+        // The box showed a marker; the agent gets the whole paste.
+        Some(Some(self.expand_pastes(&text)))
     }
 
     /// What is typed, split into the lines the box draws.
@@ -807,10 +927,9 @@ impl Footer {
         for offset in 0..shown {
             let at = self.menu_top + offset;
             let Some(name) = self.menu.get(at) else { break };
-            let desc = COMMANDS
-                .iter()
+            let desc = crate::custom_commands::all_commands()
                 .find(|(entry, _)| command_name(entry) == *name)
-                .map_or("", |(_, d)| *d);
+                .map_or("", |(_, d)| d);
             let chosen = at == self.selected;
             let marker = if chosen { "\u{203a}" } else { " " };
             // Two columns further in than the frame, so the list reads as
@@ -828,12 +947,21 @@ impl Footer {
             row = row.saturating_add(1);
         }
 
-        let segments = self.session.segments();
+        // The operator's own line, when they configured one, in place of the
+        // built-in facts.
+        let segments = match &self.status_line {
+            Some(line) => line.clone(),
+            None => self.session.segments(),
+        };
+        let mut hint = self.more_hint();
+        if self.vi_normal() {
+            hint.push_str(" NORMAL ");
+        }
         let _ = execute!(out, MoveTo(0, row), Clear(ClearType::CurrentLine));
         let _ = write!(
             out,
             "\x1b[2m{}\x1b[0m",
-            top_rule_with(width, &segments, &self.more_hint())
+            top_rule_with(width, &segments, &hint)
         );
         row = row.saturating_add(1);
 
@@ -904,8 +1032,7 @@ pub fn command_word(line: &str) -> Option<&str> {
 /// Commands whose name starts with `head`.
 #[must_use]
 pub fn matching(head: &str) -> Vec<&'static str> {
-    COMMANDS
-        .iter()
+    crate::custom_commands::all_commands()
         .map(|(entry, _)| command_name(entry))
         .filter(|name| name.starts_with(head))
         .collect()
@@ -1055,6 +1182,7 @@ pub(crate) fn mouse_disable_sequence(enabled: bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::slash_commands::COMMANDS;
 
     /// **The other writer's format is not something a person typed.**
     ///
@@ -1218,7 +1346,53 @@ mod tests {
             menu_hidden: false,
             session: Session::default(),
             pastes: Vec::new(),
+            editing: crate::cli::keys::EditingMode::Emacs,
+            vi_insert: true,
+            vi_pending: None,
+            keymap: crate::cli::keys::Keymap::default(),
+            status_line: None,
         }
+    }
+
+    #[test]
+    fn in_vi_mode_escape_leaves_insert_and_dd_clears_the_line() {
+        let mut f = typed("fix the parser");
+        f.editing = crate::cli::keys::EditingMode::Vi;
+        assert!(f.on_key(KeyCode::Esc, KeyModifiers::NONE).is_none());
+        assert!(f.vi_normal());
+        assert_eq!(f.caret, 13, "Esc steps back onto the last character");
+        f.on_key(KeyCode::Char('b'), KeyModifiers::NONE);
+        assert_eq!(f.caret, 8);
+        f.on_key(KeyCode::Char('d'), KeyModifiers::NONE);
+        f.on_key(KeyCode::Char('d'), KeyModifiers::NONE);
+        assert_eq!(line_of(&f), "");
+        f.on_key(KeyCode::Char('i'), KeyModifiers::NONE);
+        f.on_key(KeyCode::Char('x'), KeyModifiers::NONE);
+        assert_eq!(line_of(&f), "x", "after i, keys type again");
+    }
+
+    #[test]
+    fn enter_submits_from_vi_normal_mode() {
+        let mut f = typed("go");
+        f.editing = crate::cli::keys::EditingMode::Vi;
+        f.on_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(
+            f.on_key(KeyCode::Enter, KeyModifiers::NONE),
+            Some(Some("go".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_bound_key_runs_its_action_before_the_built_in_one() {
+        let mut f = typed("hello world");
+        let (map, _) = crate::cli::keys::Keymap::parse(
+            "\"ctrl-a\" = \"word-left\"\n\"ctrl-l\" = \"clear-line\"",
+        );
+        f.keymap = map;
+        f.on_key(KeyCode::Char('a'), KeyModifiers::CONTROL);
+        assert_eq!(f.caret, 6, "ctrl-a now moves a word, not to the start");
+        f.on_key(KeyCode::Char('l'), KeyModifiers::CONTROL);
+        assert_eq!(line_of(&f), "");
     }
 
     fn line_of(f: &Footer) -> String {
@@ -1497,6 +1671,11 @@ mod tests {
             menu_hidden: false,
             session: Session::default(),
             pastes: Vec::new(),
+            editing: crate::cli::keys::EditingMode::Emacs,
+            vi_insert: true,
+            vi_pending: None,
+            keymap: crate::cli::keys::Keymap::default(),
+            status_line: None,
         };
 
         // Shift+Up must not recall history into footer.line

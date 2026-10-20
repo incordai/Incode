@@ -4,6 +4,7 @@
 //! sbx run [options] -- <command> [args...]
 //! sbx check [options]          what this machine would enforce of the policy
 //! sbx doctor                   what this machine can enforce at all
+//! sbx mcp [options]            sandboxes as an MCP server an agent drives
 //! ```
 
 use std::ffi::OsString;
@@ -21,6 +22,17 @@ USAGE:
     sbx run   [OPTIONS] -- <COMMAND> [ARGS...]
     sbx check [OPTIONS]      print what this machine enforces of the policy (JSON with --json)
     sbx doctor               print what this machine can enforce at all
+    sbx mcp   [MCP OPTIONS]  serve sandboxes over MCP (stdio): an agent creates one,
+                             writes scripts into it, runs them, reads the results
+
+MCP OPTIONS (the ceilings; an agent can ask for less, never more):
+        --root <DIR>         where sandboxes live (default: <temp>/sbx-mcp-<pid>)
+        --net <MODE>         most network a sandbox may have: deny (default) | proxy | allow
+        --allow-host <HOST>  with --net proxy: a host sandboxes may name (repeatable)
+        --max-wall <SECS>    longest one run may take (default 600)
+    -p, --policy <FILE>      base policy (environment, limits) every sandbox starts from
+        --keep               leave sandboxes on disk when the server stops
+        --best-effort        run even if part of the policy cannot be enforced here
 
 POLICY (a file, then flags on top of it):
     -p, --policy <FILE>      TOML (or .json) policy file
@@ -36,6 +48,9 @@ POLICY (a file, then flags on top of it):
         --set-env <K=V>      set a variable (repeatable)
         --keep-agent-session keep CLAUDECODE / CLAUDE_CODE_SESSION* (stripped by default)
         --keep-git-redirects keep GIT_DIR / GIT_WORK_TREE / ... (stripped by default)
+        --no-protect-git     let the command change .git/hooks and .git/config (by default
+                             they are put back after the run: a planted hook would run,
+                             unsandboxed, the next time anyone uses git there)
         --wall <SECS>        kill the command (and everything it started) after SECS
         --cpu <SECS>         CPU seconds per process
         --mem <MB>           address space per process
@@ -53,12 +68,204 @@ EXIT:
 fn main() -> ExitCode {
     incord_sandbox::enter_if_requested();
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    // On Windows: natively, or forwarded into WSL2 when the policy needs
+    // what only the Linux sandbox enforces (see `incord_sandbox::backend`).
+    #[cfg(windows)]
+    if let Some(code) = windows_backend::dispatch(&args) {
+        return code;
+    }
     match real_main(args) {
-        Ok(code) => ExitCode::from(u8::try_from(code.clamp(0, 255)).unwrap_or(1)),
+        Ok(code) => exit_with(code),
         Err(e) => {
             eprintln!("sbx: {e}");
             ExitCode::from(EXIT_SANDBOX as u8)
         }
+    }
+}
+
+/// The command's exit code as this process's own. Windows codes are 32
+/// bits (a crash is `0xC0000005`, negative as an `i32`): clamping one into
+/// 0..=255 could turn a crash into success, so they are passed on whole.
+fn exit_with(code: i32) -> ExitCode {
+    #[cfg(windows)]
+    if !(0..=255).contains(&code) {
+        std::process::exit(code);
+    }
+    ExitCode::from(u8::try_from(code.clamp(0, 255)).unwrap_or(1))
+}
+
+/// `sbx.exe` on Windows: run natively, or forward to the Linux `sbx` inside
+/// WSL2, where Landlock and seccomp do the confining.
+#[cfg(windows)]
+mod windows_backend {
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+    use std::process::{Command, ExitCode, Stdio};
+
+    use incord_sandbox::backend::{choose, Backend, Choice, WSL_SETUP};
+    use incord_sandbox::enforcement;
+    use incord_sandbox::wslpath::{to_wsl, translate_args};
+
+    /// Where the installer puts the Linux `sbx` inside WSL.
+    const IN_WSL: &str = "$HOME/.local/bin/sbx";
+
+    /// `Some(exit)` when this invocation was forwarded (or refused); `None`
+    /// to run it natively.
+    pub fn dispatch(args: &[OsString]) -> Option<ExitCode> {
+        let backend = match Backend::from_env(|k| std::env::var(k).ok()) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("sbx: {e}");
+                return Some(ExitCode::from(125));
+            }
+        };
+        let sub = args.first().and_then(|a| a.to_str()).unwrap_or("");
+        if backend == Backend::Wsl
+            && !matches!(sub, "" | "-h" | "--help" | "help" | "-V" | "--version")
+        {
+            return Some(forward(args));
+        }
+        // What native would leave unenforced. A command line that does not
+        // parse runs natively, which reports the mistake.
+        let (gaps, best_effort) = match sub {
+            "run" | "check" => {
+                let o = super::parse(&args[1..]).ok()?;
+                (enforcement(&o.policy).gaps(), o.best_effort)
+            }
+            "mcp" => {
+                let (_, c) = super::parse_mcp(&args[1..]).ok()?;
+                (enforcement(&c.widest_policy()).gaps(), c.best_effort)
+            }
+            _ => return None,
+        };
+        match choose(backend, &gaps, best_effort, wsl_ready) {
+            Choice::Native => None,
+            Choice::Wsl => Some(forward(args)),
+            // `check` is a report: say what native enforces (exit 1 for the
+            // gaps) and why WSL was not used.
+            Choice::Refuse(why) if sub == "check" => {
+                eprintln!("sbx: {why}");
+                None
+            }
+            Choice::Refuse(why) => {
+                eprintln!("sbx: {why}");
+                Some(ExitCode::from(125))
+            }
+        }
+    }
+
+    fn wsl_exe() -> PathBuf {
+        let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+        PathBuf::from(root).join("System32").join("wsl.exe")
+    }
+
+    /// Whether forwarding would work: `wsl.exe` exists and the Linux `sbx`
+    /// is installed in the distribution. Starts WSL, so asked only when it
+    /// matters.
+    pub fn wsl_ready() -> Result<(), String> {
+        let exe = wsl_exe();
+        if !exe.is_file() {
+            return Err("wsl.exe was not found: WSL is not installed".into());
+        }
+        let mut cmd = Command::new(&exe);
+        if let Some(distro) = std::env::var_os("SBX_WSL_DISTRO") {
+            cmd.arg("-d").arg(distro);
+        }
+        let status = cmd
+            .args(["-e", "sh", "-c", &format!("[ -x \"{IN_WSL}\" ]")])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        match status {
+            Ok(s) if s.success() => Ok(()),
+            Ok(_) => Err(format!(
+                "the Linux sbx is not installed inside WSL at {IN_WSL}, or WSL has no Linux \
+                 distribution"
+            )),
+            Err(e) => Err(format!("wsl.exe cannot start: {e}")),
+        }
+    }
+
+    /// The Windows lines of `sbx doctor`: the backend, and whether WSL2
+    /// forwarding is there for what native cannot enforce.
+    pub fn doctor() {
+        match Backend::from_env(|k| std::env::var(k).ok()) {
+            Ok(b) => println!(
+                "  [info] backend        SBX_BACKEND={}: {}",
+                b.as_str(),
+                match b {
+                    Backend::Auto => "native when it enforces the whole policy, else WSL2",
+                    Backend::Native => "always native",
+                    Backend::Wsl => "always WSL2",
+                }
+            ),
+            Err(e) => println!("  [no  ] backend        {e}"),
+        }
+        match wsl_ready() {
+            Ok(()) => println!(
+                "  [ok  ] WSL2           forwarding available: network deny/proxy and deny_read \
+                 are enforced there (run `SBX_BACKEND=wsl sbx doctor` for its report)"
+            ),
+            Err(why) => println!("  [no  ] WSL2           {why}; to have it, {WSL_SETUP}"),
+        }
+    }
+
+    pub fn forward(args: &[OsString]) -> ExitCode {
+        match run(args) {
+            Ok(code) => super::exit_with(code),
+            Err(e) => {
+                eprintln!("sbx: {e}");
+                ExitCode::from(125)
+            }
+        }
+    }
+
+    fn run(args: &[OsString]) -> Result<i32, String> {
+        let args: Vec<String> = args
+            .iter()
+            .map(|a| {
+                a.to_str()
+                    .map(str::to_string)
+                    .ok_or("an argument is not valid UTF-8")
+            })
+            .collect::<Result<_, _>>()?;
+        let args = translate_args(&args)?;
+        let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+        let cwd = to_wsl(&cwd.display().to_string()).ok_or_else(|| {
+            format!(
+                "the current folder {} has no path inside WSL; run from a drive folder",
+                cwd.display()
+            )
+        })?;
+        let mut cmd = Command::new(wsl_exe());
+        if let Some(distro) = std::env::var_os("SBX_WSL_DISTRO") {
+            cmd.arg("-d").arg(distro);
+        }
+        cmd.arg("--cd")
+            .arg(&cwd)
+            .arg("-e")
+            .arg("sh")
+            .arg("-c")
+            .arg(format!(
+                "[ -x \"{IN_WSL}\" ] || {{ echo 'sbx is not installed inside WSL' >&2; exit 126; }}; \
+                 exec \"{IN_WSL}\" \"$@\""
+            ))
+            .arg("sbx")
+            .args(&args);
+        let status = cmd
+            .status()
+            .map_err(|e| format!("cannot start wsl.exe ({e}); {WSL_SETUP}"))?;
+        let code = status.code().unwrap_or(1);
+        // wsl.exe itself fails with -1 (no WSL, no distribution); the
+        // command's own codes pass through.
+        if code < 0 || code == 126 {
+            eprintln!(
+                "sbx: forwarding to WSL2 failed; {WSL_SETUP}. Or set SBX_BACKEND=native to run \
+                 natively (writes, environment and limits confined; network and deny_read not)."
+            );
+        }
+        Ok(code)
     }
 }
 
@@ -103,6 +310,7 @@ fn real_main(args: Vec<OsString>) -> Result<i32, String> {
             Ok(if e.gaps().is_empty() { 0 } else { 1 })
         }
         "run" => run(parse(&args[1..])?),
+        "mcp" => mcp(&args[1..]),
         other => Err(format!("unknown command `{other}` (try `sbx --help`)")),
     }
 }
@@ -124,11 +332,84 @@ fn run(o: Options) -> Result<i32, String> {
         for d in outcome.decisions.iter().filter(|d| !d.allowed) {
             eprintln!("sbx: network refused {} ({})", d.target, d.reason);
         }
+        for r in &outcome.restored {
+            eprintln!("sbx: protected path changed by the command, {r}");
+        }
         if outcome.timed_out {
             eprintln!("sbx: killed after the wall-clock limit");
         }
     }
     Ok(outcome.code())
+}
+
+fn mcp(args: &[OsString]) -> Result<i32, String> {
+    let (root, mut ceilings) = parse_mcp(args)?;
+    let root = root
+        .unwrap_or_else(|| std::env::temp_dir().join(format!("sbx-mcp-{}", std::process::id())));
+    std::fs::create_dir_all(&root).map_err(|e| format!("{}: {e}", root.display()))?;
+    ceilings.root =
+        incord_sandbox::plain_path(std::fs::canonicalize(&root).map_err(|e| e.to_string())?);
+    let stdin = std::io::stdin();
+    incord_sandbox::server::Server::new(ceilings)
+        .serve(stdin.lock(), std::io::stdout().lock())
+        .map_err(|e| format!("mcp: {e}"))?;
+    Ok(0)
+}
+
+/// `sbx mcp`'s options: the sandboxes' root (if given) and the ceilings.
+fn parse_mcp(
+    args: &[OsString],
+) -> Result<(Option<PathBuf>, incord_sandbox::server::Ceilings), String> {
+    use incord_sandbox::server::Ceilings;
+    let mut root: Option<PathBuf> = None;
+    let mut ceilings = Ceilings::new(PathBuf::new());
+    let mut i = 0;
+    let value = |i: usize| -> Result<String, String> {
+        args.get(i)
+            .and_then(|v| v.to_str())
+            .map(str::to_string)
+            .ok_or_else(|| "a value is missing after an option".to_string())
+    };
+    while i < args.len() {
+        let flag = args[i].to_str().unwrap_or("");
+        match flag {
+            "--root" => {
+                i += 1;
+                root = Some(PathBuf::from(value(i)?));
+            }
+            "--net" => {
+                i += 1;
+                let v = value(i)?;
+                ceilings.network =
+                    NetMode::parse(&v).ok_or(format!("--net: unknown mode `{v}`"))?;
+            }
+            "--allow-host" => {
+                i += 1;
+                ceilings.hosts.push(value(i)?);
+            }
+            "--max-wall" => {
+                i += 1;
+                let v = value(i)?;
+                ceilings.max_wall_secs = v
+                    .parse()
+                    .ok()
+                    .filter(|n| *n > 0)
+                    .ok_or(format!("--max-wall: `{v}` is not a positive number"))?;
+            }
+            "-p" | "--policy" => {
+                i += 1;
+                ceilings.base = Policy::load(&PathBuf::from(value(i)?))?;
+            }
+            "--keep" => ceilings.keep = true,
+            "--best-effort" => ceilings.best_effort = true,
+            other => return Err(format!("sbx mcp: unknown option `{other}`")),
+        }
+        i += 1;
+    }
+    if !ceilings.hosts.is_empty() && ceilings.network == NetMode::Deny {
+        ceilings.network = NetMode::Proxy;
+    }
+    Ok((root, ceilings))
 }
 
 fn parse(args: &[OsString]) -> Result<Options, String> {
@@ -232,6 +513,7 @@ fn parse(args: &[OsString]) -> Result<Options, String> {
             }
             "--keep-agent-session" => policy.env.strip_agent_session = false,
             "--keep-git-redirects" => policy.env.strip_git_redirects = false,
+            "--no-protect-git" => policy.fs.protect_git = false,
             "--wall" => policy.limits.wall_secs = Some(num(&v)?),
             "--cpu" => policy.limits.cpu_secs = Some(num(&v)?),
             "--mem" => policy.limits.memory_mb = Some(num(&v)?),
@@ -266,6 +548,12 @@ fn doctor() {
     };
     let full = probe(FsMode::WorkspaceWrite, NetMode::Proxy);
     let deny = probe(FsMode::Off, NetMode::Deny);
+    let hidden = {
+        let mut p = Policy::default();
+        p.fs.mode = FsMode::ReadOnly;
+        p.fs.deny_read.push(PathBuf::from("hidden"));
+        enforcement(&p)
+    };
     println!(
         "sbx {} on {}",
         env!("CARGO_PKG_VERSION"),
@@ -277,6 +565,7 @@ fn doctor() {
         Status::NotRequested => {}
     };
     show("filesystem", &full.filesystem);
+    show("deny_read", &hidden.filesystem);
     show("network deny", &deny.network);
     show("network proxy", &full.network);
     show("limits", &full.limits);
@@ -288,4 +577,6 @@ fn doctor() {
         ),
         None => println!("  [ok  ] proxy          connects directly; allowed names that resolve to private addresses are refused"),
     }
+    #[cfg(windows)]
+    windows_backend::doctor();
 }

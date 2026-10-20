@@ -99,6 +99,11 @@ pub fn model_settings(
             .unwrap_or(super::api::DEFAULT_API_VERSION)
             .to_string(),
         route: name.to_string(),
+        // Zero is meaningful here — never compact on its own — so it is taken
+        // as given.
+        context_window: model
+            .context_window
+            .unwrap_or(super::compact::DEFAULT_CONTEXT_WINDOW),
     })
 }
 
@@ -332,6 +337,7 @@ mod tests {
             prompt_cache: None,
             auth: None,
             api_version: None,
+            context_window: None,
         }
     }
 

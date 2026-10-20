@@ -57,14 +57,21 @@ An unknown key is an error, so a misspelt `wirte` can't silently do nothing.
 
 ## What is enforced, and how
 
-| | Linux | macOS | Windows |
+| | Linux | macOS | Windows (native) |
 |---|---|---|---|
-| filesystem: write | Landlock (5.13+) | Seatbelt | **not yet** |
-| filesystem: `deny_read` | Landlock | Seatbelt | **not yet** |
-| network: `deny` | Landlock TCP (6.7+) + seccomp for every other socket | Seatbelt | **not yet** |
-| network: `proxy` | Landlock: TCP only to the proxy's port; seccomp as for `deny` | Seatbelt: outbound only to the proxy | **not yet** |
-| limits | `setrlimit` + wall clock | `setrlimit` + wall clock | wall clock |
+| filesystem: write | Landlock (5.13+) | Seatbelt | write-restricted token + a per-run ACE on each root |
+| filesystem: `deny_read` | Landlock | Seatbelt | **not enforced** (WSL2 does it) |
+| network: `deny` | Landlock TCP (6.7+) + seccomp for every other socket | Seatbelt | **not enforced** (WSL2 does it) |
+| network: `proxy` | Landlock: TCP only to the proxy's port; seccomp as for `deny` | Seatbelt: outbound only to the proxy | **not enforced** (WSL2 does it) |
+| `.git/hooks`, `.git/config` | snapshotted, put back after the run | Seatbelt refuses the write | snapshotted, put back after the run |
+| signals, abstract Unix sockets | Landlock scopes (6.12+): only within the sandbox | Seatbelt default | the token cannot open other processes for writing (measured by incode) |
+| Windows programs (inside WSL2) | interop interpreter and sockets hidden, `WSL_INTEROP` removed, vsock refused | n/a | n/a |
+| limits | `setrlimit` + wall clock; no core dumps | `setrlimit` + wall clock; no core dumps | job object: wall clock, CPU and committed memory per process; **no** `file_size_mb`, `open_files` |
 | environment | yes | yes | yes |
+
+On Windows, `sbx.exe` runs natively when native enforces the whole policy,
+and forwards it to the Linux `sbx` inside WSL2 when it doesn't (see
+[Windows](#windows-native-or-wsl2)).
 
 - **Every process it starts.** The confinement is applied in a helper
   process just before it execs the command. Children inherit it, and it
@@ -89,6 +96,19 @@ An unknown key is an error, so a misspelt `wirte` can't silently do nothing.
   - The filter knows x86-64 and aarch64. On any other architecture none is
     installed, the network is reported **not enforced**, and strict mode
     refuses.
+- **Terminal and VM-socket hardening.** The seccomp filter is also installed
+  whenever the filesystem is confined, not only under `deny`/`proxy`. It
+  always refuses:
+  - `ioctl(TIOCSTI)` and `ioctl(TIOCLINUX)` (EPERM), which would let a
+    command type keystrokes into the terminal it shares with your shell, to
+    run unconfined after it exits. Window size, termios and the other
+    terminal ioctls still work.
+  - `AF_VSOCK` sockets (EACCES): vsock reaches a VM's host directly, and on
+    WSL2 that means Windows interop.
+  - io_uring.
+
+  A filesystem-only policy on an architecture without a filter runs without
+  this extra hardening.
 - **The proxy.** `proxy` mode runs an allowlisting HTTP proxy in the
   unconfined parent and points the command at it (`HTTP(S)_PROXY`).
   - It sees host names, not content: TLS is tunnelled with `CONNECT`.
@@ -104,6 +124,27 @@ An unknown key is an error, so a misspelt `wirte` can't silently do nothing.
   - A symlink that leads into or above a hidden path isn't granted.
   - Not covered: a hard link to a hidden file made elsewhere beforehand, or
     the same directory mounted a second time.
+- **The repository's hooks and config** (`fs.protect_git`, on by default).
+  - **Why:** a hook, or a `core.fsmonitor`/`core.hooksPath` line, is code
+    git runs the next time anyone uses the repository, outside any sandbox.
+  - **How (Linux):** Landlock can't make part of a writable root read-only
+    without also blocking file creation in the root, so `sbx` snapshots each
+    root's `.git/hooks` and `.git/config` before the run. Anything changed is
+    put back afterwards and reported (`protected path changed by the
+    command, restored …`, and `protected_restored` from `sbx mcp`).
+  - **How (macOS):** Seatbelt also refuses the writes.
+  - **Worktrees:** a `.git` file (`gitdir:`) and its `commondir` are
+    followed.
+  - **Opting out:** `--no-protect-git` for a run that should change hooks.
+- **Signals and abstract sockets.** On Landlock ABI v6 (Linux 6.12+) a
+  sandboxed command can't signal processes outside its sandbox, or connect to
+  an abstract Unix socket made outside it (a D-Bus session bus, X11). `sbx
+  doctor` says whether the kernel does this.
+- **Code the loader would inject.** `LD_PRELOAD`, `LD_AUDIT`,
+  `DYLD_INSERT_LIBRARIES` and `DYLD_FORCE_FLAT_NAMESPACE` are removed by
+  default (`env.strip_loader_injection`): they would load a library into
+  every program, the sandbox's own helper included. Core dumps are off
+  (`RLIMIT_CORE=0`), so a crash can't write the process's memory to disk.
 - **Process lifetime.**
   - With a wall-clock limit, the command gets its own process group. The
     limit kills all of it, and `SIGINT`/`SIGTERM`/`SIGHUP` sent to `sbx` are
@@ -120,7 +161,144 @@ An unknown key is an error, so a misspelt `wirte` can't silently do nothing.
 - Landlock matches network ports, not addresses. Under `proxy` the command
   could connect to *any* host on the proxy's (random, high) port.
 - On macOS the profile is generated and unit-tested, but this crate's
-  network and `deny_read` clauses have not yet been run on a Mac.
+  network, `deny_read` and protected-path clauses have not yet been run on a
+  Mac. The profile still starts from `(allow default)`; a deny-by-default
+  profile (only the system services a build needs) is the next step there.
+- The hook protection on Linux restores *after* the run. A hook planted
+  during the run would execute if someone ran git in that workspace before
+  the run ended.
+
+## Windows: native, or WSL2
+
+`sbx.exe` has two backends, picked per run by `SBX_BACKEND`:
+
+| `SBX_BACKEND` | what runs |
+|---|---|
+| `auto` (default) | natively when native enforces everything the policy asks for; otherwise in WSL2 when it is set up; otherwise refused, naming both ways forward |
+| `native` | always natively; what it can't enforce is refused (strict) or reported (`--best-effort`) |
+| `wsl` | always the Linux `sbx` inside WSL2 |
+
+`SBX_NATIVE=1`, the older switch, still means `native`. `sbx doctor` shows
+what native enforces and whether WSL2 forwarding is available.
+
+So a policy that confines files, environment and time runs natively, and
+one that asks for `network: deny`/`proxy` or `deny_read` goes to WSL2.
+`sbx mcp` follows the same rule from its ceilings: with `--net allow` it
+runs natively, with `--net deny` (its default) or `proxy` in WSL2.
+
+### Native
+
+Ported from incode's own Windows sandbox, whose authors measured it on
+Windows. **This crate's port has not run on Windows yet:** its tests
+(`tests/escape_windows.rs`) run on the `windows-latest` CI runner.
+
+- **Writes.** The command runs under a *write-restricted token*: it reads
+  anything its user can, but writes only where the user may **and** one of
+  the token's restricting SIDs is granted. Those are a private SID made for
+  this run, `Everyone` (so `> NUL` works) and the logon SID (so the command
+  can start). The run's SID is granted `Modify`, as one inheritable ACE, on
+  each writable root and on the run's private temp directory, and nowhere
+  else. `read-only` grants only the temp directory.
+- **The grant is per run.** Before the command starts, the ACE is added to
+  each root; after it exits, it is removed. NTFS writes an inherited ACE into
+  every object beneath a root, so this takes time in proportion to the tree
+  (incode measured about 2.5 s each way on 18,673 files). No file's contents
+  or modification time change, and incode found the tree's ACLs
+  byte-identical afterwards. A grant is written down first
+  (`%LOCALAPPDATA%\sbx\grants`). If `sbx` crashes, the next run removes
+  the ACE it left. A drive root and any folder holding your user profile
+  are refused as roots.
+- **Everything it starts.** The command starts suspended, goes into a job
+  object, and only then runs. Everything it starts is in the job too and
+  cannot leave it. The job is killed when the command exits, at the
+  wall-clock limit, or when `sbx` itself dies. So on Windows nothing the
+  command started outlives the run, even without a time limit.
+- **Limits.** `memory_mb` caps the memory each process *commits* (an
+  allocation beyond it fails), which is not quite `RLIMIT_AS`. `cpu_secs`
+  caps each process's user-mode CPU time. `file_size_mb` and `open_files`
+  have no Windows equivalent: asking for them is reported not enforced.
+  (`sbx mcp` sets no file size limit on Windows for this reason.)
+- **Programs.** The program is found on `PATH` with `PATHEXT`, never in the
+  current folder, so a `cmd.exe` planted in the workspace is not picked up.
+  A `.bat`/`.cmd` runs through `cmd.exe /d`, so `cmd` parses its arguments.
+- **Exit codes** are passed through whole (32 bits).
+
+**Not enforced natively, and why:**
+- **Network.** No token restricts the network (incode measured TCP, HTTP and
+  HTTPS all working under it). Only an AppContainer does, and an AppContainer
+  reads only what is granted to it: the workspace, your toolchains, your
+  profile. `deny` and `proxy` go to WSL2 (`auto`) or are refused (`native`).
+- **`deny_read`.** A write-restricted token checks its restricting SIDs only
+  for writes, so no ACE can hide a path from the sandbox alone. Denying your
+  own SID would hide it from you everywhere. A fully restricted token would
+  need everything a toolchain reads granted to it. So `deny_read` goes to
+  WSL2 (`auto`) or is refused (`native`).
+- **Places `Everyone` may write** stay writable to the command, because
+  `Everyone` is one of the token's restricting SIDs.
+- **Git Bash and every msys program** fail to start under the token: the
+  msys runtime maps a shared section the token may not map writable, and
+  dies with `CreateFileMapping ..., Win32 error 5` (measured by incode).
+  Use `cmd` or PowerShell natively, or `SBX_BACKEND=wsl` for a POSIX shell.
+  `sbx mcp` scripts default to PowerShell on Windows.
+- **Grants are visible.** While a run lasts, every object under a root
+  carries the run's ACE, and the grant and revoke cost time on large trees.
+
+### WSL2
+
+Inside WSL2 the sandbox is the Linux one: Landlock, seccomp, the git
+protection and `sbx mcp` all apply unchanged.
+
+**Setup, once** (PowerShell, from the incode folder):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install-windows.ps1
+```
+
+It:
+1. installs WSL2 and Ubuntu if they're missing (asks first, one
+   administrator prompt, usually a restart, then run it again);
+2. builds the Linux `sbx` inside WSL2 at `~/.local/bin/sbx`;
+3. builds `sbx.exe` and adds it to your PATH;
+4. runs `sbx doctor`.
+
+**How `sbx.exe` forwards.**
+- The command (`run`, `check`, `mcp`; `doctor` too under `SBX_BACKEND=wsl`)
+  is passed to the Linux `sbx` with `wsl.exe`, from the same folder.
+- Paths are translated: `C:\work\app` becomes `/mnt/c/work/app`, and
+  `\\wsl$\Ubuntu\home\me` becomes `/home/me`.
+- Output, input and the exit code pass straight through, so `sbx mcp` works
+  for agents on Windows too.
+- **Choosing a distribution:** `SBX_WSL_DISTRO` picks one other than the
+  default.
+- **Windows environment variables don't reach WSL** unless listed in
+  `WSLENV` (for example `WSLENV=ANTHROPIC_API_KEY`).
+- The command must exist inside WSL (`python3`, not `python.exe`).
+
+WSL2 adds one way out that plain Linux doesn't have: starting a Windows
+program (`cmd.exe`, `powershell.exe`, any `.exe` under `/mnt/c`), which
+runs on Windows, outside the sandbox. When the filesystem is confined and
+WSL is detected, `sbx` closes it (`fs.block_wsl_interop`, on by default):
+- WSL's interop interpreter (`/init`, read from
+  `/proc/sys/fs/binfmt_misc/WSLInterop`) is hidden like a `deny_read` path,
+  so no `.exe` can start;
+- `/run/WSL`, where the interop sockets live, is hidden and `WSL_INTEROP`
+  is removed;
+- vsock is refused by seccomp.
+
+Hiding `/init` means `ls /` is refused inside the sandbox; files beneath
+`/` still read normally.
+
+**Network inside WSL2:** `network: deny` needs Landlock's TCP rules (Linux
+6.7+). On an older WSL kernel only UDP/DNS are blocked, `sbx doctor` says
+the network is not enforced, and strict mode refuses `deny`/`proxy` rather
+than pretend. Update WSL (`wsl --update`) for a newer kernel.
+
+**Tested:** the mechanism (a hidden interpreter can't run, directly or as
+a script's) runs on every Linux CI machine. `tests/wsl.rs` tries the real
+ways out (`cmd.exe`, `/mnt/c/.../cmd.exe`, `powershell.exe`,
+`WSL_INTEROP`, `/run/WSL`), but only on a WSL2 machine. It has not run on
+one yet, so run `cargo test -p incord-sandbox --test wsl` there before
+relying on this.
 
 ## Exit codes
 
@@ -131,6 +309,48 @@ An unknown key is an error, so a misspelt `wirte` can't silently do nothing.
 | 125 | `sbx` refused (strict, or a bad policy) or failed |
 | 126 / 127 | the command could not be run / found |
 | 128 + n | it was killed by signal n |
+
+## Sandboxes as a service: `sbx mcp`
+
+`sbx mcp` is an MCP server (stdio) that lets an agent work in sandboxes:
+create one, write scripts and files into it, run them, read what they
+produced, and delete it. Any agent that speaks MCP can use it: Claude Code,
+Codex, incode, or your own.
+
+```json
+{ "mcpServers": { "sbx": { "command": "sbx", "args": ["mcp", "--net", "proxy", "--allow-host", "pypi.org", "--allow-host", "*.pythonhosted.org"] } } }
+```
+
+| Tool | What it does |
+|---|---|
+| `sandbox_create` | A private folder. Network `deny` unless the agent asks for `proxy` with hosts (or `allow`) within the server's limits. Natively on Windows only `allow` can be enforced, and asking for anything else is refused at once, saying so. |
+| `sandbox_write_file` | Write a script or file, creating folders; `executable` sets 755. |
+| `sandbox_run` | Run `command` (argv) or `script` (text, run with `interpreter`, default `sh`; PowerShell natively on Windows) with optional `stdin`, `cwd` and `timeout_secs`. Returns `exit_code`, `stdout`, `stderr` (64 KB each), `timed_out` and `network_refused`. |
+| `sandbox_read_file` / `sandbox_list` | Read results back (256 KB at most). |
+| `sandbox_info` | The folder, network and limits, and what this machine enforces. |
+| `sandbox_destroy` | Delete it. |
+
+The operator sets the ceilings when starting the server (`--net`,
+`--allow-host`, `--max-wall`, `--policy` for environment and limits). An
+agent can ask for less, never more, and a request above a ceiling is refused
+rather than quietly lowered.
+
+By default every sandbox gets:
+- no network;
+- an empty environment apart from `PATH`, `HOME` and the other
+  essentials, so no host secrets;
+- 4 GB of memory and 1 GB files per process (no file size limit natively
+  on Windows, which cannot enforce one);
+- 120 seconds a run (at most 600).
+
+Every run is confined to its sandbox's folder. When a run ends, everything
+it started is killed, so nothing keeps running in the background.
+
+The server itself is not confined, so the file tools only accept relative
+paths with no `..`, and refuse any path through a symlink (each part is
+checked). This stops a script from planting a link that would lead the
+server out of the sandbox. Sandboxes are removed when the server stops,
+unless `--keep` is given.
 
 ## Using it from Rust
 
@@ -156,7 +376,11 @@ holds the proxy and the temp directory.
 ## Tests
 
 `cargo test -p incord-sandbox` runs:
-- the unit tests (policy, environment, allowlist, Seatbelt profile);
+- `tests/mcp.rs`: `sbx mcp` driven over stdio like an agent drives it. It writes a script, runs it and reads its result; tries escapes (writing outside, the network, host secrets, a planted symlink, `..`, absolute paths); checks the time limit and background cleanup, the limits on what an agent may ask for, and that sandboxes are removed on exit;
+- the unit tests (policy, environment, allowlist, Seatbelt profile, and the
+  Windows backend's pure parts on every platform: backend choice, SID and
+  record handling, root checks, program lookup, command-line quoting, job
+  limits, what each status reports);
 - on Linux, escape tests through the real binary: writes outside the root,
   symlinks, hard links, renames, `/proc/self/root`, child processes, reading
   a hidden path, connecting and binding under `deny`, UDP and raw sockets
@@ -164,7 +388,14 @@ holds the proxy and the temp directory.
   `SIGKILL` cleanup, limits and exit codes;
 - on macOS, the same escapes against Seatbelt where they apply (writes,
   symlinks, children, read-only, `deny_read`, TCP under `deny`, the proxy,
-  the environment, the wall limit).
+  the environment, the wall limit);
+- on Windows (`tests/escape_windows.rs`, with only `cmd` and PowerShell):
+  writes outside the root, the grant held during the run and gone after,
+  read-only and its private temp, child `cmd` and PowerShell, a planted
+  program in the current folder, the wall limit and killing `sbx` taking
+  the whole tree, the job's memory and CPU limits, the environment, exit
+  codes, refusing what native can't enforce, `auto` without WSL, `doctor`,
+  and `sbx mcp` run natively.
 
 Each escape test skips, and says so, on a kernel that cannot enforce what
 it checks.

@@ -60,33 +60,40 @@ impl TokenUsage {
     /// reported as a dollar amount. A made-up number in a cost line is worse
     /// than no number: the operator cannot tell it is made up.
     ///
-    /// The rates below are one vendor's published per-million prices and are
-    /// matched by name. Anything else is unpriced until an operator supplies a
-    /// rate — which does not exist yet, and is the honest next step rather than
-    /// a table of guesses for every vendor.
+    /// The rates are one vendor's published per-million prices, in
+    /// [`PRICES`], matched by name. Anything else is unpriced until an
+    /// operator supplies a rate — which does not exist yet, and is the honest
+    /// next step rather than a table of guesses for every vendor.
+    ///
+    /// Cache writes and cache reads are priced at their own rates: on a
+    /// resumed agent session they are most of the input, and leaving them out
+    /// reported a cache-heavy turn at a fraction of its bill.
     #[must_use]
     pub fn estimate_cost_usd(self, model: Option<&str>) -> Option<f64> {
-        let (input_rate, output_rate) = Self::rate_for(model?)?;
-        let input_cost = f64::from(self.input_tokens) / 1_000_000.0 * input_rate;
-        let output_cost = f64::from(self.output_tokens) / 1_000_000.0 * output_rate;
-        Some(input_cost + output_cost)
+        let price = price_for(model?)?;
+        let per = |tokens: u32, rate: f64| f64::from(tokens) / 1_000_000.0 * rate;
+        Some(
+            per(self.input_tokens, price.input)
+                + per(self.output_tokens, price.output)
+                + per(self.cache_creation_input_tokens, price.cache_write)
+                + per(self.cache_read_input_tokens, price.cache_read),
+        )
     }
 
-    /// The per-million (input, output) rate for a model this harness can price.
-    fn rate_for(model: &str) -> Option<(f64, f64)> {
-        let id = model.to_ascii_lowercase();
-        // Ordered most specific first: several ids contain more than one of
-        // these words, and the first match must be the model's own tier.
-        for (needle, rates) in [
-            ("haiku", (1.0, 5.0)),
-            ("opus", (15.0, 75.0)),
-            ("sonnet", (3.0, 15.0)),
-        ] {
-            if id.contains(needle) {
-                return Some(rates);
-            }
+    /// Add another, separate spend to this one (not the same response — see
+    /// [`Self::merge`] for that).
+    #[must_use]
+    pub fn plus(self, other: Self) -> Self {
+        Self {
+            input_tokens: self.input_tokens.saturating_add(other.input_tokens),
+            output_tokens: self.output_tokens.saturating_add(other.output_tokens),
+            cache_creation_input_tokens: self
+                .cache_creation_input_tokens
+                .saturating_add(other.cache_creation_input_tokens),
+            cache_read_input_tokens: self
+                .cache_read_input_tokens
+                .saturating_add(other.cache_read_input_tokens),
         }
-        None
     }
 
     /// Human-readable summary line.
@@ -107,6 +114,116 @@ impl TokenUsage {
             self.cache_read_input_tokens,
         )
     }
+}
+
+// ---------------------------------------------------------------------------
+// Prices
+// ---------------------------------------------------------------------------
+
+/// Dollars per million tokens for one model family.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ModelPrice {
+    pub input: f64,
+    pub output: f64,
+    /// Writing the prompt cache (the 5-minute tier).
+    pub cache_write: f64,
+    /// Reading from the prompt cache.
+    pub cache_read: f64,
+}
+
+const fn price(input: f64, output: f64, cache_write: f64, cache_read: f64) -> ModelPrice {
+    ModelPrice {
+        input,
+        output,
+        cache_write,
+        cache_read,
+    }
+}
+
+/// THE PRICE TABLE. Update it here; nothing else holds a rate.
+///
+/// Matched as a substring of the model id, lower-cased with `.` and `_` read
+/// as `-` (so `claude-opus-5-5`, `opus-5.5` and `us.anthropic.claude-opus-5-5`
+/// all match `opus-5-5`). ORDERED MOST SPECIFIC FIRST: `opus-5` would
+/// otherwise claim `opus-5-5`, and the bare family names are a last resort.
+///
+/// Anthropic first-party list prices per million tokens, as published
+/// 2026-10. A bare alias (`opus`, `sonnet`, `haiku`) names whichever model
+/// the agent resolves it to, which this cannot see — it is priced at the
+/// family's older, higher rate so the estimate errs high rather than low.
+pub const PRICES: &[(&str, ModelPrice)] = &[
+    ("fable", price(10.0, 50.0, 12.5, 0.25)),
+    ("mythos", price(10.0, 50.0, 12.5, 0.25)),
+    ("opus-5-5", price(4.0, 20.0, 5.0, 0.20)),
+    ("opus-5", price(5.0, 25.0, 6.25, 0.50)),
+    ("opus-4-8", price(5.0, 25.0, 6.25, 0.50)),
+    ("opus-4-7", price(5.0, 25.0, 6.25, 0.50)),
+    ("opus-4-6", price(5.0, 25.0, 6.25, 0.50)),
+    ("opus-4-5", price(5.0, 25.0, 6.25, 0.50)),
+    ("opus", price(15.0, 75.0, 18.75, 1.50)),
+    ("sonnet-5", price(2.0, 10.0, 2.5, 0.20)),
+    ("sonnet", price(3.0, 15.0, 3.75, 0.30)),
+    ("haiku-5", price(0.10, 0.50, 0.125, 0.01)),
+    ("haiku", price(1.0, 5.0, 1.25, 0.10)),
+];
+
+/// The rate for a model this harness can price, or `None`.
+#[must_use]
+pub fn price_for(model: &str) -> Option<ModelPrice> {
+    let id: String = model
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| if c == '.' || c == '_' { '-' } else { c })
+        .collect();
+    PRICES
+        .iter()
+        .find(|(needle, _)| id.contains(needle))
+        .map(|(_, p)| *p)
+}
+
+/// `/cost`: tokens and estimated dollars, one block per model, then a total.
+///
+/// An unpriced model says so, and the total then says it covers only the
+/// priced part — a sum that silently left one model out would read as whole.
+#[must_use]
+pub fn cost_report(by_model: &[(String, TokenUsage)]) -> Vec<String> {
+    if by_model.is_empty() {
+        return vec!["No tokens reported yet this session.".to_string()];
+    }
+    let mut lines = Vec::new();
+    let mut total = 0.0;
+    let mut unpriced = 0;
+    for (model, used) in by_model {
+        let cost = match used.estimate_cost_usd(Some(model)) {
+            Some(usd) => {
+                total += usd;
+                format!("~${usd:.4}")
+            }
+            None => {
+                unpriced += 1;
+                "unpriced".to_string()
+            }
+        };
+        lines.push(format!("{model}: {cost}"));
+        lines.push(format!(
+            "  input {}  output {}  cache write {}  cache read {}",
+            used.input_tokens,
+            used.output_tokens,
+            used.cache_creation_input_tokens,
+            used.cache_read_input_tokens
+        ));
+    }
+    let note = if unpriced > 0 {
+        format!(" ({unpriced} model(s) unpriced, not included)")
+    } else {
+        String::new()
+    };
+    lines.push(format!("Total: ~${total:.4}{note}"));
+    lines.push(
+        "Estimate from list prices (src/runtime/usage.rs PRICES); a subscription is billed differently."
+            .to_string(),
+    );
+    lines
 }
 
 // ---------------------------------------------------------------------------
@@ -281,5 +398,64 @@ mod tests {
         // assertions above are not passing because pricing broke entirely.
         assert!(used.estimate_cost_usd(Some("opus")).is_some());
         assert!(used.summary_line(Some("opus")).contains('$'));
+    }
+
+    /// Cache tokens are priced at their own rates, and the most specific
+    /// family wins over its prefix.
+    #[test]
+    fn cache_tokens_are_priced_and_the_specific_model_wins() {
+        let used = TokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            cache_creation_input_tokens: 1_000_000,
+            cache_read_input_tokens: 1_000_000,
+        };
+        let opus55 = used.estimate_cost_usd(Some("claude-opus-5-5")).unwrap();
+        assert!(
+            (opus55 - (4.0 + 20.0 + 5.0 + 0.20)).abs() < 1e-9,
+            "{opus55}"
+        );
+        let opus5 = used.estimate_cost_usd(Some("claude-opus-5")).unwrap();
+        assert!((opus5 - (5.0 + 25.0 + 6.25 + 0.5)).abs() < 1e-9, "{opus5}");
+        // Dots and provider prefixes are the same model.
+        assert_eq!(
+            price_for("us.anthropic.claude-sonnet-5.5"),
+            price_for("claude-sonnet-5-5")
+        );
+        assert_eq!(price_for("claude-haiku-5-5").unwrap().input, 0.10);
+        assert_eq!(price_for("claude-haiku-4-5").unwrap().input, 1.0);
+    }
+
+    #[test]
+    fn the_cost_report_totals_priced_models_and_names_unpriced_ones() {
+        let used = TokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        };
+        let lines = cost_report(&[
+            ("claude-sonnet-5-5".to_string(), used),
+            ("gemini-3".to_string(), used),
+        ]);
+        let text = lines.join("\n");
+        assert!(text.contains("claude-sonnet-5-5: ~$2.0000"), "{text}");
+        assert!(text.contains("gemini-3: unpriced"), "{text}");
+        assert!(
+            text.contains("Total: ~$2.0000 (1 model(s) unpriced"),
+            "{text}"
+        );
+        assert_eq!(cost_report(&[]).len(), 1);
+    }
+
+    #[test]
+    fn adding_spends_sums_every_field() {
+        let a = TokenUsage {
+            input_tokens: 1,
+            output_tokens: 2,
+            cache_creation_input_tokens: 3,
+            cache_read_input_tokens: 4,
+        };
+        assert_eq!(a.plus(a).total_tokens(), 20);
     }
 }

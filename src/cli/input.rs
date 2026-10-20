@@ -18,7 +18,7 @@ use rustyline::highlight::Highlighter;
 use rustyline::hint::Hinter;
 use rustyline::{ColorMode, CompletionType, Config, Context, Editor};
 
-use super::slash_commands::{command_name, COMMANDS};
+use super::slash_commands::command_name;
 
 /// Editor with the command menu attached.
 type Prompted = Editor<Menu, rustyline::history::FileHistory>;
@@ -34,9 +34,8 @@ pub struct Menu;
 impl Menu {
     /// The commands whose name starts with `head`, as (name, description).
     fn matching(head: &str) -> impl Iterator<Item = (&'static str, &'static str)> + '_ {
-        COMMANDS
-            .iter()
-            .map(|(entry, desc)| (command_name(entry), *desc))
+        crate::custom_commands::all_commands()
+            .map(|(entry, desc)| (command_name(entry), desc))
             .filter(move |(name, _)| name.starts_with(head))
     }
 
@@ -137,6 +136,15 @@ impl LineEditor {
         }
     }
 
+    /// Emacs- or vi-style editing, as rustyline provides it.
+    pub fn set_editing_mode(&mut self, mode: super::keys::EditingMode) {
+        use rustyline::config::Configurer;
+        self.editor.set_edit_mode(match mode {
+            super::keys::EditingMode::Emacs => rustyline::EditMode::Emacs,
+            super::keys::EditingMode::Vi => rustyline::EditMode::Vi,
+        });
+    }
+
     /// Read one line from the user. Returns `None` on Ctrl-C / Ctrl-D / EOF.
     pub fn readline(&mut self, prompt: &str) -> Option<String> {
         match self.editor.readline(prompt) {
@@ -169,6 +177,7 @@ impl Drop for LineEditor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::slash_commands::COMMANDS;
 
     #[test]
     fn a_lone_slash_completes_to_every_command() {

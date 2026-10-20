@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 
 use landlock::{
     Access, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, NetPort, PathBeneath, PathFd,
-    RulesetAttr, RulesetCreatedAttr, RulesetStatus, ABI,
+    RulesetAttr, RulesetCreatedAttr, RulesetStatus, Scope, ABI,
 };
 
 use crate::policy::{FsMode, NetMode};
@@ -45,6 +45,17 @@ fn hard_ruleset_fs(abi: ABI) -> bool {
     landlock::Ruleset::default()
         .set_compatibility(CompatLevel::HardRequirement)
         .handle_access(AccessFs::from_all(abi))
+        .and_then(landlock::Ruleset::create)
+        .is_ok()
+}
+
+/// Whether this kernel scopes signals and abstract Unix sockets to the
+/// sandbox (Landlock ABI v6).
+#[must_use]
+pub fn scopes_supported() -> bool {
+    landlock::Ruleset::default()
+        .set_compatibility(CompatLevel::HardRequirement)
+        .scope(Scope::AbstractUnixSocket | Scope::Signal)
         .and_then(landlock::Ruleset::create)
         .is_ok()
 }
@@ -72,7 +83,15 @@ pub(crate) fn fs_status(mode: FsMode) -> Status {
              out of a read-only tree (needs v2, Linux 5.19)"
                 .into(),
         ),
-        Some(abi) => Status::Enforced(format!("Landlock (filesystem ABI {})", abi_number(abi))),
+        Some(abi) => Status::Enforced(format!(
+            "Landlock (filesystem ABI {}); {}",
+            abi_number(abi),
+            if scopes_supported() {
+                "signals and abstract Unix sockets scoped to the sandbox"
+            } else {
+                "signals and abstract Unix sockets NOT scoped (needs Landlock ABI v6, Linux 6.12)"
+            }
+        )),
     }
 }
 
@@ -136,6 +155,14 @@ pub(crate) fn restrict(spec: &EnterSpec) -> Result<(), String> {
             .handle_access(AccessNet::from_all(ABI::V4))
             .map_err(|e| e.to_string())?;
     }
+    // Landlock ABI v6 (Linux 6.12): the command may not signal a process
+    // outside its sandbox, nor connect to an abstract Unix socket made
+    // outside it (a D-Bus or X11 session bus, a container shim). Best effort:
+    // an older kernel drops the scopes and the rest still applies; `doctor`
+    // and the status say which.
+    ruleset = ruleset
+        .scope(Scope::AbstractUnixSocket | Scope::Signal)
+        .map_err(|e| e.to_string())?;
     let mut ruleset = ruleset.create().map_err(|e| e.to_string())?;
 
     if wants_fs {
