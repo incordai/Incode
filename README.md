@@ -1352,10 +1352,14 @@ The full list is in `docs/ROADMAP.md`.
 ## Development
 
 ```sh
-cargo test                          # about 1,900 tests (1,878 library, 46 binary)
+scripts/test-all.sh                 # everything CI runs, and the SDKs and editor extension
+cargo test                          # about 2,100 tests (library and binary)
 cargo clippy --all-targets -- -D warnings
 cargo fmt
 ```
+
+[TESTING.md](TESTING.md) lists every suite, the Windows check, the live tests
+that are off by default and what is worth trying by hand.
 
 The documents under `docs/` are the input the loop reads, not decoration:
 `PRD.md` (what and why), `ARCHITECTURE.md` (the shape), `CONVENTIONS.md` (how
