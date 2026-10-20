@@ -93,8 +93,29 @@ impl CliApp {
 /// listed them — and say which configured tools are not installed. What
 /// became of each server is traced, never printed over the prompt.
 fn connect_ext_tools(prepared: &Prepared) {
-    let (specs, said) =
+    let (mut specs, mut said) =
         crate::ext_tools::session_servers(&prepared.admin.tools, &prepared.incode_dir);
+    // `.mcp.json` and `~/.incode/mcp.json`. A project's server not yet
+    // approved is put to the person at the terminal, before the prompt.
+    let at_terminal = std::io::IsTerminal::is_terminal(&std::io::stdin())
+        && std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let ask = |name: &str, entry: &crate::mcp_config::ServerEntry| {
+        render::print_info(&format!(
+            "This project's {} wants to start the MCP server `{name}`: {}",
+            crate::mcp_config::PROJECT_FILE,
+            entry.summary()
+        ));
+        out!("Start it now and remember the approval? [y/N] ");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer).is_ok()
+            && matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+    };
+    let asker: Option<crate::mcp_config::Asker<'_>> = if at_terminal { Some(&ask) } else { None };
+    let (from_files, about_files) =
+        crate::mcp_config::session_servers(&prepared.workspace, &prepared.incode_dir, asker);
+    specs.extend(from_files);
+    said.extend(about_files);
     for line in said {
         render::print_info(&line);
     }
@@ -831,6 +852,7 @@ impl CliApp {
                     SlashCommand::Links(target) => {
                         slash_commands::handle_links(&session.roots(), target.as_deref());
                     }
+                    SlashCommand::Permissions => slash_commands::handle_permissions(&workspace),
                     SlashCommand::Guards => {
                         slash_commands::handle_guards(&workspace);
                     }

