@@ -447,6 +447,14 @@ pub fn handle_help() {
     for (cmd, desc) in COMMANDS {
         outln!("  {cmd:<20} {desc}");
     }
+    let custom = crate::custom_commands::menu();
+    if !custom.is_empty() {
+        outln!();
+        render::print_header("Custom Commands");
+        for (cmd, desc) in custom {
+            outln!("  {cmd:<20} {desc}");
+        }
+    }
     outln!();
 }
 
@@ -492,13 +500,16 @@ pub fn skills_lines(set: &crate::skills::Skillset, source: crate::skills::Source
         crate::skills::Source::Cache(age) => out.push(format!(
             "  The skill store did not answer — this is what it last said, {age}s ago."
         )),
-        crate::skills::Source::Nothing => {
+        crate::skills::Source::Nothing if set.is_empty() => {
             out.push(
                 "  The skill store did not answer and nothing was kept. This session is \
                  running without skills."
                     .to_string(),
             );
             return out;
+        }
+        crate::skills::Source::Nothing => {
+            out.push("  The skill store did not answer; only plugin skills are listed.".to_string())
         }
     }
 

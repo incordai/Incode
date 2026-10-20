@@ -380,7 +380,10 @@ fn connect_ext_tools(workspace: &Path) -> std::sync::Arc<crate::toolbox::Session
     let configured = crate::admin::AdminConfig::load(&data_dir)
         .map(|admin| admin.tools)
         .unwrap_or_default();
-    let (specs, said) = crate::ext_tools::session_servers(&configured, &data_dir);
+    let (mut specs, mut said) = crate::ext_tools::session_servers(&configured, &data_dir);
+    let (plugin_specs, plugin_said) = crate::plugins::session_servers(workspace);
+    specs.extend(plugin_specs);
+    said.extend(plugin_said);
     for line in said {
         eprintln!("incode: {line}");
     }

@@ -93,8 +93,11 @@ impl CliApp {
 /// listed them — and say which configured tools are not installed. What
 /// became of each server is traced, never printed over the prompt.
 fn connect_ext_tools(prepared: &Prepared) {
-    let (specs, said) =
+    let (mut specs, mut said) =
         crate::ext_tools::session_servers(&prepared.admin.tools, &prepared.incode_dir);
+    let (plugin_specs, plugin_said) = crate::plugins::session_servers(&prepared.workspace);
+    specs.extend(plugin_specs);
+    said.extend(plugin_said);
     for line in said {
         render::print_info(&line);
     }
@@ -781,6 +784,14 @@ impl CliApp {
         // agent only names its session after the first one.
         let mut session_record: Option<crate::session::Record> = None;
 
+        // The operator's own slash commands, the project's and the plugins'.
+        // A built-in always wins; a typed custom command becomes the turn.
+        let custom_commands = crate::custom_commands::Registry::load(&workspace);
+        for warning in &custom_commands.warnings {
+            render::print_info(&format!("warning: {warning}"));
+        }
+        custom_commands.publish_menu();
+
         while let Some(line) = match footer {
             Some(ref mut f) => f.read_line(),
             None => editor.readline("You: "),
@@ -788,6 +799,10 @@ impl CliApp {
             if line.is_empty() {
                 continue;
             }
+            let line = match custom_commands.expand_line(&line) {
+                Some(expanded) => crate::custom_commands::announce(&expanded),
+                None => line,
+            };
 
             // Check for slash commands
             if let Some(cmd) = SlashCommand::parse(&line) {
