@@ -568,16 +568,35 @@ model: sonnet
 allowed-tools: Bash(npm test:*), Read
 ---
 Run the tests in $1, filtered to `$2`. Everything typed: $ARGUMENTS
+Our test conventions: @docs/testing.md
 ```
 
 `$ARGUMENTS` is everything after the name; `$1`..`$9` are its words, split like
 a shell (quotes group). A body with neither gets the arguments appended. Typing
 `/frontend:test app.tsx` sends the filled-in text as your turn, and `incode -t
 "/frontend:test app.tsx"` runs it headless. Custom commands are listed in
-`/help` and complete on Tab. `model` is used by `-t` when `-m` is not given; in
-the REPL it is only named, since switching models starts the conversation over.
-`allowed-tools` is advisory: shown, not enforced — guards, the permission mode
-and hooks are what restrict tools.
+`/help`, complete on Tab, and are offered to ACP clients (`incode --acp`) beside
+the built-ins, with `argument-hint` as the input hint. `model` is used by `-t`
+when `-m` is not given; in the REPL and over ACP it is only named, since
+switching models starts the conversation over.
+
+`@path` in the body (at its start or after a space, naming something with a `/`
+or a `.` — `@src/main.rs`, `@./Makefile`) is replaced by that file in a fenced
+block headed by its path. The path must resolve inside the workspace (`..` and
+symlinks are followed before checking); a file is read up to 256 KB and a
+command's files up to 1 MB in all. Anything that cannot be included leaves a
+marker such as `[@path: not found]` or `[@path: outside the workspace]`. Email
+addresses are left alone, and only the command file's own text is looked at —
+an `@path` you type as an argument is passed on as text, not read.
+
+`allowed-tools` holds the turn the command starts: each entry is a permission
+rule (`Bash(npm test:*)`, `Read`, `Edit(src/**)` — the grammar of
+[permission rules](#permission-rules)), and a tool call none of them covers is
+refused, with the list named to the model. A compound shell line is covered
+only when every part is. Only that turn: the next one is unrestricted. It only
+narrows — deny and ask rules, guards, the mode and hooks still apply. It binds
+where incode runs the tools (the API route and Claude Code); on Codex and
+Antigravity, which bring their own tools, the turn says it was not enforced.
 
 A **plugin** is a folder in `~/.incode/plugins/<name>/` or
 `.incode/plugins/<name>/` with a `plugin.toml` (`name`, `version`,

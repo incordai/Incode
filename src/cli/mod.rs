@@ -827,9 +827,14 @@ impl CliApp {
             if line.is_empty() {
                 continue;
             }
-            let line = match custom_commands.expand_line(&line) {
-                Some(expanded) => crate::custom_commands::announce(&expanded),
-                None => line,
+            // A custom command's `allowed-tools` hold the turn it starts, and
+            // only that one.
+            let (line, allowed_tools) = match custom_commands.expand_line(&line, &workspace) {
+                Some(expanded) => (
+                    crate::custom_commands::announce(&expanded),
+                    expanded.allowed_tools,
+                ),
+                None => (line, Vec::new()),
             };
 
             // Check for slash commands
@@ -1272,9 +1277,13 @@ impl CliApp {
             // Context, checkpoint, turn and streaming all live in one place
             // now, shared with the one-shot path above so the two cannot drift.
             let turn_began = std::time::Instant::now();
+            session.restrict_next_turn(allowed_tools);
             if let Err(e) = run_one_turn(&mut session, &workspace, &augmented_input, &line) {
                 render::print_error(&e);
             }
+            // Lifted whether or not a turn ran: a line answered without one
+            // (a reply to a question) must not pass it on to the next.
+            session.restrict_next_turn(Vec::new());
             notify::turn_finished(turn_began.elapsed());
             ux.refresh_status(footer.as_mut(), &session, &workspace, git_context.as_ref());
 

@@ -1434,6 +1434,10 @@ impl AgentBackend for ApiBackend {
         self.tools.share_session(state);
     }
 
+    fn runs_tools_here(&self) -> bool {
+        true
+    }
+
     /// The team channel's tools are the toolbox's, so the toolbox is who
     /// speaks.
     fn set_team_identity(&mut self, role: &str) {

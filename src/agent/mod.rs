@@ -993,6 +993,16 @@ pub trait AgentBackend {
     /// jobs or list of incode's to share.
     fn share_session_tools(&mut self, _state: std::sync::Arc<crate::toolbox::SessionTools>) {}
 
+    /// Whether every tool call this backend's model makes runs through
+    /// incode's [`crate::toolbox::Toolbox`] — so a restriction set on the
+    /// shared [`crate::toolbox::SessionTools`] binds it.
+    ///
+    /// Defaulted to no: an agent CLI that brings its own tools runs them
+    /// where incode cannot refuse one.
+    fn runs_tools_here(&self) -> bool {
+        false
+    }
+
     /// The model this backend was asked for, when it was asked for one.
     fn model(&self) -> Option<&str> {
         None
@@ -1167,6 +1177,10 @@ impl AgentBackend for Box<dyn AgentBackend> {
 
     fn share_session_tools(&mut self, state: std::sync::Arc<crate::toolbox::SessionTools>) {
         (**self).share_session_tools(state);
+    }
+
+    fn runs_tools_here(&self) -> bool {
+        (**self).runs_tools_here()
     }
 
     fn model(&self) -> Option<&str> {

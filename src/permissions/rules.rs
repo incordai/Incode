@@ -1069,6 +1069,62 @@ impl PermissionRules {
     }
 }
 
+// ---------------------------------------------------------------------------
+// A turn's own allowlist
+// ---------------------------------------------------------------------------
+
+/// The tools ONE turn may use, as a custom command's `allowed-tools` names
+/// them: the same grammar as an `allow` rule, judged the way an `allow` list
+/// is — a command line only when EVERY part is covered and none is opaque,
+/// several paths only when every one is.
+///
+/// It only narrows. A call it lets through still meets the deny and ask
+/// rules, the guards, the mode and the hooks; being listed here is not an
+/// `allow` rule and does not skip the `prompt` mode's question.
+#[derive(Debug, Clone)]
+pub struct Allowlist {
+    allow: Vec<Sourced>,
+    /// As written, for the refusal the model reads.
+    listed: Vec<String>,
+}
+
+impl Allowlist {
+    /// The rules in `texts`, and a line for each one that did not parse. A
+    /// rule that does not parse is left out — which allows LESS, never more.
+    #[must_use]
+    pub fn parse(texts: &[String], home: Option<&Path>) -> (Self, Vec<String>) {
+        let mut allow = Vec::new();
+        let mut warnings = Vec::new();
+        for text in texts {
+            match Rule::parse(text, home) {
+                Ok(rule) => allow.push(Sourced {
+                    rule,
+                    layer: Layer::User,
+                }),
+                Err(why) => warnings.push(format!("allowed-tools: {why}; left out")),
+            }
+        }
+        let listed = texts.iter().map(|t| t.trim().to_string()).collect();
+        (Self { allow, listed }, warnings)
+    }
+
+    /// Whether this call is one the list covers.
+    #[must_use]
+    pub fn permits(&self, tool: &str, subject: &Subject, ctx: &PathContext) -> bool {
+        let segments = match subject {
+            Subject::Command(line) => split_command(line),
+            _ => Vec::new(),
+        };
+        permits(&self.allow, tool, subject, &segments, ctx).is_some()
+    }
+
+    /// The rules as written, parsed or not.
+    #[must_use]
+    pub fn listed(&self) -> &[String] {
+        &self.listed
+    }
+}
+
 /// Whether a deny or ask rule applies: to ANY part of the call.
 fn restricts(
     rule: &Rule,

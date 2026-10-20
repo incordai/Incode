@@ -1345,6 +1345,12 @@ impl AgentBackend for ClaudeCodeBackend {
         self.tools.share_session(state);
     }
 
+    /// The CLI's own tools are switched off; every call comes back through
+    /// the bridge to this backend's toolbox.
+    fn runs_tools_here(&self) -> bool {
+        true
+    }
+
     fn deny_rules(&self) -> &[String] {
         ClaudeCodeBackend::deny_rules(self)
     }

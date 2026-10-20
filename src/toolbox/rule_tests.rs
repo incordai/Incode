@@ -129,3 +129,86 @@ fn an_allow_rule_does_not_lift_read_only() {
         .expect_err("read-only");
     assert!(refused.contains("read-only"), "{refused}");
 }
+
+/// The toolbox and a session state it shares, held to `allowed` until the
+/// returned guard is dropped.
+fn restricted(root: &Path, allowed: &[&str]) -> (Toolbox, TurnRestriction) {
+    let state = SessionTools::new(true);
+    let mut box_ = Toolbox::new(root, true);
+    box_.share_session(Arc::clone(&state));
+    let texts: Vec<String> = allowed.iter().map(|s| (*s).to_string()).collect();
+    let (list, warnings) = crate::permissions::rules::Allowlist::parse(&texts, None);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    (box_, state.restrict_turn(list))
+}
+
+/// **A COMMAND'S `allowed-tools` HOLDS ITS TURN**: what the list covers runs,
+/// anything else — another tool, a command line with one part outside the
+/// list — is refused with the list named, and nothing it would do happens.
+#[test]
+fn a_turn_restriction_refuses_what_its_list_does_not_cover() {
+    let dir = tempfile::tempdir().expect("tmp");
+    std::fs::write(dir.path().join("a.txt"), "hello").expect("seed");
+    let (box_, _held) = restricted(dir.path(), &["Read", "Bash(echo:*)"]);
+    assert!(box_
+        .run(READ, &json!({"path": "a.txt"}))
+        .expect("listed")
+        .contains("hello"));
+    box_.run(BASH, &json!({"command": "echo ok"}))
+        .expect("listed");
+    let refused = box_
+        .run(WRITE, &json!({"path": "b.txt", "content": "x"}))
+        .expect_err("not listed");
+    assert!(
+        refused.contains("allowed-tools (Read, Bash(echo:*))"),
+        "{refused}"
+    );
+    assert!(!dir.path().join("b.txt").exists());
+    let refused = box_
+        .run(BASH, &json!({"command": "echo ok && touch pwned"}))
+        .expect_err("one part is not listed");
+    assert!(refused.contains("allowed-tools"), "{refused}");
+    assert!(!dir.path().join("pwned").exists());
+}
+
+/// A path pattern in the list narrows a family of tools to those paths.
+#[test]
+fn a_turn_restriction_narrows_writes_to_its_paths() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let (box_, _held) = restricted(dir.path(), &["Edit(notes/**)"]);
+    box_.run(WRITE, &json!({"path": "notes/a.md", "content": "x"}))
+        .expect("inside notes");
+    let refused = box_
+        .run(WRITE, &json!({"path": "other.md", "content": "x"}))
+        .expect_err("outside notes");
+    assert!(refused.contains("Edit(notes/**)"), "{refused}");
+}
+
+/// **THE NEXT TURN IS NOT HELD TO IT**: once the guard is dropped, the same
+/// toolbox runs what it refused.
+#[test]
+fn a_turn_restriction_is_lifted_when_the_turn_ends() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let (box_, held) = restricted(dir.path(), &["Read"]);
+    box_.run(WRITE, &json!({"path": "b.txt", "content": "x"}))
+        .expect_err("restricted");
+    drop(held);
+    box_.run(WRITE, &json!({"path": "b.txt", "content": "x"}))
+        .expect("unrestricted");
+    assert!(dir.path().join("b.txt").exists());
+}
+
+/// Listed is not allowed: the settings' deny rules still refuse.
+#[test]
+fn a_turn_restriction_does_not_outrank_a_deny_rule() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let state = SessionTools::new(true);
+    let mut box_ = with_rules(dir.path(), &[], &[], &["Bash(rm:*)"]);
+    box_.share_session(Arc::clone(&state));
+    let (list, _) = crate::permissions::rules::Allowlist::parse(&["Bash".to_string()], None);
+    let _held = state.restrict_turn(list);
+    let refused = box_
+        .run(BASH, &json!({"command": "rm -r gone"}))
+        .expect_err("denied");
+    assert!(refused.contains("Bash(rm:*)"), "{refused}");
+}

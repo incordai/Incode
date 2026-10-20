@@ -124,6 +124,9 @@ pub struct AgentSession {
     /// Who is told what the tools and workers do while they run, so a
     /// backend switched in tells them too.
     watch: Option<std::sync::Arc<dyn crate::watch::Watch>>,
+    /// The `allowed-tools` of the custom command the next turn runs, taken
+    /// by that turn and held for it alone. Empty: the turn is not narrowed.
+    next_allowed: Vec<String>,
 }
 
 /// How wide a tool result panel is drawn in a conversation.
@@ -244,7 +247,39 @@ impl AgentSession {
             mode: None,
             prompter: None,
             watch: None,
+            next_allowed: Vec::new(),
         }
+    }
+
+    /// Hold the next turn — that one, not the session — to `allowed`, a custom
+    /// command's `allowed-tools` in the permission rules' grammar. Empty lifts
+    /// a restriction set and not yet used.
+    pub fn restrict_next_turn(&mut self, allowed: Vec<String>) {
+        self.next_allowed = allowed;
+    }
+
+    /// The next turn's restriction, put in force on the session's tools:
+    /// the guard that lifts it, or `None` when the turn is not narrowed. Said
+    /// in the notices when a rule does not parse, and when the agent serving
+    /// the turn runs its own tools, where incode cannot refuse a call.
+    fn hold_turn_to_allowed(&mut self) -> Option<crate::toolbox::TurnRestriction> {
+        let allowed = std::mem::take(&mut self.next_allowed);
+        if allowed.is_empty() {
+            return None;
+        }
+        let (list, warnings) = crate::permissions::rules::Allowlist::parse(
+            &allowed,
+            crate::admin::home_dir().as_deref(),
+        );
+        self.notices.extend(warnings);
+        if !self.backend.runs_tools_here() {
+            self.notices.push(crate::custom_commands::not_enforced_by(
+                self.backend.id(),
+                &allowed,
+            ));
+        }
+        crate::trace!("session", "this turn's tools: {}", allowed.join(", "));
+        Some(self.session_tools.restrict_turn(list))
     }
 
     /// Put `backend` in as the agent that serves the next turn, carrying
@@ -751,6 +786,9 @@ impl AgentSession {
         if let Some(token) = &self.cancel {
             token.reset();
         }
+        // A custom command's `allowed-tools`, in force for this turn — its
+        // follow-up and continuations included — and lifted when it ends.
+        let held_to = self.hold_turn_to_allowed();
         // A turn not opened by a person's line (a continuation, `/run`) still
         // carries the session-start block.
         self.settle_memory_start();
@@ -1005,6 +1043,15 @@ impl AgentSession {
 
             start_new_line!(on_text);
             on_text(&format!("\n[{handover}]\n\n"));
+            if held_to.is_some() && !self.standby[index].runs_tools_here() {
+                self.notices.push(crate::custom_commands::not_enforced_by(
+                    &took_over,
+                    &self
+                        .session_tools
+                        .turn_allowlist()
+                        .map_or_else(Vec::new, |l| l.listed().to_vec()),
+                ));
+            }
 
             // Reset stream filter and turn tracking for the standby agent attempt
             filter = crate::ask::StreamFilter::new();
@@ -2089,6 +2136,110 @@ mod tests {
             seen.context[1].ends_with("START-X") && seen.context[1].contains(&fresh),
             "{:?}",
             seen.context
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // A custom command's `allowed-tools`, held for one turn.
+    // -----------------------------------------------------------------------
+
+    /// The allowlist each turn ran under, as written; `None` for a turn with
+    /// none.
+    type HeldTo = Arc<Mutex<Vec<Option<Vec<String>>>>>;
+
+    /// A backend that writes down, each turn, the allowlist in force on the
+    /// session tools it was handed.
+    struct ToolsSpy {
+        runs_tools_here: bool,
+        state: Option<Arc<crate::toolbox::SessionTools>>,
+        seen: HeldTo,
+    }
+
+    impl AgentBackend for ToolsSpy {
+        fn id(&self) -> &str {
+            "spy"
+        }
+        fn run_turn(
+            &mut self,
+            _prompt: &str,
+            _on_event: &mut dyn FnMut(&AgentEvent),
+        ) -> Result<TurnOutcome, crate::agent::AgentError> {
+            let held = self
+                .state
+                .as_ref()
+                .and_then(|s| s.turn_allowlist())
+                .map(|list| list.listed().to_vec());
+            self.seen.lock().expect("seen").push(held);
+            Ok(TurnOutcome {
+                session_id: String::new(),
+                stop_reason: "end_turn".to_string(),
+                is_error: false,
+                detail: None,
+                served_by: Vec::new(),
+            })
+        }
+        fn session_id(&self) -> Option<&str> {
+            None
+        }
+        fn share_session_tools(&mut self, state: Arc<crate::toolbox::SessionTools>) {
+            self.state = Some(state);
+        }
+        fn runs_tools_here(&self) -> bool {
+            self.runs_tools_here
+        }
+    }
+
+    fn spied(dir: &Path, runs_tools_here: bool) -> (AgentSession, HeldTo) {
+        let seen = Arc::default();
+        let s = session(dir).with_backend(Box::new(ToolsSpy {
+            runs_tools_here,
+            state: None,
+            seen: Arc::clone(&seen),
+        }));
+        (s, seen)
+    }
+
+    /// **ONE TURN, NOT THE SESSION.** The restriction is in force while the
+    /// turn it was set for runs, lifted when it ends, and the next turn runs
+    /// with none.
+    #[test]
+    fn a_command_restriction_holds_its_turn_and_no_other() {
+        let dir = tempfile::tempdir().expect("ws");
+        let (mut s, seen) = spied(dir.path(), true);
+        s.restrict_next_turn(vec!["Read".to_string(), "Bash(npm test:*)".to_string()]);
+        s.turn(dir.path(), "first", &[], &mut |_| {}, &mut |_| {})
+            .expect("turn");
+        assert!(s.session_tools().turn_allowlist().is_none(), "lifted");
+        s.turn(dir.path(), "second", &[], &mut |_| {}, &mut |_| {})
+            .expect("turn");
+        assert_eq!(
+            *seen.lock().expect("seen"),
+            vec![
+                Some(vec!["Read".to_string(), "Bash(npm test:*)".to_string()]),
+                None
+            ]
+        );
+        assert!(
+            !s.take_notices().iter().any(|n| n.contains("NOT enforced")),
+            "enforced where incode runs the tools"
+        );
+    }
+
+    /// An agent that runs its own tools is not held to it, and the turn says
+    /// so rather than letting the list read as enforced.
+    #[test]
+    fn a_command_restriction_on_an_agent_with_its_own_tools_is_said_unenforced() {
+        let dir = tempfile::tempdir().expect("ws");
+        let (mut s, _seen) = spied(dir.path(), false);
+        s.restrict_next_turn(vec!["Read".to_string()]);
+        s.turn(dir.path(), "first", &[], &mut |_| {}, &mut |_| {})
+            .expect("turn");
+        let notices = s.take_notices();
+        assert!(
+            notices
+                .iter()
+                .any(|n| n.contains("allowed-tools (Read) was NOT enforced") && n.contains("spy")),
+            "{notices:?}"
         );
     }
 }
