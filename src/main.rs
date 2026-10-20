@@ -19,6 +19,7 @@ USAGE:
     incode update [--check]   Install the latest release over this program
                               (sha256 checked); --check only reports it
     incode review [--base <REF>] [-p]   Review the current change (see `incode review -h`)
+    incode plugin list | add <git-url | path> [--project] | remove <name> [--project]
 
 OPTIONS:
     -m, --model <NAME>        Model to use (or set INCODE_MODEL)
@@ -123,6 +124,17 @@ fn main() -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!(e));
         }
     }
+    // `incode plugin ...` manages plugin folders and runs nothing else.
+    {
+        let raw: Vec<String> = std::env::args().skip(1).collect();
+        if raw.first().map(String::as_str) == Some("plugin") {
+            let workspace = std::env::current_dir()?;
+            let said =
+                incord_code::plugins::cli(&raw[1..], &workspace).map_err(|e| anyhow::anyhow!(e))?;
+            println!("{}", said.trim_end());
+            return Ok(());
+        }
+    }
     // NOTE: the crate emits `tracing` events (MCP connection failures, tool
     // errors) but no subscriber is installed, so they currently go nowhere.
     // Installing one needs a new dependency, which is a decision to take
@@ -176,6 +188,9 @@ fn main() -> anyhow::Result<()> {
                     .as_deref(),
             )
             .map_err(|e| anyhow::anyhow!(e))?;
+            // `-t "/name args"` runs the operator's custom command.
+            let (instruction, model) =
+                incord_code::custom_commands::expand_task(&workspace, instruction, model);
             return on_a_runtime(|| {
                 incord_code::task_run::run_task_as(
                     &workspace,

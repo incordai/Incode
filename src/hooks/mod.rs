@@ -205,7 +205,10 @@ impl HookRunner {
     /// test never runs the operator's commands.
     #[must_use]
     pub fn from_settings() -> Option<Self> {
-        let config = crate::admin::AdminConfig::load_default().desktop_hooks;
+        let mut config = crate::admin::AdminConfig::load_default().desktop_hooks;
+        let plugins = crate::plugins::session_hooks();
+        config.pre_tool_use.extend(plugins.pre_tool_use);
+        config.post_tool_use.extend(plugins.post_tool_use);
         (!config.is_empty()).then(|| Self::new(config))
     }
 

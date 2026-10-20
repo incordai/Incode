@@ -33,7 +33,7 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen,
 };
 
-use super::slash_commands::{command_name, COMMANDS};
+use super::slash_commands::command_name;
 
 /// Start of a synchronized update — the terminal shows nothing until the end.
 const SYNC_BEGIN: &str = "\x1b[?2026h";
@@ -927,10 +927,9 @@ impl Footer {
         for offset in 0..shown {
             let at = self.menu_top + offset;
             let Some(name) = self.menu.get(at) else { break };
-            let desc = COMMANDS
-                .iter()
+            let desc = crate::custom_commands::all_commands()
                 .find(|(entry, _)| command_name(entry) == *name)
-                .map_or("", |(_, d)| *d);
+                .map_or("", |(_, d)| d);
             let chosen = at == self.selected;
             let marker = if chosen { "\u{203a}" } else { " " };
             // Two columns further in than the frame, so the list reads as
@@ -1033,8 +1032,7 @@ pub fn command_word(line: &str) -> Option<&str> {
 /// Commands whose name starts with `head`.
 #[must_use]
 pub fn matching(head: &str) -> Vec<&'static str> {
-    COMMANDS
-        .iter()
+    crate::custom_commands::all_commands()
         .map(|(entry, _)| command_name(entry))
         .filter(|name| name.starts_with(head))
         .collect()
@@ -1184,6 +1182,7 @@ pub(crate) fn mouse_disable_sequence(enabled: bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::slash_commands::COMMANDS;
 
     /// **The other writer's format is not something a person typed.**
     ///

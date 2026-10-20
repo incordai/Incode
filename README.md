@@ -21,7 +21,7 @@ tools — see [Limits](#limits).)
 - [A new project](#a-new-project)
 - [Modes](#modes)
 - [Choosing agents and models](#choosing-agents-and-models)
-- [Commands inside a session](#commands-inside-a-session)
+- [Commands inside a session](#commands-inside-a-session) · [Custom commands and plugins](#custom-commands-and-plugins)
 - [Code review and GitHub](#code-review-and-github)
 - [Tools](#tools)
 - [Computer use](#computer-use)
@@ -550,6 +550,53 @@ answers `@incode` mentions on issues and pull requests (posting the reply and
 pushing any change to a new branch), or reviews each pull request as it opens.
 Setup, inputs and the safety defaults are in
 [docs/github-action.md](docs/github-action.md).
+
+## Custom commands and plugins
+
+A markdown file is a slash command. Put it in `.incode/commands/` (the
+project's) or `~/.incode/commands/` (yours; the project's wins on a name
+clash). The name is the path with `/` turned into `:` — `frontend/test.md` is
+`/frontend:test`. Built-in commands always win, and a file that shadows one is
+reported at start.
+
+```markdown
+---
+description: Run the frontend tests for one file
+argument-hint: <file> [pattern]
+model: sonnet
+allowed-tools: Bash(npm test:*), Read
+---
+Run the tests in $1, filtered to `$2`. Everything typed: $ARGUMENTS
+```
+
+`$ARGUMENTS` is everything after the name; `$1`..`$9` are its words, split like
+a shell (quotes group). A body with neither gets the arguments appended. Typing
+`/frontend:test app.tsx` sends the filled-in text as your turn, and `incode -t
+"/frontend:test app.tsx"` runs it headless. Custom commands are listed in
+`/help` and complete on Tab. `model` is used by `-t` when `-m` is not given; in
+the REPL it is only named, since switching models starts the conversation over.
+`allowed-tools` is advisory: shown, not enforced — guards, the permission mode
+and hooks are what restrict tools.
+
+A **plugin** is a folder in `~/.incode/plugins/<name>/` or
+`.incode/plugins/<name>/` with a `plugin.toml` (`name`, `version`,
+`description`) and any of: `commands/**/*.md` (as `/<plugin>:<cmd>`),
+`skills/<skill>/SKILL.md` (listed in `/skills` as `<plugin>:<skill>`),
+`hooks.json` (`{"pre_tool_use": [...], "post_tool_use": [...]}`, added to
+`admin.json`'s hooks) and `.mcp.json` (`{"mcpServers": {"db": {"command",
+"args", "env"}}}`, or `{"type": "http", "url", "headers"}`, started with the
+session). `${INCODE_PLUGIN_ROOT}` in a hook or server is the plugin's folder.
+
+```sh
+incode plugin list
+incode plugin add https://github.com/you/incode-web-plugin   # git clone --depth 1
+incode plugin add ./my-plugin --project                      # copied into .incode/plugins/
+incode plugin remove web
+```
+
+A plugin's hooks and servers run with your authority; install only what you
+would run yourself. Skills and hooks are read for the directory incode was
+started in.
 
 ## Tools
 
