@@ -178,10 +178,13 @@ fn a_picked_role_routes_the_next_turns_model() {
     );
     let dir = tempfile::tempdir().expect("ws");
     let (session, _) = new_session(&mut client, dir.path(), json!([]));
-    let set = client.call(
+    let asked = client.request(
         "session/set_config_option",
         json!({"sessionId": session, "configId": "role", "value": "explore"}),
     );
+    // Applied at once while the session is idle, so the session's update can
+    // race the reply: what came before the reply is kept and looked at too.
+    let (mut seen, set) = client.until_response(asked);
     assert_eq!(
         option(&result_of(&set)["configOptions"], "role")["currentValue"],
         "explore"
@@ -191,15 +194,12 @@ fn a_picked_role_routes_the_next_turns_model() {
         text_of(&said).contains("on small-model"),
         "the turn after the pick runs on the role's model: {said:#?}"
     );
-    let updates = updates_of(&said);
-    let mut told = updates
+    seen.extend(said);
+    let updates = updates_of(&seen);
+    let told = updates
         .iter()
-        .filter(|u| u["sessionUpdate"] == "config_option_update");
-    let told = told.next().unwrap_or_else(|| {
-        // Applied while idle, before the prompt: the update may have come
-        // ahead of it.
-        panic!("no config_option_update with the prompt: {said:#?}")
-    });
+        .find(|u| u["sessionUpdate"] == "config_option_update")
+        .unwrap_or_else(|| panic!("no config_option_update: {seen:#?}"));
     let role = option(&told["configOptions"], "role");
     assert!(
         role["description"]
