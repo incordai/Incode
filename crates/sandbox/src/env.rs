@@ -65,6 +65,7 @@ pub const ESSENTIAL: &[&str] = &[
     "TZ",
     // Windows: the loader, the shell and the profile directories.
     "SYSTEMROOT",
+    "SYSTEMDRIVE",
     "WINDIR",
     "COMSPEC",
     "PATHEXT",
@@ -73,6 +74,13 @@ pub const ESSENTIAL: &[&str] = &[
     "LOCALAPPDATA",
     "PROGRAMDATA",
     "PROGRAMFILES",
+    "PROGRAMFILES(X86)",
+    "PROGRAMW6432",
+    "COMMONPROGRAMFILES",
+    // Windows: what runtimes (.NET, PowerShell, compilers) read to size
+    // themselves for the machine. No secrets.
+    "PROCESSOR_ARCHITECTURE",
+    "NUMBER_OF_PROCESSORS",
 ];
 
 /// Whether `name` matches `pattern`: exact, or a prefix when the pattern ends

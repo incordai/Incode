@@ -59,12 +59,14 @@ pub struct Ceilings {
 impl Ceilings {
     /// The defaults: no network, ten minutes a run, an empty environment
     /// apart from the essentials, 4 GB of memory and 1 GB files per process.
+    /// On Windows there is no file size limit: Windows cannot enforce one,
+    /// and a default every run is refused for would make the server useless.
     #[must_use]
     pub fn new(root: PathBuf) -> Self {
         let mut base = Policy::default();
         base.env.inherit = Inherit::None;
         base.limits.memory_mb = Some(4096);
-        base.limits.file_size_mb = Some(1024);
+        base.limits.file_size_mb = (!cfg!(windows)).then_some(1024);
         Self {
             network: NetMode::Deny,
             hosts: Vec::new(),
@@ -74,6 +76,22 @@ impl Ceilings {
             keep: false,
             best_effort: false,
         }
+    }
+}
+
+impl Ceilings {
+    /// The most a sandbox under these ceilings may ask for, as one policy:
+    /// what a caller checks to know whether this machine can serve them
+    /// (`sbx.exe` choosing between native Windows and WSL2).
+    #[must_use]
+    pub fn widest_policy(&self) -> Policy {
+        let mut p = self.base.clone();
+        p.fs.mode = FsMode::WorkspaceWrite;
+        p.fs.write = vec![self.root.clone()];
+        p.network.mode = self.network;
+        p.network.allow = self.hosts.clone();
+        p.limits.wall_secs = Some(self.max_wall_secs);
+        p
     }
 }
 
@@ -222,12 +240,30 @@ impl Server {
         } else if !hosts.is_empty() {
             return Err("allow_hosts needs network `proxy`".to_string());
         }
+        // On native Windows, where only `allow` is ever enforced, say so now
+        // rather than at every run, which would each be refused anyway.
+        // (Elsewhere enforcement depends on the kernel, and each run says.)
+        if cfg!(windows) && !self.ceilings.best_effort {
+            let mut probe = Policy::default();
+            probe.network.mode = network;
+            if let crate::Status::NotEnforced(why) = crate::enforcement(&probe).network {
+                return Err(format!(
+                    "network `{}` cannot be enforced on this machine: {why}{}",
+                    network.as_str(),
+                    if rank(self.ceilings.network) >= rank(NetMode::Allow) {
+                        " (this server allows `allow`, if an open network will do)"
+                    } else {
+                        ""
+                    }
+                ));
+            }
+        }
 
         self.next += 1;
         let id = format!("sbx-{}-{}", std::process::id(), self.next);
         let dir = self.ceilings.root.join(&id);
         std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        let dir = std::fs::canonicalize(&dir).map_err(|e| e.to_string())?;
+        let dir = crate::plain_path(std::fs::canonicalize(&dir).map_err(|e| e.to_string())?);
         self.boxes.insert(
             id.clone(),
             Box_ {
@@ -360,12 +396,13 @@ impl Server {
                 let interpreter = args
                     .get("interpreter")
                     .and_then(Value::as_str)
-                    .unwrap_or("sh");
+                    .unwrap_or(DEFAULT_INTERPRETER);
                 let runs = self.boxes.get(&id).map_or(0, |b| b.runs) + 1;
-                let name = format!(".sbx/script-{runs}");
+                let (ext, _) = interpreter_style(interpreter, cfg!(windows));
+                let name = format!(".sbx/script-{runs}{ext}");
                 let path = inside(&dir, &name, true)?;
                 write_new(&path, script.as_bytes())?;
-                vec![interpreter.to_string(), path.display().to_string()]
+                script_argv(interpreter, &path.display().to_string(), cfg!(windows))
             }
             _ => return Err("give either `command` (a list) or `script` (text)".to_string()),
         };
@@ -404,12 +441,59 @@ impl Server {
             .remove(id)
             .ok_or_else(|| format!("no sandbox `{id}`"))?;
         // Only ever a folder this server made beneath its root.
-        let root = std::fs::canonicalize(&self.ceilings.root).map_err(|e| e.to_string())?;
+        let root = crate::plain_path(
+            std::fs::canonicalize(&self.ceilings.root).map_err(|e| e.to_string())?,
+        );
         if !b.dir.starts_with(&root) || b.dir == root {
             return Err(format!("{} is not a sandbox folder", b.dir.display()));
         }
         std::fs::remove_dir_all(&b.dir).map_err(|e| format!("{}: {e}", b.dir.display()))
     }
+}
+
+/// The interpreter a `script` runs with when none is named: `sh`, or
+/// PowerShell on Windows, where there is no `sh` (and Git Bash cannot start
+/// under the write-restricted token).
+const DEFAULT_INTERPRETER: &str = if cfg!(windows) { "powershell" } else { "sh" };
+
+/// On Windows, how an interpreter wants its script: the file extension it
+/// needs (PowerShell runs only `.ps1` files, `cmd` only `.cmd`/`.bat`) and
+/// the arguments before the script's path. Elsewhere: no extension, none.
+fn interpreter_style(interpreter: &str, windows: bool) -> (&'static str, &'static [&'static str]) {
+    if !windows {
+        return ("", &[]);
+    }
+    let name = interpreter
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(interpreter)
+        .to_ascii_lowercase();
+    let name = name.strip_suffix(".exe").unwrap_or(&name);
+    match name {
+        "powershell" | "pwsh" => (
+            ".ps1",
+            &[
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ],
+        ),
+        "cmd" => (".cmd", &["/d", "/c"]),
+        "python" | "python3" | "py" => (".py", &[]),
+        "node" => (".js", &[]),
+        _ => ("", &[]),
+    }
+}
+
+/// The argv that runs the script at `path` with `interpreter`.
+fn script_argv(interpreter: &str, path: &str, windows: bool) -> Vec<String> {
+    let (_, flags) = interpreter_style(interpreter, windows);
+    let mut argv = vec![interpreter.to_string()];
+    argv.extend(flags.iter().map(|f| (*f).to_string()));
+    argv.push(path.to_string());
+    argv
 }
 
 fn rank(m: NetMode) -> u8 {
@@ -534,12 +618,12 @@ fn tools() -> Value {
         },
         {
             "name": "sandbox_run",
-            "description": "Run a command (`command`, an argv list) or a script (`script`, text run with `interpreter`, default sh) inside the sandbox. Returns exit_code, stdout, stderr (64 KB each at most), timed_out, and any network requests the proxy refused. Everything the run started is stopped when it ends.",
+            "description": "Run a command (`command`, an argv list) or a script (`script`, text run with `interpreter`, default sh, or powershell on Windows) inside the sandbox. Returns exit_code, stdout, stderr (64 KB each at most), timed_out, and any network requests the proxy refused. Everything the run started is stopped when it ends.",
             "inputSchema": { "type": "object", "required": ["id"], "properties": {
                 "id": id,
                 "command": { "type": "array", "items": { "type": "string" } },
                 "script": { "type": "string" },
-                "interpreter": { "type": "string", "description": "For script: sh, bash, python3, node, ..." },
+                "interpreter": { "type": "string", "description": "For script: sh, bash, python3, node, ... (default sh; powershell on Windows, where cmd works too)" },
                 "cwd": path,
                 "stdin": { "type": "string" },
                 "timeout_secs": { "type": "integer", "description": "Default 120, at most the server's limit." }
@@ -609,12 +693,61 @@ mod tests {
         assert!(s
             .create(&json!({"network": "proxy", "allow_hosts": ["evil.example"]}))
             .is_err());
-        assert!(s
-            .create(
-                &json!({"network": "proxy", "allow_hosts": ["pypi.org", "files.pythonhosted.org"]})
-            )
-            .is_ok());
-        assert!(s.create(&json!({})).is_ok(), "deny is always allowed");
+        // Within the ceilings. Native Windows enforces neither proxy nor
+        // deny, and says so at once instead.
+        let within = |r: Result<Value, String>| {
+            if cfg!(windows) {
+                r.is_err_and(|e| e.contains("cannot be enforced"))
+            } else {
+                r.is_ok()
+            }
+        };
+        assert!(within(s.create(
+            &json!({"network": "proxy", "allow_hosts": ["pypi.org", "files.pythonhosted.org"]})
+        )));
+        assert!(within(s.create(&json!({}))), "deny is always allowed");
+    }
+
+    #[test]
+    fn scripts_get_what_their_interpreter_needs_on_windows() {
+        assert_eq!(
+            script_argv("sh", "/b/.sbx/script-1", false),
+            ["sh", "/b/.sbx/script-1"]
+        );
+        assert_eq!(interpreter_style("powershell", false), ("", &[][..]));
+        assert_eq!(
+            script_argv("powershell", r"C:\b\.sbx\script-1.ps1", true),
+            [
+                "powershell",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                r"C:\b\.sbx\script-1.ps1"
+            ]
+        );
+        assert_eq!(interpreter_style(r"C:\x\PWSH.EXE", true).0, ".ps1");
+        assert_eq!(
+            script_argv("cmd", r"C:\b\s.cmd", true),
+            ["cmd", "/d", "/c", r"C:\b\s.cmd"]
+        );
+        assert_eq!(interpreter_style("python3", true), (".py", &[][..]));
+        assert_eq!(interpreter_style("ruby", true), ("", &[][..]));
+    }
+
+    #[test]
+    fn the_widest_policy_is_what_the_ceilings_allow() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut c = Ceilings::new(root.path().to_path_buf());
+        c.network = NetMode::Proxy;
+        c.hosts = vec!["pypi.org".into()];
+        let p = c.widest_policy();
+        assert_eq!(p.fs.mode, FsMode::WorkspaceWrite);
+        assert_eq!(p.network.mode, NetMode::Proxy);
+        assert_eq!(p.network.allow, ["pypi.org"]);
+        assert_eq!(p.limits.wall_secs, Some(600));
+        assert_eq!(p.env.inherit, Inherit::None);
     }
 
     #[test]

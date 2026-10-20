@@ -19,9 +19,12 @@
 //! ```
 //!
 //! On macOS the helper runs under `sandbox-exec` with a generated Seatbelt
-//! profile instead of Landlock. The helper is the calling binary re-executed
-//! with a private first argument, so a program that embeds this library must
-//! call [`enter_if_requested`] first thing in `main`.
+//! profile instead of Landlock. On Windows, which has no `exec`, the parent
+//! grants the writable roots to a private per-run SID first, and the helper
+//! starts the command under a write-restricted token, in a job object, and
+//! stays to supervise it (see [`windows`]). The helper is the calling binary
+//! re-executed with a private first argument, so a program that embeds this
+//! library must call [`enter_if_requested`] first thing in `main`.
 //!
 //! # Platforms
 //!
@@ -29,8 +32,9 @@
 //! |---|---|---|---|
 //! | Linux | Landlock (5.13+) | Landlock TCP (6.7+) + seccomp | setrlimit + wall |
 //! | macOS | Seatbelt | Seatbelt | setrlimit + wall |
-//! | Windows | not yet (see incode's ACL sandbox) | not yet | wall only |
+//! | Windows | write-restricted token + ACL grant (writes only; no `deny_read`) | not enforced (WSL2: see [`backend`]) | job object + wall |
 
+pub mod backend;
 pub mod env;
 pub mod limits;
 pub mod policy;
@@ -39,6 +43,8 @@ pub mod proxy;
 pub mod seatbelt;
 pub mod server;
 pub mod wslpath;
+
+pub mod windows;
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -150,6 +156,14 @@ pub struct EnterSpec {
     /// SIGKILL, which nothing can forward) the whole group dies with it.
     #[serde(default)]
     pub supervise: bool,
+    /// Windows: the run's private SID, granted on its writable roots and
+    /// temp directory; the helper restricts the command's token to it.
+    #[serde(default)]
+    pub sid: Option<String>,
+    /// Windows: the parent's process id. The helper watches it and ends the
+    /// command's job if the parent dies (there is no parent-death signal).
+    #[serde(default)]
+    pub parent_pid: Option<u32>,
 }
 
 /// Call first thing in `main` of any program that embeds this library. When
@@ -208,9 +222,9 @@ fn enter(args: &[OsString]) -> Result<Never, EnterError> {
         .get(2)
         .ok_or_else(|| sandbox_err("helper started without a command"))?;
     let program_args = &args[3..];
-    // Nothing in the spec is enforced by the helper off Unix yet: the parent
-    // already refused (strict) or reported (best effort) every gap.
-    #[cfg(not(unix))]
+    // Off Unix and Windows nothing in the spec is enforced by the helper: the
+    // parent already refused (strict) or reported (best effort) every gap.
+    #[cfg(not(any(unix, windows)))]
     let _ = &spec;
 
     // If the parent dies (SIGKILL included, which nothing can forward), the
@@ -280,6 +294,16 @@ fn enter(args: &[OsString]) -> Result<Never, EnterError> {
     if spec.supervise {
         supervise(program, program_args, parent);
     }
+    // No exec on Windows: the helper starts the command confined, in a job,
+    // and stays to pass its exit code on.
+    #[cfg(windows)]
+    {
+        match windows::enter(&spec, program, program_args) {
+            Ok(code) => std::process::exit(code),
+            Err((message, code)) => Err(EnterError { message, code }),
+        }
+    }
+    #[cfg(not(windows))]
     exec(program, program_args)
 }
 
@@ -355,9 +379,9 @@ fn exec(program: &OsString, args: &[OsString]) -> Result<Never, EnterError> {
     })
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn exec(program: &OsString, args: &[OsString]) -> Result<Never, EnterError> {
-    // No exec on Windows: run it and pass its exit code on.
+    // No exec here: run it and pass its exit code on.
     let status = Command::new(program)
         .args(args)
         .status()
@@ -384,6 +408,11 @@ pub struct Sandbox {
 /// temp directory. Dropped after the command exits.
 pub struct Guard {
     proxy: Option<proxy::Proxy>,
+    /// Windows: the run's ACL grant on its roots and temp directory, revoked
+    /// when dropped. Declared before `temp` so it drops first, while the
+    /// temp directory still exists to be revoked.
+    #[cfg(windows)]
+    _lease: Option<windows::acl::Lease>,
     temp: TempDir,
     pub enforcement: Enforcement,
     protected: Option<protect::Snapshot>,
@@ -532,7 +561,29 @@ impl Sandbox {
             && self.policy.fs.protect_git)
             .then(|| protect::Snapshot::take(protect::git_paths(&roots)));
         let temp = TempDir::new()?;
-        let own_group = self.policy.limits.wall_secs.is_some() && !stdin_is_terminal();
+        // Windows has no process groups: the helper's job object does that.
+        let own_group =
+            cfg!(unix) && self.policy.limits.wall_secs.is_some() && !stdin_is_terminal();
+        // Windows: grant the writable roots and the temp directory to a
+        // private SID for this run, before the helper restricts the
+        // command's token to it. A grant that fails refuses the run in
+        // strict mode; best effort runs it with the writes unconfined, and
+        // says so.
+        #[cfg(windows)]
+        let lease = if self.policy.fs.mode == FsMode::Off {
+            None
+        } else {
+            let mut grant = roots.clone();
+            grant.push(temp.path.clone());
+            match windows::acl::Lease::acquire(&grant) {
+                Ok(lease) => Some(lease),
+                Err(e) if self.strict => return Err(e),
+                Err(e) => {
+                    eprintln!("sbx: writes not confined (best effort): {e}");
+                    None
+                }
+            }
+        };
 
         let proxy = if self.policy.network.mode == NetMode::Proxy {
             let allowlist = proxy::Allowlist::new(
@@ -572,6 +623,11 @@ impl Sandbox {
             limits: self.policy.limits.clone(),
             strict: self.strict,
             supervise: own_group,
+            #[cfg(windows)]
+            sid: lease.as_ref().map(|l| l.sid().to_string()),
+            #[cfg(not(windows))]
+            sid: None,
+            parent_pid: Some(std::process::id()),
         };
         let helper = match &self.helper {
             Some(h) => h.clone(),
@@ -596,6 +652,8 @@ impl Sandbox {
             cmd,
             Guard {
                 proxy,
+                #[cfg(windows)]
+                _lease: lease,
                 temp,
                 enforcement,
                 protected,
@@ -748,11 +806,26 @@ fn kill_group(pid: u32) {
     let _ = pid;
 }
 
+/// `path` as commands expect to see it. On Windows `canonicalize` returns
+/// `\\?\C:\...`, which `cmd.exe` refuses as a working folder and which
+/// does not accept `/`; this gives back `C:\...`. Elsewhere, unchanged.
+#[must_use]
+pub fn plain_path(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        PathBuf::from(windows::strip_verbatim(&path.to_string_lossy()))
+    }
+    #[cfg(not(windows))]
+    {
+        path
+    }
+}
+
 /// The enforcement of `policy` on this machine.
 #[must_use]
 pub fn enforcement(policy: &Policy) -> Enforcement {
     Enforcement {
-        filesystem: fs_status(policy.fs.mode),
+        filesystem: fs_status(&policy.fs),
         network: net_status(policy.network.mode),
         limits: limits::status(&policy.limits),
         environment: Status::Enforced(environment_summary(&policy.env)),
@@ -778,8 +851,8 @@ fn environment_summary(e: &policy::Env) -> String {
 }
 
 #[cfg(target_os = "linux")]
-fn fs_status(mode: FsMode) -> Status {
-    match linux::fs_status(mode) {
+fn fs_status(fs: &policy::Fs) -> Status {
+    match linux::fs_status(fs.mode) {
         Status::Enforced(how) if wsl::detected() => Status::Enforced(format!(
             "{how}; WSL: starting Windows programs is blocked (interop interpreter and \
              sockets hidden, WSL_INTEROP removed, vsock refused)"
@@ -789,8 +862,8 @@ fn fs_status(mode: FsMode) -> Status {
 }
 
 #[cfg(target_os = "macos")]
-fn fs_status(mode: FsMode) -> Status {
-    match mode {
+fn fs_status(fs: &policy::Fs) -> Status {
+    match fs.mode {
         FsMode::Off => Status::NotRequested,
         _ if Path::new(seatbelt::SANDBOX_EXEC).exists() => {
             Status::Enforced("Seatbelt (sandbox-exec)".into())
@@ -799,9 +872,14 @@ fn fs_status(mode: FsMode) -> Status {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn fs_status(mode: FsMode) -> Status {
-    match mode {
+#[cfg(windows)]
+fn fs_status(fs: &policy::Fs) -> Status {
+    windows::fs_status(fs)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn fs_status(fs: &policy::Fs) -> Status {
+    match fs.mode {
         FsMode::Off => Status::NotRequested,
         _ => {
             Status::NotEnforced("no filesystem sandbox is implemented for this platform yet".into())
@@ -826,7 +904,12 @@ fn net_status(mode: NetMode) -> Status {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(windows)]
+fn net_status(mode: NetMode) -> Status {
+    windows::net_status(mode)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn net_status(mode: NetMode) -> Status {
     match mode {
         NetMode::Allow => Status::NotRequested,
@@ -995,7 +1078,8 @@ impl TempDir {
             let path = base.join(name);
             match create_private_dir(&path) {
                 Ok(()) => {
-                    let path = std::fs::canonicalize(&path).unwrap_or(path);
+                    // Plain, not `\\?\C:\...`: many tools cannot use that as TEMP.
+                    let path = plain_path(std::fs::canonicalize(&path).unwrap_or(path));
                     return Ok(Self { path });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
