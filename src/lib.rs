@@ -43,6 +43,7 @@ pub mod runner;
 pub mod runtime;
 pub mod sandbox;
 pub mod scaffold;
+pub mod self_update;
 pub mod serve;
 pub mod session;
 pub mod skills;
