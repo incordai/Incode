@@ -407,7 +407,11 @@ mod tests {
     #[test]
     fn a_leading_tilde_is_the_home_directory() {
         let cwd = Path::new("/work");
-        let home = std::env::var_os("HOME").map(PathBuf::from).expect("HOME");
+        // As `absolute` finds it: HOME, else USERPROFILE (Windows).
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from)
+            .expect("a home directory");
         assert_eq!(absolute(Path::new("~/.claude"), cwd), home.join(".claude"));
         assert_eq!(absolute(Path::new("~"), cwd), home);
         assert_eq!(absolute(Path::new("a/~b"), cwd), cwd.join("a/~b"));
