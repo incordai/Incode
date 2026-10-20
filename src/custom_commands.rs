@@ -587,8 +587,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("dir");
         let project = dir.path().join("p");
         let user = dir.path().join("u");
-        write(&project.join("review.md"), "project review");
-        write(&user.join("review.md"), "user review");
+        write(&project.join("deploy.md"), "project deploy");
+        write(&user.join("deploy.md"), "user deploy");
         write(
             &user.join("frontend/test.md"),
             "---\ndescription: t\n---\nrun $1",
@@ -598,12 +598,12 @@ mod tests {
 
         let r = Registry::load_from(&project, &user, &[]);
         let names: Vec<_> = r.commands().iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, vec!["review", "frontend:test"]);
-        assert_eq!(r.find("review").expect("found").body, "project review");
-        assert_eq!(r.find("review").expect("found").origin, Origin::Project);
+        assert_eq!(names, vec!["deploy", "frontend:test"]);
+        assert_eq!(r.find("deploy").expect("found").body, "project deploy");
+        assert_eq!(r.find("deploy").expect("found").origin, Origin::Project);
         assert_eq!(r.warnings.len(), 2, "{:?}", r.warnings);
         assert!(r.warnings.iter().any(|w| w.contains("built-in /help")));
-        assert!(r.warnings.iter().any(|w| w.contains("/review")));
+        assert!(r.warnings.iter().any(|w| w.contains("/deploy")));
 
         // A built-in is never expanded, even with a file of its name.
         assert_eq!(r.expand_line("/help"), None);
