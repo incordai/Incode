@@ -1,0 +1,32 @@
+[package]
+name = "incord-sandbox"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "Apache-2.0"
+description = "Run any command - an agent CLI, a test suite, a tool call - under one policy file: filesystem, network, environment and resource limits"
+repository = "https://github.com/incordai/Incode"
+keywords = ["sandbox", "landlock", "seatbelt", "agents", "security"]
+categories = ["command-line-utilities", "os"]
+
+[lib]
+name = "incord_sandbox"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sbx"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "=0.4.7"
+
+[dev-dependencies]
+tempfile = "3"

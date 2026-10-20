@@ -1,4 +1,5 @@
 [workspace]
+members = [".", "crates/sandbox"]
 # Standalone workspace root. The crate previously inherited version/edition from
 # a parent workspace that does not exist, so cargo failed while parsing the
 # manifest, before it could even look at the source.

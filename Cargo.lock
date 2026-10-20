@@ -2040,6 +2040,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "incord-sandbox"
+version = "0.1.0"
+dependencies = [
+ "landlock",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
 name = "indexmap"
 version = "1.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
