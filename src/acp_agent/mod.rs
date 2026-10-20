@@ -1025,6 +1025,12 @@ fn drive<F: SessionFactory>(
     let (tools, about_tools) = factory.tool_servers();
     specs.extend(tools);
     connected.extend(about_tools);
+    // `.mcp.json` and `~/.incode/mcp.json`. The protocol has no way to ask
+    // about a project's server, so only approved ones start.
+    let (from_files, about_files) =
+        crate::mcp_config::session_servers(&workspace, &factory.data_dir(), None);
+    specs.extend(from_files);
+    connected.extend(about_files);
     let later: Arc<Mutex<Later>> = Arc::default();
     connected.extend(session.session_tools().connect_client_servers(
         specs,

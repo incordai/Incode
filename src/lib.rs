@@ -28,6 +28,7 @@ pub mod knowledge;
 pub mod ledger;
 pub mod lessons;
 pub mod links;
+pub mod mcp_config;
 pub mod mcp_stdio;
 pub mod migrate;
 pub mod owner;

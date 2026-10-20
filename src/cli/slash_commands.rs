@@ -48,6 +48,8 @@ pub enum SlashCommand {
     Doctor,
     /// What the agent is not allowed to write.
     Guards,
+    /// The settings' allow / ask / deny rules in force.
+    Permissions,
     /// Also work in another directory.
     AddDir(Option<String>),
     /// What else touches this file.
@@ -117,6 +119,7 @@ impl SlashCommand {
             "/agents" => Self::Agents,
             "/doctor" | "/dr" => Self::Doctor,
             "/guards" | "/g" => Self::Guards,
+            "/permissions" | "/perms" => Self::Permissions,
             "/add-dir" => Self::AddDir(arg),
             "/links" | "/l" => Self::Links(arg),
             "/run" => Self::Run,
@@ -231,6 +234,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
     (
         "/guards",
         "Show the paths the agent is not allowed to write",
+    ),
+    (
+        "/permissions",
+        "Show the allow / ask / deny rules in force, and where each came from",
     ),
     (
         "/add-dir <path>",
@@ -852,6 +859,21 @@ pub fn handle_doctor(workspace: &std::path::Path) {
 /// A guard nobody can see is a guard nobody can check — and this one decides
 /// whether the thing being judged can edit its own exam, so it is worth being
 /// able to read without opening a JSON file.
+pub fn handle_permissions(workspace: &std::path::Path) {
+    render::print_header("Permission rules (deny > ask > allow > mode)");
+    let rules = crate::permissions::rules::PermissionRules::load(workspace);
+    let lines = rules.describe();
+    if lines.is_empty() {
+        outln!("  None. Add `permissions` to ~/.incode/admin.json or .incode/settings.json.");
+    }
+    for line in lines {
+        outln!("  {line}");
+    }
+    for warning in rules.warnings() {
+        render::print_error(warning);
+    }
+}
+
 pub fn handle_guards(workspace: &std::path::Path) {
     render::print_header("Protected paths");
     match crate::guards::Guards::load(workspace) {

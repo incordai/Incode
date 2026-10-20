@@ -306,17 +306,24 @@ impl SessionTools {
         bounds: client_servers::Bounds,
         on_connected: &OnConnected,
     ) -> Vec<String> {
+        // The administrator's `[mcp]` lists, here where every server is
+        // connected — whatever named it.
+        let (specs, mut said) = crate::mcp_config::apply_managed_policy(
+            &crate::permissions::managed::mcp_policy(),
+            specs,
+        );
         if specs.is_empty() {
-            return Vec::new();
+            return said;
         }
-        client_servers::ClientServers::connect_in_background(
+        said.extend(client_servers::ClientServers::connect_in_background(
             &self.client,
             specs,
             cwd,
             self.filter_env,
             bounds,
             on_connected,
-        )
+        ));
+        said
     }
 
     /// The client's servers started and still connecting, by name — for the
@@ -516,6 +523,10 @@ pub struct Toolbox {
     /// What the sandbox holds for this session — on Windows workspace-write,
     /// the ACE granted on each root — released when the toolbox drops.
     sandbox_grant: crate::sandbox::SessionGrant,
+    /// The `allow` / `ask` / `deny` rules of the managed, user and project
+    /// settings ([`crate::permissions::rules`]), loaded with the workspace like
+    /// the guards so that they apply by default.
+    rules: Arc<crate::permissions::rules::PermissionRules>,
 }
 
 impl Toolbox {
@@ -557,6 +568,7 @@ impl Toolbox {
             hooks: None,
             sandbox: crate::sandbox::SandboxPolicy::OFF,
             sandbox_grant: crate::sandbox::SessionGrant::default(),
+            rules: Arc::new(crate::permissions::rules::PermissionRules::load(workspace)),
         }
     }
 
@@ -812,6 +824,11 @@ impl Toolbox {
     /// the guards and the engine.
     pub fn set_permission_mode(&mut self, mode: crate::permissions::PermissionMode) {
         self.mode = Some(mode);
+    }
+
+    /// Replace the permission rules loaded from the settings files.
+    pub fn set_permission_rules(&mut self, rules: crate::permissions::rules::PermissionRules) {
+        self.rules = Arc::new(rules);
     }
 
     /// Ask this engine before every call. Opt-in here, and done by the one
@@ -1571,6 +1588,20 @@ impl Toolbox {
             crate::trace!("tool", "{name} REFUSED: input does not match its schema");
             return Err(problems);
         }
+        // The settings' permission rules. A deny is final — before a guard,
+        // a person or the engine is asked, and whatever the mode; an ask or
+        // an allow is weighed with the mode below.
+        let ruled = self.rule_verdict(name, input);
+        if let Some(verdict) = &ruled {
+            if verdict.effect == crate::permissions::rules::Effect::Deny {
+                crate::trace!("tool", "{name} REFUSED by {}", verdict.describe());
+                return Err(format!(
+                    "NOT RUN — {name} is refused by the {}. Do not retry it in another form; \
+                     say what you needed it for instead.",
+                    verdict.describe()
+                ));
+            }
+        }
         // BEFORE the call, not after. The sentinel that watches the tree can
         // only report a write that already happened; a protected path has to be
         // refused while refusing it still means something.
@@ -1634,7 +1665,7 @@ impl Toolbox {
         // call a person already allowed is not asked about again: it is never
         // read-only here, since `ask_protected` does not ask then.
         if !confirmed {
-            if let Err(refusal) = self.mode_allows(call_id, name, input, reach) {
+            if let Err(refusal) = self.mode_allows(call_id, name, input, reach, ruled.as_ref()) {
                 crate::trace!("tool", "{name} REFUSED by the permission mode: {refusal}");
                 return Err(refusal);
             }
@@ -1843,70 +1874,152 @@ impl Toolbox {
         }
     }
 
-    /// Whether the session's permission mode lets this call run.
+    /// What the settings' permission rules say about this call, if anything.
+    fn rule_verdict(
+        &self,
+        name: &str,
+        input: &Value,
+    ) -> Option<crate::permissions::rules::Verdict> {
+        use crate::permissions::rules::{PathContext, Subject};
+        if self.rules.is_empty() {
+            return None;
+        }
+        let text = |key: &str| {
+            input
+                .get(key)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        let subject = match name {
+            BASH => Subject::Command(text("command")),
+            // A search or a listing with no `path` covers the workspace.
+            READ | WRITE | EDIT | MULTI_EDIT | NOTEBOOK_EDIT | LS | OUTLINE | GLOB | GREP => {
+                let path = text("path");
+                Subject::Paths(vec![if path.is_empty() {
+                    ".".to_string()
+                } else {
+                    path
+                }])
+            }
+            APPLY_PATCH | CONVERT_DOCUMENT | RENDER_PDF => {
+                let mut paths = self.changed_paths(name, input).unwrap_or_default();
+                if let Some(read) = input.get("path").and_then(Value::as_str) {
+                    paths.push(read.to_string());
+                }
+                Subject::Paths(paths)
+            }
+            crate::web::FETCH_TOOL => Subject::Url(text("url")),
+            _ => Subject::None,
+        };
+        let ctx = PathContext {
+            workspace: self.workspace.clone(),
+            home: crate::admin::home_dir(),
+        };
+        self.rules.decide(name, &subject, &ctx)
+    }
+
+    /// Whether the session's permission mode, and the settings' `ask` and
+    /// `allow` rules, let this call run (a `deny` rule was applied before).
     ///
     /// Decided by the call's [`Reach`]: a tool that only observes runs under
     /// every mode; everything else is refused read-only and asked about under
     /// `prompt`. A subagent is refused wherever the mode restricts anything,
     /// because the agent it would start does not carry this mode and could do
     /// what this one may not.
+    ///
+    /// The rules come after those two refusals and before the rest: read-only
+    /// is a promise that nothing changes, which no allow rule breaks. Past it,
+    /// an `ask` rule asks the person, whatever the mode — even for a tool that
+    /// only observes — and an `allow` rule runs the call without the `prompt`
+    /// mode's question.
     fn mode_allows(
         &self,
         call_id: &str,
         name: &str,
         input: &Value,
         reach: Reach,
+        ruled: Option<&crate::permissions::rules::Verdict>,
     ) -> Result<(), String> {
+        use crate::permissions::rules::Effect;
         use crate::permissions::PermissionMode;
-        let Some(mode) = self.mode else {
-            return Ok(());
-        };
-        let restricted = matches!(mode, PermissionMode::ReadOnly | PermissionMode::Prompt);
-        if name == AGENT && restricted {
-            return Err(format!(
-                "this session is {}, and a subagent would not be held to that. Do the \
-                 work here instead.",
-                mode.as_str()
-            ));
+        if let Some(mode) = self.mode {
+            let restricted = matches!(mode, PermissionMode::ReadOnly | PermissionMode::Prompt);
+            if name == AGENT && restricted {
+                return Err(format!(
+                    "this session is {}, and a subagent would not be held to that. Do the \
+                     work here instead.",
+                    mode.as_str()
+                ));
+            }
+            if mode == PermissionMode::ReadOnly && !reach.only_observes() {
+                return Err(format!(
+                    "NOT RUN — this session is read-only, and {name} changes the workspace or \
+                     runs code. Describe the change instead of making it."
+                ));
+            }
+        }
+        if let Some(verdict) = ruled {
+            match verdict.effect {
+                Effect::Ask => {
+                    let reason = format!("the {} asks before this {name}", verdict.describe());
+                    return self.confirm_with_person(call_id, name, input, &reason);
+                }
+                Effect::Allow => {
+                    crate::trace!("tool", "{name} allowed by {}", verdict.describe());
+                    return Ok(());
+                }
+                // Applied before this was asked.
+                Effect::Deny => {}
+            }
         }
         if reach.only_observes() {
             return Ok(());
         }
-        match mode {
-            PermissionMode::ReadOnly => Err(format!(
-                "NOT RUN — this session is read-only, and {name} changes the workspace or runs \
-                 code. Describe the change instead of making it."
-            )),
-            PermissionMode::Prompt => {
-                let shown = self.event_input(name, input);
+        match self.mode {
+            Some(PermissionMode::Prompt) => {
                 let reason = format!("the session asks before every {name}");
-                let ask = crate::hooks::engine::Ask {
-                    call_id,
-                    tool_name: name,
-                    tool_input: &shown,
-                    reason: &reason,
-                };
-                let stopped = || {
-                    self.cancel
-                        .as_ref()
-                        .is_some_and(crate::runtime::cancel::CancelToken::is_cancelled)
-                };
-                match self
-                    .prompter
-                    .as_ref()
-                    .and_then(|p| p.confirm(&ask, &stopped))
-                {
-                    Some(crate::hooks::engine::Verdict::Allow) => Ok(()),
-                    Some(crate::hooks::engine::Verdict::Deny(why)) => Err(why),
-                    None => Err(format!(
-                        "NOT RUN — this session asks before every {name}, and nobody could be \
-                         asked."
-                    )),
-                }
+                self.confirm_with_person(call_id, name, input, &reason)
             }
-            PermissionMode::WorkspaceWrite
-            | PermissionMode::DangerFullAccess
-            | PermissionMode::Allow => Ok(()),
+            Some(
+                PermissionMode::ReadOnly
+                | PermissionMode::WorkspaceWrite
+                | PermissionMode::DangerFullAccess
+                | PermissionMode::Allow,
+            )
+            | None => Ok(()),
+        }
+    }
+
+    /// Put this call to the person at the session, for `reason`. Refused when
+    /// nobody can be asked.
+    fn confirm_with_person(
+        &self,
+        call_id: &str,
+        name: &str,
+        input: &Value,
+        reason: &str,
+    ) -> Result<(), String> {
+        let shown = self.event_input(name, input);
+        let ask = crate::hooks::engine::Ask {
+            call_id,
+            tool_name: name,
+            tool_input: &shown,
+            reason,
+        };
+        let stopped = || {
+            self.cancel
+                .as_ref()
+                .is_some_and(crate::runtime::cancel::CancelToken::is_cancelled)
+        };
+        match self
+            .prompter
+            .as_ref()
+            .and_then(|p| p.confirm(&ask, &stopped))
+        {
+            Some(crate::hooks::engine::Verdict::Allow) => Ok(()),
+            Some(crate::hooks::engine::Verdict::Deny(why)) => Err(why),
+            None => Err(format!("NOT RUN — {reason}, and nobody could be asked.")),
         }
     }
 
@@ -2263,6 +2376,9 @@ mod client_tool_tests;
 
 #[cfg(test)]
 mod hook_tests;
+
+#[cfg(test)]
+mod rule_tests;
 
 #[cfg(test)]
 pub(crate) use client_servers::tests::{

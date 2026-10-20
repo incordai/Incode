@@ -2021,6 +2021,7 @@ dependencies = [
  "tar",
  "tempfile",
  "tokio",
+ "toml",
  "tracing",
  "tree-sitter",
  "tree-sitter-go",

@@ -419,6 +419,11 @@ fn connect_ext_tools(workspace: &Path) -> std::sync::Arc<crate::toolbox::Session
     let (plugin_specs, plugin_said) = crate::plugins::session_servers(workspace);
     specs.extend(plugin_specs);
     said.extend(plugin_said);
+    // `.mcp.json` and `~/.incode/mcp.json`; nobody is here to approve a
+    // project's server, so only approved ones start.
+    let (from_files, about_files) = crate::mcp_config::session_servers(workspace, &data_dir, None);
+    specs.extend(from_files);
+    said.extend(about_files);
     for line in said {
         eprintln!("incode: {line}");
     }

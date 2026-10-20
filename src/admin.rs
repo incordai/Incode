@@ -316,6 +316,15 @@ pub struct AdminConfig {
     /// toggles it for the session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub editing_mode: Option<String>,
+    /// Per-command permission rules — `allow`, `ask`, `deny` lists of `Tool`
+    /// or `Tool(specifier)` — applied to every tool call the toolbox runs.
+    /// Unioned with the managed and project rules; deny beats ask beats allow.
+    /// See [`crate::permissions::rules`].
+    #[serde(
+        default,
+        skip_serializing_if = "crate::permissions::rules::RuleLists::is_empty"
+    )]
+    pub permissions: crate::permissions::rules::RuleLists,
 }
 
 /// One service that serves API agents and lists them on request.
@@ -1504,6 +1513,12 @@ mod tests {
             notify_after_secs: Some(30),
             statusline_command: Some("~/.incode/statusline.sh".to_string()),
             editing_mode: Some("vi".to_string()),
+            // The permission rules, or a `/roles` save would drop them.
+            permissions: crate::permissions::rules::RuleLists {
+                allow: vec!["Bash(npm test:*)".to_string()],
+                ask: vec!["Bash(git push:*)".to_string()],
+                deny: vec!["Read(.env)".to_string()],
+            },
         };
         admin.save(dir.path()).expect("saves");
 
