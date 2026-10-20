@@ -297,7 +297,7 @@ impl ServerApprovals {
     }
 
     fn start(&self, server: &crate::mcp_config::Configured) {
-        match server.spec() {
+        match server.spec(&self.data_dir) {
             Ok(spec) => {
                 for line in self.late.connect(vec![spec], &self.workspace, &self.said) {
                     (self.said)(line);

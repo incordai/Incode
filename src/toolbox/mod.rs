@@ -2434,7 +2434,7 @@ mod rule_tests;
 
 #[cfg(test)]
 pub(crate) use client_servers::tests::{
-    calls_in as client_server_calls, fake_server, slow_fake_server,
+    calls_in as client_server_calls, fake_server, slow_fake_server, Connected,
 };
 
 #[cfg(test)]

@@ -30,8 +30,24 @@
 //! machine). `sse` is accepted and tried over Streamable HTTP; a server that
 //! speaks only the legacy SSE transport will not connect, and says so.
 //!
-//! TODO: OAuth. A server that needs an OAuth flow is not supported yet; give
-//! it a token in `headers` (from a `${VAR}`) instead.
+//! # OAuth
+//!
+//! An `http` server that needs OAuth is logged in to once, with `incode mcp
+//! login <name>` ([`crate::mcp_oauth`]): the browser opens, and the tokens are
+//! kept in `~/.incode/mcp-tokens.json`, refreshed as they expire. An entry
+//! may say more under `"oauth"` — a `client_id` (and `client_secret`) for an
+//! authorization server without dynamic registration, the `scopes`, a fixed
+//! `callback_port`:
+//!
+//! ```json
+//! "docs": { "url": "https://mcp.example.com/mcp",
+//!           "oauth": { "client_id": "abc", "scopes": ["read"] } }
+//! ```
+//!
+//! A session never waits on a browser: a server with an `"oauth"` entry and no
+//! token is not started, and one that answers `401` with no token to renew is
+//! dropped — each with the command that logs in. A server given its own
+//! `Authorization` header is sent that, and no OAuth token.
 //!
 //! # A project's servers are asked about first
 //!
@@ -90,6 +106,9 @@ pub struct ServerEntry {
     pub url: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub headers: BTreeMap<String, String>,
+    /// How to log in to an `http` server that needs OAuth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth: Option<crate::mcp_oauth::OAuthConfig>,
     /// Whatever else the file says about this server, kept when it is
     /// written back.
     #[serde(flatten)]
@@ -293,6 +312,9 @@ impl ServerEntry {
                     let names: Vec<&str> = self.headers.keys().map(String::as_str).collect();
                     said.push_str(&format!(" (headers: {})", names.join(", ")));
                 }
+                if self.oauth.is_some() {
+                    said.push_str(" (OAuth)");
+                }
                 said
             }
             Err(why) => why,
@@ -343,6 +365,7 @@ impl ServerEntry {
                         .iter()
                         .map(|(k, v)| Ok((k.clone(), expand(v, lookup)?)))
                         .collect::<Result<_, String>>()?,
+                    oauth: None,
                 }
             }
         };
@@ -386,6 +409,12 @@ pub fn approval_key(name: &str, entry: &ServerEntry) -> String {
     for (k, v) in &entry.headers {
         field(k);
         field(v);
+    }
+    // Only when present, so approvals of entries without it stay valid: a
+    // changed client or wider scopes is a different server to approve.
+    if let Some(oauth) = &entry.oauth {
+        field("oauth");
+        field(&serde_json::to_string(oauth).unwrap_or_default());
     }
     let digest = hasher.finalize();
     let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
@@ -481,7 +510,7 @@ pub(crate) fn session_servers_asking_later(
                 }
             }
         }
-        match server.spec() {
+        match server.spec(data_dir) {
             Ok(spec) => specs.push(spec),
             Err(why) => said.push(why),
         }
@@ -495,14 +524,17 @@ impl Configured {
     /// # Errors
     ///
     /// It names no command or url for its type, or a variable is unset.
-    pub(crate) fn spec(&self) -> Result<ServerSpec, String> {
-        self.entry.to_spec(&self.name, &from_env).map_err(|why| {
+    /// An http server is bound to its stored OAuth token from `data_dir`
+    /// ([`with_oauth`]); one that needs a login it lacks cannot start.
+    pub(crate) fn spec(&self, data_dir: &Path) -> Result<ServerSpec, String> {
+        let spec = self.entry.to_spec(&self.name, &from_env).map_err(|why| {
             format!(
                 "MCP server `{}` ({} settings) is not started: {why}",
                 self.name,
                 self.scope.as_str()
             )
-        })
+        })?;
+        with_oauth(spec, &self.entry, data_dir)
     }
 }
 
@@ -526,6 +558,56 @@ pub(crate) fn refused(name: &str) -> String {
 #[must_use]
 pub(crate) fn approved_once(name: &str, why: &str) -> String {
     format!("MCP server `{name}` approved for this session only: {why}")
+}
+
+/// Whether `name: value` is an `Authorization` header with no credential in
+/// it — `Bearer ${TOKEN:-}` with the variable unset.
+fn is_blank_authorization(name: &str, value: &str) -> bool {
+    name.eq_ignore_ascii_case("authorization") && value.split_whitespace().nth(1).is_none()
+}
+
+/// Whether `headers` carries an `Authorization` with a credential in it.
+fn has_authorization(headers: &[(String, String)]) -> bool {
+    headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("authorization") && !is_blank_authorization(name, value)
+    })
+}
+
+/// `spec`, an `http` server, bound to its OAuth token in `data_dir` — unless
+/// it sends an `Authorization` header of its own (a blank one is dropped, and
+/// OAuth used instead). A server whose entry says it
+/// needs OAuth and that has no token is refused, with the command that logs
+/// in: a session does not wait on a browser.
+fn with_oauth(
+    mut spec: ServerSpec,
+    entry: &ServerEntry,
+    data_dir: &Path,
+) -> Result<ServerSpec, String> {
+    let Transport::Http {
+        url,
+        headers,
+        oauth,
+    } = &mut spec.transport
+    else {
+        return Ok(spec);
+    };
+    if has_authorization(headers) {
+        return Ok(spec);
+    }
+    let store = data_dir.join(crate::mcp_oauth::TOKENS_FILE);
+    if entry.oauth.is_some() && crate::mcp_oauth::load(&store, &spec.name, url).is_none() {
+        return Err(format!(
+            "MCP server `{0}` needs OAuth and is not logged in, so it is not started: run \
+             `incode mcp login {0}`",
+            spec.name
+        ));
+    }
+    headers.retain(|(name, value)| !is_blank_authorization(name, value));
+    *oauth = Some(crate::mcp_oauth::Binding {
+        name: spec.name.clone(),
+        store,
+    });
+    Ok(spec)
 }
 
 /// `specs` less those the administrator's `[mcp]` lists refuse, and a line
@@ -573,10 +655,14 @@ USAGE:
                    [-H 'Name: value']... <name> [--] <command-or-url> [args...]
     incode mcp remove [-s user|project] <name>
     incode mcp approve <name>
+    incode mcp login <name>
+    incode mcp logout <name>
 
 Servers live in ~/.incode/mcp.json (user, the default) and ./.mcp.json
 (project). A project's server starts only once approved; adding one here
-approves it. `${VAR}` and `${VAR:-default}` are expanded when a session starts.";
+approves it. `${VAR}` and `${VAR:-default}` are expanded when a session starts.
+`login` opens the browser to authorize an http server that needs OAuth; its
+tokens are kept in ~/.incode/mcp-tokens.json.";
 
 /// Run `incode mcp <args>` and return what to print.
 ///
@@ -609,27 +695,88 @@ pub fn command(args: &[String], workspace: &Path, data_dir: &Path) -> Result<Str
             approve(data_dir, name, entry)?;
             Ok(format!("approved `{name}`: {}", entry.summary()))
         }
+        "login" => {
+            let [name] = rest else {
+                return Err("usage: incode mcp login <name>".to_string());
+            };
+            login(workspace, data_dir, name)
+        }
+        "logout" => {
+            let [name] = rest else {
+                return Err("usage: incode mcp logout <name>".to_string());
+            };
+            let store = data_dir.join(crate::mcp_oauth::TOKENS_FILE);
+            Ok(if crate::mcp_oauth::forget(&store, name)? {
+                format!("logged out of `{name}`; its tokens are forgotten")
+            } else {
+                format!("`{name}` was not logged in")
+            })
+        }
         "-h" | "--help" | "help" => Ok(USAGE.to_string()),
         other => Err(format!("unknown `incode mcp {other}`\n\n{USAGE}")),
     }
 }
 
+/// `incode mcp login <name>`: the browser flow, its address printed too.
+fn login(workspace: &Path, data_dir: &Path, name: &str) -> Result<String, String> {
+    let (servers, _) = configured(workspace, data_dir);
+    let server = servers
+        .iter()
+        .find(|s| s.name == name)
+        .ok_or_else(|| format!("no MCP server `{name}` is configured"))?;
+    let Transport::Http { url, .. } = server.entry.to_spec(name, &from_env)?.transport else {
+        return Err(format!(
+            "`{name}` is a stdio server; OAuth is for http servers"
+        ));
+    };
+    let mut config = server.entry.oauth.clone().unwrap_or_default();
+    // A client's secret belongs in the environment, not in a file a
+    // repository carries.
+    for field in [&mut config.client_id, &mut config.client_secret] {
+        if let Some(text) = field.as_mut() {
+            *text = expand(text, &from_env)?;
+        }
+    }
+    // `${SECRET:-}` with the variable unset: a public client.
+    config.client_secret = config.client_secret.filter(|s| !s.is_empty());
+    crate::mcp_oauth::login(
+        name,
+        &url,
+        &config,
+        &data_dir.join(crate::mcp_oauth::TOKENS_FILE),
+        &|line| println!("{line}"),
+        &crate::mcp_oauth::open_browser,
+    )
+}
+
 fn status(data_dir: &Path, server: &Configured) -> String {
     let policy = crate::permissions::managed::mcp_policy();
     let lookup = |name: &str| from_env(name);
+    let mut auth = String::new();
     if let Ok(spec) = server.entry.to_spec(&server.name, &lookup) {
+        if let Transport::Http { url, headers, .. } = &spec.transport {
+            if !has_authorization(headers) {
+                let store = data_dir.join(crate::mcp_oauth::TOKENS_FILE);
+                let configured = server.entry.oauth.is_some();
+                if let Some(said) = crate::mcp_oauth::status(&store, &server.name, url, configured)
+                {
+                    auth = format!("; {said}");
+                }
+            }
+        }
         let (_, refused) = apply_managed_policy(&policy, vec![spec]);
         if let Some(why) = refused.first() {
             return format!("blocked — {why}");
         }
     }
-    match server.scope {
+    let trust = match server.scope {
         Scope::User => "trusted (user settings)".to_string(),
         Scope::Project if is_approved(data_dir, &server.name, &server.entry) => {
             "approved".to_string()
         }
         Scope::Project => format!("needs approval: incode mcp approve {}", server.name),
-    }
+    };
+    trust + &auth
 }
 
 fn list(workspace: &Path, data_dir: &Path) -> String {
