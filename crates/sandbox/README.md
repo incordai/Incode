@@ -65,6 +65,7 @@ An unknown key is an error, so a misspelt `wirte` can't silently do nothing.
 | network: `proxy` | Landlock: TCP only to the proxy's port; seccomp as for `deny` | Seatbelt: outbound only to the proxy | **not yet** |
 | `.git/hooks`, `.git/config` | snapshotted, put back after the run | Seatbelt refuses the write | **not yet** |
 | signals, abstract Unix sockets | Landlock scopes (6.12+): only within the sandbox | Seatbelt default | **not yet** |
+| Windows programs (inside WSL2) | interop interpreter and sockets hidden, `WSL_INTEROP` removed, vsock refused | n/a | n/a |
 | limits | `setrlimit` + wall clock; no core dumps | `setrlimit` + wall clock; no core dumps | wall clock |
 | environment | yes | yes | yes |
 
@@ -162,6 +163,39 @@ An unknown key is an error, so a misspelt `wirte` can't silently do nothing.
 - The hook protection on Linux restores *after* the run. A hook planted
   during the run would execute if someone ran git in that workspace before
   the run ended.
+
+## Windows: run it inside WSL2
+
+On Windows, run `sbx` inside WSL2, where the Linux sandbox applies
+unchanged: Landlock, seccomp, the git protection and `sbx mcp`. Build it in
+your distribution (`cargo build --release -p incord-sandbox`) and check
+`sbx doctor`, which says it found WSL.
+
+WSL2 adds one way out that plain Linux doesn't have: starting a Windows
+program (`cmd.exe`, `powershell.exe`, any `.exe` under `/mnt/c`), which
+runs on Windows, outside the sandbox. When the filesystem is confined and
+WSL is detected, `sbx` closes it (`fs.block_wsl_interop`, on by default):
+- WSL's interop interpreter (`/init`, read from
+  `/proc/sys/fs/binfmt_misc/WSLInterop`) is hidden like a `deny_read` path,
+  so no `.exe` can start;
+- `/run/WSL`, where the interop sockets live, is hidden and `WSL_INTEROP`
+  is removed;
+- vsock is refused by seccomp.
+
+Hiding `/init` means `ls /` is refused inside the sandbox; files beneath
+`/` still read normally.
+
+**Network inside WSL2:** `network: deny` needs Landlock's TCP rules (Linux
+6.7+). On an older WSL kernel only UDP/DNS are blocked, `sbx doctor` says
+the network is not enforced, and strict mode refuses `deny`/`proxy` rather
+than pretend. Update WSL (`wsl --update`) for a newer kernel.
+
+**Tested:** the mechanism (a hidden interpreter can't run, directly or as
+a script's) runs on every Linux CI machine. `tests/wsl.rs` tries the real
+ways out (`cmd.exe`, `/mnt/c/.../cmd.exe`, `powershell.exe`,
+`WSL_INTEROP`, `/run/WSL`), but only on a WSL2 machine. It has not run on
+one yet, so run `cargo test -p incord-sandbox --test wsl` there before
+relying on this.
 
 ## Exit codes
 

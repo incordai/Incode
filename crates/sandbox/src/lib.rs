@@ -43,6 +43,8 @@ pub mod server;
 mod linux;
 #[cfg(target_os = "linux")]
 mod seccomp;
+#[cfg(target_os = "linux")]
+pub mod wsl;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -507,7 +509,24 @@ impl Sandbox {
             ));
         }
         let roots = self.policy.resolved_roots(cwd)?;
-        let deny_read = self.policy.resolved_deny_read(cwd, &roots)?;
+        #[allow(unused_mut)]
+        let mut deny_read = self.policy.resolved_deny_read(cwd, &roots)?;
+        // Inside WSL2 a Windows program started from the sandbox would run
+        // outside it altogether: hide the interop interpreter and sockets.
+        #[cfg(target_os = "linux")]
+        let block_interop = self.policy.fs.mode != FsMode::Off
+            && self.policy.fs.block_wsl_interop
+            && wsl::detected();
+        #[cfg(not(target_os = "linux"))]
+        let block_interop = false;
+        #[cfg(target_os = "linux")]
+        if block_interop {
+            for p in wsl::interop_paths() {
+                if !deny_read.contains(&p) && !roots.iter().any(|r| p.starts_with(r)) {
+                    deny_read.push(p);
+                }
+            }
+        }
         let protected = (self.policy.fs.mode == FsMode::WorkspaceWrite
             && self.policy.fs.protect_git)
             .then(|| protect::Snapshot::take(protect::git_paths(&roots)));
@@ -533,7 +552,10 @@ impl Sandbox {
         if let Some(p) = &proxy {
             extra.extend(p.client_env());
         }
-        let environment = env::compute(&self.policy.env, std::env::vars_os(), &extra);
+        let mut environment = env::compute(&self.policy.env, std::env::vars_os(), &extra);
+        if block_interop {
+            environment.retain(|(k, _)| k != "WSL_INTEROP");
+        }
 
         let spec = EnterSpec {
             fs_mode: self.policy.fs.mode,
@@ -756,7 +778,13 @@ fn environment_summary(e: &policy::Env) -> String {
 
 #[cfg(target_os = "linux")]
 fn fs_status(mode: FsMode) -> Status {
-    linux::fs_status(mode)
+    match linux::fs_status(mode) {
+        Status::Enforced(how) if wsl::detected() => Status::Enforced(format!(
+            "{how}; WSL: starting Windows programs is blocked (interop interpreter and \
+             sockets hidden, WSL_INTEROP removed, vsock refused)"
+        )),
+        other => other,
+    }
 }
 
 #[cfg(target_os = "macos")]

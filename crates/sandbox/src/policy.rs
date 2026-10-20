@@ -6,6 +6,7 @@
 //! write = ["."]                   # writable roots (workspace-write only)
 //! deny_read = ["../private"]      # hidden: not even readable
 //! protect_git = true              # .git/hooks and .git/config kept as they were (default)
+//! block_wsl_interop = true        # inside WSL2: no starting Windows programs (default)
 //!
 //! [network]
 //! mode = "proxy"                  # allow | deny | proxy
@@ -67,6 +68,10 @@ pub struct Fs {
     /// were: a planted hook runs, unsandboxed, the next time anyone uses git
     /// there (see [`crate::protect`]). On by default.
     pub protect_git: bool,
+    /// Inside WSL2: stop the command starting Windows programs, which would
+    /// run outside the sandbox altogether (see [`crate::wsl`]). On by
+    /// default; only applies when the filesystem is confined.
+    pub block_wsl_interop: bool,
 }
 
 impl Default for Fs {
@@ -76,6 +81,7 @@ impl Default for Fs {
             write: Vec::new(),
             deny_read: Vec::new(),
             protect_git: true,
+            block_wsl_interop: true,
         }
     }
 }
@@ -234,6 +240,7 @@ impl Policy {
                 write: vec![root.into()],
                 deny_read: Vec::new(),
                 protect_git: true,
+                block_wsl_interop: true,
             },
             ..Self::default()
         }
