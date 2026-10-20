@@ -167,7 +167,14 @@ tar = { version = "=0.4.46", default-features = false }
 #
 # `screenshots` is NOT used: it is deprecated in favour of xcap by the same
 # author, and the 0.8.x version in the original sketch is two minor lines stale.
-xcap = { version = "0.9.8", default-features = false }
+#
+# xcap is OPTIONAL, behind the `desktop-capture` feature (on by default). On
+# Linux 0.9.8 has no feature to leave out its Wayland backend: it always
+# builds libwayshot-xcap (wayland-client, GBM, EGL) and PipeWire (bindgen, so
+# libclang too), which this crate never uses — Linux computer use is X11 only
+# (docs/COMPUTER_USE.md decision 5). Building without the feature drops them,
+# for a server that never runs computer use.
+xcap = { version = "0.9.8", default-features = false, optional = true }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 enigo = { version = "0.6.1", default-features = false }
 
@@ -267,7 +274,11 @@ zbus = "5.19"
 [features]
 # Every Outline grammar is on by default; each can be dropped to shrink the
 # binary, and Outline then says that language was not built in.
-default = ["lang-rust", "lang-ts", "lang-python", "lang-go", "lang-js"]
+default = ["desktop-capture", "lang-rust", "lang-ts", "lang-python", "lang-go", "lang-js"]
+# Screenshots and the display list for computer use (`src/desktop/capture.rs`).
+# Without it every capture is refused by name; on Linux it is what needs the
+# Wayland, GBM, EGL, PipeWire and libclang development packages to build.
+desktop-capture = ["dep:xcap"]
 lang-rust = ["dep:tree-sitter-rust"]
 lang-ts = ["dep:tree-sitter-typescript"]
 lang-python = ["dep:tree-sitter-python"]

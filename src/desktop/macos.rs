@@ -577,6 +577,7 @@ fn info_of(
         pid: pid as u32,
         focused: matches!(focus, Some((p, w)) if *p == pid && same(w, window)),
         rect: rect_of(window),
+        has_tree: true,
     })
 }
 
@@ -676,14 +677,15 @@ pub(crate) fn window_info(window: Option<&str>) -> Result<WindowInfo, DesktopErr
 
 pub(crate) fn tree(window: Option<&str>, max_depth: u32) -> Result<Tree, DesktopError> {
     let (root, info) = target(window)?;
-    let (elements, truncated) = walk(&root, max_depth, &describe, &children);
+    let walked = walk(&root, max_depth, &describe, &children);
     Ok(Tree {
         root_name: info.title,
         window: info.id,
         app: info.app,
         no_positions: None,
-        elements,
-        truncated,
+        elements: walked.elements,
+        truncated: walked.truncated,
+        offscreen: walked.offscreen,
     })
 }
 
@@ -712,23 +714,21 @@ pub(crate) fn set_value(
             "{what} has no value to set; click_element it and use type_text instead"
         )));
     }
+    let did = described.set_to(value);
     if described.secret {
-        return Ok(Done::unverified(
-            format!("set {what}"),
-            "a password field is never read back",
-        ));
+        return Ok(Done::unverified(did, "a password field is never read back"));
     }
     Ok(match text_attribute(&element, "AXValue") {
-        Some(now) if now == value.trim() => Done::verified(format!("set {what}")),
+        Some(now) if now == value.trim() => Done::verified(did),
         Some(now) => Done::unverified(
-            format!("set {what}"),
+            did,
             &format!(
                 "it reads back as {} characters, not the {} sent",
                 now.chars().count(),
                 value.chars().count()
             ),
         ),
-        None => Done::unverified(format!("set {what}"), "its value could not be read back"),
+        None => Done::unverified(did, "its value could not be read back"),
     })
 }
 

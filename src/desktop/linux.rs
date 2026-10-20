@@ -25,6 +25,13 @@
 //! applications whose own `DISPLAY` is this server's — read from the process
 //! that owns the application's bus name. A window on the operator's desktop
 //! is never offered as something to click on the agent's.
+//!
+//! # The windows
+//!
+//! The X server's own list is the whole truth of what is on the display;
+//! AT-SPI knows only the programs with an accessibility bridge. Both are read
+//! and merged (`x11.rs`), so a window with no tree — xterm — is still listed,
+//! focused, pictured and kept out of a click when its owner is blocked.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::process::CommandExt;
@@ -36,6 +43,7 @@ use zbus::blocking::Connection;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 
 use super::uia::{self, Done, Element, Tree, WindowInfo};
+use super::x11::{self, Listed, X11Window};
 use super::{DesktopError, Rect};
 
 /// The size of a private display when the setting names none.
@@ -591,9 +599,9 @@ fn window_id(node: &Node) -> String {
     format!("{}|{}", node.0, node.1.as_str())
 }
 
-/// Every window SHOWING on this server's display, with what is known of it.
-/// Only applications whose own `DISPLAY` is this server's are looked at: the
-/// accessibility bus lists every application of the session, the
+/// Every window SHOWING on this server's display that has an accessibility
+/// tree. Only applications whose own `DISPLAY` is this server's are looked
+/// at: the accessibility bus lists every application of the session, the
 /// operator's own desktop included.
 fn windows_on(bus: &Connection, display: u32) -> Result<Vec<(Node, WindowInfo)>, DesktopError> {
     let root: Node = (
@@ -622,23 +630,299 @@ fn windows_on(bus: &Connection, display: u32) -> Result<Vec<(Node, WindowInfo)>,
                 pid,
                 focused: has_state(&set, STATE_ACTIVE),
                 rect: extents(bus, &window),
+                has_tree: true,
             };
             out.push((window, info));
         }
     }
-    // A bare Xvfb has no window manager to mark a window active. The X
-    // server itself says whose window keystrokes reach; the one showing
-    // window of that process is the focused one — and if it has several, or
-    // the owner cannot be named, none is, rather than a guess.
-    if !out.iter().any(|(_, w)| w.focused) {
-        if let KeyTarget::Process(pid) = keyboard_target(display) {
-            let theirs: Vec<usize> = (0..out.len()).filter(|&i| out[i].1.pid == pid).collect();
-            if let [only] = theirs[..] {
-                out[only].1.focused = true;
-            }
+    Ok(out)
+}
+
+/// What is on this server's display: every window, merged from the X
+/// server's list and the accessibility tree's ([`x11::merge`]), and the
+/// accessibility bus — or why it did not answer.
+struct Desktop {
+    display: u32,
+    bus: Result<Connection, DesktopError>,
+    windows: Vec<Listed<Node>>,
+    window_manager: bool,
+}
+
+/// Read the display. The X server's answer is required: it is the one list
+/// that holds every window, so without it no click or capture can be checked
+/// against a blocked application. The accessibility bus is not — without it
+/// every window is still listed, with no tree.
+fn desktop() -> Result<Desktop, DesktopError> {
+    let display = ours()?;
+    let shown = x_windows(display).map_err(|e| {
+        DesktopError::Os(format!(
+            "the X server on :{display} could not be asked which windows it shows ({e})"
+        ))
+    })?;
+    let bus = a11y_bus();
+    let accessible = match &bus {
+        Ok(bus) => windows_on(bus, display)?,
+        Err(_) => Vec::new(),
+    };
+    let mut windows = x11::merge(accessible, &shown.windows);
+    mark_focus(&mut windows, &shown.focus_chain, display);
+    Ok(Desktop {
+        display,
+        bus,
+        windows,
+        window_manager: shown.window_manager,
+    })
+}
+
+/// Mark the window keystrokes reach. The X server's input focus decides
+/// when it lands in a listed window — it is where keys go, whatever a toolkit
+/// last reported — and then only that window is focused. Otherwise an
+/// accessible window that says it is ACTIVE is (a window manager set it);
+/// otherwise the one showing accessible window of the process keys reach —
+/// and if it has several, or the owner cannot be named, none is, rather than
+/// a guess.
+fn mark_focus(windows: &mut [Listed<Node>], focus_chain: &[u32], display: u32) {
+    if let Some(at) = x11::focused_index(windows, focus_chain) {
+        for (i, window) in windows.iter_mut().enumerate() {
+            window.info.focused = i == at;
+        }
+        return;
+    }
+    if windows.iter().any(|w| w.info.focused) {
+        return;
+    }
+    if let KeyTarget::Process(pid) = keyboard_target(display) {
+        let theirs: Vec<usize> = (0..windows.len())
+            .filter(|&i| windows[i].node.is_some() && windows[i].info.pid == pid)
+            .collect();
+        if let [only] = theirs[..] {
+            windows[only].info.focused = true;
         }
     }
-    Ok(out)
+}
+
+/// What the X server says of its display.
+struct XWindows {
+    windows: Vec<X11Window>,
+    /// From the window keys reach (the focus, or under `PointerRoot` the
+    /// window under the pointer) up toward the root, the root left out.
+    /// Empty when keys reach no window.
+    focus_chain: Vec<u32>,
+    /// A window manager answers `_NET_SUPPORTING_WM_CHECK` on the root.
+    window_manager: bool,
+}
+
+/// How many parents a window is climbed through toward the root. Real
+/// stacks are two or three deep (client, frame, root); the bound keeps a
+/// broken tree from looping.
+const MAX_CLIMB: usize = 32;
+
+/// The top-level windows on the display: the window manager's client list
+/// (`_NET_CLIENT_LIST`) when one runs, else the root's children — each kept
+/// when it is mapped, can be drawn in (InputOutput) and says who it is (a
+/// title, a WM_CLASS or a pid). Rectangles are on the root, in pixels.
+fn x_windows(display: u32) -> Result<XWindows, String> {
+    use x11rb::connection::Connection as _;
+    use x11rb::protocol::xproto::{
+        AtomEnum, ConnectionExt as _, GetPropertyReply, MapState, WindowClass,
+    };
+
+    let (conn, screen) = x11rb::connect(Some(&format!(":{display}"))).map_err(|e| e.to_string())?;
+    let root = conn
+        .setup()
+        .roots
+        .get(screen)
+        .ok_or("the display has no screen")?
+        .root;
+    let e = |e: &dyn std::fmt::Display| e.to_string();
+    let atom = |name: &[u8]| -> Result<u32, String> {
+        Ok(conn
+            .intern_atom(true, name)
+            .map_err(|x| e(&x))?
+            .reply()
+            .map_err(|x| e(&x))?
+            .atom)
+    };
+    let net_client_list = atom(b"_NET_CLIENT_LIST")?;
+    let net_wm_name = atom(b"_NET_WM_NAME")?;
+    let net_wm_pid = atom(b"_NET_WM_PID")?;
+    let net_wm_check = atom(b"_NET_SUPPORTING_WM_CHECK")?;
+    // `None` for a property this server has never heard of (its atom is 0).
+    let property = |window: u32, name: u32| -> Result<Option<GetPropertyReply>, String> {
+        if name == 0 {
+            return Ok(None);
+        }
+        conn.get_property(false, window, name, AtomEnum::ANY, 0, 1024)
+            .map_err(|x| e(&x))?
+            .reply()
+            .map(Some)
+            .map_err(|x| e(&x))
+    };
+    let bytes = |reply: Option<GetPropertyReply>| reply.map(|r| r.value).unwrap_or_default();
+    let words = |reply: Option<GetPropertyReply>| -> Vec<u32> {
+        reply
+            .as_ref()
+            .and_then(GetPropertyReply::value32)
+            .map(Iterator::collect)
+            .unwrap_or_default()
+    };
+
+    let window_manager = words(property(root, net_wm_check)?)
+        .first()
+        .is_some_and(|&w| w != 0);
+    let listed = words(property(root, net_client_list)?);
+    let candidates = if listed.is_empty() {
+        conn.query_tree(root)
+            .map_err(|x| e(&x))?
+            .reply()
+            .map_err(|x| e(&x))?
+            .children
+    } else {
+        listed
+    };
+
+    let mut windows = Vec::new();
+    for xid in candidates {
+        // A window can close between the list and these questions; it is
+        // then simply not on screen.
+        let Ok(Ok(attributes)) = conn.get_window_attributes(xid).map(|c| c.reply()) else {
+            continue;
+        };
+        if attributes.map_state != MapState::VIEWABLE
+            || attributes.class != WindowClass::INPUT_OUTPUT
+        {
+            continue;
+        }
+        let utf8 = bytes(property(xid, net_wm_name)?);
+        let title = if utf8.is_empty() {
+            String::from_utf8_lossy(&bytes(property(xid, AtomEnum::WM_NAME.into())?)).into_owned()
+        } else {
+            String::from_utf8_lossy(&utf8).into_owned()
+        };
+        let class: Vec<String> = bytes(property(xid, AtomEnum::WM_CLASS.into())?)
+            .split(|b| *b == 0)
+            .filter(|part| !part.is_empty())
+            .map(|part| String::from_utf8_lossy(part).into_owned())
+            .collect();
+        let pid = words(property(xid, net_wm_pid)?)
+            .first()
+            .copied()
+            .filter(|&p| p != 0);
+        if title.trim().is_empty() && class.is_empty() && pid.is_none() {
+            continue;
+        }
+        let (Ok(Ok(geometry)), Ok(Ok(at))) = (
+            conn.get_geometry(xid).map(|c| c.reply()),
+            conn.translate_coordinates(xid, root, 0, 0)
+                .map(|c| c.reply()),
+        ) else {
+            continue;
+        };
+        windows.push(X11Window {
+            xid,
+            title,
+            class,
+            pid,
+            program: pid.map(program_of).unwrap_or_default(),
+            rect: Rect {
+                x: i32::from(at.dst_x),
+                y: i32::from(at.dst_y),
+                width: i32::from(geometry.width),
+                height: i32::from(geometry.height),
+            },
+        });
+    }
+
+    let focus = conn
+        .get_input_focus()
+        .map_err(|x| e(&x))?
+        .reply()
+        .map_err(|x| e(&x))?
+        .focus;
+    // 0 is None and 1 is PointerRoot: keys follow the pointer.
+    let mut window = if focus <= 1 || focus == root {
+        conn.query_pointer(root)
+            .map_err(|x| e(&x))?
+            .reply()
+            .map_err(|x| e(&x))?
+            .child
+    } else {
+        focus
+    };
+    let mut focus_chain = Vec::new();
+    for _ in 0..MAX_CLIMB {
+        if window == 0 || window == root {
+            break;
+        }
+        focus_chain.push(window);
+        window = match conn.query_tree(window).map(|c| c.reply()) {
+            Ok(Ok(tree)) => tree.parent,
+            _ => break,
+        };
+    }
+    Ok(XWindows {
+        windows,
+        focus_chain,
+        window_manager,
+    })
+}
+
+/// Give an X window the keyboard: through the window manager when one runs
+/// (`_NET_ACTIVE_WINDOW`, which it may honour or refuse), else directly —
+/// raised to the top and given the input focus, since with no manager
+/// nothing else would. Each request is checked, so a window that closed in
+/// between is an error rather than a silent no-op.
+fn give_focus(display: u32, xid: u32, window_manager: bool) -> Result<(), DesktopError> {
+    use x11rb::connection::Connection as _;
+    use x11rb::protocol::xproto::{
+        ClientMessageEvent, ConfigureWindowAux, ConnectionExt as _, EventMask, InputFocus,
+        StackMode,
+    };
+
+    let fail = |e: &dyn std::fmt::Display| {
+        DesktopError::Os(format!(
+            "could not give window {} the keyboard: {e}",
+            x11::id_of(xid)
+        ))
+    };
+    let (conn, screen) = x11rb::connect(Some(&format!(":{display}"))).map_err(|e| fail(&e))?;
+    let root = conn
+        .setup()
+        .roots
+        .get(screen)
+        .ok_or_else(|| fail(&"the display has no screen"))?
+        .root;
+    if window_manager {
+        let active = conn
+            .intern_atom(false, b"_NET_ACTIVE_WINDOW")
+            .map_err(|e| fail(&e))?
+            .reply()
+            .map_err(|e| fail(&e))?
+            .atom;
+        // Source 2 is a pager: a request from outside the application, which
+        // a manager's focus-stealing prevention lets through.
+        let event = ClientMessageEvent::new(32, xid, active, [2u32, 0, 0, 0, 0]);
+        conn.send_event(
+            false,
+            root,
+            EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+            event,
+        )
+        .map_err(|e| fail(&e))?
+        .check()
+        .map_err(|e| fail(&e))?;
+    } else {
+        conn.configure_window(xid, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE))
+            .map_err(|e| fail(&e))?
+            .check()
+            .map_err(|e| fail(&e))?;
+        conn.set_input_focus(InputFocus::PARENT, xid, x11rb::CURRENT_TIME)
+            .map_err(|e| fail(&e))?
+            .check()
+            .map_err(|e| fail(&e))?;
+    }
+    conn.flush().map_err(|e| fail(&e))?;
+    Ok(())
 }
 
 /// Where keystrokes go now, as the X server says.
@@ -707,6 +991,10 @@ fn keyboard_target(display: u32) -> KeyTarget {
 /// controls. Named, so a capture of "that window" is refused rather than
 /// cut from wherever the rectangle happens to say.
 pub(crate) fn window_position_unknown(window: &WindowInfo) -> Option<String> {
+    // A window with no tree is placed by the X server itself.
+    if !window.has_tree {
+        return None;
+    }
     let bus_name = window.id.split('|').next()?;
     let bus = a11y_bus().ok()?;
     let toolkit = toolkit(&bus, bus_name);
@@ -716,27 +1004,24 @@ pub(crate) fn window_position_unknown(window: &WindowInfo) -> Option<String> {
         .then(|| format!("{toolkit} does not report where its windows are on screen,"))
 }
 
+/// Every window on the display — the accessibility tree's and the X
+/// server's — so the checks that keep clicks and captures off a blocked
+/// application see a window whether or not it has a tree.
 pub(crate) fn list_windows() -> Result<Vec<WindowInfo>, DesktopError> {
-    let bus = a11y_bus()?;
-    Ok(windows_on(&bus, ours()?)?
-        .into_iter()
-        .map(|(_, info)| info)
-        .collect())
+    Ok(desktop()?.windows.into_iter().map(|w| w.info).collect())
 }
 
-/// The window keystrokes reach. When that is not one accessible window —
-/// a program with no tree, one with several windows, or a window nobody can
-/// name — it is still reported, by its owner, so the checks on what may be
-/// typed into still apply: an unnamed owner is treated as blocked. `None`
-/// only when keys reach no window at all.
+/// The window keystrokes reach. When that is not one listed window — a
+/// window that says nothing about itself, or a program with several accessible
+/// windows and no X window paired — it is still reported, by its owner, so
+/// the checks on what may be typed into still apply: an unnamed owner is
+/// treated as blocked. `None` only when keys reach no window at all.
 pub(crate) fn foreground() -> Result<Option<WindowInfo>, DesktopError> {
-    let bus = a11y_bus()?;
-    let display = ours()?;
-    let windows = windows_on(&bus, display)?;
-    if let Some((_, focused)) = windows.iter().find(|(_, w)| w.focused) {
-        return Ok(Some(focused.clone()));
+    let desktop = desktop()?;
+    if let Some(focused) = desktop.windows.iter().find(|w| w.info.focused) {
+        return Ok(Some(focused.info.clone()));
     }
-    let (pid, app) = match keyboard_target(display) {
+    let (pid, app) = match keyboard_target(desktop.display) {
         KeyTarget::Nobody => return Ok(None),
         KeyTarget::Process(pid) => (pid, program_of(pid)),
         KeyTarget::Unnamed => (0, String::new()),
@@ -753,41 +1038,45 @@ pub(crate) fn foreground() -> Result<Option<WindowInfo>, DesktopError> {
             width: 0,
             height: 0,
         },
+        has_tree: false,
     }))
 }
 
 /// The window `window` names on this display, or the focused one — refusing
 /// and naming the candidates rather than guessing between several.
-fn target(bus: &Connection, window: Option<&str>) -> Result<(Node, WindowInfo), DesktopError> {
-    let display = ours()?;
-    let mut windows = windows_on(bus, display)?;
+fn target<'d>(
+    desktop: &'d Desktop,
+    window: Option<&str>,
+) -> Result<&'d Listed<Node>, DesktopError> {
+    let display = desktop.display;
+    let windows = &desktop.windows;
     if let Some(id) = window {
-        return windows
-            .into_iter()
-            .find(|(_, info)| info.id == id)
-            .ok_or_else(|| {
-                DesktopError::Os(format!(
-                    "no window {id} is showing on display :{display}; take one from \
-                     list_windows"
-                ))
-            });
+        if id.trim().starts_with("x11:") && x11::parse_id(id).is_none() {
+            return Err(DesktopError::Os(format!(
+                "\"{id}\" is not an X window id (x11:0x…); take one from list_windows"
+            )));
+        }
+        return windows.iter().find(|w| w.info.id == id).ok_or_else(|| {
+            DesktopError::Os(format!(
+                "no window {id} is showing on display :{display}; take one from list_windows"
+            ))
+        });
     }
-    if let Some(at) = windows.iter().position(|(_, info)| info.focused) {
-        return Ok(windows.swap_remove(at));
+    if let Some(focused) = windows.iter().find(|w| w.info.focused) {
+        return Ok(focused);
     }
     Err(DesktopError::Os(if windows.is_empty() {
         format!(
-            "no application on display :{display} exposes an accessibility tree. Start one \
-             there (GTK and Qt applications do); pixels still work: screenshot and click."
+            "no window is showing on display :{display}. Start a program there (DISPLAY=:{display})."
         )
     } else {
         // A blocked window is named by its id alone: its title is exactly
         // what is never read out of it.
         let names: Vec<String> = windows
             .iter()
-            .map(|(_, w)| match super::limits::get().blocked(&w.app) {
-                Some(_) => format!("a blocked application's window ({})", w.id),
-                None => format!("\"{}\" ({})", w.title, w.id),
+            .map(|w| match super::limits::get().blocked(&w.info.app) {
+                Some(_) => format!("a blocked application's window ({})", w.info.id),
+                None => format!("\"{}\" ({})", w.info.title, w.info.id),
             })
             .collect();
         format!(
@@ -799,54 +1088,90 @@ fn target(bus: &Connection, window: Option<&str>) -> Result<(Node, WindowInfo), 
     }))
 }
 
+/// The accessible window behind a listed one and the bus it is reached on —
+/// or, for a window only the X server knows, the refusal that points at the
+/// pixel tools. Named by id: a blocked window's title is never read out.
+fn accessible<'d>(
+    desktop: &'d Desktop,
+    listed: &'d Listed<Node>,
+) -> Result<(&'d Connection, &'d Node), DesktopError> {
+    // Pointing a blocked window at the pixel tools would point at a refusal.
+    if listed.node.is_none() && super::limits::get().blocked(&listed.info.app).is_some() {
+        return Err(DesktopError::Os(format!(
+            "refused: window {} belongs to a blocked application, and incode does not read or \
+             act on it",
+            listed.info.id
+        )));
+    }
+    match (&listed.node, &desktop.bus) {
+        (Some(node), Ok(bus)) => Ok((bus, node)),
+        (_, Err(why)) => Err(DesktopError::Os(format!(
+            "window {} has no accessibility tree to read: {why}. Use screenshot (with this \
+             window) and click instead.",
+            listed.info.id
+        ))),
+        (None, Ok(_)) => Err(DesktopError::Os(format!(
+            "window {} exposes no accessibility tree (its program has no accessibility \
+             bridge); use screenshot (with this window) and click instead.",
+            listed.info.id
+        ))),
+    }
+}
+
 pub(crate) fn window_info(window: Option<&str>) -> Result<WindowInfo, DesktopError> {
-    let bus = a11y_bus()?;
-    Ok(target(&bus, window)?.1)
+    let desktop = desktop()?;
+    Ok(target(&desktop, window)?.info.clone())
 }
 
 pub(crate) fn tree(window: Option<&str>, max_depth: u32) -> Result<Tree, DesktopError> {
-    let bus = a11y_bus()?;
-    let (window, info) = target(&bus, window)?;
-    let (elements, truncated) = uia::walk(
-        &window,
+    let desktop = desktop()?;
+    let listed = target(&desktop, window)?;
+    let (bus, window) = accessible(&desktop, listed)?;
+    let walked = uia::walk(
+        window,
         max_depth,
-        &|node: &Node, id, depth| describe(&bus, node, id, depth),
-        &|node: &Node| children(&bus, node),
+        &|node: &Node, id, depth| describe(bus, node, id, depth),
+        &|node: &Node| children(bus, node),
     );
-    let no_positions = positions_are_unreal(&elements).then(|| {
+    let no_positions = positions_are_unreal(&walked.elements).then(|| {
         // The window's bus name is its application's.
         format!(
             "{} does not report where its controls are on screen (every one claims the same \
              corner).",
-            toolkit(&bus, &window.0)
+            toolkit(bus, &window.0)
         )
     });
+    let info = listed.info.clone();
     Ok(Tree {
         root_name: info.title,
         window: info.id,
         app: info.app,
         no_positions,
-        elements,
-        truncated,
+        elements: walked.elements,
+        truncated: walked.truncated,
+        offscreen: walked.offscreen,
     })
 }
 
-/// The live element with this id in the window, re-found by walking again.
-fn control(
-    bus: &Connection,
+/// The live element with this id in the window, re-found by walking again,
+/// with the bus it is reached on.
+fn control<'d>(
+    desktop: &'d Desktop,
     window: Option<&str>,
     want: &uia::Want,
     max_depth: u32,
-) -> Result<(Node, Element), DesktopError> {
-    let (root, info) = target(bus, window)?;
-    uia::find(
-        &root,
+) -> Result<(&'d Connection, Node, Element), DesktopError> {
+    let listed = target(desktop, window)?;
+    let (bus, root) = accessible(desktop, listed)?;
+    let (node, element) = uia::find(
+        root,
         max_depth,
         &|node: &Node, id, depth| describe(bus, node, id, depth),
         &|node: &Node| children(bus, node),
         want,
     )
-    .ok_or_else(|| uia::gone(want.id, &info))
+    .ok_or_else(|| uia::gone(want.id, &listed.info))?;
+    Ok((bus, node, element))
 }
 
 /// Call a method on one element and read its one return value.
@@ -878,11 +1203,11 @@ pub(crate) fn set_value(
     max_depth: u32,
     value: &str,
 ) -> Result<Done, DesktopError> {
-    let bus = a11y_bus()?;
-    let (node, described) = control(&bus, window, want, max_depth)?;
+    let desktop = desktop()?;
+    let (bus, node, described) = control(&desktop, window, want, max_depth)?;
     let what = described.label();
     let set: bool = ask(
-        &bus,
+        bus,
         &node,
         "org.a11y.atspi.EditableText",
         "SetTextContents",
@@ -896,30 +1221,22 @@ pub(crate) fn set_value(
     if !set {
         return Err(DesktopError::Os(format!("{what} refused the new text")));
     }
+    let did = described.set_to(value);
     if described.secret {
-        return Ok(Done::unverified(
-            format!("set {what}"),
-            "a password field is never read back",
-        ));
+        return Ok(Done::unverified(did, "a password field is never read back"));
     }
     Ok(
-        match ask::<String, _>(
-            &bus,
-            &node,
-            "org.a11y.atspi.Text",
-            "GetText",
-            &(0i32, -1i32),
-        ) {
-            Ok(now) if now == value => Done::verified(format!("set {what}")),
+        match ask::<String, _>(bus, &node, "org.a11y.atspi.Text", "GetText", &(0i32, -1i32)) {
+            Ok(now) if now == value => Done::verified(did),
             Ok(now) => Done::unverified(
-                format!("set {what}"),
+                did,
                 &format!(
                     "it reads back as {} characters, not the {} sent",
                     now.chars().count(),
                     value.chars().count()
                 ),
             ),
-            Err(_) => Done::unverified(format!("set {what}"), "its text could not be read back"),
+            Err(_) => Done::unverified(did, "its text could not be read back"),
         },
     )
 }
@@ -949,13 +1266,13 @@ pub(crate) fn act(
     max_depth: u32,
     action: &str,
 ) -> Result<Done, DesktopError> {
-    let bus = a11y_bus()?;
-    let (node, described) = control(&bus, window, want, max_depth)?;
+    let desktop = desktop()?;
+    let (bus, node, described) = control(&desktop, window, want, max_depth)?;
     let what = described.label();
     if action.trim().eq_ignore_ascii_case("focus") {
-        let ok: bool = ask(&bus, &node, "org.a11y.atspi.Component", "GrabFocus", &())
+        let ok: bool = ask(bus, &node, "org.a11y.atspi.Component", "GrabFocus", &())
             .map_err(|e| DesktopError::Os(format!("{what} cannot take focus: {e}")))?;
-        let focused = has_state(&states(&bus, &node), STATE_FOCUSED);
+        let focused = has_state(&states(bus, &node), STATE_FOCUSED);
         return Ok(if ok && focused {
             Done::verified(format!("focused {what}"))
         } else {
@@ -966,7 +1283,7 @@ pub(crate) fn act(
         });
     }
     let offered: Vec<(String, String, String)> =
-        ask(&bus, &node, "org.a11y.atspi.Action", "GetActions", &()).unwrap_or_default();
+        ask(bus, &node, "org.a11y.atspi.Action", "GetActions", &()).unwrap_or_default();
     let names: Vec<String> = offered.into_iter().map(|(name, _, _)| name).collect();
     let Some(index) = pick_action(action, &names) else {
         return Err(DesktopError::Os(if names.is_empty() {
@@ -979,7 +1296,7 @@ pub(crate) fn act(
         }));
     };
     let ok: bool = ask(
-        &bus,
+        bus,
         &node,
         "org.a11y.atspi.Action",
         "DoAction",
@@ -998,19 +1315,45 @@ pub(crate) fn act(
     ))
 }
 
+/// Bring a window forward and give it the keyboard. Its X window, when it
+/// has one, is focused through the X server (see [`give_focus`]) — the one
+/// way to reach a window with no tree, and the one way keys move on a
+/// display with no window manager, where the input focus otherwise stays
+/// wherever it was last put. An accessible window is asked as well.
+///
+/// Verified by asking again where keys go: the X input focus inside the
+/// window, or the window reporting itself active.
 pub(crate) fn focus_window(window: &str) -> Result<Done, DesktopError> {
-    let bus = a11y_bus()?;
-    let (node, info) = target(&bus, Some(window))?;
-    let _ = ask::<bool, _>(&bus, &node, "org.a11y.atspi.Component", "GrabFocus", &());
+    let desktop = desktop()?;
+    let listed = target(&desktop, Some(window))?;
+    let title = &listed.info.title;
+    if let Some(xid) = listed.xid {
+        give_focus(desktop.display, xid, desktop.window_manager)?;
+    }
+    if let (Some(node), Ok(bus)) = (&listed.node, &desktop.bus) {
+        let _ = ask::<bool, _>(bus, node, "org.a11y.atspi.Component", "GrabFocus", &());
+    }
     std::thread::sleep(std::time::Duration::from_millis(150));
-    let now = has_state(&states(&bus, &node), STATE_ACTIVE);
-    Ok(if now {
-        Done::verified(format!("focused window \"{}\"", info.title))
+    let has_keys = match listed.xid {
+        Some(xid) => x_windows(desktop.display).is_ok_and(|now| now.focus_chain.contains(&xid)),
+        None => false,
+    };
+    let active = match (&listed.node, &desktop.bus) {
+        (Some(node), Ok(bus)) => has_state(&states(bus, node), STATE_ACTIVE),
+        _ => false,
+    };
+    Ok(if has_keys || active {
+        Done::verified(format!("focused window \"{title}\""))
     } else {
         Done::unverified(
-            format!("asked window \"{}\" to take the focus", info.title),
-            "it does not report itself active (a display with no window manager has no \
-             active window); click in it instead",
+            format!("asked window \"{title}\" to take the focus"),
+            if desktop.window_manager {
+                "the window manager has not given it the keyboard (yet); click in it, or call \
+                 focus_window again"
+            } else {
+                "it does not report itself active and no X window could be matched to it; click \
+                 in it instead"
+            },
         )
     })
 }

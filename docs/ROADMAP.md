@@ -415,6 +415,24 @@ crate directory), and pass on a writable copy.
 **Still open on Linux:** the pixel viewer (x11vnc + noVNC, 14b); Qt and
 Chromium trees not yet measured.
 
+**Windows with no tree, 2026-10-19 (#9).** `list_windows` read AT-SPI only,
+so xterm (no bridge) had no id and could not be focused, pictured or kept out
+of a click. The X server's own list is now merged in (`desktop/x11.rs`, pure
+and tested on every platform): `_NET_CLIENT_LIST` under a window manager, else
+the root's mapped InputOutput children; paired with an accessible window by
+`_NET_WM_PID` + rectangle, otherwise listed as `x11:0x…` with `"tree": false`
+and its app read from the pid's program plus any WM_CLASS that says something
+else (an unreadable owner is `UNNAMED_APP`, blocked). `focus_window` raises it
+and sets the X input focus (or asks the manager via `_NET_ACTIVE_WINDOW`),
+verified by re-reading the focus; the X focus also decides which window is
+focused. In passing: off-screen controls (GTK's `i32::MIN`) are counted on one
+line instead of listed, ids unchanged; `set_value` says `set e50 (Edit) to 17
+chars`; a lone monitor is primary and screenshots report screen_info's id.
+Live in Docker (Xvfb :99, gedit + `xterm -T probe`) against the real server,
+12/12, including `focus_window` on the xterm then `type_text` + Enter creating
+`/tmp/x`; and 6/6 with `blocked_apps: ["xterm"]` — the tree-less window is
+listed blocked, and clicks, captures and focus are refused.
+
 **Built 2026-10-01, second round — what Orca had and incode lacked, then a
 review of the result.** New tools: `list_windows` (ids, apps, rectangles),
 `focus_window`, `set_value` and `element_action` (no mouse: UIA patterns,

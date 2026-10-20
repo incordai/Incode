@@ -133,10 +133,31 @@ impl Element {
     /// An unnamed structural wrapper tells it nothing and costs tokens; an
     /// off-screen or zero-sized control cannot be clicked.
     fn is_useful(&self) -> bool {
-        if self.rect.width <= 0 || self.rect.height <= 0 {
+        if self.rect.width <= 0 || self.rect.height <= 0 || self.is_offscreen() {
             return false;
         }
         !self.name.trim().is_empty() || self.role.is_interactive()
+    }
+
+    /// Whether the control is at a place no display has. GTK 3 puts a widget
+    /// that is not laid out at the lowest coordinate there is (measured on
+    /// gedit: dozens of rows at (-2147483648,-2147483648) 1x1), and listing
+    /// each one buries the controls that are on screen.
+    fn is_offscreen(&self) -> bool {
+        self.rect.x == i32::MIN || self.rect.y == i32::MIN
+    }
+
+    /// What `set_value` did, for its reply: `set e49 (Edit) to 17 chars`.
+    /// Not the label: an edit field's name is often empty, and `set e49 ""`
+    /// reads as though the value set were empty. The length, never the
+    /// value — it may be a password.
+    pub(crate) fn set_to(&self, value: &str) -> String {
+        format!(
+            "set e{} ({:?}) to {} chars",
+            self.id,
+            self.role,
+            value.chars().count()
+        )
     }
 }
 
@@ -161,6 +182,15 @@ pub struct Tree {
     /// of tree. Reported so an agent can narrow its request instead of assuming
     /// it has seen everything.
     pub truncated: bool,
+    /// How many controls the walk passed that are at no place on screen
+    /// (`Element::is_offscreen`). Not listed, but counted, so the tree does
+    /// not read as the whole window when it is not.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub offscreen: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 impl Tree {
@@ -192,6 +222,12 @@ impl Tree {
                 if e.enabled { "" } else { "  disabled" },
                 if e.secret { "  password" } else { "" },
                 indent = (e.depth as usize).min(12) * 2,
+            ));
+        }
+        if self.offscreen > 0 {
+            out.push_str(&format!(
+                "… {} off-screen elements hidden\n",
+                self.offscreen
             ));
         }
         if self.truncated {
@@ -292,6 +328,11 @@ pub struct WindowInfo {
     /// Whether it is the window keystrokes go to.
     pub focused: bool,
     pub rect: Rect,
+    /// Whether `ui_tree` can walk it. False for a Linux window the X server
+    /// shows and AT-SPI does not know (xterm, and any program with no
+    /// accessibility bridge): screenshots and pixel clicks are its only way
+    /// in, and the agent is told so before it asks for a tree.
+    pub has_tree: bool,
 }
 
 /// What an action did, and whether that was checked.
@@ -574,9 +615,20 @@ struct Walk<'a, N> {
     next_id: u32,
     max_visited: u32,
     truncated: bool,
+    offscreen: u32,
     want: Option<&'a Want>,
     found: Option<(N, Element)>,
     done: bool,
+}
+
+/// What one [`walk`] kept, and what it passed without keeping.
+pub(crate) struct Walked {
+    pub elements: Vec<Element>,
+    /// It stopped at a bound rather than at the end of the tree.
+    pub truncated: bool,
+    /// Controls at no place on screen: numbered like every other, so no id
+    /// shifts, but never shown — and so never acted on by id.
+    pub offscreen: u32,
 }
 
 impl<N: Clone> Walk<'_, N> {
@@ -593,6 +645,9 @@ impl<N: Clone> Walk<'_, N> {
         let described = (self.describe)(node, id, depth);
         self.next_id += 1;
         let useful = described.is_useful();
+        if described.is_offscreen() {
+            self.offscreen += 1;
+        }
         if let Some(want) = self.want.filter(|w| w.id == id) {
             // Only the element `ui_tree` showed at this id resolves.
             if useful && same_control(&described, &want.expect) {
@@ -627,7 +682,7 @@ pub(crate) fn walk<N: Clone>(
     max_depth: u32,
     describe: &dyn Fn(&N, u32, u32) -> Element,
     children: &dyn Fn(&N) -> Vec<N>,
-) -> (Vec<Element>, bool) {
+) -> Walked {
     let mut walk = Walk {
         max_depth,
         describe,
@@ -636,12 +691,17 @@ pub(crate) fn walk<N: Clone>(
         next_id: 0,
         max_visited: super::limits::get().tree_max_visited,
         truncated: false,
+        offscreen: 0,
         want: None,
         found: None,
         done: false,
     };
     walk.visit(root, 0);
-    (walk.out, walk.truncated)
+    Walked {
+        elements: walk.out,
+        truncated: walk.truncated,
+        offscreen: walk.offscreen,
+    }
 }
 
 /// The handle and description of the element numbered `want.id` by [`walk`],
@@ -665,6 +725,7 @@ pub(crate) fn find<N: Clone>(
         next_id: 0,
         max_visited: super::limits::get().tree_max_visited,
         truncated: false,
+        offscreen: 0,
         want: Some(want),
         found: None,
         done: false,
@@ -693,20 +754,32 @@ mod tests {
     #[derive(Clone)]
     struct Node(Role, &'static str, Vec<Node>);
 
+    /// A node named "offscreen…" is where GTK puts a widget it has not laid
+    /// out (measured on gedit): at the lowest coordinate, 1x1.
     fn node(n: &Node, id: u32, d: u32) -> Element {
         Element {
             id,
             depth: d,
             role: n.0,
             name: n.1.to_string(),
-            rect: Rect::from_edges(0, 0, 10, 10),
+            rect: if n.1.starts_with("offscreen") {
+                Rect {
+                    x: i32::MIN,
+                    y: i32::MIN,
+                    width: 1,
+                    height: 1,
+                }
+            } else {
+                Rect::from_edges(0, 0, 10, 10)
+            },
             enabled: true,
             secret: false,
         }
     }
 
     fn walk_of(root: &Node, depth: u32) -> (Vec<Element>, bool) {
-        walk(root, depth, &node, &|n: &Node| n.2.clone())
+        let walked = walk(root, depth, &node, &|n: &Node| n.2.clone());
+        (walked.elements, walked.truncated)
     }
 
     fn want(shown: &Element) -> Want {
@@ -811,6 +884,7 @@ mod tests {
             no_positions: None,
             elements: vec![field],
             truncated: false,
+            offscreen: 0,
         }
         .render();
         assert!(text.contains("[e4] Edit"), "{text}");
@@ -840,6 +914,69 @@ mod tests {
         let (shallow, _) = walk_of(&tree, 1);
         assert!(shallow.iter().all(|e| e.depth <= 1), "{shallow:?}");
         assert!(!shallow.iter().any(|e| e.name == "OK"));
+    }
+
+    /// **A CONTROL AT NO PLACE ON SCREEN IS COUNTED, NOT LISTED, AND TAKES
+    /// ITS ID.** Hiding it must not renumber the controls after it — ids are
+    /// positions in one walk — and its id resolves to nothing, so an agent
+    /// cannot act on a control it was never shown.
+    #[test]
+    fn offscreen_controls_are_counted_not_listed_and_keep_every_id_in_place() {
+        let tree = Node(
+            Role::Window,
+            "Find",
+            vec![
+                Node(Role::ListItem, "offscreen row 1", vec![]),
+                Node(Role::ListItem, "offscreen row 2", vec![]),
+                Node(Role::Button, "Replace", vec![]),
+            ],
+        );
+        let children = |n: &Node| n.2.clone();
+        let walked = walk(&tree, 8, &node, &children);
+        let seen: Vec<(u32, &str)> = walked
+            .elements
+            .iter()
+            .map(|e| (e.id, e.name.as_str()))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![(0, "Find"), (3, "Replace")],
+            "the button keeps id 3, behind the two hidden rows"
+        );
+        assert_eq!(walked.offscreen, 2);
+        assert!(!walked.truncated);
+
+        let replace = &walked.elements[1];
+        let (_, found) = find(&tree, 8, &node, &children, &want(replace)).expect("on screen");
+        assert_eq!(found.name, "Replace");
+        let hidden = node(&tree.2[0], 1, 1);
+        assert!(
+            find(&tree, 8, &node, &children, &want(&hidden)).is_none(),
+            "an off-screen control is never resolved by id"
+        );
+
+        let text = Tree {
+            root_name: "Find".to_string(),
+            window: String::new(),
+            app: String::new(),
+            no_positions: None,
+            elements: walked.elements,
+            truncated: false,
+            offscreen: walked.offscreen,
+        }
+        .render();
+        assert!(text.contains("… 2 off-screen elements hidden"), "{text}");
+        assert!(!text.contains("-2147483648"), "{text}");
+    }
+
+    /// set_value's reply names the control and the LENGTH set — never the
+    /// value, and never an empty name that reads like an empty value.
+    #[test]
+    fn a_set_reply_says_the_length_not_an_empty_name() {
+        let field = element(49, Role::Edit, "", Rect::from_edges(0, 0, 90, 20));
+        let said = field.set_to("hello, seventeen!");
+        assert_eq!(said, "set e49 (Edit) to 17 chars");
+        assert!(!said.contains("\"\""), "{said}");
     }
 
     /// The walk stops at [`MAX_ELEMENTS`] and says so.
@@ -960,6 +1097,7 @@ mod tests {
                 Rect::from_edges(0, 0, 10, 10),
             )],
             truncated: true,
+            offscreen: 0,
         };
         let text = tree.render();
         assert!(text.contains("Settings"), "{text}");
@@ -982,6 +1120,7 @@ mod tests {
                 element(7, Role::Button, "No", Rect::from_edges(20, 0, 30, 10)),
             ],
             truncated: false,
+            offscreen: 0,
         };
         assert_eq!(tree.get(7).map(|e| e.name.as_str()), Some("No"));
         assert!(

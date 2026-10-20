@@ -157,6 +157,7 @@ fn info_of(element: &UIElement, hwnd: isize) -> WindowInfo {
         pid,
         focused: hwnd == foreground_hwnd(),
         rect: rect_of(element),
+        has_tree: true,
     }
 }
 
@@ -250,7 +251,7 @@ pub(super) fn tree(window: Option<&str>, max_depth: u32) -> Result<Tree, Desktop
     let walker = automation
         .create_tree_walker()
         .map_err(|e| DesktopError::Os(format!("could not walk the tree: {e}")))?;
-    let (elements, truncated) = walk(&root, max_depth, &describe, &|e: &UIElement| {
+    let walked = walk(&root, max_depth, &describe, &|e: &UIElement| {
         children_of(&walker, e)
     });
     Ok(Tree {
@@ -258,8 +259,9 @@ pub(super) fn tree(window: Option<&str>, max_depth: u32) -> Result<Tree, Desktop
         window: info.id,
         app: info.app,
         no_positions: None,
-        elements,
-        truncated,
+        elements: walked.elements,
+        truncated: walked.truncated,
+        offscreen: walked.offscreen,
     })
 }
 
@@ -293,33 +295,31 @@ pub(super) fn set_value(
 ) -> Result<Done, DesktopError> {
     let (element, described, _) = control(window, want, max_depth)?;
     let what = described.label();
+    let did = described.set_to(value);
     if let Ok(pattern) = element.get_pattern::<UIValuePattern>() {
         pattern
             .set_value(value)
             .map_err(|e| DesktopError::Os(format!("could not set {what}: {e}")))?;
         if described.secret {
-            return Ok(Done::unverified(
-                format!("set {what}"),
-                "a password field is never read back",
-            ));
+            return Ok(Done::unverified(did, "a password field is never read back"));
         }
         return Ok(match pattern.get_value() {
-            Ok(now) if now == value => Done::verified(format!("set {what}")),
+            Ok(now) if now == value => Done::verified(did),
             Ok(now) => Done::unverified(
-                format!("set {what}"),
+                did,
                 &format!(
                     "it reads back as {} characters, not the {} sent",
                     now.chars().count(),
                     value.chars().count()
                 ),
             ),
-            Err(_) => Done::unverified(format!("set {what}"), "its value could not be read back"),
+            Err(_) => Done::unverified(did, "its value could not be read back"),
         });
     }
     if let Ok(pattern) = element.get_pattern::<UILegacyIAccessiblePattern>() {
         if pattern.set_value(value).is_ok() {
             return Ok(Done::unverified(
-                format!("set {what}"),
+                did,
                 "set through the legacy accessibility interface, which cannot be read back",
             ));
         }

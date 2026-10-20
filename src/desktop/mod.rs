@@ -49,6 +49,9 @@ pub mod linux;
 pub(crate) mod macos;
 #[cfg(windows)]
 mod win32;
+// Pure, so its tests run on every platform; only Linux uses it.
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) mod x11;
 
 /// Why a desktop query could not be answered.
 ///

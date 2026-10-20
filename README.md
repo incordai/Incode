@@ -126,6 +126,20 @@ The design is in `docs/ARCHITECTURE.md`; the tool layer is its §5a and §5b.
 - **Rust 1.88+** to build — the highest `rust-version` any locked dependency
   declares. It is set in `Cargo.toml`, so cargo refuses an older toolchain by
   name.
+- **On Linux, system development packages** to build. Measured by building
+  on a clean Debian 13 image; the same names install on Ubuntu 24.04:
+
+  ```sh
+  sudo apt install pkg-config libssl-dev \
+    libclang-dev libwayland-dev libegl-dev libgbm-dev libpipewire-0.3-dev libxcb1-dev
+  ```
+
+  The first line is for HTTPS. The second is the screen-capture library's,
+  for computer use: it builds a Wayland and PipeWire backend even though
+  incode drives X11 only. A server that never runs computer use can skip it
+  by building without the `desktop-capture` feature (see [Install](#install));
+  the binary then also runs without `libgbm`, `libwayland-client` and
+  `libxcb` installed.
 - **At least one coding agent CLI**, installed and logged in: `claude`, `codex`
   or `agy`. `/doctor` names what it found and what is missing. `gemini`,
   `opencode` and `cursor` are detected but not driven.
@@ -161,7 +175,15 @@ Copy-Item target\release\incode.exe $env:USERPROFILE\.local\bin\
 
 Each Outline language is a default cargo feature (`lang-rust`, `lang-ts`,
 `lang-python`, `lang-go`, `lang-js`); build with `--no-default-features` and a
-subset to drop grammars.
+subset to drop grammars. Screen capture for computer use is the default
+feature `desktop-capture`; leaving it out (on a server that never drives a
+desktop) drops the Linux Wayland/PipeWire build dependencies, and every
+screenshot is then refused by name:
+
+```sh
+cargo build --release --no-default-features \
+  --features lang-rust,lang-ts,lang-python,lang-go,lang-js
+```
 
 ## Quick start
 
@@ -577,7 +599,7 @@ your `desktop_hooks`.
 |---|---|---|---|
 | Windows | `SendInput` | UI Automation | Works in the logged-in session. **It drives your own desktop**: while it runs, do not use the mouse or keyboard, or your input and the agent's interleave. |
 | macOS | CGEvent | AXUIElement | Needs the **Accessibility** and **Screen Recording** grants for the binary that runs, and a logged-in graphical session. Over SSH there is no window-server access and posted events vanish silently, so incode refuses to start there instead. `screen_info` reports any missing grant by name. Coordinates are in **points**. |
-| Linux | X11 (XTEST) | AT-SPI2 over D-Bus | X11 only, not Wayland. `desktop_display` names the display: `":N"` attaches to a running one, `"xvfb"` or `"xvfb:1280x800"` starts a private Xvfb that ends with the server. Unset is a refusal; `$DISPLAY`, your own desktop, is never used. Only applications whose own `DISPLAY` is that display are seen. |
+| Linux | X11 (XTEST) | AT-SPI2 over D-Bus | X11 only, not Wayland. `desktop_display` names the display: `":N"` attaches to a running one, `"xvfb"` or `"xvfb:1280x800"` starts a private Xvfb that ends with the server. Unset is a refusal; `$DISPLAY`, your own desktop, is never used. Only applications whose own `DISPLAY` is that display are seen. A window with no accessibility tree (xterm, or any program without an AT-SPI bridge) is listed from the X server with `"tree": false` and an `x11:0x…` id, so it can still be focused, pictured and clicked. |
 
 GTK 4 (measured on 4.18.6) reports every control at the window's corner. Its
 tree comes back with a note saying so: `set_value` and `element_action` work
@@ -589,8 +611,8 @@ plain screenshots and pixel clicks still work.
 | Tool | What it does |
 |---|---|
 | `screen_info` | Displays, their sizes and scale, and on macOS any missing grant. |
-| `list_windows` | The open windows: `id`, title, app, pid, focused, rectangle. A blocked app's window is listed without its title. |
-| `ui_tree` | One window's controls as `[e<id>] Role "name" (x,y,w×h)`, with `password` on secret fields. `window` picks the window (default: the focused one); `depth` limits the walk. |
+| `list_windows` | The open windows: `id`, title, app, pid, focused, rectangle, and `tree` (false when the window exposes no accessibility tree). A blocked app's window is listed without its title. |
+| `ui_tree` | One window's controls as `[e<id>] Role "name" (x,y,w×h)`, with `password` on secret fields. `window` picks the window (default: the focused one); `depth` limits the walk. Controls at no place on screen are counted on one line, not listed. A window with no tree is refused with a pointer to `screenshot` and `click`. |
 | `screenshot` | The primary display, or one `window`. The reply carries the region and origin, so a point in the picture maps back to the screen. |
 | `cursor_position` | Where the pointer is. |
 | `click_element` | Click a control by id, at its centre as it is *now*. |

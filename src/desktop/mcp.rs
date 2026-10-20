@@ -651,6 +651,7 @@ impl Server {
                             "pid": w.pid,
                             "focused": w.focused,
                             "rect": w.rect,
+                            "tree": w.has_tree,
                         }),
                     })
                     .collect();
@@ -1092,9 +1093,11 @@ fn base_definitions() -> Vec<Value> {
         json!({
             "name": "list_windows",
             "description": format!(
-                "Every top-level window: id, title, app, pid, whether it is focused, and its \
-                 rectangle. Pass an id as `window` to ui_tree, screenshot and the actions to \
-                 work on that window rather than whichever has focus. Windows of blocked \
+                "Every top-level window: id, title, app, pid, whether it is focused, its \
+                 rectangle, and `tree` — false when the window exposes no accessibility tree, \
+                 so ui_tree has nothing to show and screenshot + click are the way in. Pass an \
+                 id as `window` to ui_tree, screenshot and the actions to work on that window \
+                 rather than whichever has focus. Windows of blocked \
                  applications (password managers) are listed as blocked, without a title. \
                  {UNTRUSTED}"
             ),

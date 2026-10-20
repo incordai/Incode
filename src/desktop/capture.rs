@@ -18,16 +18,27 @@
 //! Everything here is downstream of [`super::coords`], which owns the actual
 //! mapping arithmetic. This module decides *what* to capture and how to encode
 //! it; it does not do geometry of its own.
+//!
+//! # Built without capture
+//!
+//! The capture library is the `desktop-capture` cargo feature, on by default.
+//! On Linux it links Wayland, GBM, EGL and PipeWire — even though this crate
+//! drives X11 only — so a server that never runs computer use can be built
+//! without those libraries. Such a build answers every capture with a refusal
+//! that names the feature, rather than an empty or invented display.
 
 use std::io::Cursor;
 
 use image::codecs::jpeg::JpegEncoder;
 use image::{ExtendedColorType, ImageEncoder, ImageFormat, RgbaImage};
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "desktop-capture")]
 use xcap::Monitor;
 
 use super::coords::{PhysicalPoint, ViewTransform};
-use super::{dpi, DesktopError, Rect};
+#[cfg(feature = "desktop-capture")]
+use super::dpi;
+use super::{DesktopError, Rect};
 
 /// How a screenshot is encoded on the way to the model.
 ///
@@ -100,19 +111,24 @@ impl Screenshot {
     }
 }
 
-/// Capture the primary display.
+/// Capture the primary display — or the first, when none says it is primary
+/// (a lone Xvfb screen does not).
+#[cfg(feature = "desktop-capture")]
 pub fn capture_primary(options: CaptureOptions) -> Result<Screenshot, DesktopError> {
     let monitors = all_monitors()?;
-    let monitor = monitors
+    let index = monitors
         .iter()
-        .find(|m| m.is_primary().unwrap_or(false))
-        .or_else(|| monitors.first())
+        .position(|m| m.is_primary().unwrap_or(false))
+        .unwrap_or(0);
+    let monitor = monitors
+        .get(index)
         .ok_or_else(|| DesktopError::Os("no displays are attached to this session".to_string()))?;
 
-    capture(monitor, options)
+    capture(monitor, index, options)
 }
 
 /// Capture one display by the id [`super::screen_info`] reported.
+#[cfg(feature = "desktop-capture")]
 pub fn capture_monitor(
     monitor_id: u32,
     options: CaptureOptions,
@@ -122,7 +138,7 @@ pub fn capture_monitor(
         .get(monitor_id as usize)
         .ok_or_else(|| DesktopError::Os(format!("no display with id {monitor_id}")))?;
 
-    capture(monitor, options)
+    capture(monitor, monitor_id as usize, options)
 }
 
 /// Capture one region of the desktop — a window's rectangle — from the
@@ -132,6 +148,7 @@ pub fn capture_monitor(
 /// tree use), clipped to that display. What is IN FRONT of the window is
 /// captured with it: this is a crop of the screen, not the window's own
 /// buffer, so the caller brings the window forward first when it matters.
+#[cfg(feature = "desktop-capture")]
 pub fn capture_region(region: Rect, options: CaptureOptions) -> Result<Screenshot, DesktopError> {
     let monitors = all_monitors()?;
     let (cx, cy) = region.center();
@@ -139,7 +156,7 @@ pub fn capture_region(region: Rect, options: CaptureOptions) -> Result<Screensho
         DesktopError::Os(format!("could not read a display's {what}: {e}"))
     };
     let mut chosen = None;
-    for monitor in &monitors {
+    for (index, monitor) in monitors.iter().enumerate() {
         let (x, y) = (
             monitor.x().map_err(|e| read("x", e))?,
             monitor.y().map_err(|e| read("y", e))?,
@@ -150,6 +167,7 @@ pub fn capture_region(region: Rect, options: CaptureOptions) -> Result<Screensho
         );
         if cx >= x && cx < x + w && cy >= y && cy < y + h {
             chosen = Some((
+                index,
                 monitor,
                 Rect {
                     x,
@@ -161,15 +179,16 @@ pub fn capture_region(region: Rect, options: CaptureOptions) -> Result<Screensho
             break;
         }
     }
-    let (monitor, screen) = chosen.ok_or_else(|| {
+    let (index, monitor, screen) = chosen.ok_or_else(|| {
         DesktopError::Os(format!(
             "the window at ({},{}) {}x{} is not on any display",
             region.x, region.y, region.width, region.height
         ))
     })?;
-    let id = monitor
-        .id()
-        .map_err(|e| DesktopError::Os(format!("could not read a display's id: {e}")))?;
+    // The id screen_info gives this display: its place in the list. The
+    // library's own id (an X11 RandR output, a Windows handle) is a number
+    // nothing else in the tool surface uses.
+    let id = index as u32;
 
     // The part of the region that is on this display, in desktop units.
     let left = region.x.max(screen.x);
@@ -232,12 +251,15 @@ pub fn capture_region(region: Rect, options: CaptureOptions) -> Result<Screensho
 ///
 /// The library reports no reserved areas (menu bar, dock, panels), so the
 /// work area is the whole display there.
+#[cfg(feature = "desktop-capture")]
 #[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn monitor_infos() -> Result<Vec<super::MonitorInfo>, DesktopError> {
     let read = |what: &str, i: usize, e: xcap::XCapError| {
         DesktopError::Os(format!("could not read display {i}'s {what}: {e}"))
     };
-    all_monitors()?
+    let monitors = all_monitors()?;
+    let count = monitors.len();
+    monitors
         .iter()
         .enumerate()
         .map(|(i, m)| {
@@ -255,12 +277,22 @@ pub(crate) fn monitor_infos() -> Result<Vec<super::MonitorInfo>, DesktopError> {
                 work_area: rect,
                 dpi: (96.0 * scale).round() as u32,
                 scale,
-                primary: m.is_primary().unwrap_or(false),
+                primary: is_primary(m.is_primary().unwrap_or(false), count),
             })
         })
         .collect()
 }
 
+/// Whether a display is the primary one: what the OS says, or the only
+/// display there is. A lone Xvfb screen reports no primary (measured:
+/// `"primary": false`), yet it is the one every unqualified screenshot
+/// captures. Among several displays none is guessed at. Pure.
+#[cfg(any(test, feature = "desktop-capture"))]
+fn is_primary(reported: bool, displays: usize) -> bool {
+    reported || displays == 1
+}
+
+#[cfg(feature = "desktop-capture")]
 fn all_monitors() -> Result<Vec<Monitor>, DesktopError> {
     // BEFORE the enumeration, not merely before the capture: xcap reads process
     // awareness while it works, so a late call would leave part of this answer
@@ -270,10 +302,15 @@ fn all_monitors() -> Result<Vec<Monitor>, DesktopError> {
     Monitor::all().map_err(|e| DesktopError::Os(format!("could not enumerate displays: {e}")))
 }
 
-fn capture(monitor: &Monitor, options: CaptureOptions) -> Result<Screenshot, DesktopError> {
-    let id = monitor
-        .id()
-        .map_err(|e| DesktopError::Os(format!("could not read a display's id: {e}")))?;
+/// `index` is the display's place in the list, which is the id
+/// `screen_info` reports for it; the library's own id is not shown.
+#[cfg(feature = "desktop-capture")]
+fn capture(
+    monitor: &Monitor,
+    index: usize,
+    options: CaptureOptions,
+) -> Result<Screenshot, DesktopError> {
+    let id = index as u32;
     let name = monitor.name().unwrap_or_else(|_| String::new());
     let origin_x = monitor
         .x()
@@ -333,6 +370,35 @@ fn capture(monitor: &Monitor, options: CaptureOptions) -> Result<Screenshot, Des
     })
 }
 
+/// What every capture answers in a build without the capture library.
+#[cfg(not(feature = "desktop-capture"))]
+fn not_built() -> DesktopError {
+    DesktopError::Os(
+        "this incode was built without screen capture (the `desktop-capture` cargo feature), so \
+         it has no screenshots and no display list. Rebuild with default features to have them; \
+         the accessibility tree and input do not need it."
+            .to_string(),
+    )
+}
+
+#[cfg(not(feature = "desktop-capture"))]
+pub fn capture_primary(_options: CaptureOptions) -> Result<Screenshot, DesktopError> {
+    Err(not_built())
+}
+
+#[cfg(not(feature = "desktop-capture"))]
+pub fn capture_region(_region: Rect, _options: CaptureOptions) -> Result<Screenshot, DesktopError> {
+    Err(not_built())
+}
+
+#[cfg(all(
+    not(feature = "desktop-capture"),
+    any(target_os = "macos", target_os = "linux")
+))]
+pub(crate) fn monitor_infos() -> Result<Vec<super::MonitorInfo>, DesktopError> {
+    Err(not_built())
+}
+
 /// How an image of a display maps back onto the desktop.
 ///
 /// The REGION is the display in desktop units — what the OS's monitor API
@@ -344,6 +410,7 @@ fn capture(monitor: &Monitor, options: CaptureOptions) -> Result<Screenshot, Des
 /// display's corner.
 ///
 /// Pure, so the arithmetic is tested without a screen.
+#[cfg(any(test, feature = "desktop-capture"))]
 pub(crate) fn desktop_view(
     origin: PhysicalPoint,
     (desktop_width, desktop_height): (u32, u32),
@@ -577,7 +644,20 @@ mod tests {
         );
     }
 
-    #[cfg(windows)]
+    /// **A LONE DISPLAY IS THE PRIMARY ONE.** Xvfb reports its only screen as
+    /// not primary; screen_info must still name the display an unqualified
+    /// screenshot captures. Among several, an unreported primary stays
+    /// unreported rather than guessed.
+    #[test]
+    fn a_lone_display_is_primary_and_several_are_not_guessed() {
+        assert!(is_primary(false, 1), "the only display there is");
+        assert!(is_primary(true, 1));
+        assert!(is_primary(true, 3));
+        assert!(!is_primary(false, 2), "one of two is not guessed at");
+        assert!(!is_primary(false, 0));
+    }
+
+    #[cfg(all(windows, feature = "desktop-capture"))]
     mod live {
         use super::*;
         use crate::desktop::screen_info;
