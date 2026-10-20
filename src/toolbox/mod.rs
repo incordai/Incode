@@ -234,6 +234,49 @@ pub struct SessionTools {
     allowed: Arc<AllowedWrites>,
 }
 
+/// Starts servers into a session after it opened — a project's server the
+/// person approved once the session was answered. Holds the session's servers
+/// weakly: once the session is gone it starts nothing.
+#[derive(Clone)]
+pub(crate) struct LateServers {
+    client: std::sync::Weak<RwLock<client_servers::ClientServers>>,
+    filter_env: bool,
+}
+
+impl LateServers {
+    /// Whether the session is still there to start servers into.
+    pub(crate) fn is_open(&self) -> bool {
+        self.client.strong_count() > 0
+    }
+
+    /// [`SessionTools::connect_client_servers`] for servers named late: the
+    /// administrator's `[mcp]` lists applied, each started in the
+    /// background, a line returned for each.
+    pub(crate) fn connect(
+        &self,
+        specs: Vec<ServerSpec>,
+        cwd: &Path,
+        on_connected: &OnConnected,
+    ) -> Vec<String> {
+        let (specs, mut said) = crate::mcp_config::apply_managed_policy(
+            &crate::permissions::managed::mcp_policy(),
+            specs,
+        );
+        let Some(client) = self.client.upgrade() else {
+            return said;
+        };
+        said.extend(client_servers::ClientServers::add_in_background(
+            &client,
+            specs,
+            cwd,
+            self.filter_env,
+            client_servers::Bounds::DEFAULT,
+            on_connected,
+        ));
+        said
+    }
+}
+
 /// The protected files a person allowed to be written, by
 /// [`crate::guards::file_key`], until the turn that watches them takes them.
 #[derive(Default)]
@@ -324,6 +367,15 @@ impl SessionTools {
             on_connected,
         ));
         said
+    }
+
+    /// A handle that starts more servers into this session's after its own
+    /// were started, from any thread, for as long as the session lasts.
+    pub(crate) fn late_servers(&self) -> LateServers {
+        LateServers {
+            client: Arc::downgrade(&self.client),
+            filter_env: self.filter_env,
+        }
     }
 
     /// The client's servers started and still connecting, by name — for the

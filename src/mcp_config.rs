@@ -41,8 +41,11 @@
 //! (type, command, args, env, url, headers — as written, before expansion).
 //! Approvals are kept in `~/.incode/mcp-approvals.json`; a repository that
 //! changes its server's command needs approving again. The REPL asks at
-//! start; elsewhere (`-t`, `--acp`) an unapproved server is skipped, with the
-//! command that approves it: `incode mcp approve <name>`. The user's own
+//! start; `--acp` asks the client once the session is open
+//! (`session/request_permission`: allow once, allow always, reject — see
+//! `acp_agent::permission`). Under `-t`, or when the client cannot answer, an
+//! unapproved server is skipped, with the command that approves it:
+//! `incode mcp approve <name>`. The user's own
 //! `~/.incode/mcp.json` needs no approval — the user wrote it.
 //!
 //! A project's server overrides the user's of the same name, and still needs
@@ -440,45 +443,89 @@ pub(crate) fn session_servers(
     data_dir: &Path,
     ask: Option<Asker<'_>>,
 ) -> (Vec<ServerSpec>, Vec<String>) {
+    let (specs, mut said, unapproved) = session_servers_asking_later(workspace, data_dir, ask);
+    said.extend(
+        unapproved
+            .iter()
+            .map(|server| not_approved(&server.name, &server.entry)),
+    );
+    (specs, said)
+}
+
+/// [`session_servers`], with the project servers not yet approved — and not
+/// asked about, with no `ask` — handed back instead of said: for a caller
+/// that asks about them once the session is open (`--acp`).
+pub(crate) fn session_servers_asking_later(
+    workspace: &Path,
+    data_dir: &Path,
+    ask: Option<Asker<'_>>,
+) -> (Vec<ServerSpec>, Vec<String>, Vec<Configured>) {
     let (servers, mut said) = configured(workspace, data_dir);
     let mut specs = Vec::new();
+    let mut unapproved = Vec::new();
     for server in servers {
-        let Configured { name, scope, entry } = server;
-        if scope == Scope::Project && !is_approved(data_dir, &name, &entry) {
+        if server.scope == Scope::Project && !is_approved(data_dir, &server.name, &server.entry) {
             match ask {
-                Some(ask) if ask(&name, &entry) => {
-                    if let Err(why) = approve(data_dir, &name, &entry) {
-                        said.push(format!(
-                            "MCP server `{name}` approved for this session only: {why}"
-                        ));
+                Some(ask) if ask(&server.name, &server.entry) => {
+                    if let Err(why) = approve(data_dir, &server.name, &server.entry) {
+                        said.push(approved_once(&server.name, &why));
                     }
                 }
                 Some(_) => {
-                    said.push(format!(
-                        "MCP server `{name}` from {PROJECT_FILE} was not approved and is not \
-                         started"
-                    ));
+                    said.push(refused(&server.name));
                     continue;
                 }
                 None => {
-                    said.push(format!(
-                        "MCP server `{name}` from {PROJECT_FILE} is not started: it has not \
-                         been approved. `incode mcp approve {name}` approves it ({})",
-                        entry.summary()
-                    ));
+                    unapproved.push(server);
                     continue;
                 }
             }
         }
-        match entry.to_spec(&name, &from_env) {
+        match server.spec() {
             Ok(spec) => specs.push(spec),
-            Err(why) => said.push(format!(
-                "MCP server `{name}` ({} settings) is not started: {why}",
-                scope.as_str()
-            )),
+            Err(why) => said.push(why),
         }
     }
-    (specs, said)
+    (specs, said, unapproved)
+}
+
+impl Configured {
+    /// This server as the toolbox connects it, or why it cannot start.
+    ///
+    /// # Errors
+    ///
+    /// It names no command or url for its type, or a variable is unset.
+    pub(crate) fn spec(&self) -> Result<ServerSpec, String> {
+        self.entry.to_spec(&self.name, &from_env).map_err(|why| {
+            format!(
+                "MCP server `{}` ({} settings) is not started: {why}",
+                self.name,
+                self.scope.as_str()
+            )
+        })
+    }
+}
+
+/// What is said of a project server skipped for want of an approval.
+#[must_use]
+pub(crate) fn not_approved(name: &str, entry: &ServerEntry) -> String {
+    format!(
+        "MCP server `{name}` from {PROJECT_FILE} is not started: it has not been approved. \
+         `incode mcp approve {name}` approves it ({})",
+        entry.summary()
+    )
+}
+
+/// What is said of a project server the person refused.
+#[must_use]
+pub(crate) fn refused(name: &str) -> String {
+    format!("MCP server `{name}` from {PROJECT_FILE} was not approved and is not started")
+}
+
+/// What is said when an approval could not be remembered.
+#[must_use]
+pub(crate) fn approved_once(name: &str, why: &str) -> String {
+    format!("MCP server `{name}` approved for this session only: {why}")
 }
 
 /// `specs` less those the administrator's `[mcp]` lists refuse, and a line

@@ -48,7 +48,9 @@
 //!
 //! - `session/request_permission` — when the memory engine says a call on
 //!   incode's own tools needs a person ([`permission`]). The client's response
-//!   comes back on the reader and is handed to the waiting turn.
+//!   comes back on the reader and is handed to the waiting turn. Also, once a
+//!   session is answered, for each project `.mcp.json` server not yet
+//!   approved — allow once, allow always or reject — from a thread of its own.
 //!
 //! # Threads
 //!
@@ -1025,17 +1027,18 @@ fn drive<F: SessionFactory>(
     let (tools, about_tools) = factory.tool_servers();
     specs.extend(tools);
     connected.extend(about_tools);
-    // `.mcp.json` and `~/.incode/mcp.json`. The protocol has no way to ask
-    // about a project's server, so only approved ones start.
-    let (from_files, about_files) =
-        crate::mcp_config::session_servers(&workspace, &factory.data_dir(), None);
+    // `.mcp.json` and `~/.incode/mcp.json`. A project's server nobody has
+    // approved yet is asked about once the session is answered, below.
+    let (from_files, about_files, unapproved) =
+        crate::mcp_config::session_servers_asking_later(&workspace, &factory.data_dir(), None);
     specs.extend(from_files);
     connected.extend(about_files);
     let later: Arc<Mutex<Later>> = Arc::default();
+    let on_connected = connected_later(outbox, session_id, shared, &later);
     connected.extend(session.session_tools().connect_client_servers(
         specs,
         &workspace,
-        &connected_later(outbox, session_id, shared, &later),
+        &on_connected,
     ));
     for line in &connected {
         eprintln!("incode acp: {line}");
@@ -1087,6 +1090,17 @@ fn drive<F: SessionFactory>(
     say(acp::SessionUpdate::AvailableCommandsUpdate(
         acp::AvailableCommandsUpdate::new(commands::available()),
     ));
+    // After the answer too: the client is asked about the session it knows.
+    // Not waited for — each one allowed connects in the background.
+    permission::ServerApprovals {
+        outbox: Arc::clone(outbox),
+        session: session_id.clone(),
+        workspace: held.workspace.clone(),
+        data_dir: factory.data_dir(),
+        late: held.session.session_tools().late_servers(),
+        said: on_connected,
+    }
+    .ask_in_background(unapproved);
     if !connected.is_empty() {
         say(acp::SessionUpdate::AgentMessageChunk(
             acp::ContentChunk::new(acp::ContentBlock::from(format!(
@@ -2135,6 +2149,11 @@ mod tests {
         pub(super) fn call(&mut self, method: &str, params: Value) -> Value {
             let id = self.request(method, params);
             self.until_response(id).1
+        }
+
+        /// The sessions' settings directory: where approvals are kept.
+        pub(super) fn data_dir(&self) -> &Path {
+            self._data_dir.path()
         }
 
         pub(super) fn open_session(&mut self, cwd: &Path) -> String {

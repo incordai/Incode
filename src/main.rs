@@ -19,7 +19,7 @@ USAGE:
     incode update [--check]   Install the latest release over this program
                               (sha256 checked); --check only reports it
     incode review [--base <REF>] [-p]   Review the current change (see `incode review -h`)
-    incode plugin list | add <git-url | path> [--project] | remove <name> [--project]
+    incode plugin list | add <git-url | path> | update [name] | remove <name>   [--project]
     incode mcp <list|get|add|remove|approve> ...   (see `incode mcp help`)
 
 OPTIONS:
