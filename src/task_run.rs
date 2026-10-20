@@ -271,24 +271,32 @@ impl Report {
 /// As [`run_task_with_model`]; and, for a JSON format, when stdout cannot be
 /// taken for it. A JSON run's `result` line says the same error.
 ///
-/// `created` is what the process wrote outside the workspace before the run —
-/// the shipped sub-agent definitions on a first run — for the `init` event.
-///
-/// `command_tools`, when not empty, are a custom command's `allowed-tools`:
-/// the run is held to them ([`crate::custom_commands`]).
+/// `options` are what a caller may also set; [`RunOptions::default`] is none
+/// of them.
 pub fn run_task_as(
     workspace: &Path,
     instruction: &str,
     model: Option<&str>,
-    command_tools: &[String],
     format: OutputFormat,
     spec_gate: crate::spec::SpecGate,
-    created: &[std::path::PathBuf],
+    options: &RunOptions<'_>,
 ) -> Result<String, String> {
+    let RunOptions {
+        command_tools,
+        permission_mode,
+        created,
+    } = *options;
     crate::spec::set_for_this_run(spec_gate);
     if format == OutputFormat::Text {
         let mut report = Report::text();
-        let ran = run_task_reporting(workspace, instruction, model, command_tools, &mut report);
+        let ran = run_task_reporting(
+            workspace,
+            instruction,
+            model,
+            command_tools,
+            permission_mode,
+            &mut report,
+        );
         // The run's spend, once, at the end: the per-event lines above it are
         // each one request, and the question afterwards is what it all cost.
         if let Some(line) = report.cost_line() {
@@ -305,9 +313,29 @@ pub fn run_task_as(
         .map(|path| path.to_string_lossy().into_owned())
         .collect();
     let began = std::time::Instant::now();
-    let ran = run_task_reporting(workspace, instruction, model, command_tools, &mut report);
+    let ran = run_task_reporting(
+        workspace,
+        instruction,
+        model,
+        command_tools,
+        permission_mode,
+        &mut report,
+    );
     report.finish(&ran, began.elapsed());
     ran
+}
+
+/// The parts of a run most callers leave alone.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RunOptions<'a> {
+    /// A custom command's `allowed-tools`, when not empty: the run is held to
+    /// them ([`crate::custom_commands`]).
+    pub command_tools: &'a [String],
+    /// `-p`, when given: what every candidate agent may do.
+    pub permission_mode: Option<crate::permissions::PermissionMode>,
+    /// What the process wrote outside the workspace before the run — the
+    /// shipped sub-agent definitions on a first run — for the `init` event.
+    pub created: &'a [std::path::PathBuf],
 }
 
 /// Run one instruction through an installed agent and report what happened.
@@ -328,7 +356,14 @@ pub fn run_task_with_model(
     instruction: &str,
     model: Option<&str>,
 ) -> Result<String, String> {
-    run_task_reporting(workspace, instruction, model, &[], &mut Report::text())
+    run_task_reporting(
+        workspace,
+        instruction,
+        model,
+        &[],
+        None,
+        &mut Report::text(),
+    )
 }
 
 /// The run itself, telling `report` what happens.
@@ -337,6 +372,7 @@ fn run_task_reporting(
     instruction: &str,
     model: Option<&str>,
     command_tools: &[String],
+    permission_mode: Option<crate::permissions::PermissionMode>,
     report: &mut Report,
 ) -> Result<String, String> {
     if instruction.trim().is_empty() {
@@ -418,6 +454,7 @@ fn run_task_reporting(
         system: &system,
         tools: &tools,
         command_tools,
+        permission_mode,
     };
     let ran = drive(&task, &mut memory, report);
     memory.end("other");
@@ -488,6 +525,8 @@ struct Task<'a> {
     tools: &'a std::sync::Arc<crate::toolbox::SessionTools>,
     /// The custom command's `allowed-tools` the run is held to, if any.
     command_tools: &'a [String],
+    /// `-p`, when given: applied to every candidate agent.
+    permission_mode: Option<crate::permissions::PermissionMode>,
 }
 
 /// The instruction, through each usable agent in turn until one runs it.
@@ -528,6 +567,7 @@ fn drive(
         system,
         tools,
         command_tools,
+        permission_mode,
     } = *task;
     // WHICH ROUTE, and the CLI requirement belongs INSIDE the choice.
     //
@@ -587,8 +627,10 @@ fn drive(
                         .with_code_edits(crate::toolbox::CodeEdits::locate())
                         .with_operator_hooks(crate::hooks::HookRunner::from_settings())
                         .with_sandbox(
-                            crate::admin::AdminConfig::load_default()
-                                .sandbox_policy(crate::permissions::PermissionMode::WorkspaceWrite),
+                            crate::admin::AdminConfig::load_default().sandbox_policy(
+                                permission_mode
+                                    .unwrap_or(crate::permissions::PermissionMode::WorkspaceWrite),
+                            ),
                         )
                         .with_tool_allowlist(allowed_tools()),
                     ),
@@ -612,6 +654,11 @@ fn drive(
         // The run's one set of session tools, holding the external tools'
         // servers, is every candidate's.
         backend.share_session_tools(std::sync::Arc::clone(tools));
+        // `-p`: what the agent may do, decided by the agent's own mode on a
+        // CLI route and by the toolbox on the API route.
+        if let Some(mode) = permission_mode {
+            backend.set_permission_mode(mode.agent_mode());
+        }
         if !command_tools.is_empty() && !backend.runs_tools_here() {
             outln!(
                 "  · {}",

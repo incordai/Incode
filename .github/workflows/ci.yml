@@ -27,6 +27,23 @@ jobs:
           components: rustfmt
       - run: cargo fmt --check
 
+  # The SDKs and the VS Code extension, against their fake incode/agent.
+  sdk-and-editor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python3 -m unittest discover sdk/python/tests
+      - run: npm ci && npm test
+        working-directory: sdk/typescript
+      - run: npm ci && npm run compile && npm test
+        working-directory: editors/vscode
+
   test:
     name: test (${{ matrix.os }})
     strategy:

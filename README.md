@@ -538,7 +538,8 @@ Prices for `/cost`, the status line and `-t --output-format json` (`cost_usd`) a
 
 `incode review` (and `/review` in a session) hands the model the change and
 one job: report correctness bugs first, then security problems, then
-simplifications, each cited as `path:line` — or say "No issues found."
+simplifications, each cited as `path:line` — or say "No issues found." It
+runs read-only: the agent may read the code and run nothing that writes.
 
 ```sh
 incode review                     # the branch since it forked from origin's default branch, plus uncommitted and untracked work

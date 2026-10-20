@@ -340,12 +340,15 @@ pub fn run(
             workspace,
             &ask,
             model,
-            &[],
             crate::task_run::OutputFormat::Text,
             // A review writes nothing, so the intake the spec gate asks for
             // would only steer the model away from the diff.
             crate::spec::SpecGate::Off,
-            &[],
+            // A review reads; it never writes.
+            &crate::task_run::RunOptions {
+                permission_mode: Some(crate::permissions::PermissionMode::ReadOnly),
+                ..Default::default()
+            },
         )
         .map(|_| ());
     }
@@ -357,10 +360,13 @@ pub fn run(
         workspace,
         &ask,
         model,
-        &[],
         crate::task_run::OutputFormat::Text,
         crate::spec::SpecGate::Off,
-        &[],
+        // A review reads; it never writes.
+        &crate::task_run::RunOptions {
+            permission_mode: Some(crate::permissions::PermissionMode::ReadOnly),
+            ..Default::default()
+        },
     )?;
     let mut out = claimed.output;
     std::io::Write::write_all(&mut out, findings.trim().as_bytes())

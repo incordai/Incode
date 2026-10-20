@@ -32,7 +32,7 @@ an email (`git config --global user.name ...`, `user.email ...`).
 | rust | `cargo fmt --all -- --check` · `cargo clippy --all-targets -- -D warnings` · `cargo test --lib` · `cargo test --bins` | incode itself: about 2,100 library and 50 binary tests |
 | rust | `cargo test --test sbx_engine` | Real shell commands run under `sandbox_engine = "sbx"`: a write outside the workspace refused (with an unconfined control), a planted git hook undone, `GIT_DIR` stripped. Linux; says it skipped elsewhere |
 | sbx | `cargo clippy -p incord-sandbox --all-targets -- -D warnings` · `cargo test -p incord-sandbox` | The standalone sandbox: escape tests per OS, the MCP server, `.git` protection, WSL path translation |
-| python | `python3 -m unittest discover -s sdk/python/tests -t sdk/python` | The Python SDK, against a fake incode |
+| python | `python3 -m unittest discover sdk/python/tests` | The Python SDK, against a fake incode |
 | ts | `cd sdk/typescript && npm install && npm test` | The TypeScript SDK, against the same fake |
 | vscode | `cd editors/vscode && npm install && npm run compile && npm test` | The VS Code extension's ACP client, against a fake agent |
 

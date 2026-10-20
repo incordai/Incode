@@ -13,9 +13,9 @@
 //! # Methods answered
 //!
 //! - `initialize` — protocol version 1, and the capabilities incode really
-//!   has: text and embedded-context prompts, loading and listing sessions,
-//!   and stdio MCP servers from the client (no HTTP or SSE ones). No
-//!   authentication methods.
+//!   has: text, image and embedded-context prompts, loading and listing
+//!   sessions, and stdio and HTTP MCP servers from the client (no SSE ones).
+//!   No authentication methods.
 //! - `authenticate` — refused as invalid params: the method id must be one
 //!   `initialize` advertised, and none is. The subscription CLIs hold their
 //!   own logins.

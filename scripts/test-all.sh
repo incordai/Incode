@@ -60,7 +60,7 @@ fi
 
 if wants python; then
     if have python3 && [ -d sdk/python ]; then
-        step python python3 -m unittest discover -s sdk/python/tests -t sdk/python
+        step python python3 -m unittest discover sdk/python/tests
     else
         skipped="$skipped python"
     fi

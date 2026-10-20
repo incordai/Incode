@@ -58,10 +58,11 @@ an SDK at it with `incode_path=[sys.executable, ".../fake_incode.py"]` /
 
 ## Things to know about incode itself
 
-- `-p` is accepted with `-t` but not applied (the one-shot run ignores it).
-- An error found before the run starts (bad `-w`, bad `-p`) prints nothing on
-  stdout even with `--output-format json`: only stderr and exit code 1. The SDKs
-  raise `IncodeError` with that stderr.
+- `-p` with `-t` sets what every candidate agent may do (`read-only`, `workspace-write`, ...).
+- An error found before the run starts (bad `-w`, bad `-p`) still prints one
+  result object with `--output-format json` (`{"type": "result", "is_error":
+  true, "error": ...}`) and exits 1; the SDKs raise `TaskFailed` with it, or
+  `IncodeError` with stderr from an older incode that printed nothing.
 - `session/update` notifications are per session, not per prompt. incode sends
   `available_commands_update` just *after* answering `session/new`, so a prompt
   sent at once can see it in its stream.
