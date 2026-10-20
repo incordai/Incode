@@ -592,8 +592,14 @@ session). `${INCODE_PLUGIN_ROOT}` in a hook or server is the plugin's folder.
 incode plugin list
 incode plugin add https://github.com/you/incode-web-plugin   # git clone --depth 1
 incode plugin add ./my-plugin --project                      # copied into .incode/plugins/
+incode plugin update [web]                                   # fetch again; no name: all
 incode plugin remove web
 ```
+
+`add` records where a plugin came from (`.incode-source` in its folder), and
+`update` fetches it again the same way — a fresh clone of the git URL or a
+fresh copy of the folder — then swaps it in, printing the old and new
+`version`. An update whose `plugin.toml` names a different plugin is refused.
 
 A plugin's hooks and servers run with your authority; install only what you
 would run yourself. Skills and hooks are read for the directory incode was
@@ -747,9 +753,13 @@ incode starts the MCP servers named in a project's `.mcp.json` and in your
   `git clone` can bring one. The REPL asks; approvals are remembered in
   `~/.incode/mcp-approvals.json`, keyed by the server's name and a sha256 of
   its type, command, args, env, url and headers as written — change any of
-  them and it is asked about again. Under `-t` and `--acp` an unapproved
-  server is skipped with the command that approves it. Your own
-  `~/.incode/mcp.json` needs no approval.
+  them and it is asked about again. Under `--acp` the client is asked, once
+  the session is open, with `session/request_permission` (allow once, allow
+  always — remembered like `incode mcp approve` — or reject); the session
+  does not wait, and an allowed server connects in the background. Under
+  `-t`, or when the client cannot answer, an unapproved server is skipped
+  with the command that approves it. Your own `~/.incode/mcp.json` needs no
+  approval.
 
 ```sh
 incode mcp list                       # every server, its scope and status
