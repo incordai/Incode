@@ -51,6 +51,9 @@ jobs:
       matrix:
         os: [windows-latest, macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
+    # A whole run takes under 15 minutes; a test that hangs fails the job
+    # here instead of holding it for GitHub's 6-hour default.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       # The Linux desktop backends (xcap, enigo's x11rb, AT-SPI over zbus)

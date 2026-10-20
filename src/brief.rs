@@ -2460,6 +2460,30 @@ mod tests {
 
     /// Proves the real request path, not just the parsing: a served payload
     /// reaches `check` and resolves to a decision.
+    /// One connection to a fake server, or `None` after 30 seconds. These
+    /// servers are joined while the test holds ENV_LOCK, so a request that
+    /// never comes must end the server rather than hold every env test behind
+    /// it (seen on Windows CI: four tests stuck for 35 minutes).
+    fn accept_within(listener: &std::net::TcpListener) -> Option<std::net::TcpStream> {
+        listener.set_nonblocking(true).expect("nonblocking");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            match listener.accept() {
+                Ok((socket, _)) => {
+                    socket.set_nonblocking(false).expect("blocking");
+                    return Some(socket);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() > deadline {
+                        return None;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(e) => panic!("accept: {e}"),
+            }
+        }
+    }
+
     #[test]
     fn a_served_brief_is_read_over_http() {
         use std::io::{Read as _, Write as _};
@@ -2468,7 +2492,9 @@ mod tests {
         let addr = listener.local_addr().expect("addr");
 
         let server = std::thread::spawn(move || {
-            let (mut socket, _) = listener.accept().expect("accept");
+            let Some(mut socket) = accept_within(&listener) else {
+                return;
+            };
             let mut buf = [0u8; 4096];
             let _ = socket.read(&mut buf);
             let body = r#"{"briefs":[{"project":"served-demo","about":"a","goals":"g",
@@ -3048,7 +3074,9 @@ No auth in v1.
         let addr = listener.local_addr().expect("addr");
 
         let server = std::thread::spawn(move || {
-            let (mut socket, _) = listener.accept().expect("accept");
+            let Some(mut socket) = accept_within(&listener) else {
+                return;
+            };
             let mut buf = [0u8; 4096];
             let n = socket.read(&mut buf).expect("read");
             let request = String::from_utf8_lossy(&buf[..n]);
