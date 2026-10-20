@@ -340,6 +340,7 @@ pub fn run(
             workspace,
             &ask,
             model,
+            &[],
             crate::task_run::OutputFormat::Text,
             // A review writes nothing, so the intake the spec gate asks for
             // would only steer the model away from the diff.
@@ -356,6 +357,7 @@ pub fn run(
         workspace,
         &ask,
         model,
+        &[],
         crate::task_run::OutputFormat::Text,
         crate::spec::SpecGate::Off,
         &[],

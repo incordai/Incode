@@ -32,7 +32,9 @@
 //!   list, the diff of each edit that landed and the context window's fill
 //!   stream as `session/update`, and the reply carries the stop reason. A
 //!   prompt that is a slash command runs that command instead ([`commands`]);
-//!   `/run` works the ledger and sends it as the plan ([`run`]).
+//!   `/run` works the ledger and sends it as the plan ([`run`]). One that
+//!   names the operator's own command ([`crate::custom_commands`]) is
+//!   expanded and is the turn, held to the command's `allowed-tools`.
 //! - `session/cancel` — trips the session's cancel token; the pending prompt
 //!   answers `cancelled`.
 //! - `session/set_mode` — `read-only`, `workspace-write` or
@@ -48,7 +50,9 @@
 //!
 //! - `session/request_permission` — when the memory engine says a call on
 //!   incode's own tools needs a person ([`permission`]). The client's response
-//!   comes back on the reader and is handed to the waiting turn.
+//!   comes back on the reader and is handed to the waiting turn. Also, once a
+//!   session is answered, for each project `.mcp.json` server not yet
+//!   approved — allow once, allow always or reject — from a thread of its own.
 //!
 //! # Threads
 //!
@@ -869,6 +873,7 @@ fn server_specs(servers: &[acp::McpServer]) -> (Vec<crate::toolbox::ServerSpec>,
                         .iter()
                         .map(|header| (header.name.clone(), header.value.clone()))
                         .collect(),
+                    oauth: None,
                 },
             }),
             acp::McpServer::Sse(sse) => said.push(format!(
@@ -1025,20 +1030,28 @@ fn drive<F: SessionFactory>(
     let (tools, about_tools) = factory.tool_servers();
     specs.extend(tools);
     connected.extend(about_tools);
-    // `.mcp.json` and `~/.incode/mcp.json`. The protocol has no way to ask
-    // about a project's server, so only approved ones start.
-    let (from_files, about_files) =
-        crate::mcp_config::session_servers(&workspace, &factory.data_dir(), None);
+    // `.mcp.json` and `~/.incode/mcp.json`. A project's server nobody has
+    // approved yet is asked about once the session is answered, below.
+    let (from_files, about_files, unapproved) =
+        crate::mcp_config::session_servers_asking_later(&workspace, &factory.data_dir(), None);
     specs.extend(from_files);
     connected.extend(about_files);
     let later: Arc<Mutex<Later>> = Arc::default();
+    let on_connected = connected_later(outbox, session_id, shared, &later);
     connected.extend(session.session_tools().connect_client_servers(
         specs,
         &workspace,
-        &connected_later(outbox, session_id, shared, &later),
+        &on_connected,
     ));
     for line in &connected {
         eprintln!("incode acp: {line}");
+    }
+    // The operator's own slash commands — the project's, the user's and the
+    // plugins' — offered beside the built-ins. What was wrong with a file is
+    // said where the servers' troubles are.
+    let custom = crate::custom_commands::Registry::load(&workspace);
+    for warning in &custom.warnings {
+        eprintln!("incode acp: {warning}");
     }
     let choices = config::opening(&settings, &roles, session.model());
     *shared.choices() = Some(choices.clone());
@@ -1055,6 +1068,7 @@ fn drive<F: SessionFactory>(
         shown: choices.options(),
         replay: None,
         watch,
+        custom,
     };
     let say = |update: acp::SessionUpdate| {
         outbox.notify(
@@ -1085,8 +1099,19 @@ fn drive<F: SessionFactory>(
     }
     // After the answer, so the client knows the session the list belongs to.
     say(acp::SessionUpdate::AvailableCommandsUpdate(
-        acp::AvailableCommandsUpdate::new(commands::available()),
+        acp::AvailableCommandsUpdate::new(commands::available(&held.custom)),
     ));
+    // After the answer too: the client is asked about the session it knows.
+    // Not waited for — each one allowed connects in the background.
+    permission::ServerApprovals {
+        outbox: Arc::clone(outbox),
+        session: session_id.clone(),
+        workspace: held.workspace.clone(),
+        data_dir: factory.data_dir(),
+        late: held.session.session_tools().late_servers(),
+        said: on_connected,
+    }
+    .ask_in_background(unapproved);
     if !connected.is_empty() {
         say(acp::SessionUpdate::AgentMessageChunk(
             acp::ContentChunk::new(acp::ContentBlock::from(format!(
@@ -1186,6 +1211,8 @@ struct Held {
     replay: Option<String>,
     /// The session's watch: its turns' steps are shown through it.
     watch: workers::SessionWatch,
+    /// The operator's own slash commands, as the session opened.
+    custom: crate::custom_commands::Registry,
 }
 
 /// One prompt: the same turn an interactive line runs, streamed as updates —
@@ -1204,6 +1231,19 @@ fn run_prompt(
     if text.trim().is_empty() {
         return Err(invalid_params("the prompt has no text"));
     }
+    // The operator's own command becomes the prompt, as it does in the REPL:
+    // before anything asks whether the prompt is a slash command, so it is
+    // never answered as one that is not offered. Its `allowed-tools` hold
+    // the turn it starts.
+    let typed = text.clone();
+    let (text, allowed_tools, expanded) = match held.custom.expand_line(&text, workspace) {
+        Some(expanded) => (
+            expanded.prompt.clone(),
+            expanded.allowed_tools.clone(),
+            Some(crate::custom_commands::note(&expanded)),
+        ),
+        None => (text, Vec::new(), None),
+    };
     // Pictures go to the model with a question; a command runs here and has
     // nowhere to put them.
     if !images.is_empty() && crate::cli::slash_commands::SlashCommand::parse(text.trim()).is_some()
@@ -1261,6 +1301,10 @@ fn run_prompt(
             ));
         }
     };
+
+    if let Some(note) = &expanded {
+        say_text(&format!("{note}\n\n"));
+    }
 
     // A slash command is run here, as the REPL runs it, and never reaches the
     // agent. It runs to the end: a cancel that lands meanwhile decides the
@@ -1334,6 +1378,9 @@ fn run_prompt(
     };
     held.watch.serve_as(who.clone());
     let mut presenter = held.watch.presenter(workspace);
+    // Set here, after every way out above that runs no turn, so it is taken
+    // by this turn and no other.
+    session.restrict_next_turn(allowed_tools);
     let outcome = session.turn_observed(
         workspace,
         &instruction,
@@ -1360,7 +1407,7 @@ fn run_prompt(
     // Which conversation the model holds now, so the session can be loaded
     // and resumed; and the pickers, when the turn changed what serves the
     // session (a standby took over) or what model it asks for.
-    history::remember(held, session_id, &text);
+    history::remember(held, session_id, &typed);
     config::report(held, shared, outbox, session_id);
 
     // A cancel decides the answer whatever the turn did with it: ACP requires
@@ -1881,6 +1928,10 @@ mod tests {
             }
         }
 
+        fn runs_tools_here(&self) -> bool {
+            self.tools.is_some()
+        }
+
         fn set_cancel(&mut self, token: CancelToken) {
             if let Some(tools) = &mut self.tools {
                 tools.set_cancel(token.clone());
@@ -2135,6 +2186,11 @@ mod tests {
         pub(super) fn call(&mut self, method: &str, params: Value) -> Value {
             let id = self.request(method, params);
             self.until_response(id).1
+        }
+
+        /// The sessions' settings directory: where approvals are kept.
+        pub(super) fn data_dir(&self) -> &Path {
+            self._data_dir.path()
         }
 
         pub(super) fn open_session(&mut self, cwd: &Path) -> String {
@@ -2599,14 +2655,64 @@ mod tests {
         let announced = client.next();
         assert_eq!(announced["params"]["sessionId"], session, "{announced}");
         let names = commands_announced(std::slice::from_ref(&announced)).expect("a command list");
+        // The built-ins first; the operator's own commands, if this machine
+        // has any, after them.
         assert_eq!(
-            names,
+            names[..16],
             [
                 "undo", "rewind", "plan", "act", "diff", "links", "roadmap", "run", "doctor",
                 "memories", "remember", "worktree", "agent", "agents", "roles", "tools"
             ],
             "{announced}"
         );
+        client.close();
+    }
+
+    /// **A CUSTOM COMMAND IS OFFERED AND RUNS AS THE TURN.** The project's
+    /// command is in the list with its hint; typed, it is expanded — its
+    /// arguments and its `@file` filled in — and the agent is asked the
+    /// expansion, not the slash line, with what it became said first.
+    #[test]
+    fn a_custom_command_is_offered_and_expanded_into_the_turn() {
+        let mut client = client(Behaviour::Named);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let commands = dir.path().join(crate::custom_commands::PROJECT_DIR);
+        std::fs::create_dir_all(&commands).expect("mkdir");
+        std::fs::write(
+            commands.join("greet.md"),
+            "---\ndescription: Greet someone\nargument-hint: <name>\nallowed-tools: Read\n---\n\
+             Write a greeting for $1 in the style of @style.txt",
+        )
+        .expect("write");
+        std::fs::write(dir.path().join("style.txt"), "pirate").expect("write");
+        let session = client.open_session(dir.path());
+        let announced = client.next();
+        let listed = updates_of(std::slice::from_ref(&announced))
+            .into_iter()
+            .find(|u| u["sessionUpdate"] == "available_commands_update")
+            .and_then(|u| u["availableCommands"].as_array().cloned())
+            .expect("a command list");
+        let greet = listed
+            .iter()
+            .find(|c| c["name"] == "greet")
+            .unwrap_or_else(|| panic!("greet is not offered: {announced}"));
+        assert_eq!(greet["description"], "Greet someone (project)", "{greet}");
+        assert_eq!(greet["input"]["hint"], "<name>", "{greet}");
+
+        let (streamed, reply) = prompt_in(&mut client, &session, "/greet Ada");
+        assert_eq!(reply["result"]["stopReason"], "end_turn", "{reply}");
+        let said = text_of(&streamed);
+        assert!(
+            said.contains("/greet expanded into the prompt; this turn may use only: Read"),
+            "{said:?}"
+        );
+        assert!(
+            said.contains(
+                "Write a greeting for Ada in the style of \nstyle.txt:\n```\npirate\n```"
+            ),
+            "the agent was not asked the expansion: {said:?}"
+        );
+        assert!(!said.contains("not a command offered here"), "{said:?}");
         client.close();
     }
 

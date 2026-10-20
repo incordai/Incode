@@ -232,6 +232,68 @@ pub struct SessionTools {
     /// sentinel to leave out. Its own `Arc`, because a sub-agent's toolbox
     /// keeps its own session state but writes into this same record.
     allowed: Arc<AllowedWrites>,
+    /// The tools the turn now running may use, when a custom command's
+    /// `allowed-tools` narrowed it; `None` the rest of the time. Set and
+    /// lifted by the session around one turn ([`TurnRestriction`]).
+    turn_allow: Mutex<Option<Arc<crate::permissions::rules::Allowlist>>>,
+}
+
+/// A turn's narrowing of the session's tools, in force until this is
+/// dropped — at the turn's end however it ends, a panic included.
+#[must_use = "the restriction is lifted when this is dropped"]
+pub struct TurnRestriction(Arc<SessionTools>);
+
+impl Drop for TurnRestriction {
+    fn drop(&mut self) {
+        *self
+            .0
+            .turn_allow
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+    }
+}
+
+/// Starts servers into a session after it opened — a project's server the
+/// person approved once the session was answered. Holds the session's servers
+/// weakly: once the session is gone it starts nothing.
+#[derive(Clone)]
+pub(crate) struct LateServers {
+    client: std::sync::Weak<RwLock<client_servers::ClientServers>>,
+    filter_env: bool,
+}
+
+impl LateServers {
+    /// Whether the session is still there to start servers into.
+    pub(crate) fn is_open(&self) -> bool {
+        self.client.strong_count() > 0
+    }
+
+    /// [`SessionTools::connect_client_servers`] for servers named late: the
+    /// administrator's `[mcp]` lists applied, each started in the
+    /// background, a line returned for each.
+    pub(crate) fn connect(
+        &self,
+        specs: Vec<ServerSpec>,
+        cwd: &Path,
+        on_connected: &OnConnected,
+    ) -> Vec<String> {
+        let (specs, mut said) = crate::mcp_config::apply_managed_policy(
+            &crate::permissions::managed::mcp_policy(),
+            specs,
+        );
+        let Some(client) = self.client.upgrade() else {
+            return said;
+        };
+        said.extend(client_servers::ClientServers::add_in_background(
+            &client,
+            specs,
+            cwd,
+            self.filter_env,
+            client_servers::Bounds::DEFAULT,
+            on_connected,
+        ));
+        said
+    }
 }
 
 /// The protected files a person allowed to be written, by
@@ -274,7 +336,30 @@ impl SessionTools {
             client: Arc::default(),
             filter_env,
             allowed: Arc::default(),
+            turn_allow: Mutex::new(None),
         })
+    }
+
+    /// Hold every toolbox sharing this state to `list` until the returned
+    /// guard is dropped: a call it does not cover is refused.
+    pub fn restrict_turn(
+        self: &Arc<Self>,
+        list: crate::permissions::rules::Allowlist,
+    ) -> TurnRestriction {
+        *self
+            .turn_allow
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(list));
+        TurnRestriction(Arc::clone(self))
+    }
+
+    /// The turn's allowlist, while one is in force.
+    #[must_use]
+    pub fn turn_allowlist(&self) -> Option<Arc<crate::permissions::rules::Allowlist>> {
+        self.turn_allow
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Start the MCP servers the session's client named, in `cwd`, in the
@@ -324,6 +409,15 @@ impl SessionTools {
             on_connected,
         ));
         said
+    }
+
+    /// A handle that starts more servers into this session's after its own
+    /// were started, from any thread, for as long as the session lasts.
+    pub(crate) fn late_servers(&self) -> LateServers {
+        LateServers {
+            client: Arc::downgrade(&self.client),
+            filter_env: self.filter_env,
+        }
     }
 
     /// The client's servers started and still connecting, by name — for the
@@ -1588,6 +1682,23 @@ impl Toolbox {
             crate::trace!("tool", "{name} REFUSED: input does not match its schema");
             return Err(problems);
         }
+        // The custom command that started this turn named the tools it may
+        // use: any other call is refused, before the rules, a guard, a person
+        // or the engine is asked. The next turn is not held to it.
+        if let Some(list) = self.state.turn_allowlist() {
+            if !list.permits(name, &self.rule_subject(name, input), &self.rule_context()) {
+                crate::trace!(
+                    "tool",
+                    "{name} REFUSED: outside the command's allowed-tools"
+                );
+                return Err(format!(
+                    "NOT RUN — this turn was started by a custom command whose allowed-tools \
+                     ({}) do not cover this {name} call. Use only those tools for this task, \
+                     or say what else you would need and why.",
+                    list.listed().join(", ")
+                ));
+            }
+        }
         // The settings' permission rules. A deny is final — before a guard,
         // a person or the engine is asked, and whatever the mode; an ask or
         // an allow is weighed with the mode below.
@@ -1880,10 +1991,17 @@ impl Toolbox {
         name: &str,
         input: &Value,
     ) -> Option<crate::permissions::rules::Verdict> {
-        use crate::permissions::rules::{PathContext, Subject};
         if self.rules.is_empty() {
             return None;
         }
+        self.rules
+            .decide(name, &self.rule_subject(name, input), &self.rule_context())
+    }
+
+    /// What a rule's specifier is matched against for this call: the command,
+    /// the paths or the address it names.
+    fn rule_subject(&self, name: &str, input: &Value) -> crate::permissions::rules::Subject {
+        use crate::permissions::rules::Subject;
         let text = |key: &str| {
             input
                 .get(key)
@@ -1891,7 +2009,7 @@ impl Toolbox {
                 .unwrap_or_default()
                 .to_string()
         };
-        let subject = match name {
+        match name {
             BASH => Subject::Command(text("command")),
             // A search or a listing with no `path` covers the workspace.
             READ | WRITE | EDIT | MULTI_EDIT | NOTEBOOK_EDIT | LS | OUTLINE | GLOB | GREP => {
@@ -1911,12 +2029,15 @@ impl Toolbox {
             }
             crate::web::FETCH_TOOL => Subject::Url(text("url")),
             _ => Subject::None,
-        };
-        let ctx = PathContext {
+        }
+    }
+
+    /// Where a rule's relative paths are resolved, and what `~` is.
+    fn rule_context(&self) -> crate::permissions::rules::PathContext {
+        crate::permissions::rules::PathContext {
             workspace: self.workspace.clone(),
             home: crate::admin::home_dir(),
-        };
-        self.rules.decide(name, &subject, &ctx)
+        }
     }
 
     /// Whether the session's permission mode, and the settings' `ask` and
@@ -2382,7 +2503,7 @@ mod rule_tests;
 
 #[cfg(test)]
 pub(crate) use client_servers::tests::{
-    calls_in as client_server_calls, fake_server, slow_fake_server,
+    calls_in as client_server_calls, fake_server, slow_fake_server, Connected,
 };
 
 #[cfg(test)]

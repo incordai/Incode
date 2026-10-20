@@ -95,10 +95,13 @@ pub(crate) enum Transport {
         args: Vec<String>,
         env: Vec<(String, String)>,
     },
-    /// An MCP endpoint over Streamable HTTP, and the headers to send it.
+    /// An MCP endpoint over Streamable HTTP, and the headers to send it —
+    /// and, for a server from incode's own configuration, where its OAuth
+    /// token is kept ([`crate::mcp_oauth`]).
     Http {
         url: String,
         headers: Vec<(String, String)>,
+        oauth: Option<crate::mcp_oauth::Binding>,
     },
 }
 
@@ -116,9 +119,10 @@ impl std::fmt::Debug for Transport {
                 .field("args", args)
                 .field("env", &names(env))
                 .finish(),
-            Self::Http { headers, .. } => f
+            Self::Http { headers, oauth, .. } => f
                 .debug_struct("Http")
                 .field("headers", &names(headers))
+                .field("oauth", &oauth.is_some())
                 .finish_non_exhaustive(),
         }
     }
@@ -152,6 +156,8 @@ pub(super) struct ClientServers {
     connecting: Vec<String>,
     /// Whether this session's servers were started. Once per session.
     opened: bool,
+    /// Every server name started in this session, connected or not.
+    taken: Vec<String>,
 }
 
 /// How long each kind of server has to start: [`START_BOUND`] and
@@ -202,30 +208,60 @@ impl ClientServers {
         bounds: Bounds,
         on_connected: &OnConnected,
     ) -> Vec<String> {
-        let mut said = Vec::new();
         let mut all = shared.write().unwrap_or_else(PoisonError::into_inner);
         if all.opened {
             return vec!["this session's MCP servers are already connected".to_string()];
         }
         all.opened = true;
-        let mut taken: Vec<String> = Vec::new();
-        for (index, spec) in specs.into_iter().enumerate() {
+        all.start_each(shared, specs, cwd, filter_env, bounds, on_connected)
+    }
+
+    /// Start more servers into a session whose own were started already — a
+    /// project's server the person approved after the session opened — the
+    /// same way, under the same names and limit.
+    pub(super) fn add_in_background(
+        shared: &Arc<RwLock<Self>>,
+        specs: Vec<ServerSpec>,
+        cwd: &Path,
+        filter_env: bool,
+        bounds: Bounds,
+        on_connected: &OnConnected,
+    ) -> Vec<String> {
+        shared
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .start_each(shared, specs, cwd, filter_env, bounds, on_connected)
+    }
+
+    /// Start each of `specs` on its own thread into `shared` — which `self`
+    /// is, held for writing.
+    fn start_each(
+        &mut self,
+        shared: &Arc<RwLock<Self>>,
+        specs: Vec<ServerSpec>,
+        cwd: &Path,
+        filter_env: bool,
+        bounds: Bounds,
+        on_connected: &OnConnected,
+    ) -> Vec<String> {
+        let mut said = Vec::new();
+        for spec in specs {
             let server = safe(spec.name.trim());
-            if index >= MAX_SERVERS {
+            if self.taken.len() >= MAX_SERVERS {
                 said.push(format!(
                     "MCP server `{}` was not started: a session starts at most {MAX_SERVERS}",
                     spec.name
                 ));
                 continue;
             }
-            if server.is_empty() || taken.contains(&server) {
+            if server.is_empty() || self.taken.contains(&server) {
                 said.push(format!(
                     "MCP server `{}` was not started: its name is empty or already taken",
                     spec.name
                 ));
                 continue;
             }
-            taken.push(server.clone());
+            self.taken.push(server.clone());
             let bound = match spec.transport {
                 Transport::Stdio { .. } => bounds.stdio,
                 Transport::Http { .. } => bounds.http,
@@ -235,7 +271,7 @@ impl ClientServers {
                  request); its tools are offered from the first turn after it answers",
                 bound.as_secs()
             ));
-            all.connecting.push(server.clone());
+            self.connecting.push(server.clone());
             let into = Arc::downgrade(shared);
             let cwd = cwd.to_path_buf();
             let on_connected = Arc::clone(on_connected);
@@ -379,8 +415,18 @@ fn start(
         }
         // Each POST is capped at the longest a call may take; `McpClient`
         // bounds each request more tightly where it must.
-        Transport::Http { url, headers } => {
-            Box::new(HttpLink::connect(url, headers, CALL_BOUND, &what)?)
+        Transport::Http {
+            url,
+            headers,
+            oauth,
+        } => {
+            let link = HttpLink::connect(url, headers, CALL_BOUND, &what)?;
+            match oauth {
+                Some(binding) => {
+                    Box::new(link.with_auth(crate::mcp_oauth::TokenSource::new(binding, url)))
+                }
+                None => Box::new(link),
+            }
         }
     };
     let mut client = McpClient::open(link, &what, bound)?;
@@ -750,6 +796,7 @@ pub(crate) mod tests {
             transport: Transport::Http {
                 url: "https://example.test/mcp?key=k3y".to_string(),
                 headers: vec![("authorization".to_string(), "Bearer s3cret".to_string())],
+                oauth: None,
             },
         };
         let shown = format!("{http:?}");

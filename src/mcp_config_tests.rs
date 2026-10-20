@@ -60,7 +60,7 @@ fn entries_become_specs_with_variables_expanded() {
     }
     let docs = file.servers["docs"].to_spec("docs", &lookup).expect("spec");
     match docs.transport {
-        Transport::Http { url, headers } => {
+        Transport::Http { url, headers, .. } => {
             assert_eq!(url, "https://mcp.example.com/mcp", "the default applies");
             assert_eq!(headers[0].1, "Bearer d0c");
         }
@@ -135,6 +135,15 @@ fn the_approval_key_changes_with_anything_that_decides_what_runs() {
     env.env.insert("X".to_string(), "1".to_string());
     let mut url = base.clone();
     url.url = Some("https://x".to_string());
+    let mut oauth = base.clone();
+    oauth.oauth = Some(crate::mcp_oauth::OAuthConfig {
+        scopes: vec!["read".to_string()],
+        ..Default::default()
+    });
+    let mut wider = oauth.clone();
+    if let Some(o) = wider.oauth.as_mut() {
+        o.scopes.push("admin".to_string());
+    }
     let mut extra = base.clone();
     extra
         .extra
@@ -148,10 +157,16 @@ fn the_approval_key_changes_with_anything_that_decides_what_runs() {
         ),
         ("env", approval_key("s", &env)),
         ("url", approval_key("s", &url)),
+        ("oauth", approval_key("s", &oauth)),
     ] {
         assert_ne!(key, other, "a changed {what} must change the key");
     }
     assert_eq!(key, approval_key("s", &extra), "unrelated keys do not");
+    assert_ne!(
+        approval_key("s", &oauth),
+        approval_key("s", &wider),
+        "wider scopes are asked about again"
+    );
     // Moving text between fields is a different server.
     assert_ne!(
         approval_key("s", &stdio("a", &["b c"])),

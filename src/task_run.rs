@@ -273,10 +273,14 @@ impl Report {
 ///
 /// `created` is what the process wrote outside the workspace before the run —
 /// the shipped sub-agent definitions on a first run — for the `init` event.
+///
+/// `command_tools`, when not empty, are a custom command's `allowed-tools`:
+/// the run is held to them ([`crate::custom_commands`]).
 pub fn run_task_as(
     workspace: &Path,
     instruction: &str,
     model: Option<&str>,
+    command_tools: &[String],
     format: OutputFormat,
     spec_gate: crate::spec::SpecGate,
     created: &[std::path::PathBuf],
@@ -284,7 +288,7 @@ pub fn run_task_as(
     crate::spec::set_for_this_run(spec_gate);
     if format == OutputFormat::Text {
         let mut report = Report::text();
-        let ran = run_task_reporting(workspace, instruction, model, &mut report);
+        let ran = run_task_reporting(workspace, instruction, model, command_tools, &mut report);
         // The run's spend, once, at the end: the per-event lines above it are
         // each one request, and the question afterwards is what it all cost.
         if let Some(line) = report.cost_line() {
@@ -301,7 +305,7 @@ pub fn run_task_as(
         .map(|path| path.to_string_lossy().into_owned())
         .collect();
     let began = std::time::Instant::now();
-    let ran = run_task_reporting(workspace, instruction, model, &mut report);
+    let ran = run_task_reporting(workspace, instruction, model, command_tools, &mut report);
     report.finish(&ran, began.elapsed());
     ran
 }
@@ -324,7 +328,7 @@ pub fn run_task_with_model(
     instruction: &str,
     model: Option<&str>,
 ) -> Result<String, String> {
-    run_task_reporting(workspace, instruction, model, &mut Report::text())
+    run_task_reporting(workspace, instruction, model, &[], &mut Report::text())
 }
 
 /// The run itself, telling `report` what happens.
@@ -332,6 +336,7 @@ fn run_task_reporting(
     workspace: &Path,
     instruction: &str,
     model: Option<&str>,
+    command_tools: &[String],
     report: &mut Report,
 ) -> Result<String, String> {
     if instruction.trim().is_empty() {
@@ -360,6 +365,18 @@ fn run_task_reporting(
     // The owner's installed external tools, started as MCP servers now, in
     // the background, so they connect while the memory session opens.
     let tools = connect_ext_tools(workspace);
+    // A custom command's `allowed-tools` hold the whole run — it is the
+    // command's one turn — on every candidate whose tools are incode's.
+    let _held_to = (!command_tools.is_empty()).then(|| {
+        let (list, warnings) = crate::permissions::rules::Allowlist::parse(
+            command_tools,
+            crate::admin::home_dir().as_deref(),
+        );
+        for warning in warnings {
+            eprintln!("incode: {warning}");
+        }
+        tools.restrict_turn(list)
+    });
     let mut memory = crate::hooks::memory::MemoryHooks::new(
         crate::hooks::engine::Engine::locate(),
         workspace,
@@ -400,6 +417,7 @@ fn run_task_reporting(
         prompt: &prompt,
         system: &system,
         tools: &tools,
+        command_tools,
     };
     let ran = drive(&task, &mut memory, report);
     memory.end("other");
@@ -468,6 +486,8 @@ struct Task<'a> {
     system: &'a [String],
     /// The run's session tools, with the external tools' servers.
     tools: &'a std::sync::Arc<crate::toolbox::SessionTools>,
+    /// The custom command's `allowed-tools` the run is held to, if any.
+    command_tools: &'a [String],
 }
 
 /// The instruction, through each usable agent in turn until one runs it.
@@ -507,6 +527,7 @@ fn drive(
         prompt,
         system,
         tools,
+        command_tools,
     } = *task;
     // WHICH ROUTE, and the CLI requirement belongs INSIDE the choice.
     //
@@ -591,6 +612,12 @@ fn drive(
         // The run's one set of session tools, holding the external tools'
         // servers, is every candidate's.
         backend.share_session_tools(std::sync::Arc::clone(tools));
+        if !command_tools.is_empty() && !backend.runs_tools_here() {
+            outln!(
+                "  · {}",
+                crate::custom_commands::not_enforced_by(&route, command_tools)
+            );
+        }
 
         if let Some(m) = model {
             backend.choose_model(m);

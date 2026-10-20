@@ -568,16 +568,35 @@ model: sonnet
 allowed-tools: Bash(npm test:*), Read
 ---
 Run the tests in $1, filtered to `$2`. Everything typed: $ARGUMENTS
+Our test conventions: @docs/testing.md
 ```
 
 `$ARGUMENTS` is everything after the name; `$1`..`$9` are its words, split like
 a shell (quotes group). A body with neither gets the arguments appended. Typing
 `/frontend:test app.tsx` sends the filled-in text as your turn, and `incode -t
 "/frontend:test app.tsx"` runs it headless. Custom commands are listed in
-`/help` and complete on Tab. `model` is used by `-t` when `-m` is not given; in
-the REPL it is only named, since switching models starts the conversation over.
-`allowed-tools` is advisory: shown, not enforced — guards, the permission mode
-and hooks are what restrict tools.
+`/help`, complete on Tab, and are offered to ACP clients (`incode --acp`) beside
+the built-ins, with `argument-hint` as the input hint. `model` is used by `-t`
+when `-m` is not given; in the REPL and over ACP it is only named, since
+switching models starts the conversation over.
+
+`@path` in the body (at its start or after a space, naming something with a `/`
+or a `.` — `@src/main.rs`, `@./Makefile`) is replaced by that file in a fenced
+block headed by its path. The path must resolve inside the workspace (`..` and
+symlinks are followed before checking); a file is read up to 256 KB and a
+command's files up to 1 MB in all. Anything that cannot be included leaves a
+marker such as `[@path: not found]` or `[@path: outside the workspace]`. Email
+addresses are left alone, and only the command file's own text is looked at —
+an `@path` you type as an argument is passed on as text, not read.
+
+`allowed-tools` holds the turn the command starts: each entry is a permission
+rule (`Bash(npm test:*)`, `Read`, `Edit(src/**)` — the grammar of
+[permission rules](#permission-rules)), and a tool call none of them covers is
+refused, with the list named to the model. A compound shell line is covered
+only when every part is. Only that turn: the next one is unrestricted. It only
+narrows — deny and ask rules, guards, the mode and hooks still apply. It binds
+where incode runs the tools (the API route and Claude Code); on Codex and
+Antigravity, which bring their own tools, the turn says it was not enforced.
 
 A **plugin** is a folder in `~/.incode/plugins/<name>/` or
 `.incode/plugins/<name>/` with a `plugin.toml` (`name`, `version`,
@@ -592,8 +611,14 @@ session). `${INCODE_PLUGIN_ROOT}` in a hook or server is the plugin's folder.
 incode plugin list
 incode plugin add https://github.com/you/incode-web-plugin   # git clone --depth 1
 incode plugin add ./my-plugin --project                      # copied into .incode/plugins/
+incode plugin update [web]                                   # fetch again; no name: all
 incode plugin remove web
 ```
+
+`add` records where a plugin came from (`.incode-source` in its folder), and
+`update` fetches it again the same way — a fresh clone of the git URL or a
+fresh copy of the folder — then swaps it in, printing the old and new
+`version`. An update whose `plugin.toml` names a different plugin is refused.
 
 A plugin's hooks and servers run with your authority; install only what you
 would run yourself. Skills and hooks are read for the directory incode was
@@ -741,15 +766,20 @@ incode starts the MCP servers named in a project's `.mcp.json` and in your
   default stops that server and names the variable.
 - `http` servers speak MCP Streamable HTTP (https anywhere, plain http only to
   this machine). `sse` is tried the same way; a server that speaks only the
-  legacy SSE transport will not connect. OAuth is not supported yet — pass a
-  token in `headers`.
+  legacy SSE transport will not connect. A server that needs OAuth is logged
+  in to with `incode mcp login <name>` (below); a fixed token can still go in
+  `headers` instead.
 - **A project's server is asked about before it first runs**, because a
   `git clone` can bring one. The REPL asks; approvals are remembered in
   `~/.incode/mcp-approvals.json`, keyed by the server's name and a sha256 of
   its type, command, args, env, url and headers as written — change any of
-  them and it is asked about again. Under `-t` and `--acp` an unapproved
-  server is skipped with the command that approves it. Your own
-  `~/.incode/mcp.json` needs no approval.
+  them and it is asked about again. Under `--acp` the client is asked, once
+  the session is open, with `session/request_permission` (allow once, allow
+  always — remembered like `incode mcp approve` — or reject); the session
+  does not wait, and an allowed server connects in the background. Under
+  `-t`, or when the client cannot answer, an unapproved server is skipped
+  with the command that approves it. Your own `~/.incode/mcp.json` needs no
+  approval.
 
 ```sh
 incode mcp list                       # every server, its scope and status
@@ -758,10 +788,53 @@ incode mcp add fs -- npx -y @modelcontextprotocol/server-filesystem .
 incode mcp add -s project -H 'Authorization: Bearer ${T}' docs https://mcp.example.com/mcp
 incode mcp remove [-s user|project] <name>
 incode mcp approve <name>             # approve a project server as it is written now
+incode mcp login <name>               # OAuth: authorize an http server in the browser
+incode mcp logout <name>              # forget its tokens
 ```
 
 `add` writes `~/.incode/mcp.json` unless given `-s project`; a project server
 added this way is approved as written.
+
+#### OAuth for remote servers
+
+`incode mcp login <name>` follows the MCP authorization spec: the server's
+`401` names its Protected Resource Metadata (RFC 9728), which names the
+authorization server, whose metadata is read from
+`/.well-known/oauth-authorization-server` (RFC 8414) or
+`/.well-known/openid-configuration`. incode registers itself (RFC 7591) when
+the authorization server allows it, then opens the browser for an
+authorization code with PKCE (S256) and the `resource` parameter (RFC 8707),
+redirected to a one-request listener on `127.0.0.1` at an ephemeral port. The
+address is printed too, for a machine without a browser — open it anywhere
+that can reach back to this one's `127.0.0.1` (an SSH port forward, say).
+
+An authorization server without dynamic registration needs a client
+registered by hand, named in the server's entry:
+
+```json
+"docs": { "type": "http", "url": "https://mcp.example.com/mcp",
+          "oauth": { "client_id": "abc123", "client_secret": "${DOCS_SECRET:-}",
+                     "scopes": ["read"], "callback_port": 8765 } }
+```
+
+Every field is optional; `scopes` defaults to what the server asks for, and
+`callback_port` is for a client registered with a fixed redirect
+(`http://127.0.0.1:<port>/callback`). `client_secret` is sent in the token
+request's body. `${VAR}` is expanded in `client_id` and `client_secret`.
+
+- Tokens are kept in `~/.incode/mcp-tokens.json` (mode `0600` on unix),
+  keyed by the server's name **and** its url, so a project that reuses the
+  name for another address gets nothing. They are sent as
+  `Authorization: Bearer`, refreshed before they expire and once more on a
+  `401`.
+- A session never waits on a browser: a server with an `oauth` entry and no
+  token is not started, and one that answers `401` with nothing to refresh is
+  dropped — each with the `incode mcp login <name>` that fixes it. A server
+  whose `headers` carry their own `Authorization` is sent that instead.
+- `incode mcp list` shows whether each such server is logged in.
+- Every OAuth endpoint must be https (plain http only to this machine), no
+  redirect is followed, and an authorization server whose metadata names
+  another issuer or leaves S256 out of its PKCE methods is refused.
 
 ## Computer use
 
@@ -1195,7 +1268,7 @@ Environment variables:
 | Path | What it holds |
 |---|---|
 | `~/.incode/admin.json` | Your settings, including your [permission rules](#permission-rules) |
-| `~/.incode/mcp.json` · `~/.incode/mcp-approvals.json` | Your [MCP servers](#mcp-servers) · the project servers you approved |
+| `~/.incode/mcp.json` · `~/.incode/mcp-approvals.json` · `~/.incode/mcp-tokens.json` | Your [MCP servers](#mcp-servers) · the project servers you approved · their OAuth tokens |
 | `~/.incode/agents/*.md` | Your sub-agents, for every project |
 | `~/.incode/sessions/<workspace>.json` | Session pointers, so a conversation can be reopened |
 | `~/.incode/history.txt` | The lines you typed |

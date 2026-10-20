@@ -34,6 +34,16 @@
 //! A plugin is somebody else's bundle that the operator chose to install, so
 //! its hooks and servers run with the operator's authority. `incode plugin add`
 //! is the only thing that puts one there, and it says what it installed.
+//!
+//! # Updating
+//!
+//! `add` records where a plugin came from in its folder's [`SOURCE`] file —
+//! `git = "<url>"` or `path = "<folder>"`. `incode plugin update` fetches it
+//! again the same way (a fresh `--depth 1` clone, or a fresh copy) into a
+//! staging folder beside it and swaps the two, so a failed fetch leaves the
+//! installed copy as it was. A fetch whose manifest names a different plugin
+//! is refused: the name is what its commands, skills and servers are filed
+//! under.
 
 use std::path::{Path, PathBuf};
 
@@ -42,6 +52,9 @@ pub const PLUGINS_DIR: &str = "plugins";
 
 /// Every plugin's manifest.
 pub const MANIFEST: &str = "plugin.toml";
+
+/// Where an installed plugin came from, in its folder.
+pub const SOURCE: &str = ".incode-source";
 
 /// What a plugin's root folder is called in its own paths.
 pub const ROOT_VAR: &str = "${INCODE_PLUGIN_ROOT}";
@@ -363,6 +376,7 @@ impl Plugin {
                 crate::toolbox::Transport::Http {
                     url: self.fill(url),
                     headers: pairs(def.get("headers")),
+                    oauth: None,
                 }
             } else if let Some(command) = def.get("command").and_then(serde_json::Value::as_str) {
                 crate::toolbox::Transport::Stdio {
@@ -441,14 +455,19 @@ pub(crate) fn session_servers(workspace: &Path) -> (Vec<crate::toolbox::ServerSp
 }
 
 // ---------------------------------------------------------------------------
-// `incode plugin list | add | remove`
+// `incode plugin list | add | update | remove`
 // ---------------------------------------------------------------------------
 
 pub const USAGE: &str = "\
 USAGE:
     incode plugin list
     incode plugin add <git-url | path> [--project]
+    incode plugin update [name] [--project]
     incode plugin remove <name> [--project]
+
+`update` fetches a plugin again from where it was added: a fresh clone of
+its git URL, or a fresh copy of its folder. With no name, every plugin in
+that folder is updated.
 
 Plugins are installed in ~/.incode/plugins/, or with --project in this
 workspace's .incode/plugins/.";
@@ -477,6 +496,8 @@ pub fn cli(args: &[String], workspace: &Path) -> Result<String, String> {
                 contents(&plugin)
             )
         }),
+        ["update"] => update_all(&target),
+        ["update", name] => update(name, &target).map(|done| done.to_string()),
         ["remove", name] | ["rm", name] => {
             remove(name, &target).map(|path| format!("removed {}", path.display()))
         }
@@ -536,13 +557,7 @@ pub fn add(source: &str, target: &Path) -> Result<Plugin, String> {
         .map_err(|e| format!("could not create {}: {e}", target.display()))?;
     let staging = target.join(format!(".adding-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&staging);
-    let local = Path::new(source);
-    let fetched = if local.is_dir() {
-        copy_dir(local, &staging).map_err(|e| format!("could not copy {source}: {e}"))
-    } else {
-        clone(source, &staging)
-    };
-    let installed = fetched.and_then(|()| {
+    let installed = Source::of(source).fetch(&staging).and_then(|()| {
         let plugin = load_one(&staging, Scope::User)?;
         let dest = target.join(&plugin.manifest.name);
         if dest.exists() {
@@ -560,6 +575,235 @@ pub fn add(source: &str, target: &Path) -> Result<Plugin, String> {
     installed
 }
 
+/// Where a plugin is fetched from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Source {
+    /// A git URL, cloned with `--depth 1`.
+    Git(String),
+    /// A local folder, copied — kept absolute, so an update from another
+    /// directory finds it.
+    Path(PathBuf),
+}
+
+impl Source {
+    /// What `incode plugin add` was given: a folder when one is there, a git
+    /// URL otherwise.
+    #[must_use]
+    pub fn of(source: &str) -> Self {
+        let local = Path::new(source);
+        if local.is_dir() {
+            Self::Path(std::fs::canonicalize(local).unwrap_or_else(|_| local.to_path_buf()))
+        } else {
+            Self::Git(source.to_string())
+        }
+    }
+
+    /// Put a fresh copy into `dest`, and record there where it came from.
+    fn fetch(&self, dest: &Path) -> Result<(), String> {
+        match self {
+            Self::Git(url) => clone(url, dest)?,
+            Self::Path(from) => copy_dir(from, dest)
+                .map_err(|e| format!("could not copy {}: {e}", from.display()))?,
+        }
+        std::fs::write(dest.join(SOURCE), self.to_toml())
+            .map_err(|e| format!("could not record where it came from: {e}"))
+    }
+
+    fn to_toml(&self) -> String {
+        let (key, value) = match self {
+            Self::Git(url) => ("git", url.clone()),
+            Self::Path(path) => ("path", path.to_string_lossy().into_owned()),
+        };
+        // A TOML literal string holds anything but a `'`, which a URL or a
+        // path seldom has; the basic string's escapes cover the rest.
+        if value.contains('\'') {
+            let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+            format!("{key} = \"{escaped}\"\n")
+        } else {
+            format!("{key} = '{value}'\n")
+        }
+    }
+
+    /// Where the plugin in `root` came from: its [`SOURCE`] file, or — for
+    /// one cloned before sources were recorded — its git `origin`.
+    pub fn recorded(root: &Path) -> Result<Self, String> {
+        if let Ok(text) = std::fs::read_to_string(root.join(SOURCE)) {
+            for raw in text.lines() {
+                let line = raw.trim();
+                let Some((key, value)) = line.split_once('=') else {
+                    continue;
+                };
+                let value = toml_string(value.trim())
+                    .map_err(|e| format!("{}: {e}", root.join(SOURCE).display()))?;
+                match key.trim() {
+                    "git" => return Ok(Self::Git(value)),
+                    "path" => return Ok(Self::Path(PathBuf::from(value))),
+                    _ => {}
+                }
+            }
+            return Err(format!(
+                "{} names neither `git` nor `path`",
+                root.join(SOURCE).display()
+            ));
+        }
+        if root.join(".git").exists() {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(["remote", "get-url", "origin"])
+                .stdin(std::process::Stdio::null())
+                .output()
+                .map_err(|e| format!("could not run git: {e}"))?;
+            let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if out.status.success() && !url.is_empty() {
+                return Ok(Self::Git(url));
+            }
+        }
+        Err(format!(
+            "{} does not say where it came from; remove it and add it again",
+            root.display()
+        ))
+    }
+}
+
+impl std::fmt::Display for Source {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Git(url) => write!(f, "{url}"),
+            Self::Path(path) => write!(f, "{}", path.display()),
+        }
+    }
+}
+
+/// What one update did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Updated {
+    pub name: String,
+    pub from: String,
+    pub to: String,
+    pub source: Source,
+}
+
+impl std::fmt::Display for Updated {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let shown = |v: &str| {
+            if v.is_empty() {
+                "-".to_string()
+            } else {
+                v.to_string()
+            }
+        };
+        if self.from == self.to {
+            write!(
+                f,
+                "updated plugin `{}` from {} (version {} unchanged)",
+                self.name,
+                self.source,
+                shown(&self.from)
+            )
+        } else {
+            write!(
+                f,
+                "updated plugin `{}` from {}: {} → {}",
+                self.name,
+                self.source,
+                shown(&self.from),
+                shown(&self.to)
+            )
+        }
+    }
+}
+
+/// Fetch plugin `name` in `target` again from where it came from, and swap
+/// it in. The installed copy is left as it was when anything fails.
+pub fn update(name: &str, target: &Path) -> Result<Updated, String> {
+    check_name(name)?;
+    let dest = target.join(name);
+    let installed = load_one(&dest, Scope::User).map_err(|_| {
+        format!(
+            "no plugin `{name}` in {} (`incode plugin list` shows what is installed)",
+            target.display()
+        )
+    })?;
+    let source = Source::recorded(&dest)?;
+    let staging = target.join(format!(".updating-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&staging);
+    let swapped = source.fetch(&staging).and_then(|()| {
+        let fetched = load_one(&staging, Scope::User)?;
+        if fetched.manifest.name != installed.manifest.name {
+            return Err(format!(
+                "not updated: {source} is now plugin `{}`, not `{}`; remove `{}` and add it \
+                 again if that is what you want",
+                fetched.manifest.name, installed.manifest.name, installed.manifest.name
+            ));
+        }
+        swap(&staging, &dest)?;
+        Ok(Updated {
+            name: installed.manifest.name.clone(),
+            from: installed.manifest.version.clone(),
+            to: fetched.manifest.version,
+            source: source.clone(),
+        })
+    });
+    let _ = std::fs::remove_dir_all(&staging);
+    swapped
+}
+
+/// Put `fresh` where `dest` is, moving the old copy aside first and back if
+/// the second move fails.
+fn swap(fresh: &Path, dest: &Path) -> Result<(), String> {
+    let mut old = dest.as_os_str().to_owned();
+    old.push(format!(".old-{}", std::process::id()));
+    let old = PathBuf::from(old);
+    let _ = std::fs::remove_dir_all(&old);
+    std::fs::rename(dest, &old)
+        .map_err(|e| format!("could not move {} aside: {e}", dest.display()))?;
+    if let Err(e) = std::fs::rename(fresh, dest) {
+        let _ = std::fs::rename(&old, dest);
+        return Err(format!(
+            "could not move the update into {}: {e}",
+            dest.display()
+        ));
+    }
+    let _ = std::fs::remove_dir_all(&old);
+    Ok(())
+}
+
+/// [`update`] every plugin in `target`. One that fails does not stop the
+/// rest; any failure makes the whole an error, with every line said.
+pub fn update_all(target: &Path) -> Result<String, String> {
+    let mut names: Vec<String> = std::fs::read_dir(target)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|e| e.path().join(MANIFEST).is_file())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| !n.starts_with('.'))
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    if names.is_empty() {
+        return Ok(format!("no plugins to update in {}", target.display()));
+    }
+    let mut lines = Vec::new();
+    let mut failed = false;
+    for name in names {
+        match update(&name, target) {
+            Ok(done) => lines.push(done.to_string()),
+            Err(why) => {
+                failed = true;
+                lines.push(format!("plugin `{name}`: {why}"));
+            }
+        }
+    }
+    if failed {
+        Err(lines.join("\n"))
+    } else {
+        Ok(lines.join("\n"))
+    }
+}
+
 /// `git clone --depth 1 <url> <dest>`.
 fn clone(url: &str, dest: &Path) -> Result<(), String> {
     let out = std::process::Command::new("git")
@@ -572,7 +816,7 @@ fn clone(url: &str, dest: &Path) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "`{url}` is not a folder, and git could not clone it: {}",
+            "git could not clone `{url}`: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         ))
     }
@@ -750,6 +994,121 @@ mod tests {
         assert!(remove("nope", &target).is_err());
         remove("checkout-name", &target).expect("removes");
         assert!(!target.join("checkout-name").exists());
+    }
+
+    /// Bump the manifest in `root` to `version`, under `name`.
+    fn manifest(root: &Path, name: &str, version: &str) {
+        write(
+            &root.join(MANIFEST),
+            &format!("name = \"{name}\"\nversion = \"{version}\"\n"),
+        );
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c"])
+            .arg("commit.gpgsign=false")
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    }
+
+    #[test]
+    fn update_copies_a_folder_again_and_says_the_versions() {
+        let dir = tempfile::tempdir().expect("dir");
+        let source = dir.path().join("src/web");
+        manifest(&source, "web", "1.0.0");
+        let target = dir.path().join("plugins");
+        let installed = add(&source.to_string_lossy(), &target).expect("adds");
+        assert_eq!(
+            Source::recorded(&installed.root).expect("recorded"),
+            Source::Path(std::fs::canonicalize(&source).expect("canonical"))
+        );
+
+        manifest(&source, "web", "1.1.0");
+        write(&source.join("commands/new.md"), "New");
+        let done = update("web", &target).expect("updates");
+        assert_eq!((done.from.as_str(), done.to.as_str()), ("1.0.0", "1.1.0"));
+        assert!(done.to_string().contains("1.0.0 → 1.1.0"), "{done}");
+        assert!(target.join("web/commands/new.md").is_file());
+        assert!(target.join("web").join(SOURCE).is_file(), "still recorded");
+        let left: Vec<String> = std::fs::read_dir(&target)
+            .expect("read")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, vec!["web".to_string()], "no staging or old copy left");
+
+        let same = update_all(&target).expect("all");
+        assert!(same.contains("version 1.1.0 unchanged"), "{same}");
+    }
+
+    #[test]
+    fn an_update_that_renames_the_plugin_is_refused_and_changes_nothing() {
+        let dir = tempfile::tempdir().expect("dir");
+        let source = dir.path().join("src/web");
+        manifest(&source, "web", "1.0.0");
+        let target = dir.path().join("plugins");
+        add(&source.to_string_lossy(), &target).expect("adds");
+
+        manifest(&source, "site", "2.0.0");
+        let err = update("web", &target).expect_err("refused");
+        assert!(err.contains("now plugin `site`"), "{err}");
+        let kept = load_one(&target.join("web"), Scope::User).expect("still there");
+        assert_eq!(kept.manifest.version, "1.0.0");
+        assert!(!target.join("site").exists());
+
+        let all = update_all(&target).expect_err("one failed");
+        assert!(all.contains("plugin `web`"), "{all}");
+    }
+
+    #[test]
+    fn update_clones_a_git_source_again() {
+        let dir = tempfile::tempdir().expect("dir");
+        let repo = dir.path().join("repo");
+        manifest(&repo, "web", "0.1.0");
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "one"]);
+        let url = format!("file://{}", repo.display());
+        let target = dir.path().join("plugins");
+        let installed = add(&url, &target).expect("clones");
+        assert_eq!(
+            Source::recorded(&installed.root).expect("recorded"),
+            Source::Git(url.clone())
+        );
+
+        manifest(&repo, "web", "0.2.0");
+        git(&repo, &["commit", "-q", "-am", "two"]);
+        let done = update("web", &target).expect("updates");
+        assert_eq!((done.from.as_str(), done.to.as_str()), ("0.1.0", "0.2.0"));
+        assert_eq!(done.source, Source::Git(url));
+    }
+
+    #[test]
+    fn a_plugin_without_a_recorded_source_is_not_updated() {
+        let dir = tempfile::tempdir().expect("dir");
+        plugin(dir.path(), "web", "d");
+        let err = update("web", dir.path()).expect_err("no source");
+        assert!(err.contains("add it again"), "{err}");
+        assert!(update("nope", dir.path())
+            .expect_err("missing")
+            .contains("no plugin"));
+    }
+
+    #[test]
+    fn a_source_is_recorded_so_it_reads_back() {
+        let dir = tempfile::tempdir().expect("dir");
+        for source in [
+            Source::Git("https://example.com/a.git".to_string()),
+            Source::Path(PathBuf::from("/opt/it's here")),
+        ] {
+            std::fs::write(dir.path().join(SOURCE), source.to_toml()).expect("write");
+            assert_eq!(Source::recorded(dir.path()).expect("reads"), source);
+        }
     }
 
     #[test]

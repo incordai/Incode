@@ -178,10 +178,13 @@ fn a_picked_role_routes_the_next_turns_model() {
     );
     let dir = tempfile::tempdir().expect("ws");
     let (session, _) = new_session(&mut client, dir.path(), json!([]));
-    let set = client.call(
+    let asked = client.request(
         "session/set_config_option",
         json!({"sessionId": session, "configId": "role", "value": "explore"}),
     );
+    // Applied at once while the session is idle, so the session's update can
+    // race the reply: what came before the reply is kept and looked at too.
+    let (mut seen, set) = client.until_response(asked);
     assert_eq!(
         option(&result_of(&set)["configOptions"], "role")["currentValue"],
         "explore"
@@ -191,15 +194,12 @@ fn a_picked_role_routes_the_next_turns_model() {
         text_of(&said).contains("on small-model"),
         "the turn after the pick runs on the role's model: {said:#?}"
     );
-    let updates = updates_of(&said);
-    let mut told = updates
+    seen.extend(said);
+    let updates = updates_of(&seen);
+    let told = updates
         .iter()
-        .filter(|u| u["sessionUpdate"] == "config_option_update");
-    let told = told.next().unwrap_or_else(|| {
-        // Applied while idle, before the prompt: the update may have come
-        // ahead of it.
-        panic!("no config_option_update with the prompt: {said:#?}")
-    });
+        .find(|u| u["sessionUpdate"] == "config_option_update")
+        .unwrap_or_else(|| panic!("no config_option_update: {seen:#?}"));
     let role = option(&told["configOptions"], "role");
     assert!(
         role["description"]
@@ -326,6 +326,165 @@ fn session_new_answers_before_a_slow_server_has_listed_its_tools() {
         .unwrap_or_else(|| panic!("no result: {streamed:#?}"));
     assert_eq!(result["status"], "completed", "{result}");
     assert_eq!(crate::toolbox::client_server_calls(&log).len(), 1);
+    client.close();
+}
+
+/// A workspace whose `.mcp.json` names the fake server as `fake`, logging
+/// its calls to `log`.
+fn workspace_with_project_server(log: &Path) -> tempfile::TempDir {
+    let spec = crate::toolbox::fake_server("fake", log);
+    let crate::toolbox::Transport::Stdio { command, args, env } = spec.transport else {
+        panic!("the fake is a stdio server");
+    };
+    let dir = tempfile::tempdir().expect("ws");
+    let env: serde_json::Map<String, Value> = env
+        .into_iter()
+        .map(|(name, value)| (name, Value::String(value)))
+        .collect();
+    std::fs::write(
+        dir.path().join(crate::mcp_config::PROJECT_FILE),
+        json!({"mcpServers": {"fake": {"command": command, "args": args, "env": env}}}).to_string(),
+    )
+    .expect("write .mcp.json");
+    dir
+}
+
+/// Open a session in a workspace whose `.mcp.json` names a server not yet
+/// approved, and return the client, the session, the workspace and the
+/// `session/request_permission` it was sent about the server — checked to
+/// come after `session/new` was answered.
+fn asked_about_a_project_server(log: &Path) -> (Client, String, tempfile::TempDir, Value) {
+    let mut client = client(super::tests::Behaviour::CallMcp);
+    let ws = workspace_with_project_server(log);
+    let id = client.request("session/new", json!({"cwd": ws.path(), "mcpServers": []}));
+    let (before, reply) = client.until_response(id);
+    assert!(
+        before
+            .iter()
+            .all(|m| m["method"] != "session/request_permission"),
+        "asked before the session was answered: {before:#?}"
+    );
+    let session = result_of(&reply)["sessionId"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let asked = loop {
+        let message = client.next();
+        if message["method"] == "session/request_permission" {
+            break message;
+        }
+    };
+    let params = &asked["params"];
+    assert_eq!(params["sessionId"], session, "{asked}");
+    assert!(
+        params["toolCall"]["title"]
+            .as_str()
+            .is_some_and(|t| t.contains("MCP server `fake`") && t.contains(".mcp.json")),
+        "{asked}"
+    );
+    let kinds: Vec<&str> = params["options"]
+        .as_array()
+        .expect("options")
+        .iter()
+        .filter_map(|o| o["kind"].as_str())
+        .collect();
+    assert_eq!(
+        kinds,
+        ["allow_once", "allow_always", "reject_once"],
+        "{asked}"
+    );
+    (client, session, ws, asked)
+}
+
+fn answer(client: &mut Client, asked: &Value, option: &str) {
+    client.send_raw(
+        &json!({"jsonrpc": "2.0", "id": asked["id"],
+                "result": {"outcome": {"outcome": "selected", "optionId": option}}})
+        .to_string(),
+    );
+}
+
+/// Call `mcp__fake__echo` in `session` and say whether it ran.
+fn echo_runs(client: &mut Client, session: &str) -> bool {
+    let (streamed, reply) = prompt_in(client, session, "call the echo");
+    assert_eq!(reply["result"]["stopReason"], "end_turn", "{reply}");
+    updates_of(&streamed)
+        .iter()
+        .find(|u| u["sessionUpdate"] == "tool_call_update" && u["toolCallId"] == "m1")
+        .is_some_and(|u| u["status"] == "completed")
+}
+
+fn approved(client: &Client, ws: &Path) -> bool {
+    let file = crate::mcp_config::read(&ws.join(crate::mcp_config::PROJECT_FILE)).expect("read");
+    crate::mcp_config::is_approved(client.data_dir(), "fake", &file.servers["fake"])
+}
+
+/// **A PROJECT'S SERVER IS ASKED ABOUT OVER ACP — ALLOW ONCE.** Once the
+/// session is answered the client is asked; allowed once, the server
+/// connects and its tool runs, and nothing is remembered.
+#[test]
+fn a_project_server_allowed_once_connects_and_is_not_remembered() {
+    let logs = tempfile::tempdir().expect("logs");
+    let log = logs.path().join("calls.log");
+    let (mut client, session, ws, asked) = asked_about_a_project_server(&log);
+    answer(&mut client, &asked, "allow");
+    said_until(&mut client, "MCP server `fake`: 1 tool(s)");
+    assert!(echo_runs(&mut client, &session));
+    assert_eq!(crate::toolbox::client_server_calls(&log).len(), 1);
+    assert!(!approved(&client, ws.path()), "allow once was remembered");
+    client.close();
+}
+
+/// **ALLOW ALWAYS** connects it and remembers the approval as `incode mcp
+/// approve` would: the next session starts it without asking.
+#[test]
+fn a_project_server_allowed_always_is_remembered() {
+    let logs = tempfile::tempdir().expect("logs");
+    let log = logs.path().join("calls.log");
+    let (mut client, session, ws, asked) = asked_about_a_project_server(&log);
+    answer(&mut client, &asked, "allow-always");
+    said_until(&mut client, "MCP server `fake`: 1 tool(s)");
+    assert!(echo_runs(&mut client, &session));
+    assert!(
+        approved(&client, ws.path()),
+        "allow always was not remembered"
+    );
+
+    let id = client.request("session/new", json!({"cwd": ws.path(), "mcpServers": []}));
+    client.until_response(id);
+    let said = said_until(&mut client, "MCP server `fake`: 1 tool(s)");
+    assert!(!said.contains("approve"), "{said}");
+    client.close();
+}
+
+/// **REJECT** leaves it unstarted, says so, and remembers nothing.
+#[test]
+fn a_rejected_project_server_is_not_started() {
+    let logs = tempfile::tempdir().expect("logs");
+    let log = logs.path().join("calls.log");
+    let (mut client, session, ws, asked) = asked_about_a_project_server(&log);
+    answer(&mut client, &asked, "reject");
+    said_until(&mut client, "was not approved and is not started");
+    assert!(!echo_runs(&mut client, &session));
+    assert!(crate::toolbox::client_server_calls(&log).is_empty());
+    assert!(!approved(&client, ws.path()));
+    client.close();
+}
+
+/// **A CLIENT THAT CANNOT ASK** — it answers "method not found" — gets what
+/// `-t` gets: the server skipped, with the command that approves it.
+#[test]
+fn a_client_that_cannot_ask_leaves_the_project_server_skipped() {
+    let logs = tempfile::tempdir().expect("logs");
+    let log = logs.path().join("calls.log");
+    let (mut client, _session, ws, asked) = asked_about_a_project_server(&log);
+    client.send_raw(
+        &json!({"jsonrpc": "2.0", "id": asked["id"],
+                "error": {"code": -32601, "message": "method not found"}})
+        .to_string(),
+    );
+    said_until(&mut client, "`incode mcp approve fake` approves it");
+    assert!(!approved(&client, ws.path()));
     client.close();
 }
 
