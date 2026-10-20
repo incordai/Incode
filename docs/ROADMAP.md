@@ -40,10 +40,13 @@ This is fully true for claude; section 0b says what is not.
 
 ### 0b. Still open
 
-- **codex and agy still use their own tools.** agy has no switch to turn them off
-  or add MCP per run; codex has no switch for `apply_patch` / `update_plan`, and
-  its candidate flags could not be proved (usage limit). On both routes the guards
-  are the Sentinel (detection), not a gate (`ARCHITECTURE.md` §5a).
+- **codex and agy still use their own tools by default.** agy has no switch to
+  turn them off or add MCP per run. codex can now be bridged, opt-in
+  (`codex_tools: "incode"`): measured on 0.163.0 against a stand-in model
+  endpoint, end to end; `apply_patch` has no switch and is rejected unrun under
+  read-only + never. Left: a turn with a real model, then making it the default.
+  On the unbridged routes the guards are the Sentinel (detection), not a gate
+  (`ARCHITECTURE.md` §5a).
 - **Driving ACP agents (opencode, gemini).** Built in `fcfa2d9`, reverted in
   `c98757a`; not in HEAD. gemini, opencode and cursor are detected, not driven.
 - ~~**Provider agents** from `api_providers` are listed and marked not usable.~~

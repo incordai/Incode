@@ -5,7 +5,9 @@
 //! `-p` and a structured `--output-format`. The wire shapes below were taken
 //! from real runs of CLI 2.1.229, not from documentation.
 
-use std::io::{BufRead, BufReader};
+#[cfg(test)]
+use std::io::BufRead;
+use std::io::BufReader;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -1125,49 +1127,15 @@ pub fn debug_stream_path() -> Option<String> {
         .filter(|p| !p.is_empty())
 }
 
+use crate::tool_bridge::Incoming;
 /// What a cancelled turn reports, so the caller can tell it apart from a crash.
-pub const CANCELLED: &str = "the turn was cancelled";
-
-/// What the turn's loop hears: a line the CLI printed, or a tool call the
-/// model made, forwarded by the bridge.
-enum Incoming {
-    Line(String),
-    ReadFailed(String),
-    Ended,
-    Tool(crate::tool_bridge::Request),
-}
-
-/// How long the loop waits for something to arrive before looking at the
-/// cancel flag again. A turn that has gone quiet — the model thinking, a long
-/// command running — still stops within this of being asked to.
-const POLL: std::time::Duration = std::time::Duration::from_millis(100);
-
-/// Read the CLI's output on its own thread, one line at a time, into the loop.
-///
-/// Its own thread because the loop must also answer tool calls, and the CLI
-/// is BLOCKED on each of those until it is answered: a loop sitting in a read
-/// of the CLI's output would never see the call the CLI is waiting on.
-fn pump<R: BufRead + Send + 'static>(reader: R, to: std::sync::mpsc::Sender<Incoming>) {
-    std::thread::spawn(move || {
-        for line in reader.lines() {
-            let message = match line {
-                Ok(line) => Incoming::Line(line),
-                Err(e) => {
-                    let _ = to.send(Incoming::ReadFailed(e.to_string()));
-                    return;
-                }
-            };
-            if to.send(message).is_err() {
-                return;
-            }
-        }
-        let _ = to.send(Incoming::Ended);
-    });
-}
+/// One wording for every bridged CLI — see [`crate::tool_bridge::CANCELLED`].
+pub use crate::tool_bridge::CANCELLED;
 
 /// The turn itself: the CLI's output mapped to events, and every tool call
 /// the model makes run by `tools`, until the CLI finishes or the turn is
-/// stopped.
+/// stopped. The loop is the bridge's ([`crate::tool_bridge::drive`]); what a
+/// line of THIS CLI means is decided here.
 fn consume(
     from: &std::sync::mpsc::Receiver<Incoming>,
     session: &mut Option<String>,
@@ -1176,31 +1144,8 @@ fn consume(
     tools: &mut crate::toolbox::Toolbox,
     calls: &mut u64,
 ) -> Result<Option<TurnOutcome>, AgentError> {
-    let stopped = || cancel.is_some_and(crate::runtime::cancel::CancelToken::is_cancelled);
     let mut outcome = None;
-
-    loop {
-        if stopped() {
-            return Err(AgentError::new(CANCELLED));
-        }
-        let line = match from.recv_timeout(POLL) {
-            Ok(Incoming::Line(line)) => line,
-            Ok(Incoming::Tool(request)) => {
-                // Numbered per CALL: the list the server asks for first is
-                // not a call, and must not use up an id.
-                if matches!(request, crate::tool_bridge::Request::Call { .. }) {
-                    *calls += 1;
-                }
-                let id = format!("incode-{calls}");
-                crate::tool_bridge::answer(tools, request, &id, stopped(), on_event);
-                continue;
-            }
-            Ok(Incoming::ReadFailed(e)) => {
-                return Err(AgentError::new(format!("reading agent output: {e}")))
-            }
-            Ok(Incoming::Ended) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-        };
+    crate::tool_bridge::drive(from, cancel, tools, calls, on_event, &mut |line, tools| {
         // Every raw line, when asked for. A turn that fails for a reason the
         // harness cannot explain — "stopped without finishing: stop_sequence" —
         // is unanswerable without the bytes the agent actually sent, and
@@ -1216,10 +1161,11 @@ fn consume(
             }
         }
         if line.trim().is_empty() {
-            continue;
+            return Vec::new();
         }
-        for event in map_line(&line, &mut outcome) {
-            if let AgentEvent::SessionStarted { session_id, .. } = &event {
+        let events = map_line(&line, &mut outcome);
+        for event in &events {
+            if let AgentEvent::SessionStarted { session_id, .. } = event {
                 if !session_id.is_empty() {
                     *session = Some(session_id.clone());
                     // The engine files its cards and backups under the
@@ -1227,10 +1173,9 @@ fn consume(
                     tools.set_session(session_id);
                 }
             }
-            on_event(&event);
         }
-    }
-
+        events
+    })?;
     Ok(outcome)
 }
 
@@ -1506,21 +1451,12 @@ impl ClaudeCodeBackend {
         // process answers for the whole turn. Without the bridge there would
         // be no tools but the CLI's, so a bridge that cannot open stops the
         // turn rather than falling back to them.
-        let exe = std::env::current_exe().map_err(|e| {
-            AgentError::new(format!(
-                "incode could not name its own binary, so it cannot offer its tools; \
-                 the turn was not started: {e}"
-            ))
-        })?;
-        let (to_loop, from_cli) = std::sync::mpsc::channel();
-        let bridge =
-            crate::tool_bridge::Bridge::open(to_loop.clone(), Incoming::Tool, self.cancel.clone())
-                .map_err(|e| {
-                    AgentError::new(format!(
-                        "incode could not open the channel its tools run over, so the turn \
-                         was not started: {e}"
-                    ))
-                })?;
+        let crate::tool_bridge::Turn {
+            exe,
+            bridge,
+            to: to_loop,
+            from: from_cli,
+        } = crate::tool_bridge::Turn::open(self.cancel.clone())?;
         let (servers, allowed) = servers_for(&exe);
 
         let mut cmd = self.command(
@@ -1618,7 +1554,7 @@ impl ClaudeCodeBackend {
         // blocks on the write and never exits. See `stderr_tail`.
         let stderr = crate::agent::stderr_tail::StderrTail::capture(child.stderr.take());
 
-        pump(BufReader::new(stdout), to_loop);
+        crate::tool_bridge::pump(BufReader::new(stdout), to_loop);
         let outcome = consume(
             &from_cli,
             &mut self.session_id,

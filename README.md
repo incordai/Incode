@@ -8,8 +8,8 @@ before it calls it done.
 in to — `claude`, `codex` and `agy` — are used only as models, run headless on
 your own subscriptions. The loop's tools, the permission checks, the undo
 history, the memory hooks and the record of what happened are incode's own.
-(Today that is fully true for `claude`; `codex` and `agy` still run their own
-tools — see [Limits](#limits).)
+(Today that is fully true for `claude`, and for `codex` when you opt in; `codex`
+by default and `agy` still run their own tools — see [Limits](#limits).)
 
 ---
 
@@ -450,6 +450,56 @@ it sets; any other `id` adds an agent.
 - An `id` holding `/` or `:` is skipped: those mark provider agents and role
   qualifiers.
 
+### The codex route: whose tools
+
+By default `codex` runs its own tools (`exec_command`, `apply_patch`, …) and
+incode watches the result afterwards. With `"codex_tools": "incode"` in
+`admin.json` (or `INCODE_CODEX_TOOLS=incode`, which wins) it is driven like
+`claude`: a model only, with every tool call run by incode. `incode --admin`
+shows which is in force and where it was decided. It is opt-in until a turn with
+a real model has been run this way; everything below was measured on codex 0.163.0
+against a stand-in model endpoint, end to end through `incode -t`.
+
+Each turn incode opens its tool bridge and starts `codex exec --json` with:
+
+- `--ignore-user-config` — `~/.codex/config.toml` is not read (so no MCP server
+  you registered there is reachable); login still comes from `CODEX_HOME`. A
+  model provider set only in that file is not used on this route.
+- its tools off: `features.shell_tool=false`, `features.view_image=false`,
+  `web_search="disabled"`, `features.goals=false`, `agents.enabled=false`,
+  `features.multi_agent=false`, `features.apps=false`, `features.plugins=false`,
+  `features.browser_use=false`, `features.computer_use=false`,
+  `features.image_generation=false`,
+  `tools.experimental_request_user_input.enabled=false`;
+- `sandbox_mode="read-only"`, `approval_policy="never"`;
+- one MCP server, `incode --tool-server`, given the bridge's address and token
+  through `env_vars` (codex passes a server only the variables it is told to),
+  approval mode `approve`, `required`, a one-hour call timeout, and its tools
+  listed directly rather than behind codex's tool search.
+
+What is enforced there: every file, shell, web, team, desktop and sub-agent
+call is incode's, so the guards, the [permission rules](#permission-rules), a
+command's `allowed-tools`, the permission mode, your hooks, the memory engine
+and the [OS sandbox](#the-os-sandbox) apply to it before it runs, and the
+"not enforced" notice is not shown. What is not incode's:
+
+- `apply_patch` stays on offer — codex has no switch for it (the model catalogue
+  decides). Under read-only + never codex rejects it before it runs ("patch
+  rejected: writing is blocked by read-only sandbox"), so it cannot write.
+- The three MCP resource readers (`list_mcp_resources`, …) stay; they read only
+  what incode's server offers.
+- On code-mode models (`gpt-5.6-terra`) incode's tools are reached through
+  codex's own `exec`, a JavaScript sandbox without file system or network that
+  calls them — each call still lands in incode.
+- A project's own `.codex/config.toml` is outside `--ignore-user-config`;
+  codex loads it only for a project it trusts.
+- Older codex: 0.145 has no `view_image` switch and lists incode's tools behind
+  its tool search; 0.153 has every switch above.
+
+`agy` cannot be driven this way: it has no flag to switch its tools off, and
+takes MCP servers only through a persistent `agy mcp add`, which would edit your
+machine rather than one run.
+
 ### The API providers contract
 
 ```json
@@ -596,8 +646,9 @@ rule (`Bash(npm test:*)`, `Read`, `Edit(src/**)` — the grammar of
 refused, with the list named to the model. A compound shell line is covered
 only when every part is. Only that turn: the next one is unrestricted. It only
 narrows — deny and ask rules, guards, the mode and hooks still apply. It binds
-where incode runs the tools (the API route and Claude Code); on Codex and
-Antigravity, which bring their own tools, the turn says it was not enforced.
+where incode runs the tools (the API route, Claude Code, and Codex with
+`codex_tools: "incode"`); on Codex's own tools and Antigravity, the turn says it
+was not enforced.
 
 A **plugin** is a folder in `~/.incode/plugins/<name>/` or
 `.incode/plugins/<name>/` with a `plugin.toml` (`name`, `version`,
@@ -1237,6 +1288,7 @@ and `--admin` prints which layer decided each value.
 | `sandbox` | `off` · `workspace-write` · `read-only`; unset follows the permission mode |
 | `sandbox_network` | `allow` (default) · `deny` — see [the OS sandbox](#the-os-sandbox) |
 | `sandbox_engine` · `sandbox_allow_hosts` · `sandbox_backend` | `builtin` (default) · `sbx`; under sbx, the hosts a command may reach and, on Windows, `native` · `wsl` · `auto` — see [the OS sandbox](#the-os-sandbox) |
+| `codex_tools` | `own` (default) · `incode` — whose tools a `codex` model runs; see [the codex route](#the-codex-route-whose-tools) |
 | `hooks` (also `desktop_hooks`) | Your `pre_tool_use` / `post_tool_use` commands, run for every tool. The event is JSON on stdin; exit 2 on a pre-tool command denies; bounded at 10 s |
 | `desktop_limits` | The desktop's limits, each optional: `max_actions_per_minute` (120), `heartbeat_deadline_secs` (30), `tree_depth` (12), `tree_max_elements` (400), `journal_max_bytes` (262144), `xvfb_start_timeout_secs` (10), `clipboard_timeout_secs` (5), `accessibility_call_timeout_ms` (1000), `paste_restore_delay_ms` (500, how long the pasted text stays on the clipboard before the old one is put back), `settle_ms` (300, the pause before a `screenshot_after`), `max_scroll_steps` (50, wheel steps in one `scroll`), `tree_max_visited` (4000, elements one tree walk may visit), and `blocked_apps` (application names, matched case-insensitively as a part of the name, added to the built-in password managers: 1Password, Bitwarden, LastPass, Dashlane, KeePass, NordPass, Proton Pass, Enpass, RoboForm, Keeper). The first two are safety limits and may only be lowered; zero and unknown keys are refused, and the desktop does not start on a malformed admin.json |
 | `desktop_display` | Linux computer use: `":N"` drives a running X display; `"xvfb"` or `"xvfb:1280x800"` starts a private Xvfb for the desktop server's lifetime (default 1920x1080). Unset refuses rather than using `$DISPLAY`. `paste_text` needs `xclip` or `xsel`; `ui_tree` needs a D-Bus session with at-spi2-core |
@@ -1256,6 +1308,7 @@ Environment variables:
 | `INCODE_LANES` | Parallel `/run` lanes (needs git; at most 8) |
 | `INCODE_SANDBOX` · `INCODE_SANDBOX_NETWORK` | The sandbox mode · the network switch |
 | `INCODE_DESKTOP` | `1` offers the [computer use](#computer-use) tools |
+| `INCODE_CODEX_TOOLS` | `own` · `incode`, over `admin.json` `codex_tools` |
 | The variable each `key_env` names | That entry's key — the only part of an API route read from the environment |
 | `INCORD_MEMORY_URL` · `INCORD_ENGINE_BIN` | The memory service · its engine binary |
 | `INCODE_BROWSER` · `INCODE_PDF_BROWSER` · `INCODE_SOFFICE` | The headless browser · the PDF printer · LibreOffice |
@@ -1337,8 +1390,10 @@ moved. The old `INCORD_*` variables are not read any more: rename them.
 
 ## Limits
 
-- `codex` and `agy` still use their own tools; only `claude` runs as a model
-  only. On those routes the guards are a sentinel (detection), not a gate.
+- `codex` (by default) and `agy` still use their own tools; `claude` runs as a
+  model only, and so does `codex` with `codex_tools: "incode"`
+  ([opt-in](#the-codex-route-whose-tools)). On the other routes the guards are a
+  sentinel (detection), not a gate.
 - A client's MCP servers are stdio or Streamable HTTP; the older SSE transport is
   not spoken.
 - The Windows sandbox confines workspace-write only when you name it, and does

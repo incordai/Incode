@@ -42,6 +42,11 @@ use crate::agent::AgentEvent;
 use crate::runtime::cancel::CancelToken;
 use crate::toolbox::{ToolOutput, Toolbox};
 
+/// How long, in whole seconds, the server half waits for a tool to finish —
+/// what a CLI that bounds its own MCP calls must be told, or it gives up on
+/// a call incode is still running. See `REPLY_BOUND`.
+pub const REPLY_BOUND_SECS: u64 = 60 * 60;
+
 /// Where the tool server finds the parent: `127.0.0.1:<port>`.
 pub const ADDR_ENV: &str = "INCODE_TOOL_BRIDGE";
 /// The turn's token, which every request must carry.
@@ -67,7 +72,7 @@ const CONNECT_BOUND: Duration = Duration::from_secs(5);
 /// How long the server half waits for a tool to finish. A person may be asked
 /// (bounded at ten minutes by the engine) and a command may run long; past an
 /// hour nothing is still coming.
-const REPLY_BOUND: Duration = Duration::from_secs(60 * 60);
+const REPLY_BOUND: Duration = Duration::from_secs(REPLY_BOUND_SECS);
 
 /// What reached the parent from the tool server.
 pub enum Request {
@@ -367,6 +372,141 @@ pub fn answer(
             let _ = reply.send(outcome);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The parent's turn: one loop for every CLI driven over the bridge.
+// ---------------------------------------------------------------------------
+
+/// What a cancelled turn reports, so the caller can tell it apart from a crash.
+pub const CANCELLED: &str = "the turn was cancelled";
+
+/// What a bridged turn's loop hears: a line the CLI printed, or a tool call
+/// the model made, forwarded by the bridge.
+pub enum Incoming {
+    Line(String),
+    ReadFailed(String),
+    Ended,
+    Tool(Request),
+}
+
+/// How long the loop waits for something to arrive before looking at the
+/// cancel flag again. A turn that has gone quiet — the model thinking, a long
+/// command running — still stops within this of being asked to.
+pub const POLL: Duration = Duration::from_millis(100);
+
+/// Read the CLI's output on its own thread, one line at a time, into the loop.
+///
+/// Its own thread because the loop must also answer tool calls, and the CLI
+/// is BLOCKED on each of those until it is answered: a loop sitting in a read
+/// of the CLI's output would never see the call the CLI is waiting on.
+pub fn pump<R: BufRead + Send + 'static>(reader: R, to: Sender<Incoming>) {
+    std::thread::spawn(move || {
+        for line in reader.lines() {
+            let message = match line {
+                Ok(line) => Incoming::Line(line),
+                Err(e) => {
+                    let _ = to.send(Incoming::ReadFailed(e.to_string()));
+                    return;
+                }
+            };
+            if to.send(message).is_err() {
+                return;
+            }
+        }
+        let _ = to.send(Incoming::Ended);
+    });
+}
+
+/// One turn's channel, opened before the CLI is started: the bridge, the
+/// loop's two ends, and the binary the CLI must start as the tool server.
+pub struct Turn {
+    pub exe: std::path::PathBuf,
+    pub bridge: Bridge,
+    pub to: Sender<Incoming>,
+    pub from: std::sync::mpsc::Receiver<Incoming>,
+}
+
+impl Turn {
+    /// Open the channel for one turn, refused once `cancel` trips.
+    ///
+    /// # Errors
+    ///
+    /// This binary cannot be named, or the socket cannot be bound. Either
+    /// way the turn is not started: without the bridge the model would have
+    /// no tools but the CLI's, and falling back to those is the thing this
+    /// route exists to avoid.
+    pub fn open(cancel: Option<CancelToken>) -> Result<Self, crate::agent::AgentError> {
+        let exe = std::env::current_exe().map_err(|e| {
+            crate::agent::AgentError::new(format!(
+                "incode could not name its own binary, so it cannot offer its tools; \
+                 the turn was not started: {e}"
+            ))
+        })?;
+        let (to, from) = std::sync::mpsc::channel();
+        let bridge = Bridge::open(to.clone(), Incoming::Tool, cancel).map_err(|e| {
+            crate::agent::AgentError::new(format!(
+                "incode could not open the channel its tools run over, so the turn \
+                 was not started: {e}"
+            ))
+        })?;
+        Ok(Self {
+            exe,
+            bridge,
+            to,
+            from,
+        })
+    }
+}
+
+/// The turn itself: every tool call the model makes run by `tools`, and
+/// every line the CLI prints handed to `on_line`, whose events are shown —
+/// until the CLI finishes or the turn is stopped.
+///
+/// `on_line` is given the toolbox too, so a CLI that names its conversation
+/// can tell the engine which one the calls belong to.
+///
+/// # Errors
+///
+/// [`CANCELLED`] when the turn was stopped; the CLI's output could not be read.
+pub fn drive(
+    from: &std::sync::mpsc::Receiver<Incoming>,
+    cancel: Option<&CancelToken>,
+    tools: &mut Toolbox,
+    calls: &mut u64,
+    on_event: &mut dyn FnMut(&AgentEvent),
+    on_line: &mut dyn FnMut(String, &mut Toolbox) -> Vec<AgentEvent>,
+) -> Result<(), crate::agent::AgentError> {
+    let stopped = || cancel.is_some_and(CancelToken::is_cancelled);
+    loop {
+        if stopped() {
+            return Err(crate::agent::AgentError::new(CANCELLED));
+        }
+        let line = match from.recv_timeout(POLL) {
+            Ok(Incoming::Line(line)) => line,
+            Ok(Incoming::Tool(request)) => {
+                // Numbered per CALL: the list the server asks for first is
+                // not a call, and must not use up an id.
+                if matches!(request, Request::Call { .. }) {
+                    *calls += 1;
+                }
+                let id = format!("incode-{calls}");
+                answer(tools, request, &id, stopped(), on_event);
+                continue;
+            }
+            Ok(Incoming::ReadFailed(e)) => {
+                return Err(crate::agent::AgentError::new(format!(
+                    "reading agent output: {e}"
+                )))
+            }
+            Ok(Incoming::Ended) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+        };
+        for event in on_line(line, tools) {
+            on_event(&event);
+        }
+    }
+    Ok(())
 }
 
 /// The MCP registration entry for the server half, for an `mcpServers` map.

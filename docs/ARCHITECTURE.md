@@ -993,6 +993,32 @@ feature flag or config key (only the model catalogue's `apply_patch_tool_type`);
 to switch them off was found. Until both are proved, codex keeps its own tools, the
 Sentinel remains detection-only there, and its edit events still feed the diff.
 
+**codex 0.163.0 — bridged, OPT-IN (`codex_tools: "incode"` / `INCODE_CODEX_TOOLS`).**
+The default stays `own` until a turn with a real model has run this way. The tool list
+was observed by pointing codex at a stand-in Responses endpoint
+(`-c model_providers.<n>.base_url=…`) that recorded each request — no login needed:
+
+| Need | Override | Evidence |
+|---|---|---|
+| No shell, image, web, goals or ask tools | `features.shell_tool=false`, `features.view_image=false`, `web_search="disabled"`, `features.goals=false`, `tools.experimental_request_user_input.enabled=false` | `gpt-5.5` control: `exec_command, write_stdin, request_user_input, apply_patch, view_image, get_goal, create_goal, update_goal, tool_search, web_search`; with them: `list_mcp_resources, list_mcp_resource_templates, read_mcp_resource, apply_patch, mcp__incode{…}`. |
+| No sub-agents of its own | `agents.enabled=false` (+ `features.multi_agent=false`) | `gpt-5.6-terra` (catalogue: multi-agent v2) still had a `collaboration` namespace (`spawn_agent`, …) with only the feature off; gone with `agents.enabled=false`, which `Config::multi_agent_version_override` puts above the catalogue. |
+| Its MCP servers and settings unread | `--ignore-user-config` | `exec/src/cli.rs` (global flag, 0.145+); auth still from `CODEX_HOME`. Hooks stay off by `--disable hooks`. |
+| incode's server, reachable | `mcp_servers.incode.{command,args}`, `env_vars=["INCODE_TOOL_BRIDGE","INCODE_TOOL_TOKEN"]` | codex gives a stdio server only `HOME`, `PATH`, … plus `env_vars` (`rmcp-client/src/utils.rs`); a probe server got the two named and not a third variable set beside them. |
+| Calls not refused by codex | `default_tools_approval_mode="approve"` | `auto` asks for any tool not marked read-only (`requires_mcp_tool_approval_for_mode`), and under `approval_policy="never"` the ask is a refusal. |
+| Tools listed directly | `omit_tools_from=["deferred"]` | without it the tools sat behind `tool_search`; with it `mcp__incode{…}` was in the list and `tool_search` was not (0.153+; 0.145 ignores the key). |
+| Long calls survive | `tool_timeout_sec=3600` | codex's default is 300 s (`DEFAULT_TOOL_TIMEOUT`); the bridge's own bound is an hour. |
+| `apply_patch` cannot write | `sandbox_mode="read-only"`, `approval_policy="never"` | no switch exists (the catalogue's `apply_patch_tool_type`); `assess_patch_safety` rejects it before it runs. Live: a scripted `apply_patch` adding a file came back "patch rejected: writing is blocked by read-only sandbox; rejected by user approval settings", and no file appeared. |
+
+Through `incode -t` with the stand-in scripted to call `mcp__incode` `Write`: codex
+started `incode --tool-server`, the call ran in the toolbox (`tool Write (change)`),
+the file was written, the stream showed it once as `incode-1` (codex's own
+`mcp_tool_call` items for the `incode` server are not shown again), and the model was
+handed the toolbox's answer. With `"permissions": {"deny": ["Write(secret.txt)"]}` the
+same call came back "NOT RUN — Write is refused by the deny rule" and nothing was
+written. On a code-mode model (`gpt-5.6-terra`) the tools are nested under codex's
+`exec` (JavaScript, no file system or network), and each call still lands in the
+toolbox. NOT run: a turn with a real model.
+
 **agy 1.2.11 (antigravity) — NOT bridged; cannot be.** `agy --help` has no flag to
 remove or restrict its built-in tools, no per-run MCP configuration (only a persistent
 `agy mcp add`, which edits the operator's machine), and no way to skip its settings. A

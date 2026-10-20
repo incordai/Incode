@@ -319,6 +319,11 @@ pub fn codex_config_overrides(exe: &std::path::Path, channel: &std::path::Path) 
             "mcp_servers.{CLIENT_KEY}.args=[\"--team-mcp\",\"--team-channel\",\"{}\"]",
             toml(channel)
         ),
+        // Codex starts an MCP stdio server with only HOME, PATH and a few
+        // others, plus the names listed here (codex `rmcp-client/src/utils.rs`):
+        // without it the server never sees who it speaks for, and every
+        // message is filed as unrouted. An older codex ignores the key.
+        format!("mcp_servers.{CLIENT_KEY}.env_vars=[\"{IDENTITY_ENV}\"]"),
     ]
 }
 
@@ -339,6 +344,22 @@ pub fn run_stdio(mut server: Server) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **CODEX HANDS THE SERVER WHO IT SPEAKS FOR.** Codex passes an MCP
+    /// server only the variables it is told to; the identity must be one.
+    #[test]
+    fn codex_is_told_to_pass_the_team_identity_on() {
+        let overrides = codex_config_overrides(
+            std::path::Path::new("/bin/incode"),
+            std::path::Path::new("/w/.incode/team.jsonl"),
+        );
+        assert!(
+            overrides
+                .iter()
+                .any(|o| o == &format!("mcp_servers.{CLIENT_KEY}.env_vars=[\"{IDENTITY_ENV}\"]")),
+            "{overrides:?}"
+        );
+    }
 
     fn temp_path(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
