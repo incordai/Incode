@@ -6,8 +6,10 @@ pub mod console;
 pub mod edits;
 pub mod footer;
 pub mod input;
+pub mod keys;
 pub mod logo;
 pub mod markdown;
+pub mod notify;
 pub mod paint;
 pub mod panel;
 pub mod prompt;
@@ -15,6 +17,8 @@ pub mod render;
 pub(crate) mod run_ledger;
 pub(crate) mod run_memory;
 pub mod slash_commands;
+pub mod statusline;
+mod ux;
 pub mod viewport;
 
 use crate::{out, outln};
@@ -750,6 +754,9 @@ impl CliApp {
             });
         }
         let mut editor = LineEditor::new(Some(history_path));
+        // Notifications, the status line, vi mode and key bindings.
+        let mut ux = ux::Ux::start(&admin, &incode_dir, footer.as_mut(), &mut editor);
+        ux.refresh_status(footer.as_mut(), &session, &workspace, git_context.as_ref());
         // The session's own jobs: `/bg` and the model's background `Bash`
         // share one table, so `/jobs` shows both and the stop hook waits on
         // both.
@@ -883,6 +890,8 @@ impl CliApp {
                         slash_commands::handle_roles(arg.as_deref(), &incode_dir);
                     }
                     SlashCommand::Help => slash_commands::handle_help(),
+                    SlashCommand::Cost => ux::print_cost(&session),
+                    SlashCommand::Vim => ux.toggle_vim(footer.as_mut(), &mut editor),
                     SlashCommand::Status => {
                         slash_commands::handle_agent_status(
                             &display_model,
@@ -1198,9 +1207,12 @@ impl CliApp {
             // that moment, from the table `/bg` and the model share.
             // Context, checkpoint, turn and streaming all live in one place
             // now, shared with the one-shot path above so the two cannot drift.
+            let turn_began = std::time::Instant::now();
             if let Err(e) = run_one_turn(&mut session, &workspace, &augmented_input, &line) {
                 render::print_error(&e);
             }
+            notify::turn_finished(turn_began.elapsed());
+            ux.refresh_status(footer.as_mut(), &session, &workspace, git_context.as_ref());
 
             if let Some(f) = footer.as_mut() {
                 f.set_session(footer::Session {

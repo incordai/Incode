@@ -95,6 +95,8 @@ pub struct AgentSession {
     /// turn's contribution rather than adding to it — adding would count the
     /// same tokens once per event and show a total that never matches the bill.
     usage: crate::runtime::usage::TokenUsage,
+    /// The same spend, split by the model each turn asked for, for `/cost`.
+    usage_by_model: Vec<(String, crate::runtime::usage::TokenUsage)>,
     /// The memory engine's session lifecycle, fired by this session: the
     /// session's start and end, each person's line, and each turn's stop.
     /// Fires nothing until [`Self::start_memory`] gives it an engine.
@@ -238,6 +240,7 @@ impl AgentSession {
             answers: Vec::new(),
             extra_dirs: Vec::new(),
             usage: crate::runtime::usage::TokenUsage::default(),
+            usage_by_model: Vec::new(),
             mode: None,
             prompter: None,
             watch: None,
@@ -656,6 +659,12 @@ impl AgentSession {
     #[must_use]
     pub fn usage(&self) -> crate::runtime::usage::TokenUsage {
         self.usage
+    }
+
+    /// The session's spend per model, in the order each was first used.
+    #[must_use]
+    pub fn usage_by_model(&self) -> &[(String, crate::runtime::usage::TokenUsage)] {
+        &self.usage_by_model
     }
 
     /// Whether there is a change to put back.
@@ -1180,6 +1189,15 @@ impl AgentSession {
         self.usage.output_tokens += turn_usage.output_tokens;
         self.usage.cache_creation_input_tokens += turn_usage.cache_creation_input_tokens;
         self.usage.cache_read_input_tokens += turn_usage.cache_read_input_tokens;
+        if turn_usage.total_tokens() > 0 {
+            let model = self
+                .model()
+                .map_or_else(|| self.backend_id().to_string(), str::to_string);
+            match self.usage_by_model.iter_mut().find(|(m, _)| *m == model) {
+                Some((_, used)) => *used = used.plus(turn_usage),
+                None => self.usage_by_model.push((model, turn_usage)),
+            }
+        }
 
         // THE TURN'S CHECKPOINT IS SEALED: only what changed is kept, what
         // the turn created is added, and — when the session keeps its

@@ -455,7 +455,36 @@ it sets; any other `id` adds an agent.
 | `/add-dir <path>` | Also work in this directory — guards and undo extend to it too |
 | `/tools add <name>` · `/tools update [name]` · `/tools remove <name>` | Install, update or remove an [external tool](#external-tools) (also over `--acp`) |
 | `/tools` · `/mcp` · `/env` · `/compact` | Information screens (`/tools` also lists the external tools and what is installed) |
+| `/cost` | Input, output and cache tokens per model this session, with an estimated USD figure from list prices |
+| `/vim` | Toggle vi editing in the input box for this session |
 | `/quit` | Exit |
+
+### Notifications, status line, vi mode and key bindings
+
+All optional, in `~/.incode/admin.json`:
+
+```json
+{
+  "notify": "auto",
+  "notify_command": "say \"$INCODE_MESSAGE\"",
+  "notify_after_secs": 10,
+  "statusline_command": "~/.incode/statusline.sh",
+  "editing_mode": "vi"
+}
+```
+
+- **`notify`** — when a turn that ran longer than `notify_after_secs` (default 10) finishes, or the agent stops to ask for permission or an answer: `auto` (default) sends an OSC 9 notification on terminals known to show one (iTerm2, WezTerm, Windows Terminal, kitty, Ghostty) and a bell elsewhere; `bell`; `desktop` (`notify-send` on Linux, `osascript` on macOS, a BurntToast or WinRT toast through PowerShell on Windows, a bell when that cannot start); `off`. `notify_command` also runs, with `INCODE_EVENT` (`done` or `input`) and `INCODE_MESSAGE` set. Nothing waits on either.
+- **`statusline_command`** — run at start and after each turn with the session as JSON on stdin (`cwd`, `workspace`, `model`, `session_id`, `git_branch`, `git_dirty`, `tokens` {`input`, `output`, `cache_write`, `cache_read`, `total`}, `cost_usd`, null when a model is unpriced). Its first line replaces the facts on the input box's top rule. It gets 1.5 s; a slow or failing run keeps the last good line.
+- **`editing_mode`** — `emacs` (default) or `vi`. In vi mode Esc enters normal mode (`h l w b e 0 ^ $ x X D C s S dd cc i a I A j k`) and Enter submits from either mode.
+- **`~/.incode/keybindings.toml`** — flat `"key" = "action"` lines, checked before the built-in keys. Keys: `ctrl-`, `alt-`, `shift-` plus a character, `enter`, `tab`, `esc`, `backspace`, `delete`, arrows, `home`, `end`, `space`, `f1`–`f12`. Actions: `clear-line`, `kill-to-start`, `kill-to-end`, `delete-word`, `line-start`, `line-end`, `char-left`, `char-right`, `word-left`, `word-right`, `history-prev`, `history-next`, `newline`, `submit`, `complete`.
+
+  ```toml
+  "ctrl-l" = "clear-line"
+  "alt-b" = "word-left"
+  "alt-f" = "word-right"
+  ```
+
+Prices for `/cost`, the status line and `-t --output-format json` (`cost_usd`) are one table, `PRICES` in `src/runtime/usage.rs`; a model it does not know is shown as unpriced, never guessed.
 
 ## Tools
 

@@ -72,6 +72,10 @@ pub enum SlashCommand {
     /// Send a picture with the next message.
     Image(String),
     Env,
+    /// Tokens and estimated dollars for this session, per model.
+    Cost,
+    /// Switch between vi and emacs editing.
+    Vim,
     Quit,
     /// A REAL command, typed without what it needs. Carries the usage line.
     ///
@@ -98,6 +102,8 @@ impl SlashCommand {
         Some(match cmd.as_str() {
             "/help" | "/h" | "/?" | "/" => Self::Help,
             "/status" | "/s" => Self::Status,
+            "/cost" => Self::Cost,
+            "/vim" => Self::Vim,
             "/compact" => Self::Compact,
             "/undo" | "/u" => Self::Undo,
             "/rewind" => match arg.as_deref().map(str::parse::<usize>) {
@@ -192,6 +198,8 @@ impl SlashCommand {
 pub const COMMANDS: &[(&str, &str)] = &[
     ("/help", "Show this help message"),
     ("/status", "Session info, token usage, model"),
+    ("/cost", "Tokens and estimated cost, per model"),
+    ("/vim", "Toggle vi editing for the input box"),
     (
         "/compact",
         "Say where context is managed — the agent compacts its own",
