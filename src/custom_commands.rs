@@ -597,13 +597,26 @@ fn pieces(body: &str) -> Vec<Piece<'_>> {
 /// The path `rest` starts with, when it looks like one: the characters a
 /// path is written with, less a sentence's closing `.` or `:`, naming a
 /// folder or an extension — so `@alice` stays a mention.
+///
+/// `\` separates as `/` does, and a drive (`C:\` or `C:/`) may lead, so a
+/// Windows path is read whole rather than cut at its `:` — and so is checked
+/// against the workspace like any other. A `:` anywhere else ends the path
+/// (`@a.rs:12` is `a.rs`).
 fn include_path(rest: &str) -> Option<&str> {
-    let end = rest
-        .find(|c: char| !(c.is_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '+' | '~')))
-        .unwrap_or(rest.len());
+    let bytes = rest.as_bytes();
+    let drive = bytes.len() > 2
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/');
+    let skip = if drive { 2 } else { 0 };
+    let end = rest[skip..]
+        .find(|c: char| {
+            !(c.is_alphanumeric() || matches!(c, '/' | '\\' | '.' | '_' | '-' | '+' | '~'))
+        })
+        .map_or(rest.len(), |i| i + skip);
     let path = rest[..end].trim_end_matches(['.', ':']);
-    let looks_like_one =
-        (path.contains('/') || path.contains('.')) && path.chars().any(char::is_alphanumeric);
+    let looks_like_one = (path.contains(['/', '\\']) || path.contains('.'))
+        && path.chars().any(char::is_alphanumeric);
     looks_like_one.then_some(path)
 }
 
@@ -911,6 +924,20 @@ mod tests {
             "Review \nsrc/a.rs:\n```\nfn a() {}\n```\n and \nnotes.md:\n````\nhas ``` \
              inside\n````\n please; mail a@b.com"
         );
+    }
+
+    /// A Windows path is read whole, drive and backslashes included, so it
+    /// is judged like any other; a `:` that is not a drive still ends one.
+    #[test]
+    fn a_windows_path_is_one_include() {
+        assert_eq!(
+            include_path(r"C:\Users\me\secret.txt and more"),
+            Some(r"C:\Users\me\secret.txt")
+        );
+        assert_eq!(include_path("C:/x/y.txt"), Some("C:/x/y.txt"));
+        assert_eq!(include_path(r"src\a.rs, then"), Some(r"src\a.rs"));
+        assert_eq!(include_path("a.rs:12"), Some("a.rs"));
+        assert_eq!(include_path("alice"), None);
     }
 
     #[test]

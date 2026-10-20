@@ -390,11 +390,31 @@ fn print_into(
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    let why = if cannot_sandbox(&said) {
+        format!("; {NO_BROWSER_SANDBOX}")
+    } else {
+        String::new()
+    };
     Err(format!(
-        "the browser exited with {} and printed no PDF: {}",
+        "the browser exited with {} and printed no PDF{why}: {}",
         output.status,
         crate::text::truncate(said.trim(), 600)
     ))
+}
+
+/// Said when the browser refused to start because it could not build its own
+/// sandbox. incode never turns that sandbox off (`--no-sandbox`): the page is
+/// a file the model may have written.
+pub(crate) const NO_BROWSER_SANDBOX: &str =
+    "it could not start its own sandbox on this machine (a setuid sandbox helper \
+     that is not installed as root, or unprivileged user namespaces turned off, \
+     as Ubuntu 23.10 and later do by default); fix the browser's sandbox or set \
+     `pdf_renderer` to another program";
+
+/// Whether a Chromium-family browser's output says it could not build its
+/// sandbox.
+fn cannot_sandbox(said: &str) -> bool {
+    said.contains("SUID sandbox helper") || said.contains("No usable sandbox")
 }
 
 /// Whether `path` holds a finished PDF: the header at the start and the
@@ -425,6 +445,18 @@ fn is_whole_pdf(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A browser that could not build its own sandbox is named as such, so
+    /// the error says what to fix rather than only quoting the crash.
+    #[test]
+    fn a_browser_that_cannot_sandbox_itself_is_recognised() {
+        assert!(cannot_sandbox(
+            "FATAL:setuid_sandbox_host.cc(172)] The SUID sandbox helper binary was found, \
+             but is not configured correctly."
+        ));
+        assert!(cannot_sandbox("No usable sandbox! Update your kernel"));
+        assert!(!cannot_sandbox("ERROR: net::ERR_FILE_NOT_FOUND"));
+    }
 
     /// A PDF is whole only once its end marker is written: a print still in
     /// progress must not be taken and its browser stopped half-way.

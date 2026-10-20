@@ -1165,12 +1165,15 @@ mod tests {
                     e.rect.width > 0 && e.rect.height > 0,
                     "kept an empty: {e:?}"
                 );
-                let p = e.click_point();
-                // Inside the virtual desktop, which is what proves these are
-                // physical pixels rather than some window-local space.
+                // On the virtual desktop, which is what proves these are
+                // physical pixels rather than some window-local space. Its
+                // rectangle, not its centre: a window wider than a small
+                // screen (a CI runner's 1024 pixels) has buttons only partly
+                // on it, whose centres fall off the edge.
+                let r = e.rect;
                 assert!(
-                    p.x >= bounds.x - 1 && p.x <= bounds.x + bounds.width + 1,
-                    "element {e:?} clicks outside the desktop at {p:?}"
+                    r.x <= bounds.x + bounds.width + 1 && r.x + r.width >= bounds.x - 1,
+                    "element {e:?} is not on the desktop {bounds:?}"
                 );
             }
         }

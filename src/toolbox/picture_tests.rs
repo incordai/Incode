@@ -386,12 +386,19 @@ fn render_pdf_with_the_system_browser_has_extractable_text() {
     std::fs::write(ws.path().join("article.html"), ARTICLE).expect("seed");
     let tools =
         Toolbox::new(ws.path(), true).with_printer(None, Some(pdf::Printer::Chromium(edge)));
-    let said = tools
-        .run(
-            RENDER_PDF,
-            &json!({"path": "article.html", "output": "out/article.pdf"}),
-        )
-        .expect("printed");
+    let said = match tools.run(
+        RENDER_PDF,
+        &json!({"path": "article.html", "output": "out/article.pdf"}),
+    ) {
+        Ok(said) => said,
+        // The machine's browser, not incode: a CI runner's Edge whose
+        // setuid sandbox helper is not installed as root.
+        Err(why) if why.contains(pdf::NO_BROWSER_SANDBOX) => {
+            eprintln!("SKIPPED: the system browser cannot sandbox itself here: {why}");
+            return;
+        }
+        Err(why) => panic!("printed: {why}"),
+    };
     assert!(!said.contains("IMAGE-ONLY"), "{said}");
     let bytes = std::fs::read(ws.path().join("out/article.pdf")).expect("written");
     assert!(bytes.starts_with(b"%PDF"));
