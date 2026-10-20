@@ -950,6 +950,11 @@ fn powershell_under_network_deny_starts_in_the_current_folder() {
             "-NonInteractive",
             "-Command",
             "(Get-Location).Path; [Environment]::CurrentDirectory; \
+             try { Set-Location -LiteralPath ([Environment]::CurrentDirectory) -ErrorAction Stop; \
+             Write-Error ('SETLOC-OK ' + (Get-Location).Path) } catch { Write-Error ('SETLOC-ERR ' + \
+             $_.Exception.GetType().FullName + ': ' + $_.Exception.Message + ' | ' + \
+             $_.Exception.InnerException) }; \
+             Set-Location -LiteralPath ([Environment]::CurrentDirectory) -ErrorAction SilentlyContinue; \
              Set-Content -Path rel.txt -Value x; \
              $deadline = (Get-Date).AddSeconds(60); \
              while (-not (Test-Path go.txt) -and (Get-Date) -lt $deadline) \
@@ -983,10 +988,19 @@ fn powershell_under_network_deny_starts_in_the_current_folder() {
         .map(|l| l.trim().to_lowercase())
         .filter(|l| !l.is_empty())
         .collect();
+    // What stands in PowerShell's way, when it does: each folder above the
+    // workspace as the ACLs say, beside the error Set-Location itself gives.
+    let mut chain = String::new();
+    let mut up = d.ws.parent();
+    while let Some(dir) = up {
+        chain.push_str(&icacls(dir));
+        chain.push('\n');
+        up = dir.parent();
+    }
     assert_eq!(
         lines.first(),
         Some(&ws),
-        "Get-Location is the workspace: {printed}"
+        "Get-Location is the workspace: {printed}\n-- ACEs during the run on the parent:\n{during}\n-- the chain after:\n{chain}"
     );
     assert_eq!(
         lines.get(1),
