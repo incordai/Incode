@@ -31,11 +31,40 @@
 //! A body that uses neither is given what was typed on a line of its own at
 //! the end, so arguments are never dropped in silence.
 //!
+//! # Files in the body
+//!
+//! `@path` in the body — at its start or after whitespace, naming something
+//! with a `/` or a `.` in it (`@src/main.rs`, `@./Makefile`) — is replaced by
+//! that file's contents in a fenced block headed by the path. The path is
+//! resolved against the workspace and must stay inside it once `..` and
+//! symlinks are resolved; an absolute path is taken only when it is inside.
+//! A file is read up to [`MAX_INCLUDE_BYTES`], and all of a command's files
+//! up to [`MAX_INCLUDES_TOTAL`]. What cannot be included leaves a marker the
+//! model can read — `[@path: not found]`, `[@path: outside the workspace]` —
+//! rather than vanishing. An email address (`a@b.com`) is left alone.
+//!
+//! Only the command file's own text is looked at. What was typed as
+//! arguments is substituted as it is: `/review @secrets.txt` does not read
+//! `secrets.txt`, and neither does a body's `@$1`. A file the person names
+//! is for the model to read with its tools, under the session's rules.
+//!
+//! # Model and tools
+//!
 //! `model` is honoured by `incode -t "/name args"` when `-m` is not given; in
-//! the REPL switching the model abandons the conversation, so it is said, not
-//! done. `allowed-tools` is ADVISORY: it is parsed, shown and carried on the
-//! expansion, but no tool is refused because of it — the guards, the
-//! permission mode and the operator's hooks are what restrict tools.
+//! the REPL and over ACP switching the model abandons the conversation, so it
+//! is said, not done.
+//!
+//! `allowed-tools` HOLDS THE TURN the command starts: its entries are
+//! permission rules (`Bash(npm test:*)`, `Read`, `Edit(src/**)`, see
+//! [`crate::permissions::rules`]), and a tool call none of them covers is
+//! refused, with the list named to the model. Only that turn — its follow-up
+//! and continuations included — and never the next. It only narrows: a call
+//! it covers still meets the deny and ask rules, the guards, the mode and
+//! the operator's hooks. It binds where incode runs the model's tools (the
+//! API route, and Claude Code, whose tools are incode's); an agent CLI that
+//! brings its own tools (Codex, Antigravity) is not held to it, and the turn
+//! says so. A sub-agent the turn starts with `Agent` (when the list allows
+//! it) runs under its own definition's tools, not this list.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -48,6 +77,12 @@ pub const USER_DIR: &str = "commands";
 
 /// The largest command file read. A prompt, not a document.
 pub const MAX_FILE_BYTES: u64 = 64 * 1024;
+
+/// The largest file one `@path` in a command's body brings in.
+pub const MAX_INCLUDE_BYTES: u64 = 256 * 1024;
+
+/// The most all of one command's `@path` files bring in together.
+pub const MAX_INCLUDES_TOTAL: u64 = 1024 * 1024;
 
 /// Where a command came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,7 +111,8 @@ pub struct CustomCommand {
     pub description: String,
     pub argument_hint: Option<String>,
     pub model: Option<String>,
-    /// Advisory; see the module documentation.
+    /// Permission rules the turn it starts is held to; see the module
+    /// documentation. Empty: the turn is not narrowed.
     pub allowed_tools: Vec<String>,
     pub body: String,
     pub path: PathBuf,
@@ -176,9 +212,11 @@ impl Registry {
         })
     }
 
-    /// `line` filled in, when it names one of these commands and no built-in.
+    /// `line` filled in, when it names one of these commands and no built-in:
+    /// the arguments substituted and the body's `@path` files, under
+    /// `workspace`, included.
     #[must_use]
-    pub fn expand_line(&self, line: &str) -> Option<Expanded> {
+    pub fn expand_line(&self, line: &str, workspace: &Path) -> Option<Expanded> {
         let line = line.trim();
         let rest = line.strip_prefix('/')?;
         let (name, args) = match rest.split_once(char::is_whitespace) {
@@ -194,7 +232,7 @@ impl Registry {
         let command = self.find(name)?;
         Some(Expanded {
             name: command.name.clone(),
-            prompt: substitute(&command.body, args),
+            prompt: fill(&command.body, args, Some(workspace)),
             model: command.model.clone(),
             allowed_tools: command.allowed_tools.clone(),
         })
@@ -251,10 +289,11 @@ pub fn all_commands() -> impl Iterator<Item = (&'static str, &'static str)> {
         .chain(menu().iter().copied())
 }
 
-/// Say in the REPL what a custom command became, and hand back its prompt.
-/// The model it asks for is named rather than switched to: switching starts
-/// the conversation over.
-pub fn announce(expanded: &Expanded) -> String {
+/// What a custom command became, in a line: its name, the model it asks for
+/// (named rather than switched to: switching starts the conversation over),
+/// and the tools the turn is held to.
+#[must_use]
+pub fn note(expanded: &Expanded) -> String {
     let mut note = format!("/{} expanded into the prompt", expanded.name);
     if let Some(model) = &expanded.model {
         note.push_str(&format!(
@@ -263,38 +302,74 @@ pub fn announce(expanded: &Expanded) -> String {
     }
     if !expanded.allowed_tools.is_empty() {
         note.push_str(&format!(
-            "; allowed-tools ({}) is advisory",
+            "; this turn may use only: {}",
             expanded.allowed_tools.join(", ")
         ));
     }
-    crate::cli::render::print_info(&note);
+    note
+}
+
+/// Say in the REPL what a custom command became, and hand back its prompt.
+pub fn announce(expanded: &Expanded) -> String {
+    crate::cli::render::print_info(&note(expanded));
     expanded.prompt.clone()
 }
 
-/// For `incode -t "<instruction>"`: the instruction expanded when it names a
-/// custom command, and the model to use (`-m` first, then the command's).
+/// What the person is told when the agent serving a narrowed turn runs its
+/// own tools, where incode cannot refuse a call.
 #[must_use]
-pub fn expand_task(
-    workspace: &Path,
-    instruction: String,
-    model: Option<String>,
-) -> (String, Option<String>) {
+pub fn not_enforced_by(agent: &str, allowed: &[String]) -> String {
+    crate::trace!(
+        "session",
+        "allowed-tools ({}) not enforced: {agent} runs its own tools",
+        allowed.join(", ")
+    );
+    format!(
+        "allowed-tools ({}) was NOT enforced this turn: {agent} runs its own tools, which \
+         incode cannot refuse. It binds on the API route and Claude Code.",
+        allowed.join(", ")
+    )
+}
+
+/// A `-t` instruction, after a custom command is looked for in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Task {
+    pub instruction: String,
+    /// `-m` first, then the command's.
+    pub model: Option<String>,
+    /// The command's `allowed-tools`, which the run is held to.
+    pub allowed_tools: Vec<String>,
+}
+
+/// For `incode -t "<instruction>"`: the instruction expanded when it names a
+/// custom command, the model to use, and the tools the run is held to.
+#[must_use]
+pub fn expand_task(workspace: &Path, instruction: String, model: Option<String>) -> Task {
+    let plain = |instruction, model| Task {
+        instruction,
+        model,
+        allowed_tools: Vec::new(),
+    };
     if !instruction.trim_start().starts_with('/') {
-        return (instruction, model);
+        return plain(instruction, model);
     }
     let registry = Registry::load(workspace);
-    match registry.expand_line(&instruction) {
+    match registry.expand_line(&instruction, workspace) {
         Some(expanded) => {
             eprintln!("incode: running custom command /{}", expanded.name);
             if !expanded.allowed_tools.is_empty() {
                 eprintln!(
-                    "incode: allowed-tools ({}) is advisory and not enforced",
+                    "incode: this run may use only: {}",
                     expanded.allowed_tools.join(", ")
                 );
             }
-            (expanded.prompt, model.or(expanded.model))
+            Task {
+                instruction: expanded.prompt,
+                model: model.or(expanded.model),
+                allowed_tools: expanded.allowed_tools,
+            }
         }
-        None => (instruction, model),
+        None => plain(instruction, model),
     }
 }
 
@@ -427,10 +502,44 @@ pub fn parse(text: &str) -> Result<CustomCommand, String> {
 /// The body with `$ARGUMENTS` and `$1`..`$9` filled in from `args`.
 #[must_use]
 pub fn substitute(body: &str, args: &str) -> String {
+    fill(body, args, None)
+}
+
+/// The body with its arguments substituted and, given a workspace, its
+/// `@path` files included. The two are done in one pass over the body's own
+/// text, so neither an argument nor an included file is read for the other:
+/// a `$1` inside a file stays as written, and an `@` typed as an argument is
+/// not a file.
+fn fill(body: &str, args: &str, workspace: Option<&Path>) -> String {
     let words = split_args(args);
     let mut out = String::with_capacity(body.len() + args.len());
     let mut used = false;
-    let mut rest = body;
+    let mut budget = MAX_INCLUDES_TOTAL;
+    let pieces = match workspace {
+        Some(_) => pieces(body),
+        None => vec![Piece::Text(body)],
+    };
+    for piece in pieces {
+        match (piece, workspace) {
+            (Piece::Include(path), Some(workspace)) => {
+                include(path, workspace, &mut budget, &mut out);
+            }
+            (Piece::Include(text) | Piece::Text(text), _) => {
+                used |= substitute_into(text, args, &words, &mut out);
+            }
+        }
+    }
+    if !used && !args.is_empty() {
+        out.push_str("\n\nARGUMENTS: ");
+        out.push_str(args);
+    }
+    out
+}
+
+/// `text` onto `out` with its placeholders filled; whether it had any.
+fn substitute_into(text: &str, args: &str, words: &[String], out: &mut String) -> bool {
+    let mut used = false;
+    let mut rest = text;
     while let Some(at) = rest.find('$') {
         out.push_str(&rest[..at]);
         let after = &rest[at + 1..];
@@ -449,11 +558,112 @@ pub fn substitute(body: &str, args: &str) -> String {
         }
     }
     out.push_str(rest);
-    if !used && !args.is_empty() {
-        out.push_str("\n\nARGUMENTS: ");
-        out.push_str(args);
+    used
+}
+
+/// A command body, cut at its `@path` includes.
+#[derive(Debug, PartialEq, Eq)]
+enum Piece<'a> {
+    Text(&'a str),
+    /// The path, without its `@`.
+    Include(&'a str),
+}
+
+/// `body` as text and includes, in order.
+fn pieces(body: &str) -> Vec<Piece<'_>> {
+    let mut out = Vec::new();
+    let mut text_from = 0;
+    let mut search_from = 0;
+    while let Some(found) = body[search_from..].find('@') {
+        let at = search_from + found;
+        search_from = at + 1;
+        // At the start or after whitespace: `a@b.com` is an address.
+        let starts_a_word = body[..at]
+            .chars()
+            .next_back()
+            .is_none_or(char::is_whitespace);
+        let Some(path) = include_path(&body[at + 1..]).filter(|_| starts_a_word) else {
+            continue;
+        };
+        out.push(Piece::Text(&body[text_from..at]));
+        out.push(Piece::Include(path));
+        text_from = at + 1 + path.len();
+        search_from = text_from;
     }
+    out.push(Piece::Text(&body[text_from..]));
     out
+}
+
+/// The path `rest` starts with, when it looks like one: the characters a
+/// path is written with, less a sentence's closing `.` or `:`, naming a
+/// folder or an extension — so `@alice` stays a mention.
+fn include_path(rest: &str) -> Option<&str> {
+    let end = rest
+        .find(|c: char| !(c.is_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '+' | '~')))
+        .unwrap_or(rest.len());
+    let path = rest[..end].trim_end_matches(['.', ':']);
+    let looks_like_one =
+        (path.contains('/') || path.contains('.')) && path.chars().any(char::is_alphanumeric);
+    looks_like_one.then_some(path)
+}
+
+/// The file at `path`, in a fenced block headed by the path, onto `out` —
+/// or a marker saying why it is not there. `budget` is what the command's
+/// files may still bring in.
+fn include(path: &str, workspace: &Path, budget: &mut u64, out: &mut String) {
+    let marker = |out: &mut String, why: &str| out.push_str(&format!("[@{path}: {why}]"));
+    // Where the file really is, `..` and symlinks resolved, must be inside;
+    // a path that does not exist is outside when its text already leaves.
+    let root = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+    let named = crate::permissions::rules::normalise(&root, path);
+    let Ok(real) = named.canonicalize() else {
+        return marker(
+            out,
+            if named.starts_with(&root) {
+                "not found"
+            } else {
+                "outside the workspace"
+            },
+        );
+    };
+    if !real.starts_with(&root) {
+        return marker(out, "outside the workspace");
+    }
+    let size = match std::fs::metadata(&real) {
+        Ok(meta) if meta.is_file() => meta.len(),
+        Ok(_) => return marker(out, "not a file"),
+        Err(_) => return marker(out, "not found"),
+    };
+    if size > MAX_INCLUDE_BYTES {
+        return marker(
+            out,
+            &format!("{size} bytes, over the {MAX_INCLUDE_BYTES}-byte limit for one file"),
+        );
+    }
+    if size > *budget {
+        return marker(
+            out,
+            &format!("left out, the command's files reached {MAX_INCLUDES_TOTAL} bytes"),
+        );
+    }
+    let Ok(text) = std::fs::read_to_string(&real) else {
+        return marker(out, "not readable as text");
+    };
+    *budget -= size;
+    // Longer than any run of backticks inside, so the file cannot close it.
+    let longest = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat(longest.max(2) + 1);
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&format!("{path}:\n{fence}\n{text}"));
+    if !text.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&fence);
+    out.push('\n');
 }
 
 /// Words the way a shell splits them: whitespace separates, single and double
@@ -606,14 +816,16 @@ mod tests {
         assert!(r.warnings.iter().any(|w| w.contains("/deploy")));
 
         // A built-in is never expanded, even with a file of its name.
-        assert_eq!(r.expand_line("/help"), None);
-        assert_eq!(r.expand_line("/nothing here"), None);
-        assert_eq!(r.expand_line("not a command"), None);
-        let e = r.expand_line("/frontend:test app.tsx").expect("expands");
+        assert_eq!(r.expand_line("/help", dir.path()), None);
+        assert_eq!(r.expand_line("/nothing here", dir.path()), None);
+        assert_eq!(r.expand_line("not a command", dir.path()), None);
+        let e = r
+            .expand_line("/frontend:test app.tsx", dir.path())
+            .expect("expands");
         assert_eq!(e.prompt, "run app.tsx");
         assert_eq!(e.name, "frontend:test");
         // Names are matched without regard to case, as the parser lowercases.
-        assert!(r.expand_line("/Frontend:Test").is_some());
+        assert!(r.expand_line("/Frontend:Test", dir.path()).is_some());
 
         let menu = r.menu_entries();
         assert_eq!(
@@ -654,5 +866,162 @@ mod tests {
         let (found, problems) = scan_dir(dir.path(), None);
         assert!(found.is_empty());
         assert_eq!(problems.len(), 1);
+    }
+
+    #[test]
+    fn an_include_is_an_at_starting_a_word_and_naming_a_path() {
+        assert_eq!(
+            pieces("Read @src/a.rs, then @./Makefile."),
+            vec![
+                Piece::Text("Read "),
+                Piece::Include("src/a.rs"),
+                Piece::Text(", then "),
+                Piece::Include("./Makefile"),
+                Piece::Text("."),
+            ]
+        );
+        assert_eq!(
+            pieces("@a.md"),
+            vec![Piece::Text(""), Piece::Include("a.md"), Piece::Text("")]
+        );
+        // An address, a mention, and an `@` alone are text.
+        for text in [
+            "mail a@b.com now",
+            "ask @alice",
+            "at @ noon",
+            "x@./y",
+            "@...",
+        ] {
+            assert_eq!(pieces(text), vec![Piece::Text(text)], "{text}");
+        }
+    }
+
+    #[test]
+    fn a_file_is_included_fenced_under_its_path() {
+        let dir = tempfile::tempdir().expect("dir");
+        write(&dir.path().join("src/a.rs"), "fn a() {}\n");
+        write(&dir.path().join("notes.md"), "has ``` inside");
+        let said = fill(
+            "Review @src/a.rs and @notes.md please; mail a@b.com",
+            "",
+            Some(dir.path()),
+        );
+        assert_eq!(
+            said,
+            "Review \nsrc/a.rs:\n```\nfn a() {}\n```\n and \nnotes.md:\n````\nhas ``` \
+             inside\n````\n please; mail a@b.com"
+        );
+    }
+
+    #[test]
+    fn what_cannot_be_included_leaves_a_marker() {
+        let root = tempfile::tempdir().expect("dir");
+        let ws = root.path().join("ws");
+        write(&ws.join("inside.txt"), "ok");
+        write(&root.path().join("secret.txt"), "SECRET");
+        write(&ws.join("sub/x.txt"), "x");
+        let outside = root.path().join("secret.txt");
+        let said = fill(
+            &format!(
+                "@missing.txt @../secret.txt @sub/../../secret.txt @{} @sub/ @sub/../inside.txt",
+                outside.display()
+            ),
+            "",
+            Some(&ws),
+        );
+        assert!(said.contains("[@missing.txt: not found]"), "{said}");
+        assert!(
+            said.contains("[@../secret.txt: outside the workspace]"),
+            "{said}"
+        );
+        assert!(
+            said.contains("[@sub/../../secret.txt: outside the workspace]"),
+            "{said}"
+        );
+        assert!(
+            said.contains(&format!("[@{}: outside the workspace]", outside.display())),
+            "{said}"
+        );
+        assert!(said.contains("[@sub/: not a file]"), "{said}");
+        assert!(said.contains("sub/../inside.txt:\n```\nok\n```"), "{said}");
+        assert!(!said.contains("SECRET"), "{said}");
+        // An absolute path inside the workspace is taken.
+        let inside = ws.join("inside.txt");
+        let said = fill(&format!("@{}", inside.display()), "", Some(&ws));
+        assert!(said.contains("```\nok\n```"), "{said}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_out_of_the_workspace_is_not_followed() {
+        let root = tempfile::tempdir().expect("dir");
+        let ws = root.path().join("ws");
+        write(&root.path().join("secret.txt"), "SECRET");
+        std::fs::create_dir_all(&ws).expect("mkdir");
+        std::os::unix::fs::symlink(root.path().join("secret.txt"), ws.join("link.txt"))
+            .expect("symlink");
+        let said = fill("@link.txt", "", Some(&ws));
+        assert_eq!(said, "[@link.txt: outside the workspace]");
+    }
+
+    #[test]
+    fn includes_are_capped_per_file_and_in_total() {
+        let dir = tempfile::tempdir().expect("dir");
+        let big = MAX_INCLUDE_BYTES as usize;
+        write(&dir.path().join("huge.txt"), &"x".repeat(big + 1));
+        for name in ["a.txt", "b.txt", "c.txt", "d.txt", "e.txt"] {
+            write(&dir.path().join(name), &"y".repeat(big - 10));
+        }
+        let said = fill(
+            "@huge.txt @a.txt @b.txt @c.txt @d.txt @e.txt",
+            "",
+            Some(dir.path()),
+        );
+        assert!(said.contains("[@huge.txt:"), "per file");
+        assert!(said.contains("over the 262144-byte limit"));
+        for name in ["a.txt", "b.txt", "c.txt", "d.txt"] {
+            assert!(said.contains(&format!("{name}:\n```")), "{name} included");
+        }
+        assert!(
+            said.contains("[@e.txt: left out, the command's files reached 1048576 bytes]"),
+            "the fifth is past the total"
+        );
+    }
+
+    /// Only the body is looked at: an `@` in what was typed, or one a
+    /// placeholder fills in, is not read; and a placeholder inside an included
+    /// file is not filled.
+    #[test]
+    fn arguments_are_never_included_and_files_never_substituted() {
+        let dir = tempfile::tempdir().expect("dir");
+        write(&dir.path().join("secret.txt"), "SECRET");
+        write(&dir.path().join("t.md"), "uses $1 literally");
+        let said = fill(
+            "Look at $ARGUMENTS and @$1",
+            "@secret.txt",
+            Some(dir.path()),
+        );
+        assert_eq!(said, "Look at @secret.txt and @@secret.txt");
+        let said = fill("@t.md for $1", "x", Some(dir.path()));
+        assert_eq!(
+            said,
+            "\nt.md:\n```\nuses $1 literally\n```\n for x".trim_start()
+        );
+    }
+
+    #[test]
+    fn a_command_expands_its_includes_against_the_workspace() {
+        let dir = tempfile::tempdir().expect("dir");
+        let project = dir.path().join(PROJECT_DIR);
+        write(&project.join("explain.md"), "Explain @src/lib.rs to $1");
+        write(&dir.path().join("src/lib.rs"), "pub fn x() {}");
+        let r = Registry::load_from(&project, &dir.path().join("u"), &[]);
+        let e = r
+            .expand_line("/explain newcomers", dir.path())
+            .expect("expands");
+        assert_eq!(
+            e.prompt,
+            "Explain \nsrc/lib.rs:\n```\npub fn x() {}\n```\n to newcomers"
+        );
     }
 }

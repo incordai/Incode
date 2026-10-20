@@ -193,14 +193,15 @@ fn main() -> anyhow::Result<()> {
                     .as_deref(),
             )
             .map_err(|e| anyhow::anyhow!(e))?;
-            // `-t "/name args"` runs the operator's custom command.
-            let (instruction, model) =
-                incord_code::custom_commands::expand_task(&workspace, instruction, model);
+            // `-t "/name args"` runs the operator's custom command, held to
+            // its `allowed-tools`.
+            let task = incord_code::custom_commands::expand_task(&workspace, instruction, model);
             return on_a_runtime(|| {
                 incord_code::task_run::run_task_as(
                     &workspace,
-                    &instruction,
-                    model.as_deref(),
+                    &task.instruction,
+                    task.model.as_deref(),
+                    &task.allowed_tools,
                     format,
                     spec_gate,
                     &created_outside,

@@ -6,6 +6,11 @@
 //! interactive REPL calls, inside [`crate::cli::console::capture`], and what
 //! the handler would have printed is the reply.
 //!
+//! The operator's own commands ([`crate::custom_commands`]) are offered too,
+//! after the built-ins, with their description and `argument-hint`. One is
+//! not run here: the caller expands it into the turn's prompt before asking
+//! this module, exactly as the REPL does.
+//!
 //! # What is offered, and what is not
 //!
 //! Only a command that is dispatched here AND makes sense without a terminal
@@ -34,6 +39,7 @@ use agent_client_protocol_schema::v1 as acp;
 
 use crate::cli::agent_turn::AgentSession;
 use crate::cli::slash_commands::{self, SlashCommand, COMMANDS};
+use crate::custom_commands::Registry;
 use crate::permissions::PermissionMode;
 
 /// What `/agent` and `/roles` need beyond the session: the directory the
@@ -51,26 +57,43 @@ const OFFERED: [&str; 16] = [
     "remember", "worktree", "agent", "agents", "roles", "tools",
 ];
 
-/// The list `available_commands_update` carries.
-pub(crate) fn available() -> Vec<acp::AvailableCommand> {
-    OFFERED
-        .iter()
-        .filter_map(|name| {
-            let (entry, description) = COMMANDS
-                .iter()
-                .find(|(entry, _)| slash_commands::command_name(entry).get(1..) == Some(*name))?;
-            let command = acp::AvailableCommand::new(*name, *description);
-            // The table writes the arguments after the name: `/links <file>`.
-            Some(match entry.split_once(' ').map(|(_, hint)| hint.trim()) {
-                Some(hint) if !hint.is_empty() => {
-                    command.input(acp::AvailableCommandInput::Unstructured(
-                        acp::UnstructuredCommandInput::new(hint),
-                    ))
-                }
-                _ => command,
-            })
-        })
-        .collect()
+/// The list `available_commands_update` carries: the built-ins offered, then
+/// the operator's own commands. A custom command is not run here — it is
+/// expanded into the turn's prompt by the caller, as the REPL does.
+pub(crate) fn available(custom: &Registry) -> Vec<acp::AvailableCommand> {
+    let builtin = OFFERED.iter().filter_map(|name| {
+        let (entry, description) = COMMANDS
+            .iter()
+            .find(|(entry, _)| slash_commands::command_name(entry).get(1..) == Some(*name))?;
+        // The table writes the arguments after the name: `/links <file>`.
+        let hint = entry.split_once(' ').map(|(_, hint)| hint.trim());
+        Some(with_hint(
+            acp::AvailableCommand::new(*name, *description),
+            hint,
+        ))
+    });
+    let own = custom.commands().iter().map(|command| {
+        let description = if command.description.is_empty() {
+            format!("({})", command.origin.label())
+        } else {
+            format!("{} ({})", command.description, command.origin.label())
+        };
+        with_hint(
+            acp::AvailableCommand::new(command.name.as_str(), description),
+            command.argument_hint.as_deref(),
+        )
+    });
+    builtin.chain(own).collect()
+}
+
+/// `command`, taking `hint` as its input when there is one.
+fn with_hint(command: acp::AvailableCommand, hint: Option<&str>) -> acp::AvailableCommand {
+    match hint.map(str::trim) {
+        Some(hint) if !hint.is_empty() => command.input(acp::AvailableCommandInput::Unstructured(
+            acp::UnstructuredCommandInput::new(hint),
+        )),
+        _ => command,
+    }
 }
 
 /// What running a command did.
@@ -170,7 +193,7 @@ mod tests {
     /// REPL's `/help` describe it the same way — and none is silently dropped.
     #[test]
     fn every_offered_command_is_announced_from_the_table() {
-        let announced = available();
+        let announced = available(&Registry::default());
         let names: Vec<&str> = announced.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(
             names, OFFERED,
@@ -187,6 +210,33 @@ mod tests {
             undo.input.is_none(),
             "a command with no argument has no hint"
         );
+    }
+
+    /// The operator's own commands follow the built-ins, each with its
+    /// description, where it came from, and its `argument-hint` as the input.
+    #[test]
+    fn custom_commands_are_announced_after_the_built_ins() {
+        let dir = tempfile::tempdir().expect("dir");
+        let project = dir.path().join("p");
+        std::fs::create_dir_all(project.join("ci")).expect("mkdir");
+        std::fs::write(
+            project.join("ci/test.md"),
+            "---\ndescription: Run one test file\nargument-hint: <file>\n---\nTest $1",
+        )
+        .expect("write");
+        std::fs::write(project.join("tidy.md"), "Tidy up.").expect("write");
+        let registry = Registry::load_from(&project, &dir.path().join("u"), &[]);
+        let announced = available(&registry);
+        assert_eq!(announced.len(), OFFERED.len() + 2);
+        let ci = &announced[OFFERED.len()];
+        assert_eq!(ci.name, "ci:test");
+        assert_eq!(ci.description, "Run one test file (project)");
+        let encoded = serde_json::to_value(ci).expect("encodes");
+        assert_eq!(encoded["input"]["hint"], "<file>", "{encoded}");
+        let tidy = &announced[OFFERED.len() + 1];
+        assert_eq!(tidy.name, "tidy");
+        assert_eq!(tidy.description, "(project)");
+        assert!(tidy.input.is_none());
     }
 
     /// The commands left out are left out: running one says so, and says what
