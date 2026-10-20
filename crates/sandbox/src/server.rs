@@ -394,6 +394,7 @@ impl Server {
             "stdout_truncated": captured.stdout_total > captured.stdout.len() as u64,
             "stderr_truncated": captured.stderr_total > captured.stderr.len() as u64,
             "network_refused": refused,
+            "protected_restored": captured.outcome.restored,
         }))
     }
 

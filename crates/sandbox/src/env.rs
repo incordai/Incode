@@ -41,6 +41,16 @@ pub const GIT_REDIRECTS: &[&str] = &[
     "GIT_DISCOVERY_ACROSS_FILESYSTEM",
 ];
 
+/// Variables that make the dynamic loader inject code into every program the
+/// command starts, the sandbox's own helper included, before it has confined
+/// anything. Nothing a build or test needs; removed by default.
+pub const LOADER_INJECTION: &[&str] = &[
+    "LD_PRELOAD",
+    "LD_AUDIT",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_FORCE_FLAT_NAMESPACE",
+];
+
 /// Kept under `inherit = "none"`: without them almost nothing starts.
 pub const ESSENTIAL: &[&str] = &[
     "PATH",
@@ -93,6 +103,9 @@ pub fn compute(
     }
     if policy.strip_git_redirects {
         removed.extend_from_slice(GIT_REDIRECTS);
+    }
+    if policy.strip_loader_injection {
+        removed.extend_from_slice(LOADER_INJECTION);
     }
 
     let mut out: Vec<(OsString, OsString)> = inherited
@@ -151,6 +164,8 @@ mod tests {
                 ("Git_Dir", "/elsewhere/.git"),
                 ("GIT_WORK_TREE", "/elsewhere"),
                 ("ANTHROPIC_API_KEY", "k"),
+                ("LD_PRELOAD", "/tmp/evil.so"),
+                ("DYLD_INSERT_LIBRARIES", "/tmp/evil.dylib"),
                 ("CLAUDE_CODE_OAUTH_TOKEN", "t"),
             ]),
             &[],

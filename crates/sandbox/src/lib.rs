@@ -34,6 +34,7 @@
 pub mod env;
 pub mod limits;
 pub mod policy;
+pub mod protect;
 pub mod proxy;
 pub mod seatbelt;
 pub mod server;
@@ -132,6 +133,10 @@ pub struct EnterSpec {
     pub roots: Vec<PathBuf>,
     #[serde(default)]
     pub deny_read: Vec<PathBuf>,
+    /// Paths whose writes Seatbelt refuses (macOS); on Linux they are
+    /// restored after the run instead ([`protect`]).
+    #[serde(default)]
+    pub protected: Vec<PathBuf>,
     pub temp: PathBuf,
     pub net_mode: NetMode,
     pub proxy_port: Option<u16>,
@@ -248,15 +253,23 @@ fn enter(args: &[OsString]) -> Result<Never, EnterError> {
         }
         eprintln!("sbx: Landlock not applied (best effort): {e}");
     }
-    // After Landlock, before exec: Landlock confines TCP, this refuses the
-    // sockets Landlock does not see (UDP, raw, ...). See `seccomp`.
+    // After Landlock, before exec: refuse terminal input injection, vsock and
+    // io_uring whenever anything is confined, and under deny/proxy also the
+    // sockets Landlock does not see (UDP, raw, ...). See `seccomp`. Only the
+    // socket layer is part of the network policy, so only it is fatal in
+    // strict mode; with the filesystem alone, an architecture without a
+    // filter is skipped quietly and a kernel refusal is reported.
     #[cfg(target_os = "linux")]
-    if spec.net_mode != NetMode::Allow {
-        if let Err(e) = seccomp::restrict_sockets() {
-            if spec.strict {
-                return Err(sandbox_err(format!("seccomp: {e}")));
+    {
+        let network = spec.net_mode != NetMode::Allow;
+        let fs = spec.fs_mode != FsMode::Off && seccomp::available();
+        if network || fs {
+            if let Err(e) = seccomp::install(network) {
+                if spec.strict && network {
+                    return Err(sandbox_err(format!("seccomp: {e}")));
+                }
+                eprintln!("sbx: seccomp not applied (best effort): {e}");
             }
-            eprintln!("sbx: seccomp not applied (best effort): {e}");
         }
     }
 
@@ -370,6 +383,7 @@ pub struct Guard {
     proxy: Option<proxy::Proxy>,
     temp: TempDir,
     pub enforcement: Enforcement,
+    protected: Option<protect::Snapshot>,
     /// Whether the command runs in its own process group (only with a
     /// wall-clock limit and a non-terminal stdin); kill `-pid` to stop it all.
     pub own_group: bool,
@@ -382,6 +396,16 @@ impl Guard {
         self.proxy
             .as_ref()
             .map(proxy::Proxy::decisions)
+            .unwrap_or_default()
+    }
+
+    /// Put back whatever the command changed under the protected paths
+    /// (`fs.protect_git`), and say what. Call once the command has exited.
+    #[must_use]
+    pub fn restore_protected(&self) -> Vec<String> {
+        self.protected
+            .as_ref()
+            .map(protect::Snapshot::restore)
             .unwrap_or_default()
     }
 
@@ -398,6 +422,8 @@ pub struct Outcome {
     pub status: ExitStatus,
     pub timed_out: bool,
     pub decisions: Vec<proxy::Decision>,
+    /// Protected paths the command changed, which were put back.
+    pub restored: Vec<String>,
 }
 
 impl Outcome {
@@ -482,6 +508,9 @@ impl Sandbox {
         }
         let roots = self.policy.resolved_roots(cwd)?;
         let deny_read = self.policy.resolved_deny_read(cwd, &roots)?;
+        let protected = (self.policy.fs.mode == FsMode::WorkspaceWrite
+            && self.policy.fs.protect_git)
+            .then(|| protect::Snapshot::take(protect::git_paths(&roots)));
         let temp = TempDir::new()?;
         let own_group = self.policy.limits.wall_secs.is_some() && !stdin_is_terminal();
 
@@ -510,6 +539,10 @@ impl Sandbox {
             fs_mode: self.policy.fs.mode,
             roots: roots.clone(),
             deny_read,
+            protected: protected
+                .as_ref()
+                .map(|s| s.paths().to_vec())
+                .unwrap_or_default(),
             temp: temp.path.clone(),
             net_mode: self.policy.network.mode,
             proxy_port: proxy.as_ref().map(proxy::Proxy::port),
@@ -542,6 +575,7 @@ impl Sandbox {
                 proxy,
                 temp,
                 enforcement,
+                protected,
                 own_group,
             },
         ))
@@ -572,6 +606,7 @@ impl Sandbox {
             status,
             timed_out,
             decisions: guard.decisions(),
+            restored: guard.restore_protected(),
         })
     }
 }
@@ -645,6 +680,7 @@ impl Sandbox {
                 status,
                 timed_out,
                 decisions: guard.decisions(),
+                restored: guard.restore_protected(),
             },
             stdout,
             stderr,
@@ -786,10 +822,14 @@ fn wrap_platform(helper: &Path, spec: &EnterSpec, roots: &[PathBuf]) -> Command 
         cmd.arg("-D")
             .arg(format!("DR{i}={}", real(hidden).display()));
     }
+    for (i, kept) in spec.protected.iter().enumerate() {
+        cmd.arg("-D").arg(format!("PR{i}={}", real(kept).display()));
+    }
     cmd.arg("-p").arg(seatbelt::profile(
         spec.fs_mode,
         roots.len(),
         spec.deny_read.len(),
+        spec.protected.len(),
         spec.net_mode,
         spec.proxy_port,
     ));

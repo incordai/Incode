@@ -5,6 +5,7 @@
 //! mode = "workspace-write"        # off | read-only | workspace-write
 //! write = ["."]                   # writable roots (workspace-write only)
 //! deny_read = ["../private"]      # hidden: not even readable
+//! protect_git = true              # .git/hooks and .git/config kept as they were (default)
 //!
 //! [network]
 //! mode = "proxy"                  # allow | deny | proxy
@@ -17,6 +18,7 @@
 //! remove = ["AWS_*"]              # removed; a trailing * matches a prefix
 //! strip_agent_session = true      # CLAUDECODE, CLAUDE_CODE_SESSION*, ... (default)
 //! strip_git_redirects = true      # GIT_DIR, GIT_WORK_TREE, ... (default)
+//! strip_loader_injection = true   # LD_PRELOAD, LD_AUDIT, DYLD_INSERT_LIBRARIES (default)
 //! set = { CI = "1" }
 //!
 //! [limits]
@@ -49,7 +51,7 @@ pub struct Policy {
 /// What the command may do to the filesystem. Reading is allowed everywhere
 /// (a command that cannot read its toolchain cannot run) except beneath
 /// `deny_read`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Fs {
     pub mode: FsMode,
@@ -61,6 +63,21 @@ pub struct Fs {
     /// `workspace-write`, must exist, and may not lie inside a writable root
     /// (writing implies reading). Relative paths resolve like `write`.
     pub deny_read: Vec<PathBuf>,
+    /// Keep each writable root's `.git/hooks` and `.git/config` as they
+    /// were: a planted hook runs, unsandboxed, the next time anyone uses git
+    /// there (see [`crate::protect`]). On by default.
+    pub protect_git: bool,
+}
+
+impl Default for Fs {
+    fn default() -> Self {
+        Self {
+            mode: FsMode::Off,
+            write: Vec::new(),
+            deny_read: Vec::new(),
+            protect_git: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,6 +178,9 @@ pub struct Env {
     /// Remove the variables that point git at another repository (see
     /// [`crate::env::GIT_REDIRECTS`]).
     pub strip_git_redirects: bool,
+    /// Remove the variables that make every program load a library someone
+    /// chose (see [`crate::env::LOADER_INJECTION`]).
+    pub strip_loader_injection: bool,
     /// Set last, so they win over everything above.
     pub set: BTreeMap<String, String>,
 }
@@ -173,6 +193,7 @@ impl Default for Env {
             remove: Vec::new(),
             strip_agent_session: true,
             strip_git_redirects: true,
+            strip_loader_injection: true,
             set: BTreeMap::new(),
         }
     }
@@ -212,6 +233,7 @@ impl Policy {
                 mode: FsMode::WorkspaceWrite,
                 write: vec![root.into()],
                 deny_read: Vec::new(),
+                protect_git: true,
             },
             ..Self::default()
         }

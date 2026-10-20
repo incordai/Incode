@@ -63,7 +63,9 @@ An unknown key is an error, so a misspelt `wirte` can't silently do nothing.
 | filesystem: `deny_read` | Landlock | Seatbelt | **not yet** |
 | network: `deny` | Landlock TCP (6.7+) + seccomp for every other socket | Seatbelt | **not yet** |
 | network: `proxy` | Landlock: TCP only to the proxy's port; seccomp as for `deny` | Seatbelt: outbound only to the proxy | **not yet** |
-| limits | `setrlimit` + wall clock | `setrlimit` + wall clock | wall clock |
+| `.git/hooks`, `.git/config` | snapshotted, put back after the run | Seatbelt refuses the write | **not yet** |
+| signals, abstract Unix sockets | Landlock scopes (6.12+): only within the sandbox | Seatbelt default | **not yet** |
+| limits | `setrlimit` + wall clock; no core dumps | `setrlimit` + wall clock; no core dumps | wall clock |
 | environment | yes | yes | yes |
 
 - **Every process it starts.** The confinement is applied in a helper
@@ -89,6 +91,19 @@ An unknown key is an error, so a misspelt `wirte` can't silently do nothing.
   - The filter knows x86-64 and aarch64. On any other architecture none is
     installed, the network is reported **not enforced**, and strict mode
     refuses.
+- **Terminal and VM-socket hardening.** The seccomp filter is also installed
+  whenever the filesystem is confined, not only under `deny`/`proxy`. It
+  always refuses:
+  - `ioctl(TIOCSTI)` and `ioctl(TIOCLINUX)` (EPERM), which would let a
+    command type keystrokes into the terminal it shares with your shell, to
+    run unconfined after it exits. Window size, termios and the other
+    terminal ioctls still work.
+  - `AF_VSOCK` sockets (EACCES): vsock reaches a VM's host directly, and on
+    WSL2 that means Windows interop.
+  - io_uring.
+
+  A filesystem-only policy on an architecture without a filter runs without
+  this extra hardening.
 - **The proxy.** `proxy` mode runs an allowlisting HTTP proxy in the
   unconfined parent and points the command at it (`HTTP(S)_PROXY`).
   - It sees host names, not content: TLS is tunnelled with `CONNECT`.
@@ -104,6 +119,27 @@ An unknown key is an error, so a misspelt `wirte` can't silently do nothing.
   - A symlink that leads into or above a hidden path isn't granted.
   - Not covered: a hard link to a hidden file made elsewhere beforehand, or
     the same directory mounted a second time.
+- **The repository's hooks and config** (`fs.protect_git`, on by default).
+  - **Why:** a hook, or a `core.fsmonitor`/`core.hooksPath` line, is code
+    git runs the next time anyone uses the repository, outside any sandbox.
+  - **How (Linux):** Landlock can't make part of a writable root read-only
+    without also blocking file creation in the root, so `sbx` snapshots each
+    root's `.git/hooks` and `.git/config` before the run. Anything changed is
+    put back afterwards and reported (`protected path changed by the
+    command, restored …`, and `protected_restored` from `sbx mcp`).
+  - **How (macOS):** Seatbelt also refuses the writes.
+  - **Worktrees:** a `.git` file (`gitdir:`) and its `commondir` are
+    followed.
+  - **Opting out:** `--no-protect-git` for a run that should change hooks.
+- **Signals and abstract sockets.** On Landlock ABI v6 (Linux 6.12+) a
+  sandboxed command can't signal processes outside its sandbox, or connect to
+  an abstract Unix socket made outside it (a D-Bus session bus, X11). `sbx
+  doctor` says whether the kernel does this.
+- **Code the loader would inject.** `LD_PRELOAD`, `LD_AUDIT`,
+  `DYLD_INSERT_LIBRARIES` and `DYLD_FORCE_FLAT_NAMESPACE` are removed by
+  default (`env.strip_loader_injection`): they would load a library into
+  every program, the sandbox's own helper included. Core dumps are off
+  (`RLIMIT_CORE=0`), so a crash can't write the process's memory to disk.
 - **Process lifetime.**
   - With a wall-clock limit, the command gets its own process group. The
     limit kills all of it, and `SIGINT`/`SIGTERM`/`SIGHUP` sent to `sbx` are
@@ -120,7 +156,12 @@ An unknown key is an error, so a misspelt `wirte` can't silently do nothing.
 - Landlock matches network ports, not addresses. Under `proxy` the command
   could connect to *any* host on the proxy's (random, high) port.
 - On macOS the profile is generated and unit-tested, but this crate's
-  network and `deny_read` clauses have not yet been run on a Mac.
+  network, `deny_read` and protected-path clauses have not yet been run on a
+  Mac. The profile still starts from `(allow default)`; a deny-by-default
+  profile (only the system services a build needs) is the next step there.
+- The hook protection on Linux restores *after* the run. A hook planted
+  during the run would execute if someone ran git in that workspace before
+  the run ended.
 
 ## Exit codes
 

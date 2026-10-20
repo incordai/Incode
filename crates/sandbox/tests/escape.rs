@@ -471,3 +471,105 @@ fn running(tag: &str) -> bool {
                 .is_some_and(|c| c.split(|b| *b == 0).next() == Some(tag.as_bytes()))
         })
 }
+
+/// Whether `sbx` has a seccomp filter for this architecture.
+const SECCOMP_ARCH: bool = cfg!(any(target_arch = "x86_64", target_arch = "aarch64"));
+
+/// In a new session, makes a pty's slave its controlling terminal, then
+/// tries `TIOCSTI` (inject a keystroke), `TIOCLINUX` and the harmless
+/// `TIOCGWINSZ` on it; prints one line per attempt. Never touches the
+/// caller's own terminal unless `devtty` is set, and then only to check
+/// the injection is refused.
+fn tty_probe(devtty: bool) -> String {
+    format!(
+        r#"python3 -c '
+import errno, fcntl, os, termios
+def t(name, f):
+    try:
+        f(); print(name, "ok")
+    except OSError as e:
+        print(name, "refused", e.errno)
+pid = os.fork()
+if pid == 0:
+    try:
+        os.setsid()
+        m, s = os.openpty()
+        fcntl.ioctl(s, termios.TIOCSCTTY, 0)
+        t("sti", lambda: fcntl.ioctl(s, termios.TIOCSTI, b"x"))
+        t("linux", lambda: fcntl.ioctl(s, getattr(termios, "TIOCLINUX", 0x541C), b"\x07"))
+        t("winsz", lambda: fcntl.ioctl(s, termios.TIOCGWINSZ, b"\0" * 8))
+        t("tcgets", lambda: termios.tcgetattr(s))
+    finally:
+        os._exit(0)
+os.waitpid(pid, 0)
+if {devtty}:
+    try:
+        fd = os.open("/dev/tty", os.O_RDWR)
+    except OSError:
+        print("devtty none")
+    else:
+        t("devtty", lambda: fcntl.ioctl(fd, termios.TIOCSTI, b"\n"))
+'"#,
+        devtty = if devtty { "True" } else { "False" }
+    )
+}
+
+#[test]
+fn terminal_input_injection_is_refused_when_the_filesystem_is_confined() {
+    require!(SECCOMP_ARCH, "seccomp filters on this architecture");
+    let d = dirs();
+    // Unconfined first: TIOCSTI on the session's own terminal works, or
+    // fails with EIO where `dev.tty.legacy_tiocsti` is off. Anything else
+    // (no python3, no ptys) means the probe cannot tell the filter's EPERM
+    // from the kernel's own.
+    let control = text(&sh(&d.ws, &[], &tty_probe(false)));
+    if !(control.contains("sti ok") || control.contains("sti refused 5")) {
+        eprintln!("SKIPPED: no pty to test TIOCSTI on: {control}");
+        return;
+    }
+    assert!(control.contains("winsz ok"), "{control}");
+    let o = sh(&d.ws, &["--fs", "read-only"], &tty_probe(true));
+    let out = text(&o);
+    assert!(out.contains("sti refused 1"), "TIOCSTI not refused: {out}");
+    assert!(
+        out.contains("linux refused 1"),
+        "TIOCLINUX not refused: {out}"
+    );
+    assert!(!out.contains("devtty ok"), "{out}");
+    // Ordinary terminal ioctls still work.
+    assert!(out.contains("winsz ok"), "{out}");
+    assert!(out.contains("tcgets ok"), "{out}");
+    // And under the network policy too, where the other layer is added.
+    let o = sh(&d.ws, &["--net", "deny"], &tty_probe(false));
+    if o.status.code() != Some(125) {
+        let out = text(&o);
+        assert!(out.contains("sti refused 1"), "{out}");
+        assert!(out.contains("winsz ok"), "{out}");
+    }
+}
+
+const VSOCK_PROBE: &str = r#"python3 -c '
+import socket
+try:
+    socket.socket(40, socket.SOCK_STREAM); print("vsock ok")
+except OSError as e:
+    print("vsock refused", e.errno)
+'"#;
+
+#[test]
+fn vsock_is_refused_when_the_filesystem_is_confined_even_with_the_network_allowed() {
+    require!(SECCOMP_ARCH, "seccomp filters on this architecture");
+    let d = dirs();
+    let control = text(&sh(&d.ws, &["--net", "allow"], VSOCK_PROBE));
+    if control.contains("vsock refused 97") {
+        // EAFNOSUPPORT: no vsock in this kernel. The filter answers before
+        // the kernel looks at the family, so the check below still holds.
+        eprintln!("note: this kernel has no vsock (EAFNOSUPPORT)");
+    } else if !control.contains("vsock") {
+        eprintln!("SKIPPED: the probe did not run: {control}");
+        return;
+    }
+    let o = sh(&d.ws, &["--fs", "read-only", "--net", "allow"], VSOCK_PROBE);
+    let out = text(&o);
+    assert!(out.contains("vsock refused 13"), "{out}");
+}

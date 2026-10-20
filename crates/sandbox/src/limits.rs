@@ -57,6 +57,9 @@ pub(crate) fn apply(limits: &Limits) -> Result<(), String> {
             ))
         }
     };
+    // Never a core dump: it would write the process's memory (tokens,
+    // keys) to disk, outside what the command was meant to produce.
+    set(libc::RLIMIT_CORE, 0, "core dumps")?;
     if let Some(s) = limits.cpu_secs {
         set(libc::RLIMIT_CPU, s, "cpu")?;
     }

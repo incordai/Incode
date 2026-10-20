@@ -48,6 +48,9 @@ POLICY (a file, then flags on top of it):
         --set-env <K=V>      set a variable (repeatable)
         --keep-agent-session keep CLAUDECODE / CLAUDE_CODE_SESSION* (stripped by default)
         --keep-git-redirects keep GIT_DIR / GIT_WORK_TREE / ... (stripped by default)
+        --no-protect-git     let the command change .git/hooks and .git/config (by default
+                             they are put back after the run: a planted hook would run,
+                             unsandboxed, the next time anyone uses git there)
         --wall <SECS>        kill the command (and everything it started) after SECS
         --cpu <SECS>         CPU seconds per process
         --mem <MB>           address space per process
@@ -136,6 +139,9 @@ fn run(o: Options) -> Result<i32, String> {
     if !o.quiet {
         for d in outcome.decisions.iter().filter(|d| !d.allowed) {
             eprintln!("sbx: network refused {} ({})", d.target, d.reason);
+        }
+        for r in &outcome.restored {
+            eprintln!("sbx: protected path changed by the command, {r}");
         }
         if outcome.timed_out {
             eprintln!("sbx: killed after the wall-clock limit");
@@ -306,6 +312,7 @@ fn parse(args: &[OsString]) -> Result<Options, String> {
             }
             "--keep-agent-session" => policy.env.strip_agent_session = false,
             "--keep-git-redirects" => policy.env.strip_git_redirects = false,
+            "--no-protect-git" => policy.fs.protect_git = false,
             "--wall" => policy.limits.wall_secs = Some(num(&v)?),
             "--cpu" => policy.limits.cpu_secs = Some(num(&v)?),
             "--mem" => policy.limits.memory_mb = Some(num(&v)?),
