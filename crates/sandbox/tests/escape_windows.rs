@@ -925,11 +925,12 @@ fn offline_aces(icacls: &str) -> Vec<String> {
 
 #[test]
 fn powershell_under_network_deny_starts_in_the_current_folder() {
-    // PowerShell sets its first location by looking the current folder up
-    // in its parent; as the offline account, with no right to list a parent
-    // under the user's profile, it was left at `C:\` and relative paths
-    // went there. The run lets the account list that one parent, by one ACE
-    // that reaches nothing beneath it, for the run only.
+    // Windows PowerShell sets its first location by looking every part of
+    // the current folder up in the folder above; as the offline account,
+    // with no right to list folders under the user's profile, it was left at
+    // `C:\` and relative paths went there. The run lets the account list
+    // each folder above (up to `C:\Users`), by one ACE per folder that
+    // reaches nothing beneath it, for the run only.
     if !needs_offline("powershell_under_network_deny_starts_in_the_current_folder") {
         return;
     }

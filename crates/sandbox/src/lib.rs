@@ -675,7 +675,12 @@ impl Sandbox {
                     user: ready.sid.clone(),
                     // PowerShell lists the current folder's parent to start
                     // in it at all.
-                    parents: windows::offline_parents(&grant, &reads, &real(cwd)),
+                    parents: windows::offline_parents(
+                        &grant,
+                        &reads,
+                        &real(cwd),
+                        windows::profiles_dir().as_deref(),
+                    ),
                     reads,
                 }
             });

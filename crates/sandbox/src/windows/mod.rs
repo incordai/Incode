@@ -377,39 +377,60 @@ pub fn offline_reads(roots: &[PathBuf], cwd: &Path, helper: &Path) -> Vec<PathBu
         .collect()
 }
 
-/// The folders the offline account must be able to LIST (and only list)
-/// for a run starting in `cwd`: the current folder's parent, unless it is a
-/// drive or share root (`Users` may list those already, and they are never
-/// re-ACLed) or a root or read folder already holds it (and so grants more).
+/// The folders the offline account must be able to list for the run's
+/// current folder `cwd`: every folder above it, up to (not including) a
+/// drive or share root or `profiles` (the folder holding the user profiles,
+/// `C:\Users`, which every user may list already and which an elevated run
+/// must not re-ACL), less any a root or read folder already holds.
 ///
-/// Why: Windows PowerShell (and pwsh) sets its first location by
-/// normalising the process's current directory, and the FileSystem
-/// provider's `NormalizeRelativePath` looks the folder up in its parent
-/// (`Directory.EnumerateFiles(parent, leaf)`, then `EnumerateDirectories`)
-/// to get its exact case. That enumeration needs `FILE_LIST_DIRECTORY` on
-/// the parent. The offline account has none on a folder under the user's
-/// profile, the lookup throws `UnauthorizedAccessException`, startup
-/// swallows it, and PowerShell is left at the drive root: `Set-Content
-/// rel.txt` writes `C:\rel.txt`. Nothing else is needed: traversal is
-/// `SeChangeNotifyPrivilege`'s (kept in the command's token), and the
-/// folder's own attributes come from its own read grant.
+/// Why: Windows PowerShell 5.1 sets its first location by normalising the
+/// process's current directory, and it looks up EVERY component in its
+/// parent (`Directory.EnumerateFiles`/`EnumerateDirectories`) to get its
+/// exact case, which needs `FILE_LIST_DIRECTORY` on each folder above. The
+/// offline account has none under the user's profile, the lookup throws
+/// `UnauthorizedAccessException`, startup swallows it, and PowerShell is
+/// left at the drive root: `Set-Content rel.txt` writes `C:\rel.txt`.
+/// Measured on GitHub's windows-latest: with only the immediate parent
+/// listable an explicit `Set-Location` to the current folder still failed
+/// "Access is denied"; the chain above it (`Temp`, `Local`, `AppData`, the
+/// profile) was not listable. Traversal is `SeChangeNotifyPrivilege`'s (kept
+/// in the command's token); each ACE is list-only and inherits to nothing.
 #[must_use]
-pub fn offline_parents(roots: &[PathBuf], reads: &[PathBuf], cwd: &Path) -> Vec<PathBuf> {
-    let Some(parent) = parent_of(&cwd.to_string_lossy()) else {
-        return Vec::new();
-    };
-    // Absolute and not a drive or share root.
-    if refuse_broad(&parent, None).is_err() {
-        return Vec::new();
+pub fn offline_parents(
+    roots: &[PathBuf],
+    reads: &[PathBuf],
+    cwd: &Path,
+    profiles: Option<&Path>,
+) -> Vec<PathBuf> {
+    let stop = profiles.map(|p| path_key(&p.to_string_lossy()));
+    let mut out = Vec::new();
+    let mut here = cwd.to_string_lossy().into_owned();
+    while let Some(parent) = parent_of(&here) {
+        // Absolute and not a drive or share root.
+        if refuse_broad(&parent, None).is_err() {
+            break;
+        }
+        if stop.as_deref() == Some(path_key(&parent).as_str()) {
+            break;
+        }
+        let held = roots
+            .iter()
+            .chain(reads)
+            .any(|r| holds(&r.to_string_lossy(), &parent));
+        if !held {
+            out.push(PathBuf::from(&parent));
+        }
+        here = parent;
     }
-    let held = roots
-        .iter()
-        .chain(reads)
-        .any(|r| holds(&r.to_string_lossy(), &parent));
-    if held {
-        return Vec::new();
-    }
-    vec![PathBuf::from(parent)]
+    out
+}
+
+/// The folder holding the user profiles (`C:\Users`): the parent of
+/// `USERPROFILE`. Where [`offline_parents`] stops.
+#[must_use]
+pub fn profiles_dir() -> Option<PathBuf> {
+    let profile = std::env::var("USERPROFILE").ok()?;
+    parent_of(&profile).map(PathBuf::from)
 }
 
 /// Whether `path` is one of `parents` (as Windows compares paths): another
@@ -712,21 +733,36 @@ mod tests {
     }
 
     #[test]
-    fn the_account_lists_the_current_folders_parent_and_nothing_more() {
+    fn the_account_lists_every_folder_above_the_current_one_up_to_the_profiles() {
         let none: [PathBuf; 0] = [];
+        let users = Some(Path::new(r"C:\Users"));
         let ws = Path::new(r"C:\Users\me\AppData\Local\Temp\.tmpAb\ws");
-        // The parent only: no grandparent, no drive root.
+        // Every folder above, stopping before `C:\Users`.
         assert_eq!(
-            offline_parents(&[ws.to_path_buf()], &none, ws),
-            [PathBuf::from(r"C:\Users\me\AppData\Local\Temp\.tmpAb")]
+            offline_parents(&[ws.to_path_buf()], &none, ws, users),
+            [
+                PathBuf::from(r"C:\Users\me\AppData\Local\Temp\.tmpAb"),
+                PathBuf::from(r"C:\Users\me\AppData\Local\Temp"),
+                PathBuf::from(r"C:\Users\me\AppData\Local"),
+                PathBuf::from(r"C:\Users\me\AppData"),
+                PathBuf::from(r"C:\Users\me"),
+            ]
         );
-        // As `canonicalize` spells it, and with a trailing separator.
+        // As `canonicalize` spells it (the stop compares the same way), and
+        // with a trailing separator.
         assert_eq!(
-            offline_parents(&none, &none, Path::new(r"\\?\C:\Users\me\src\proj\")),
-            [PathBuf::from(r"\\?\C:\Users\me\src")]
+            offline_parents(&none, &none, Path::new(r"\\?\C:\Users\me\src\proj\"), users),
+            [
+                PathBuf::from(r"\\?\C:\Users\me\src"),
+                PathBuf::from(r"\\?\C:\Users\me"),
+            ]
         );
-        // A folder at the top of a drive or share: its parent is a root,
-        // which `Users` lists already and is never re-ACLed.
+        // Outside the profiles: up to the drive root, which is never listed.
+        assert_eq!(
+            offline_parents(&none, &none, Path::new(r"D:\work\team\proj"), users),
+            [PathBuf::from(r"D:\work\team"), PathBuf::from(r"D:\work")]
+        );
+        // A folder at the top of a drive or share: nothing above to list.
         for top in [
             r"C:\proj",
             r"\\?\C:\proj",
@@ -736,33 +772,41 @@ mod tests {
             r"\\srv\share",
             "proj",
         ] {
-            assert_eq!(offline_parents(&none, &none, Path::new(top)), none, "{top}");
+            assert_eq!(
+                offline_parents(&none, &none, Path::new(top), users),
+                none,
+                "{top}"
+            );
         }
-        // Deeper on a share, the share's folder is listed.
+        // Deeper on a share, the share's folders are listed.
         assert_eq!(
-            offline_parents(&none, &none, Path::new(r"\\srv\share\team\proj")),
+            offline_parents(&none, &none, Path::new(r"\\srv\share\team\proj"), users),
             [PathBuf::from(r"\\srv\share\team")]
         );
-        // A root or read folder that holds the parent already grants more
-        // (`Modify` or `RX`, inherited, both list): nothing to add.
+        // A folder a root or read folder holds is listable already; the ones
+        // above it still need the ACE.
         let sub = Path::new(r"C:\w\proj\sub");
         assert_eq!(
-            offline_parents(&[PathBuf::from(r"C:\W\Proj")], &none, sub),
-            none
+            offline_parents(&[PathBuf::from(r"C:\W\Proj")], &none, sub, users),
+            [PathBuf::from(r"C:\w")]
         );
-        assert_eq!(offline_parents(&[PathBuf::from(r"C:\w")], &none, sub), none);
         assert_eq!(
-            offline_parents(&none, &[PathBuf::from(r"c:\w\proj")], sub),
+            offline_parents(&[PathBuf::from(r"C:\w")], &none, sub, users),
             none
         );
-        // A root beside it, or inside the current folder, does not.
+        assert_eq!(
+            offline_parents(&none, &[PathBuf::from(r"c:\w\proj")], sub, users),
+            [PathBuf::from(r"C:\w")]
+        );
+        // A root beside it, or inside the current folder, does not count.
         assert_eq!(
             offline_parents(
                 &[PathBuf::from(r"C:\w\proj\subway"), sub.join("x")],
                 &none,
-                sub
+                sub,
+                users
             ),
-            [PathBuf::from(r"C:\w\proj")]
+            [PathBuf::from(r"C:\w\proj"), PathBuf::from(r"C:\w")]
         );
     }
 

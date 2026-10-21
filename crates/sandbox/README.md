@@ -308,11 +308,13 @@ What changes for the command:
   granted with `--read`. A toolchain installed under your profile
   (`.cargo`, `.rustup`, a per-user Python or Node) needs `--read` once.
   Narrower than without network deny, never wider. One more right: the
-  account may *list* the folder the current folder is in (names, no
-  contents), by one ACE on that folder alone that nothing beneath it
-  inherits, for the run. PowerShell needs it: it looks its starting folder
-  up in the parent, and without it starts at `C:\` (so `Set-Content x.txt`
-  wrote `C:\x.txt`).
+  account may *list* each folder above the current folder, up to the drive
+  root or `C:\Users` (names, no contents), by one ACE per folder that
+  nothing beneath it inherits, for the run. Windows PowerShell needs it: it
+  looks every part of its starting folder up in the folder above, and
+  without it starts at `C:\` (so `Set-Content x.txt` wrote `C:\x.txt`). So
+  during a run the command can see the names in, say, your profile folder
+  and `AppData\Local\Temp` on the way to a project under them.
 - **Writes** need both the account (the token's normal check) and the run's
   private SID (its restricted check), so each root gets an ACE for each.
   Another run's command, also the account but with another run SID, cannot
