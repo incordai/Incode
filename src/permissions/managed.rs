@@ -5,7 +5,9 @@
 //!
 //! - Linux and other Unix: `/etc/incode/managed.toml`
 //! - macOS: `/Library/Application Support/incode/managed.toml`
-//! - Windows: `%ProgramData%\incode\managed.toml`
+//! - Windows: `<ProgramData>\incode\managed.toml`, where `<ProgramData>` is
+//!   the folder Windows records (`C:\ProgramData` as installed) — asked of the
+//!   OS, never read from the `%ProgramData%` variable
 //!
 //! Written by an administrator and readable by everyone; incode never writes
 //! it. Its location is fixed in code, deliberately: an environment variable
@@ -51,14 +53,51 @@ pub const MANAGED_FILE: &str = "managed.toml";
 #[must_use]
 pub fn managed_dir() -> PathBuf {
     if cfg!(windows) {
-        let base = std::env::var_os("ProgramData")
-            .map_or_else(|| PathBuf::from(r"C:\ProgramData"), PathBuf::from);
-        base.join("incode")
+        program_data().join("incode")
     } else if cfg!(target_os = "macos") {
         PathBuf::from("/Library/Application Support/incode")
     } else {
         PathBuf::from("/etc/incode")
     }
+}
+
+/// Windows' ProgramData folder as the OS records it. NOT `%ProgramData%`: the
+/// person the managed file constrains sets their own environment, and one
+/// pointing it at an empty folder would leave no policy at all.
+fn program_data() -> PathBuf {
+    #[cfg(windows)]
+    if let Some(path) = known_program_data() {
+        return path;
+    }
+    // The OS always answers; were it not to, its own default, still never
+    // a value from the environment.
+    PathBuf::from(r"C:\ProgramData")
+}
+
+/// `FOLDERID_ProgramData`, from `SHGetKnownFolderPath`.
+#[cfg(windows)]
+fn known_program_data() -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{FOLDERID_ProgramData, SHGetKnownFolderPath};
+
+    let mut raw: windows_sys::core::PWSTR = std::ptr::null_mut();
+    // SAFETY: a known-folder id, no flags, no token (this user), and an out
+    // pointer the call fills with a string for CoTaskMemFree.
+    let status =
+        unsafe { SHGetKnownFolderPath(&FOLDERID_ProgramData, 0, std::ptr::null_mut(), &mut raw) };
+    let path = (status >= 0 && !raw.is_null()).then(|| {
+        // SAFETY: on success `raw` is a NUL-terminated wide string.
+        let wide = unsafe {
+            let len = (0..).take_while(|&i| *raw.add(i) != 0).count();
+            std::slice::from_raw_parts(raw, len)
+        };
+        PathBuf::from(std::ffi::OsString::from_wide(wide))
+    });
+    // SAFETY: frees what the call allocated, on success or failure (null is
+    // allowed).
+    unsafe { CoTaskMemFree(raw.cast()) };
+    path
 }
 
 /// The managed file, on this OS.
@@ -277,5 +316,41 @@ mod tests {
     #[test]
     fn a_test_never_reads_the_machines_managed_file() {
         assert_eq!(load(), Managed::Absent);
+    }
+
+    /// **THE PERSON THE FILE CONSTRAINS SETS THEIR OWN ENVIRONMENT.** Pointing
+    /// `%ProgramData%`, or the variables Windows builds it from, at an empty
+    /// folder must not move the managed file there.
+    #[cfg(windows)]
+    #[test]
+    fn the_managed_folder_does_not_follow_the_environment() {
+        let _guard = crate::brief::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let real = managed_dir();
+        let decoy = tempfile::tempdir().expect("temp dir");
+        let names = ["ProgramData", "ALLUSERSPROFILE", "SystemDrive"];
+        let saved: Vec<_> = names.iter().map(std::env::var_os).collect();
+        for name in names {
+            std::env::set_var(name, decoy.path());
+        }
+        let moved = managed_dir();
+        for (name, value) in names.iter().zip(saved) {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+        assert!(
+            !moved.starts_with(decoy.path()),
+            "the environment moved the managed folder to {}",
+            moved.display()
+        );
+        assert_eq!(moved, real);
+        assert!(
+            real.is_absolute() && real.ends_with("incode"),
+            "{}",
+            real.display()
+        );
     }
 }

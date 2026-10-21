@@ -405,10 +405,12 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    /// A command that keeps running for about `secs` seconds.
+    /// A command that keeps running for about `secs` seconds. No `> nul`: the
+    /// Windows shell is Git Bash (`shell_choice`), where that writes a file
+    /// called `nul` into the folder the job runs in — here, the checkout.
     fn long_running(secs: u32) -> String {
         if cfg!(windows) {
-            format!("ping -n {} 127.0.0.1 > nul", secs + 1)
+            format!("ping -n {} 127.0.0.1", secs + 1)
         } else {
             format!("sleep {secs}")
         }

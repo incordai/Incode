@@ -240,6 +240,15 @@ windows-sys = { version = "0.61", features = [
     # Win32_System_Threading (already on). Each was confirmed present in the
     # cached 0.61.2 manifest before being written here.
     "Win32_Security_Authorization",
+    # permissions::managed — the ProgramData folder from the OS
+    # (SHGetKnownFolderPath, FOLDERID_ProgramData), never from `%ProgramData%`,
+    # which the person the managed file constrains can point anywhere.
+    # mcp_oauth::open_browser — ShellExecuteW, so a login URL is never parsed
+    # by cmd. CoTaskMemFree and CoInitializeEx are in Win32_System_Com. NO NEW
+    # PACKAGE: features of windows-sys 0.61.2 only, each item confirmed in the
+    # cached source before being written here.
+    "Win32_UI_Shell",
+    "Win32_System_Com",
 ] }
 
 # agent::process_tree on Linux and macOS: `killpg` for the process group the

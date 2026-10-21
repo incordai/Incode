@@ -1140,7 +1140,8 @@ careful, never less. `/permissions` lists the rules in force.
 
 **Managed settings.** An administrator can put a file at
 `/etc/incode/managed.toml` (macOS `/Library/Application Support/incode/managed.toml`,
-Windows `%ProgramData%\incode\managed.toml`):
+Windows `C:\ProgramData\incode\managed.toml` — the ProgramData folder Windows
+records, whatever a user sets `%ProgramData%` to):
 
 ```toml
 [permissions]

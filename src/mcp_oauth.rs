@@ -793,30 +793,81 @@ fn reply(stream: &mut TcpStream, status: u16, said: &str) {
 
 /// Open `url` in the user's browser; whether a browser was started is not
 /// known, so the address is always printed as well.
+///
+/// The address is built from a remote server's metadata
+/// ([`authorization_url`]), which can put `|`, `&` or `%NAME%` in it. So it
+/// goes to the OS as one argument no shell reads — on Windows through
+/// `ShellExecuteW`, never `cmd /c start`, where the text after a `|` ran as a
+/// command — and only when it is an http(s) URL ([`web_address`]).
+///
+/// Called by `mcp_config.rs` (`incode mcp login`) as the login's opener.
 pub fn open_browser(url: &str) {
-    let mut command = if cfg!(target_os = "macos") {
-        let mut c = std::process::Command::new("open");
-        c.arg(url);
-        c
-    } else if cfg!(windows) {
-        // `start` is a cmd built-in; `&` would end the command there, so it
-        // is escaped. The empty argument, which reaches cmd as `""`, is the window
-        // title `start` takes first.
-        let mut c = std::process::Command::new("cmd");
-        c.args(["/c", "start", "", &url.replace('&', "^&")]);
-        c
-    } else {
-        let mut c = std::process::Command::new("xdg-open");
-        c.arg(url);
-        c
+    let Some(address) = web_address(url) else {
+        return;
     };
-    command
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    if let Ok(mut child) = command.spawn() {
-        std::thread::spawn(move || child.wait());
+    #[cfg(windows)]
+    shell_open(address);
+    #[cfg(not(windows))]
+    {
+        let program = if cfg!(target_os = "macos") {
+            "open"
+        } else {
+            "xdg-open"
+        };
+        let mut command = std::process::Command::new(program);
+        command
+            .arg(address)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if let Ok(mut child) = command.spawn() {
+            std::thread::spawn(move || child.wait());
+        }
     }
+}
+
+/// `url` as an http or https address, or `None`. A path, a `file:` URL or
+/// another scheme would be run or opened as a document by the OS's handler.
+fn web_address(url: &str) -> Option<String> {
+    let parsed = Url::parse(url).ok()?;
+    matches!(parsed.scheme(), "https" | "http").then(|| parsed.into())
+}
+
+/// Hand `address` to the handler Windows has for its scheme. On a thread of
+/// its own, with COM set up as `ShellExecuteW` asks, so a slow handler does
+/// not hold up the login waiting for the redirect.
+#[cfg(windows)]
+fn shell_open(address: String) {
+    use windows_sys::Win32::System::Com::{
+        CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
+    };
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    std::thread::spawn(move || {
+        let wide = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
+        let (verb, file) = (wide("open"), wide(&address));
+        // SAFETY: COM is set up for this thread only, and undone below when it
+        // was. The two strings are NUL-terminated and outlive the call; the
+        // window, parameters and directory may be null.
+        unsafe {
+            let com = CoInitializeEx(
+                std::ptr::null(),
+                (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32,
+            );
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                verb.as_ptr(),
+                file.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                SW_SHOWNORMAL,
+            );
+            if com >= 0 {
+                CoUninitialize();
+            }
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------

@@ -320,7 +320,8 @@ pub struct Segment {
     /// As written, whitespace-collapsed. What an allow rule is matched with.
     pub text: String,
     /// The forms a deny or ask rule is matched with: `text`, and `text` with
-    /// leading assignments and wrapper commands peeled off, one at a time.
+    /// leading assignments and wrapper commands peeled off, one at a time;
+    /// each as written and unquoted.
     pub peeled: Vec<String>,
     /// A part no allow rule may pass: it substitutes a command, redirects,
     /// or hands a string to a shell.
@@ -342,6 +343,15 @@ pub fn split_command(line: &str) -> Vec<Segment> {
 /// How deep `sh -c "sh -c '…'"` is followed before the rest is simply opaque.
 const MAX_DEPTH: usize = 8;
 
+/// `line`'s parts, appended to `out`.
+///
+/// `$'…'` is ANSI-C quoting to bash, zsh and ksh, but a `$` and a plain
+/// quote to a POSIX `sh` such as dash — the `sh` of Debian and Ubuntu, and
+/// incode runs `sh -c` (`tools::shell_choice`). The two readings can end the
+/// quote in different places, so a command can hide from one of them. Which
+/// shell runs is not known here, so a line with `$'` is read BOTH ways: a deny
+/// or ask rule meets the parts of either, and every part is opaque, so no
+/// allow rule passes it. `guards::shell::write_targets` does the same.
 fn split_into(line: &str, out: &mut Vec<Segment>, depth: usize) {
     if depth > MAX_DEPTH {
         out.push(Segment {
@@ -351,6 +361,19 @@ fn split_into(line: &str, out: &mut Vec<Segment>, depth: usize) {
         });
         return;
     }
+    let first = out.len();
+    split_reading(line, out, depth, true);
+    if line.contains("$'") {
+        split_reading(line, out, depth, false);
+        for segment in &mut out[first..] {
+            segment.opaque = true;
+        }
+    }
+}
+
+/// One reading of `line`: with `ansi_c`, `$'…'` as bash reads it; without,
+/// as a POSIX `sh` does.
+fn split_reading(line: &str, out: &mut Vec<Segment>, depth: usize, ansi_c: bool) {
     let chars: Vec<char> = line.chars().collect();
     let mut i = 0;
     // The current part, as written; and with quoted text blanked, to look
@@ -407,7 +430,7 @@ fn split_into(line: &str, out: &mut Vec<Segment>, depth: usize) {
                 }
                 // Substitution happens inside double quotes too.
                 if (c == '$' && next == Some('(')) || c == '`' {
-                    let (body, end) = substitution(&chars, i);
+                    let (body, end) = substitution(&chars, i, ansi_c);
                     raw.extend(&chars[i..end]);
                     bare.push('_');
                     inner.push(body);
@@ -431,6 +454,30 @@ fn split_into(line: &str, out: &mut Vec<Segment>, depth: usize) {
                 bare.push_str("__");
                 i += 2;
             }
+            // `$$`, the shell's pid: a quote after it is an ordinary one.
+            '$' if next == Some('$') => {
+                raw.push_str("$$");
+                bare.push_str("$$");
+                i += 2;
+            }
+            // `$'…'`: a backslash escapes the quote, so it ends where bash
+            // says (`crate::ansi_c`). What it spells is decided by escapes,
+            // so no allow rule passes the part.
+            '$' if ansi_c && next == Some('\'') => {
+                let (_, end) = crate::ansi_c::quoted(&chars, i + 2);
+                raw.extend(&chars[i..end]);
+                bare.extend(std::iter::repeat_n('_', end - i));
+                opaque = true;
+                i = end;
+            }
+            // `$"…"`: a double-quoted string the locale may translate into
+            // other text; past the `$` it is read as `"…"`.
+            '$' if next == Some('"') => {
+                raw.push(c);
+                bare.push('_');
+                opaque = true;
+                i += 1;
+            }
             '\'' | '"' => {
                 quote = Some(c);
                 raw.push(c);
@@ -438,7 +485,7 @@ fn split_into(line: &str, out: &mut Vec<Segment>, depth: usize) {
                 i += 1;
             }
             '$' if next == Some('(') => {
-                let (body, end) = substitution(&chars, i);
+                let (body, end) = substitution(&chars, i, ansi_c);
                 raw.extend(&chars[i..end]);
                 bare.push('_');
                 inner.push(body);
@@ -446,7 +493,7 @@ fn split_into(line: &str, out: &mut Vec<Segment>, depth: usize) {
                 i = end;
             }
             '`' => {
-                let (body, end) = substitution(&chars, i);
+                let (body, end) = substitution(&chars, i, ansi_c);
                 raw.extend(&chars[i..end]);
                 bare.push('_');
                 inner.push(body);
@@ -454,7 +501,7 @@ fn split_into(line: &str, out: &mut Vec<Segment>, depth: usize) {
                 i = end;
             }
             '<' | '>' if next == Some('(') => {
-                let (body, end) = substitution(&chars, i + 1);
+                let (body, end) = substitution(&chars, i + 1, ansi_c);
                 raw.extend(&chars[i..end]);
                 bare.push('_');
                 inner.push(body);
@@ -499,7 +546,8 @@ fn split_into(line: &str, out: &mut Vec<Segment>, depth: usize) {
 
 /// The body of the substitution that starts at `start` (`$(`, `(` or a
 /// backtick), and the index just past its end. Unterminated: the rest.
-fn substitution(chars: &[char], start: usize) -> (String, usize) {
+/// `ansi_c`: whether `$'…'` is read as bash reads it ([`split_into`]).
+fn substitution(chars: &[char], start: usize, ansi_c: bool) -> (String, usize) {
     if chars[start] == '`' {
         let mut i = start + 1;
         let mut body = String::new();
@@ -538,6 +586,14 @@ fn substitution(chars: &[char], start: usize) -> (String, usize) {
             None => match c {
                 '\\' => {
                     i += 2;
+                    continue;
+                }
+                '$' if chars.get(i + 1) == Some(&'$') => {
+                    i += 2;
+                    continue;
+                }
+                '$' if ansi_c && chars.get(i + 1) == Some(&'\'') => {
+                    i = crate::ansi_c::quoted(chars, i + 2).1;
                     continue;
                 }
                 '\'' | '"' => quote = Some(c),
@@ -622,14 +678,18 @@ fn words(text: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut word = String::new();
     let mut quote: Option<char> = None;
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        i += 1;
         match quote {
             Some(q) => {
                 word.push(c);
                 if c == '\\' && q == '"' {
-                    if let Some(n) = chars.next() {
+                    if let Some(&n) = chars.get(i) {
                         word.push(n);
+                        i += 1;
                     }
                 } else if c == q {
                     quote = None;
@@ -641,14 +701,25 @@ fn words(text: &str) -> Vec<String> {
                         words.push(std::mem::take(&mut word));
                     }
                 }
+                '$' if chars.get(i) == Some(&'$') => {
+                    word.push_str("$$");
+                    i += 1;
+                }
+                // `$'…'`, kept as written, to where bash ends it.
+                '$' if chars.get(i) == Some(&'\'') => {
+                    let (_, end) = crate::ansi_c::quoted(&chars, i + 1);
+                    word.extend(&chars[i - 1..end]);
+                    i = end;
+                }
                 '\'' | '"' => {
                     quote = Some(c);
                     word.push(c);
                 }
                 '\\' => {
                     word.push(c);
-                    if let Some(n) = chars.next() {
+                    if let Some(&n) = chars.get(i) {
                         word.push(n);
+                        i += 1;
                     }
                 }
                 _ => word.push(c),
@@ -661,18 +732,35 @@ fn words(text: &str) -> Vec<String> {
     words
 }
 
-/// A word with its outer quotes and backslashes removed.
+/// A word with its outer quotes and backslashes removed, and a `$'…'` in it
+/// decoded (`crate::ansi_c`): `$'\x72m'` is `rm`.
 fn unquote(word: &str) -> String {
     let mut out = String::new();
     let mut quote: Option<char> = None;
-    let mut chars = word.chars();
-    while let Some(c) = chars.next() {
+    let chars: Vec<char> = word.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        i += 1;
         match (quote, c) {
+            (None, '$') if next == Some('$') => {
+                out.push_str("$$");
+                i += 1;
+            }
+            (None, '$') if next == Some('\'') => {
+                let (text, end) = crate::ansi_c::quoted(&chars, i + 1);
+                out.push_str(&text);
+                i = end;
+            }
+            // `$"…"` is `"…"`.
+            (None, '$') if next == Some('"') => {}
             (None, '\'' | '"') => quote = Some(c),
             (Some(q), _) if c == q => quote = None,
             (None | Some('"'), '\\') => {
-                if let Some(n) = chars.next() {
+                if let Some(n) = next {
                     out.push(n);
+                    i += 1;
                 }
             }
             _ => out.push(c),
@@ -722,10 +810,12 @@ fn flag_takes_value(wrapper: &str, flag: &str) -> bool {
 }
 
 /// `text`, then `text` with each leading assignment and wrapper peeled off in
-/// turn; and the script, when the command hands one to a shell.
+/// turn — each form also unquoted, since `'rm' -rf /` and `$'\x72m' -rf /` run
+/// `rm` — and the script, when the command hands one to a shell.
 fn peel(text: &str) -> (Vec<String>, Option<String>) {
     let all = words(text);
-    let mut forms = vec![all.join(" ")];
+    let plain: Vec<String> = all.iter().map(|w| unquote(w)).collect();
+    let mut forms = vec![all.join(" "), plain.join(" ")];
     let mut at = 0;
     while at < all.len() {
         let word = &all[at];
@@ -748,6 +838,7 @@ fn peel(text: &str) -> (Vec<String>, Option<String>) {
         }
         if at < all.len() {
             forms.push(all[at..].join(" "));
+            forms.push(plain[at..].join(" "));
         }
     }
     // `sh -c '<script>'`, `bash -lc "<script>"`, `eval <words>`.

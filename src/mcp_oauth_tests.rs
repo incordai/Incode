@@ -180,6 +180,84 @@ fn the_authorization_url_carries_every_parameter() {
     assert!(authorization_url(&clear).is_err());
 }
 
+/// **A SERVER'S ENDPOINT IS NOT A COMMAND LINE.** Its metadata can put `|`,
+/// `&` or `%NAME%` in the authorization URL, and they reach the address the
+/// browser is sent to unchanged — which is why no shell may read it.
+#[test]
+fn an_endpoint_can_carry_shell_text_into_the_browser_address() {
+    let url = authorization_url(&AuthRequest {
+        endpoint: "https://auth.example/a|b?x=%PATH%|calc",
+        client_id: "c",
+        redirect_uri: "http://127.0.0.1:1/callback",
+        scopes: &[],
+        state: "s",
+        challenge: "c",
+        resource: "r",
+    })
+    .expect("url");
+    assert!(url.contains("/a|b?x=%PATH%|calc&"), "{url}");
+    assert_eq!(web_address(&url).as_deref(), Some(url.as_str()));
+}
+
+/// Only an http(s) address is opened: a path or another scheme would be run,
+/// or opened as a document, by the OS's handler for it.
+#[test]
+fn only_a_web_address_is_handed_to_the_browser() {
+    for address in [
+        r"C:\Windows\System32\calc.exe",
+        "calc.exe",
+        "file:///C:/Windows/System32/calc.exe",
+        r"\\host\share\run.exe",
+        "javascript:alert(1)",
+        "ms-settings:privacy",
+        "",
+    ] {
+        assert_eq!(web_address(address), None, "`{address}`");
+    }
+    assert!(web_address("http://127.0.0.1:5555/callback").is_some());
+    assert!(web_address("https://auth.example/authorize?a=1").is_some());
+}
+
+/// **THE BROWSER IS OPENED WITHOUT A SHELL.** Under `cmd /c start`, the text
+/// after a `|` in the address ran as a command. The address must still reach
+/// a browser: it calls back to a listener here. It opens a browser tab, so it
+/// is run by hand: `cargo test --lib open_browser_runs_nothing -- --ignored`.
+#[cfg(windows)]
+#[test]
+#[ignore = "opens a browser tab"]
+fn open_browser_runs_nothing_from_the_address() {
+    let probe =
+        std::env::temp_dir().join(format!("incode-open-browser-probe-{}", std::process::id()));
+    let _ = std::fs::remove_dir(&probe);
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let port = listener.local_addr().expect("addr").port();
+    let address = format!("http://127.0.0.1:{port}/?q=|mkdir,{}", probe.display());
+    open_browser(&address);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut reached = false;
+    while Instant::now() < deadline {
+        if let Ok((mut stream, _)) = listener.accept() {
+            reached = true;
+            let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n");
+        }
+        if reached {
+            // Time for a command started beside the browser to have run.
+            std::thread::sleep(Duration::from_secs(2));
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let ran = probe.exists();
+    let _ = std::fs::remove_dir(&probe);
+    assert!(
+        !ran,
+        "text from the address ran as a command: it made {}",
+        probe.display()
+    );
+    assert!(reached, "no browser asked for the address within 20 s");
+}
+
 #[test]
 fn the_callback_is_parsed_and_its_state_checked() {
     assert_eq!(

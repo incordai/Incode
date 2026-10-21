@@ -74,6 +74,7 @@ with `cargo test --lib <name> -- --ignored --nocapture`.
 | `desktop::thread` (moves the cursor) | A desktop session you are not using | Moves the real mouse and puts it back |
 | `desktop::capture::tests::live::report_real_capture` | A display | Captures the real screen and prints the coordinate mapping |
 | `desktop::win32`, `desktop::uia` reports | Windows | Print the display table and the focused window's accessibility tree |
+| `mcp_oauth::tests::open_browser_runs_nothing_from_the_address` | Windows with a default browser | Opens a browser tab on a loopback listener and checks the address reached it, while a `\|mkdir,…` in the address ran nothing |
 | `toolbox::code_edits_tests::live_an_unseen_change_is_refused_by_the_engine` | `INCODE_LIVE_MEMORY_URL` (a throwaway Incord Memory engine) and `INCODE_LIVE_REPO` | Checks the engine refuses an edit to code it has not seen |
 
 ## By hand
