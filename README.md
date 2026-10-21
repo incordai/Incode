@@ -1,9 +1,9 @@
 <div align="center">
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="/assets/incord-logo-dark.svg">
-    <source media="(prefers-color-scheme: light)" srcset="/assets/incord-logo-light.svg">
-    <img alt="INCORD" src="/assets/incord-logo-light.svg" width="840">
+    <source media="(prefers-color-scheme: dark)" srcset="/assets/incode-logo-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="/assets/incode-logo-light.svg">
+    <img alt="INCORD" src="/assets/incode-logo-light.svg" width="840">
   </picture>
 </p>
 
