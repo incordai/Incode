@@ -6,6 +6,7 @@
     <img alt="INCORD" src="/assets/incode-logo-light.svg" width="840">
   </picture>
 </p>
+</div>
 
 `incode` — an autonomous coding harness. It plans work, has a model do it, runs
 every tool the model calls through its own guards, and proves the work was done
