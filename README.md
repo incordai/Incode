@@ -1,3 +1,12 @@
+<div align="center">
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="/assets/incord-logo-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="/assets/incord-logo-light.svg">
+    <img alt="INCORD" src="/assets/incord-logo-light.svg" width="840">
+  </picture>
+</p>
+
 # Incode  <img src="https://github.com/user-attachments/assets/5548318d-30b0-4d60-a3a7-97269dbb5d61" width="25px" alt="incordai" />
 
 `incode` — an autonomous coding harness. It plans work, has a model do it, runs
