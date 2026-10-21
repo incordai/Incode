@@ -498,6 +498,23 @@ fn lex(text: &str) -> Lexed {
             }
             '`' => index = lexer.substitution(&chars, index),
             '$' if matches!(next, Some('(' | '{')) => index = lexer.substitution(&chars, index),
+            // `$$`, the shell's pid: a quote after it is an ordinary one.
+            '$' if next == Some('$') => {
+                lexer.word.push_str("$$");
+                lexer.started = true;
+                index += 2;
+            }
+            // `$'…'`: escapes decoded, ending where bash ends it
+            // (`crate::ansi_c`) — a backslash escapes the quote.
+            '$' if next == Some('\'') => {
+                let (text, end) = crate::ansi_c::quoted(&chars, index + 2);
+                lexer.word.push_str(&text);
+                lexer.started = true;
+                lexer.quoted = true;
+                index = end;
+            }
+            // `$"…"` is read as `"…"`.
+            '$' if next == Some('"') => index += 1,
             '#' if !lexer.started => {
                 while index < chars.len() && chars[index] != '\n' {
                     index += 1;
@@ -647,6 +664,14 @@ impl Lexer {
                 index += 2;
                 continue;
             }
+            if c == '$' && chars.get(index + 1) == Some(&'$') {
+                index += 2;
+                continue;
+            }
+            if c == '$' && chars.get(index + 1) == Some(&'\'') {
+                index = crate::ansi_c::quoted(chars, index + 2).1;
+                continue;
+            }
             // A quoted `)` does not close `$(...)`: a quoted span is skipped
             // whole, or the rest of the command would be read off by one.
             if matches!(c, '\'' | '"') && c != close {
@@ -754,6 +779,45 @@ mod tests {
             targets(r#"echo "a > tests/a.rs""#).is_empty(),
             "a quoted `>` redirects nothing"
         );
+    }
+
+    /// **`$'…'` ENDS WHERE BASH SAYS.** A backslash escapes its quote, so
+    /// `$'\''` is one character and the redirect after the `;` is real. Read
+    /// as a plain `'…'`, the rest of the line looked quoted and the write to a
+    /// protected file went unseen.
+    #[test]
+    fn an_ansi_c_quote_does_not_hide_a_redirect_after_it() {
+        for command in [
+            r"echo $'\'' ; echo x > tests/a.rs #'",
+            r"echo $'it\'s' && echo x >tests/a.rs #'",
+            r"echo $(echo $'\'') ; echo x > tests/a.rs #'",
+        ] {
+            assert_eq!(
+                targets(command),
+                vec!["tests/a.rs".to_string()],
+                "{command}"
+            );
+        }
+        assert!(
+            targets(r"echo $'a > tests/a.rs'").is_empty(),
+            "a `>` inside `$'…'` is text"
+        );
+    }
+
+    /// A target spelled with `$'…'` or `$"…"` is the file bash writes.
+    #[test]
+    fn a_target_in_ansi_c_or_locale_quotes_is_the_file_written() {
+        for command in [
+            r"echo x > $'tests/a.rs'",
+            r"echo x > $'tests\x2fa.rs'",
+            r#"echo x > $"tests/a.rs""#,
+        ] {
+            assert_eq!(
+                targets(command),
+                vec!["tests/a.rs".to_string()],
+                "{command}"
+            );
+        }
     }
 
     /// The body of a heredoc given to `cat` is what is written, not where.

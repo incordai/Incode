@@ -4,6 +4,7 @@
 pub mod acp_agent;
 pub mod admin;
 pub mod agent;
+pub mod ansi_c;
 pub mod ask;
 pub mod auditor;
 pub mod brief;
