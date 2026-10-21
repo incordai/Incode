@@ -240,8 +240,9 @@ impl Server {
         } else if !hosts.is_empty() {
             return Err("allow_hosts needs network `proxy`".to_string());
         }
-        // On native Windows, where only `allow` is ever enforced, say so now
-        // rather than at every run, which would each be refused anyway.
+        // On native Windows, where `deny` and `proxy` need `sbx setup-windows`
+        // first, say so now rather than at every run, which would each be
+        // refused anyway.
         // (Elsewhere enforcement depends on the kernel, and each run says.)
         if cfg!(windows) && !self.ceilings.best_effort {
             let mut probe = Policy::default();
@@ -693,10 +694,13 @@ mod tests {
         assert!(s
             .create(&json!({"network": "proxy", "allow_hosts": ["evil.example"]}))
             .is_err());
-        // Within the ceilings. Native Windows enforces neither proxy nor
-        // deny, and says so at once instead.
+        // Within the ceilings. Native Windows enforces proxy and deny only
+        // after `sbx setup-windows`, and without it says so at once instead.
+        let mut deny = Policy::default();
+        deny.network.mode = NetMode::Deny;
+        let unenforced = cfg!(windows) && crate::enforcement(&deny).network.is_gap();
         let within = |r: Result<Value, String>| {
-            if cfg!(windows) {
+            if unenforced {
                 r.is_err_and(|e| e.contains("cannot be enforced"))
             } else {
                 r.is_ok()

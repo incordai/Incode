@@ -26,17 +26,27 @@ toml = "1"
 libc = "0.2"
 
 # The native Windows sandbox (`src/windows`): a write-restricted token, an
-# ACE per writable root, and a job object. The same version and features incode
-# itself already resolves (windows-sys 0.61.2 is in Cargo.lock), so nothing new
-# is downloaded or linked.
+# ACE per writable root, and a job object; and for network deny (layer 2,
+# `sbx setup-windows`) a local account, DPAPI for its password and Windows
+# Filtering Platform filters. The same windows-sys incode itself already
+# resolves (0.61.2 is in Cargo.lock), so nothing new is downloaded; the extra
+# features only add bindings.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_NetworkManagement_NetManagement",
+    "Win32_NetworkManagement_WindowsFilteringPlatform",
     "Win32_Security",
     "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
     "Win32_System_Console",
+    "Win32_System_Environment",
     "Win32_System_JobObjects",
+    "Win32_System_Registry",
+    "Win32_System_Rpc",
     "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]

@@ -10,9 +10,9 @@ use windows_sys::Win32::Security::Authorization::{
 };
 use windows_sys::Win32::Security::{
     CreateRestrictedToken, GetSecurityDescriptorDacl, GetTokenInformation, SetTokenInformation,
-    TokenDefaultDacl, TokenLogonSid, TokenUser, ACL, DISABLE_MAX_PRIVILEGE, SID_AND_ATTRIBUTES,
-    TOKEN_ACCESS_MASK, TOKEN_DEFAULT_DACL, TOKEN_GROUPS, TOKEN_INFORMATION_CLASS, TOKEN_USER,
-    WRITE_RESTRICTED,
+    TokenDefaultDacl, TokenElevation, TokenLogonSid, TokenUser, ACL, DISABLE_MAX_PRIVILEGE,
+    SID_AND_ATTRIBUTES, TOKEN_ACCESS_MASK, TOKEN_DEFAULT_DACL, TOKEN_ELEVATION, TOKEN_GROUPS,
+    TOKEN_INFORMATION_CLASS, TOKEN_QUERY, TOKEN_USER, WRITE_RESTRICTED,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -124,22 +124,40 @@ pub(crate) fn restricted(run_sid: &str) -> Result<OwnedHandle, String> {
     }
 }
 
-/// Give `token` the default DACL `sddl`.
-unsafe fn set_default_dacl(token: HANDLE, sddl: &str) -> Result<(), String> {
+/// A self-relative security descriptor from its SDDL, owned.
+pub(crate) fn security_descriptor(sddl: &str) -> Result<LocalPtr, String> {
     let mut sd: *mut core::ffi::c_void = std::ptr::null_mut();
-    if ConvertStringSecurityDescriptorToSecurityDescriptorW(
-        wide(sddl).as_ptr(),
-        1,
-        &mut sd,
-        std::ptr::null_mut(),
-    ) == 0
-        || sd.is_null()
-    {
+    // SAFETY: a NUL-terminated string in; an owned LocalAlloc'd descriptor out.
+    let ok = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            wide(sddl).as_ptr(),
+            1,
+            &mut sd,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 || sd.is_null() {
         return Err(last_error(
             "ConvertStringSecurityDescriptorToSecurityDescriptorW",
         ));
     }
-    let sd = LocalPtr(sd);
+    Ok(LocalPtr(sd))
+}
+
+/// The DACL inside `sd` (owned by `sd`: valid while it lives).
+pub(crate) unsafe fn dacl_of(sd: &LocalPtr) -> Result<*mut ACL, String> {
+    let mut present = 0;
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut defaulted = 0;
+    if GetSecurityDescriptorDacl(sd.0, &mut present, &mut dacl, &mut defaulted) == 0 {
+        return Err(last_error("GetSecurityDescriptorDacl"));
+    }
+    Ok(dacl)
+}
+
+/// Give `token` the default DACL `sddl`.
+unsafe fn set_default_dacl(token: HANDLE, sddl: &str) -> Result<(), String> {
+    let sd = security_descriptor(sddl)?;
     let mut present = 0;
     let mut dacl: *mut ACL = std::ptr::null_mut();
     let mut defaulted = 0;
@@ -197,8 +215,44 @@ unsafe fn token_information(
     Ok(buf)
 }
 
+/// The SID of the user this process runs as.
+pub(crate) fn current_user_sid() -> Result<String, String> {
+    // SAFETY: opens this process's token for query; the handle is owned.
+    unsafe {
+        let mut token: HANDLE = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return Err(last_error("OpenProcessToken"));
+        }
+        let token = OwnedHandle(token);
+        token_user_sid(token.0)
+    }
+}
+
+/// Whether this process runs elevated (an administrator's full token).
+pub(crate) fn is_elevated() -> bool {
+    // SAFETY: opens this process's token for query; reads a fixed-size
+    // structure into a value of that type.
+    unsafe {
+        let mut token: HANDLE = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return false;
+        }
+        let token = OwnedHandle(token);
+        let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+        let mut len = 0u32;
+        GetTokenInformation(
+            token.0,
+            TokenElevation,
+            std::ptr::from_mut(&mut elevation).cast(),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut len,
+        ) != 0
+            && elevation.TokenIsElevated != 0
+    }
+}
+
 /// A SID as its string form.
-unsafe fn sid_to_string(sid: *mut core::ffi::c_void) -> Result<String, String> {
+pub(crate) unsafe fn sid_to_string(sid: *mut core::ffi::c_void) -> Result<String, String> {
     let mut out: *mut u16 = std::ptr::null_mut();
     if ConvertSidToStringSidW(sid, &mut out) == 0 || out.is_null() {
         return Err(last_error("ConvertSidToStringSidW"));

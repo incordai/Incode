@@ -32,7 +32,7 @@
 //! |---|---|---|---|
 //! | Linux | Landlock (5.13+) | Landlock TCP (6.7+) + seccomp | setrlimit + wall |
 //! | macOS | Seatbelt | Seatbelt | setrlimit + wall |
-//! | Windows | write-restricted token + ACL grant (writes only; no `deny_read`) | not enforced (WSL2: see [`backend`]) | job object + wall |
+//! | Windows | write-restricted token + ACL grant (writes only; no `deny_read`) | after `sbx setup-windows`: an offline account WFP cuts off ([`windows::offline`]); else WSL2 (see [`backend`]) | job object + wall |
 
 pub mod backend;
 pub mod env;
@@ -164,7 +164,47 @@ pub struct EnterSpec {
     /// command's job if the parent dies (there is no parent-death signal).
     #[serde(default)]
     pub parent_pid: Option<u32>,
+    /// Windows, network deny: whether this helper starts a second one as the
+    /// offline account ([`windows::offline`]), or is that second one.
+    #[serde(default)]
+    pub offline: Offline,
+    /// Windows, network deny: the setup's record, where the first helper
+    /// reads the account's password.
+    #[serde(default)]
+    pub offline_record: Option<PathBuf>,
 }
+
+/// The helper's part in running a command as the offline account (Windows,
+/// network deny).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Offline {
+    /// The command runs as the caller's user.
+    #[default]
+    No,
+    /// This helper starts the second helper as the offline account.
+    Launch,
+    /// This helper is that second helper, running as the account.
+    Inner,
+}
+
+/// What the first helper hands the second, in [`INNER_ENV`]
+/// (`CreateProcessWithLogonW` takes at most 1024 characters of command line).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) struct InnerLaunch {
+    pub spec: EnterSpec,
+    pub program: String,
+    pub args: Vec<String>,
+}
+
+/// The variable [`InnerLaunch`] travels in; removed before the command
+/// starts.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) const INNER_ENV: &str = "SBX_INNER_LAUNCH";
+/// The helper's argument that says its spec is in [`INNER_ENV`].
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) const INNER_ARG: &str = "@env";
 
 /// Call first thing in `main` of any program that embeds this library. When
 /// the process was started as the helper it applies the confinement and
@@ -207,8 +247,27 @@ fn sandbox_err(message: impl Into<String>) -> EnterError {
     }
 }
 
-/// The helper: `<spec-json> -- <program> [args...]`.
+/// The helper: `<spec-json> -- <program> [args...]`, or on Windows the
+/// second helper of a network-deny run, [`INNER_ARG`] alone with the rest in
+/// [`INNER_ENV`].
 fn enter(args: &[OsString]) -> Result<Never, EnterError> {
+    #[cfg(windows)]
+    if args.len() == 1 && args[0] == INNER_ARG {
+        let json = std::env::var(INNER_ENV)
+            .map_err(|_| sandbox_err(format!("helper started without {INNER_ENV}")))?;
+        // Not for the command, nor anything it starts.
+        std::env::remove_var(INNER_ENV);
+        let launch: InnerLaunch = serde_json::from_str(&json)
+            .map_err(|e| sandbox_err(format!("helper spec does not parse: {e}")))?;
+        if launch.spec.offline != Offline::Inner {
+            return Err(sandbox_err("helper spec is not an inner one"));
+        }
+        let args: Vec<OsString> = launch.args.into_iter().map(OsString::from).collect();
+        return match windows::enter(&launch.spec, &OsString::from(launch.program), &args) {
+            Ok(code) => std::process::exit(code),
+            Err((message, code)) => Err(EnterError { message, code }),
+        };
+    }
     let spec_json = args
         .first()
         .and_then(|a| a.to_str())
@@ -578,22 +637,59 @@ impl Sandbox {
         // Windows has no process groups: the helper's job object does that.
         let own_group =
             cfg!(unix) && self.policy.limits.wall_secs.is_some() && !stdin_is_terminal();
-        // Windows: grant the writable roots and the temp directory to a
-        // private SID for this run, before the helper restricts the
-        // command's token to it. A grant that fails refuses the run in
-        // strict mode; best effort runs it with the writes unconfined, and
-        // says so.
+        let helper = match &self.helper {
+            Some(h) => h.clone(),
+            None => std::env::current_exe().map_err(|e| format!("cannot name the helper: {e}"))?,
+        };
+        // Windows, network deny or proxy: the command runs as the offline
+        // account, when `sbx setup-windows` has made it (otherwise the gap
+        // was refused above, or accepted with --best-effort).
         #[cfg(windows)]
-        let lease = if self.policy.fs.mode == FsMode::Off {
+        let mut offline = if self.policy.network.mode == NetMode::Allow {
             None
         } else {
+            windows::setup::ready().as_ref().ok().cloned()
+        };
+        // Windows: grant the writable roots and the temp directory to a
+        // private SID for this run, before the helper restricts the
+        // command's token to it; under network deny to the offline account
+        // as well, with the current folder and the helper program to read.
+        // A grant that fails refuses the run in strict mode; best effort
+        // runs it with the writes unconfined (and the network open), and
+        // says so.
+        #[cfg(windows)]
+        let lease = if self.policy.fs.mode == FsMode::Off && offline.is_none() {
+            None
+        } else {
+            let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
             let mut grant = roots.clone();
+            if self.policy.fs.mode == FsMode::Off {
+                // Not confined, but another account: give it the folder it
+                // was started in, so it can work there at all.
+                grant.push(real(cwd));
+            }
             grant.push(temp.path.clone());
-            match windows::acl::Lease::acquire(&grant) {
+            let account = offline.as_ref().map(|ready| {
+                let reads = windows::offline_reads(&grant, &real(cwd), &real(&helper));
+                windows::acl::OfflineGrant {
+                    user: ready.sid.clone(),
+                    // PowerShell lists the current folder's parent to start
+                    // in it at all.
+                    parents: windows::offline_parents(
+                        &grant,
+                        &reads,
+                        &real(cwd),
+                        windows::profiles_dir().as_deref(),
+                    ),
+                    reads,
+                }
+            });
+            match windows::acl::Lease::acquire(&grant, account) {
                 Ok(lease) => Some(lease),
                 Err(e) if self.strict => return Err(e),
                 Err(e) => {
-                    eprintln!("sbx: writes not confined (best effort): {e}");
+                    eprintln!("sbx: writes not confined and network not denied (best effort): {e}");
+                    offline = None;
                     None
                 }
             }
@@ -605,7 +701,17 @@ impl Sandbox {
                 self.policy.network.allow_private,
             )?;
             let upstream = proxy::Upstream::from_env(|k| std::env::var(k).ok());
-            Some(proxy::Proxy::start(allowlist, upstream).map_err(|e| format!("proxy: {e}"))?)
+            // As the offline account, the command may only reach the
+            // loopback ports the setup's filter permits: listen on one.
+            #[cfg(windows)]
+            let ports = offline.as_ref().map(|r| r.proxy_ports);
+            #[cfg(not(windows))]
+            let ports: Option<(u16, u16)> = None;
+            let started = match ports {
+                Some(range) => proxy::Proxy::start_in(allowlist, upstream, range),
+                None => proxy::Proxy::start(allowlist, upstream),
+            };
+            Some(started.map_err(|e| format!("proxy: {e}"))?)
         } else {
             None
         };
@@ -646,10 +752,18 @@ impl Sandbox {
             #[cfg(not(windows))]
             sid: None,
             parent_pid: Some(std::process::id()),
-        };
-        let helper = match &self.helper {
-            Some(h) => h.clone(),
-            None => std::env::current_exe().map_err(|e| format!("cannot name the helper: {e}"))?,
+            #[cfg(windows)]
+            offline: if offline.is_some() {
+                Offline::Launch
+            } else {
+                Offline::No
+            },
+            #[cfg(not(windows))]
+            offline: Offline::No,
+            #[cfg(windows)]
+            offline_record: offline.as_ref().map(|r| r.record.clone()),
+            #[cfg(not(windows))]
+            offline_record: None,
         };
         let spec_json = serde_json::to_string(&spec).map_err(|e| e.to_string())?;
 
@@ -924,7 +1038,11 @@ fn net_status(mode: NetMode) -> Status {
 
 #[cfg(windows)]
 fn net_status(mode: NetMode) -> Status {
-    windows::net_status(mode)
+    if mode == NetMode::Allow {
+        // Without asking whether the offline account is set up.
+        return Status::NotRequested;
+    }
+    windows::net_status(mode, windows::setup::ready())
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
@@ -1122,5 +1240,60 @@ fn create_private_dir(path: &Path) -> std::io::Result<()> {
 impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec() -> EnterSpec {
+        EnterSpec {
+            fs_mode: FsMode::WorkspaceWrite,
+            roots: vec![PathBuf::from("/w")],
+            deny_read: Vec::new(),
+            protected: Vec::new(),
+            temp: PathBuf::from("/t"),
+            net_mode: NetMode::Deny,
+            proxy_port: None,
+            limits: Limits::default(),
+            strict: true,
+            supervise: false,
+            sid: None,
+            parent_pid: Some(7),
+            offline: Offline::Launch,
+            offline_record: Some(PathBuf::from(r"C:\ProgramData\sbx\offline.conf")),
+        }
+    }
+
+    #[test]
+    fn a_spec_without_the_offline_fields_still_parses() {
+        let mut json: serde_json::Value = serde_json::to_value(spec()).expect("json");
+        assert_eq!(json["offline"], "launch");
+        let map = json.as_object_mut().expect("object");
+        map.remove("offline");
+        map.remove("offline_record");
+        let back: EnterSpec = serde_json::from_value(json).expect("parses");
+        assert_eq!(back.offline, Offline::No);
+        assert_eq!(back.offline_record, None);
+    }
+
+    #[test]
+    fn the_second_helper_gets_its_spec_and_command_whole() {
+        let mut inner = spec();
+        inner.offline = Offline::Inner;
+        let launch = InnerLaunch {
+            spec: inner,
+            program: "cmd".into(),
+            args: vec!["/c".into(), "echo \"a b\" & exit 3".into(), String::new()],
+        };
+        let json = serde_json::to_string(&launch).expect("json");
+        let back: InnerLaunch = serde_json::from_str(&json).expect("parses");
+        assert_eq!(back.spec.offline, Offline::Inner);
+        assert_eq!(back.program, "cmd");
+        assert_eq!(back.args, launch.args);
+        assert_eq!(back.spec.parent_pid, Some(7));
+        assert_eq!(INNER_ARG, "@env");
+        assert!(!INNER_ENV.is_empty());
     }
 }

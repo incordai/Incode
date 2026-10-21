@@ -50,13 +50,17 @@
 //! `deny_read` is reported not enforced, and `SBX_BACKEND=auto` sends such a
 //! policy to WSL2, where Landlock enforces it.
 //!
-//! # Network: NOT enforced
+//! # Network: a second account the firewall cuts off ([`offline`])
 //!
 //! No token restricts the network (incode measured raw TCP, http and https
 //! all working under it). Only an AppContainer without the internet
 //! capabilities does, and an AppContainer reads only what is granted to it:
 //! the workspace, the user's toolchains and profile would all need granting.
-//! `deny` and `proxy` are reported not enforced; `auto` sends them to WSL2.
+//! Instead, once `sbx setup-windows` has run (elevated), `deny` and `proxy`
+//! run the command as a local account, `sbx-offline`, that persistent
+//! Windows Filtering Platform filters block from the network, as OpenAI
+//! Codex's Windows sandbox does. Without that setup they are reported not
+//! enforced, and `auto` sends them to WSL2.
 //!
 //! # Lifetime and limits: a job object
 //!
@@ -82,7 +86,7 @@
 // Linux CI; only the Windows build calls them.
 #![cfg_attr(not(windows), allow(dead_code))]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::policy::{Fs, FsMode, NetMode};
 use crate::Status;
@@ -91,11 +95,33 @@ use crate::Status;
 pub(crate) mod acl;
 #[cfg(windows)]
 mod helper;
+pub mod offline;
+#[cfg(windows)]
+pub(crate) mod setup;
 #[cfg(windows)]
 mod token;
 
 #[cfg(windows)]
 pub(crate) use helper::enter;
+
+/// `sbx setup-windows` (or `--remove`): what it did, line by line.
+///
+/// # Errors
+/// When not elevated, or a step fails.
+#[cfg(windows)]
+pub fn setup_windows(args: &offline::SetupArgs) -> Result<Vec<String>, String> {
+    setup::run(args)
+}
+
+/// Whether the offline account is set up and usable by this user, and if
+/// not, why.
+///
+/// # Errors
+/// Why not.
+#[cfg(windows)]
+pub fn offline_setup() -> Result<offline::Ready, String> {
+    setup::ready().clone()
+}
 
 /// Every run's private SID starts with this, and the sweep touches no other.
 /// The domain part is made up (no real machine or domain has it) and differs
@@ -139,12 +165,6 @@ pub const DENY_READ_NOT_ENFORCED: &str =
     "a write-restricted token consults its restricting SIDs only for writes, so no ACE can hide \
      a path from the sandbox alone; use WSL2 (SBX_BACKEND=wsl, or auto), where Landlock does";
 
-/// Why `network = deny | proxy` is not enforced natively.
-pub const NETWORK_NOT_ENFORCED: &str =
-    "no token restricts the network on Windows; only an AppContainer can, and an AppContainer \
-     cannot read the workspace or the user's toolchains unless each is granted to it. Use WSL2 \
-     (SBX_BACKEND=wsl, or auto)";
-
 /// What native Windows enforces of the filesystem policy.
 #[must_use]
 pub fn fs_status(fs: &Fs) -> Status {
@@ -167,45 +187,77 @@ pub fn fs_status(fs: &Fs) -> Status {
     ))
 }
 
-/// What native Windows enforces of the network policy.
+/// What native Windows enforces of the network policy, given whether the
+/// offline account is set up ([`offline::net_status`]).
 #[must_use]
-pub fn net_status(mode: NetMode) -> Status {
-    match mode {
-        NetMode::Allow => Status::NotRequested,
-        NetMode::Deny | NetMode::Proxy => Status::NotEnforced(format!(
-            "network {} is not enforced natively on Windows: {NETWORK_NOT_ENFORCED}",
-            mode.as_str()
-        )),
-    }
+pub fn net_status(mode: NetMode, setup: &Result<offline::Ready, String>) -> Status {
+    offline::net_status(mode, setup)
 }
 
 // ---- The grant's bookkeeping (see `acl`). ----
 
-/// A grant record's contents: the SID, then one `root <path>` per root.
-#[must_use]
-pub fn record_text<'a>(sid: &str, roots: impl IntoIterator<Item = &'a PathBuf>) -> String {
-    let mut text = format!("sid {sid}\n");
-    for root in roots {
-        text.push_str(&format!("root {}\n", root.display()));
-    }
-    text
+/// What one run granted, written down before it is granted so a crash is
+/// swept ([`acl`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct GrantRecord {
+    /// The run's private SID: `Modify` on each root.
+    pub sid: String,
+    /// The writable roots and the temp directory.
+    pub roots: Vec<PathBuf>,
+    /// Network deny ([`offline`]): the offline account's SID, granted
+    /// `Modify` on every root too, and read on `reads`.
+    pub user: Option<String>,
+    /// Paths only the offline account is granted, for reading: the current
+    /// folder, the helper program.
+    pub reads: Vec<PathBuf>,
+    /// Folders the offline account may only list, by one ACE on the folder
+    /// itself and nothing beneath it: the current folder's parent
+    /// ([`offline_parents`]). Records written before this field have none.
+    pub parents: Vec<PathBuf>,
 }
 
-/// A record read back. `None` for one whose SID is not a run SID of this
-/// crate: the sweep must never revoke anyone else's ACE.
-#[must_use]
-pub fn parse_record(text: &str) -> Option<(String, Vec<PathBuf>)> {
-    let mut sid = None;
-    let mut roots = Vec::new();
-    for line in text.lines() {
-        match line.split_once(' ') {
-            Some(("sid", v)) => sid = Some(v.to_string()),
-            Some(("root", v)) => roots.push(PathBuf::from(v)),
-            _ => {}
+impl GrantRecord {
+    /// The record's text: `sid`, a `root` per root, then `user`, a `read`
+    /// per read path and a `parent` per listed folder when the offline
+    /// account takes part.
+    #[must_use]
+    pub fn to_text(&self) -> String {
+        let mut text = format!("sid {}\n", self.sid);
+        for root in &self.roots {
+            text.push_str(&format!("root {}\n", root.display()));
         }
+        if let Some(user) = &self.user {
+            text.push_str(&format!("user {user}\n"));
+        }
+        for read in &self.reads {
+            text.push_str(&format!("read {}\n", read.display()));
+        }
+        for parent in &self.parents {
+            text.push_str(&format!("parent {}\n", parent.display()));
+        }
+        text
     }
-    let sid = sid.filter(|s| is_session_sid(s))?;
-    Some((sid, roots))
+
+    /// A record read back. `None` for one whose SID is not a run SID of this
+    /// crate: the sweep must never revoke anyone else's ACE. (Which `user` a
+    /// sweep may revoke is checked there, against the real account.)
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        let mut record = Self::default();
+        let mut sid = None;
+        for line in text.lines() {
+            match line.split_once(' ') {
+                Some(("sid", v)) => sid = Some(v.to_string()),
+                Some(("root", v)) => record.roots.push(PathBuf::from(v)),
+                Some(("user", v)) if offline::is_sid(v) => record.user = Some(v.to_string()),
+                Some(("read", v)) => record.reads.push(PathBuf::from(v)),
+                Some(("parent", v)) => record.parents.push(PathBuf::from(v)),
+                _ => {}
+            }
+        }
+        record.sid = sid.filter(|s| is_session_sid(s))?;
+        Some(record)
+    }
 }
 
 /// A path as Windows compares it: `\\?\` dropped (`canonicalize` adds it),
@@ -305,6 +357,109 @@ pub fn fold_nested(roots: &[PathBuf]) -> Vec<PathBuf> {
         })
     });
     out
+}
+
+/// What the offline account must also be able to read for a run whose
+/// roots (writable roots, temp directory) are `roots`: the folder the
+/// command starts in, and the helper program it is started through, each
+/// unless a root already holds it (and so grants it `Modify`).
+#[must_use]
+pub fn offline_reads(roots: &[PathBuf], cwd: &Path, helper: &Path) -> Vec<PathBuf> {
+    let held = |p: &Path| {
+        roots
+            .iter()
+            .any(|r| holds(&r.to_string_lossy(), &p.to_string_lossy()))
+    };
+    [cwd, helper]
+        .into_iter()
+        .filter(|p| !held(p))
+        .map(Path::to_path_buf)
+        .collect()
+}
+
+/// The folders the offline account must be able to list for the run's
+/// current folder `cwd`: every folder above it, up to (not including) a
+/// drive or share root or `profiles` (the folder holding the user profiles,
+/// `C:\Users`, which every user may list already and which an elevated run
+/// must not re-ACL), less any a root or read folder already holds.
+///
+/// Why: Windows PowerShell 5.1 sets its first location by normalising the
+/// process's current directory, and it looks up EVERY component in its
+/// parent (`Directory.EnumerateFiles`/`EnumerateDirectories`) to get its
+/// exact case, which needs `FILE_LIST_DIRECTORY` on each folder above. The
+/// offline account has none under the user's profile, the lookup throws
+/// `UnauthorizedAccessException`, startup swallows it, and PowerShell is
+/// left at the drive root: `Set-Content rel.txt` writes `C:\rel.txt`.
+/// Measured on GitHub's windows-latest: with only the immediate parent
+/// listable an explicit `Set-Location` to the current folder still failed
+/// "Access is denied"; the chain above it (`Temp`, `Local`, `AppData`, the
+/// profile) was not listable. Traversal is `SeChangeNotifyPrivilege`'s (kept
+/// in the command's token); each ACE is list-only and inherits to nothing.
+#[must_use]
+pub fn offline_parents(
+    roots: &[PathBuf],
+    reads: &[PathBuf],
+    cwd: &Path,
+    profiles: Option<&Path>,
+) -> Vec<PathBuf> {
+    let stop = profiles.map(|p| path_key(&p.to_string_lossy()));
+    let mut out = Vec::new();
+    let mut here = cwd.to_string_lossy().into_owned();
+    while let Some(parent) = parent_of(&here) {
+        // Absolute and not a drive or share root.
+        if refuse_broad(&parent, None).is_err() {
+            break;
+        }
+        if stop.as_deref() == Some(path_key(&parent).as_str()) {
+            break;
+        }
+        let held = roots
+            .iter()
+            .chain(reads)
+            .any(|r| holds(&r.to_string_lossy(), &parent));
+        if !held {
+            out.push(PathBuf::from(&parent));
+        }
+        here = parent;
+    }
+    out
+}
+
+/// The folder holding the user profiles (`C:\Users`): the parent of
+/// `USERPROFILE`. Where [`offline_parents`] stops.
+#[must_use]
+pub fn profiles_dir() -> Option<PathBuf> {
+    let profile = std::env::var("USERPROFILE").ok()?;
+    parent_of(&profile).map(PathBuf::from)
+}
+
+/// Whether `path` is one of `parents` (as Windows compares paths): another
+/// live run still needs the account to list it.
+#[must_use]
+pub fn is_listed(path: &Path, parents: &[PathBuf]) -> bool {
+    let key = path_key(&path.to_string_lossy());
+    parents
+        .iter()
+        .any(|p| path_key(&p.to_string_lossy()) == key)
+}
+
+/// `path`'s parent folder, Windows-style on every platform (the pure parts
+/// are tested on Linux, where `Path::parent` does not split on `\`): the
+/// text before the last separator, a bare `C:` given back its `\`. `None`
+/// for a path with no separator.
+fn parent_of(path: &str) -> Option<String> {
+    let trimmed = path.trim_end_matches(['\\', '/']);
+    let cut = trimmed.rfind(['\\', '/'])?;
+    let parent = &trimmed[..cut];
+    if parent.is_empty() || parent.ends_with(['\\', '/']) {
+        // `\\server` and the like: no folder to grant.
+        return None;
+    }
+    Some(if parent.ends_with(':') {
+        format!("{parent}\\")
+    } else {
+        parent.to_string()
+    })
 }
 
 // ---- Starting the command: the program and its command line. ----
@@ -535,15 +690,134 @@ mod tests {
 
     #[test]
     fn a_record_round_trips_and_a_foreign_sid_is_ignored() {
-        let roots = [PathBuf::from(r"C:\w\a"), PathBuf::from(r"D:\b c")];
-        let sid = session_sid(123);
-        let text = record_text(&sid, roots.iter());
-        let (back, got) = parse_record(&text).expect("parses");
-        assert_eq!(back, sid);
-        assert_eq!(got, roots);
-        assert!(parse_record("sid S-1-1-0\nroot C:\\w\n").is_none());
-        assert!(parse_record(&format!("sid {SID_PREFIX}\n")).is_none());
-        assert!(parse_record("root C:\\w\n").is_none());
+        let roots = vec![PathBuf::from(r"C:\w\a"), PathBuf::from(r"D:\b c")];
+        let plain = GrantRecord {
+            sid: session_sid(123),
+            roots: roots.clone(),
+            ..GrantRecord::default()
+        };
+        let text = plain.to_text();
+        assert_eq!(
+            text,
+            format!("sid {}\nroot C:\\w\\a\nroot D:\\b c\n", session_sid(123))
+        );
+        assert_eq!(GrantRecord::parse(&text), Some(plain));
+        let offline = GrantRecord {
+            sid: session_sid(9),
+            roots,
+            user: Some("S-1-5-21-1-2-3-1009".into()),
+            reads: vec![PathBuf::from(r"C:\proj"), PathBuf::from(r"C:\bin\sbx.exe")],
+            parents: vec![PathBuf::from(r"C:\Users\me\src")],
+        };
+        assert!(offline.to_text().ends_with("parent C:\\Users\\me\\src\n"));
+        assert_eq!(GrantRecord::parse(&offline.to_text()), Some(offline));
+        assert!(GrantRecord::parse("sid S-1-1-0\nroot C:\\w\n").is_none());
+        assert!(GrantRecord::parse(&format!("sid {SID_PREFIX}\n")).is_none());
+        assert!(GrantRecord::parse("root C:\\w\n").is_none());
+        // A malformed user is dropped, not trusted.
+        let odd = GrantRecord::parse(&format!("sid {}\nuser everyone\n", session_sid(5)));
+        assert_eq!(odd.and_then(|r| r.user), None);
+    }
+
+    #[test]
+    fn a_record_from_before_the_parent_lines_still_parses() {
+        let text = format!(
+            "sid {}\nroot C:\\w\nuser S-1-5-21-1-2-3-1009\nread C:\\bin\\sbx.exe\n",
+            session_sid(7)
+        );
+        let record = GrantRecord::parse(&text).expect("parses");
+        assert_eq!(record.reads, [PathBuf::from(r"C:\bin\sbx.exe")]);
+        assert!(record.parents.is_empty());
+        // And written back, it is the same text: nothing new appears.
+        assert_eq!(record.to_text(), text);
+    }
+
+    #[test]
+    fn the_account_lists_every_folder_above_the_current_one_up_to_the_profiles() {
+        let none: [PathBuf; 0] = [];
+        let users = Some(Path::new(r"C:\Users"));
+        let ws = Path::new(r"C:\Users\me\AppData\Local\Temp\.tmpAb\ws");
+        // Every folder above, stopping before `C:\Users`.
+        assert_eq!(
+            offline_parents(&[ws.to_path_buf()], &none, ws, users),
+            [
+                PathBuf::from(r"C:\Users\me\AppData\Local\Temp\.tmpAb"),
+                PathBuf::from(r"C:\Users\me\AppData\Local\Temp"),
+                PathBuf::from(r"C:\Users\me\AppData\Local"),
+                PathBuf::from(r"C:\Users\me\AppData"),
+                PathBuf::from(r"C:\Users\me"),
+            ]
+        );
+        // As `canonicalize` spells it (the stop compares the same way), and
+        // with a trailing separator.
+        assert_eq!(
+            offline_parents(&none, &none, Path::new(r"\\?\C:\Users\me\src\proj\"), users),
+            [
+                PathBuf::from(r"\\?\C:\Users\me\src"),
+                PathBuf::from(r"\\?\C:\Users\me"),
+            ]
+        );
+        // Outside the profiles: up to the drive root, which is never listed.
+        assert_eq!(
+            offline_parents(&none, &none, Path::new(r"D:\work\team\proj"), users),
+            [PathBuf::from(r"D:\work\team"), PathBuf::from(r"D:\work")]
+        );
+        // A folder at the top of a drive or share: nothing above to list.
+        for top in [
+            r"C:\proj",
+            r"\\?\C:\proj",
+            r"D:\",
+            r"\\srv\share\proj",
+            r"\\?\UNC\srv\share\proj",
+            r"\\srv\share",
+            "proj",
+        ] {
+            assert_eq!(
+                offline_parents(&none, &none, Path::new(top), users),
+                none,
+                "{top}"
+            );
+        }
+        // Deeper on a share, the share's folders are listed.
+        assert_eq!(
+            offline_parents(&none, &none, Path::new(r"\\srv\share\team\proj"), users),
+            [PathBuf::from(r"\\srv\share\team")]
+        );
+        // A folder a root or read folder holds is listable already; the ones
+        // above it still need the ACE.
+        let sub = Path::new(r"C:\w\proj\sub");
+        assert_eq!(
+            offline_parents(&[PathBuf::from(r"C:\W\Proj")], &none, sub, users),
+            [PathBuf::from(r"C:\w")]
+        );
+        assert_eq!(
+            offline_parents(&[PathBuf::from(r"C:\w")], &none, sub, users),
+            none
+        );
+        assert_eq!(
+            offline_parents(&none, &[PathBuf::from(r"c:\w\proj")], sub, users),
+            [PathBuf::from(r"C:\w")]
+        );
+        // A root beside it, or inside the current folder, does not count.
+        assert_eq!(
+            offline_parents(
+                &[PathBuf::from(r"C:\w\proj\subway"), sub.join("x")],
+                &none,
+                sub,
+                users
+            ),
+            [PathBuf::from(r"C:\w\proj"), PathBuf::from(r"C:\w")]
+        );
+    }
+
+    #[test]
+    fn a_listed_parent_is_kept_while_another_run_lists_it() {
+        let others = [PathBuf::from(r"C:\Users\me\src"), PathBuf::from(r"D:\x")];
+        assert!(is_listed(Path::new(r"c:\users\ME\src\"), &others));
+        assert!(is_listed(Path::new(r"\\?\C:\Users\me\src"), &others));
+        assert!(!is_listed(Path::new(r"C:\Users\me\src\proj"), &others));
+        assert!(!is_listed(Path::new(r"C:\Users\me"), &others));
+        assert!(!is_listed(Path::new(r"C:\Users\me\src"), &[]));
     }
 
     #[test]
@@ -584,6 +858,31 @@ mod tests {
             PathBuf::from(r"D:\t"),
         ]);
         assert_eq!(folded, [PathBuf::from(r"C:\w\a"), PathBuf::from(r"D:\t")]);
+    }
+
+    #[test]
+    fn the_offline_account_reads_the_current_folder_and_helper_unless_granted_already() {
+        let roots = [
+            PathBuf::from(r"\\?\C:\w\proj"),
+            PathBuf::from(r"C:\t\sbx-1"),
+        ];
+        let helper = Path::new(r"C:\tools\sbx.exe");
+        assert_eq!(
+            offline_reads(&roots, Path::new(r"C:\w\proj\sub"), helper),
+            [PathBuf::from(r"C:\tools\sbx.exe")]
+        );
+        assert_eq!(
+            offline_reads(
+                &roots,
+                Path::new(r"C:\w"),
+                Path::new(r"c:\W\PROJ\target\sbx.exe")
+            ),
+            [PathBuf::from(r"C:\w")]
+        );
+        assert_eq!(
+            offline_reads(&[], Path::new(r"C:\w"), helper),
+            [PathBuf::from(r"C:\w"), PathBuf::from(r"C:\tools\sbx.exe")]
+        );
     }
 
     #[test]
@@ -675,8 +974,16 @@ mod tests {
         assert!(matches!(fs_status(&fs), Status::Enforced(s) if s.contains("write-restricted")));
         fs.deny_read.push(PathBuf::from("secret"));
         assert!(matches!(fs_status(&fs), Status::NotEnforced(s) if s.contains("deny_read")));
-        assert_eq!(net_status(NetMode::Allow), Status::NotRequested);
-        assert!(net_status(NetMode::Deny).is_gap());
-        assert!(net_status(NetMode::Proxy).is_gap());
+        let missing = Err("the offline account is not set up".to_string());
+        assert_eq!(net_status(NetMode::Allow, &missing), Status::NotRequested);
+        assert!(net_status(NetMode::Deny, &missing).is_gap());
+        assert!(net_status(NetMode::Proxy, &missing).is_gap());
+        let ready = Ok(offline::Ready {
+            sid: "S-1-5-21-1-1009".into(),
+            proxy_ports: offline::DEFAULT_PROXY_PORTS,
+            record: PathBuf::from(r"C:\ProgramData\sbx\offline.conf"),
+        });
+        assert!(!net_status(NetMode::Deny, &ready).is_gap());
+        assert!(!net_status(NetMode::Proxy, &ready).is_gap());
     }
 }

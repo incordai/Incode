@@ -1,16 +1,22 @@
 <#
 .SYNOPSIS
   Set up incode's sandbox (sbx) on Windows: WSL2, the Linux sbx inside it,
-  and sbx.exe on Windows, which forwards every command into WSL2.
+  and sbx.exe on Windows, which runs a policy natively when it can and
+  forwards it into WSL2 when it can't.
 
 .DESCRIPTION
-  On Windows the sandbox is the Linux one (Landlock + seccomp) running inside
-  WSL2. This script, run from the incode folder:
+  sbx.exe confines writes, the environment and limits natively; network deny
+  and proxy natively after `sbx setup-windows` (step 4); everything else
+  (deny_read) through the Linux sandbox (Landlock + seccomp) inside WSL2.
+  This script, run from the incode folder:
     1. checks for WSL2 and a Linux distribution, and installs them if missing
        (asks first; needs administrator rights once, then a restart);
     2. builds sbx inside WSL2 and installs it at ~/.local/bin/sbx there;
     3. builds sbx.exe on Windows and puts it on your PATH;
-    4. runs `sbx doctor` to show what is enforced.
+    4. when run as administrator, offers `sbx setup-windows`: an offline
+       account the firewall cuts off, so network deny and proxy run natively
+       too, without WSL2 (from a normal prompt it says how to do it later);
+    5. runs `sbx doctor` to show what is enforced.
   Run it again after the restart if step 1 installed WSL2. It is safe to run
   more than once.
 
@@ -20,12 +26,24 @@
 .PARAMETER Distro
   The WSL distribution to use (default: Ubuntu).
 
+.PARAMETER NativeOnly
+  Skip WSL2 (steps 1 and 2): only sbx.exe, and `sbx setup-windows`.
+
+.PARAMETER SetupNative
+  Run `sbx setup-windows` without asking (needs an elevated prompt).
+
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File scripts\install-windows.ps1
+
+.EXAMPLE
+  # From an elevated prompt: native only, network deny included.
+  powershell -ExecutionPolicy Bypass -File scripts\install-windows.ps1 -NativeOnly -SetupNative
 #>
 param(
     [switch]$Yes,
-    [string]$Distro = "Ubuntu"
+    [string]$Distro = "Ubuntu",
+    [switch]$NativeOnly,
+    [switch]$SetupNative
 )
 
 $ErrorActionPreference = "Stop"
@@ -49,6 +67,7 @@ if (-not (Test-Path (Join-Path $repo "crates\sandbox\Cargo.toml"))) {
     throw "Run this from the incode folder (crates\sandbox was not found in $repo)."
 }
 
+if (-not $NativeOnly) {
 # --- 1. WSL2 and a distribution ------------------------------------------
 $haveWsl = [bool](Get-Command wsl.exe -ErrorAction SilentlyContinue)
 $distros = @()
@@ -117,6 +136,7 @@ echo "sbx setup: installed $HOME/.local/bin/sbx"
 '@
 & wsl.exe -d $Distro -e bash -c $build sbx-setup "$repoInWsl"
 if ($LASTEXITCODE -ne 0) { throw "Building sbx inside WSL2 failed (exit $LASTEXITCODE)." }
+} # -not $NativeOnly
 
 # --- 3. sbx.exe on Windows ----------------------------------------------------
 $bin = Join-Path $env:USERPROFILE ".local\bin"
@@ -138,11 +158,41 @@ if (-not ($userPath -split ';' | Where-Object { $_ -eq $bin })) {
     Say "Added $bin to your PATH (new terminals pick it up)."
 }
 
-# --- 4. What is enforced --------------------------------------------------------
+# --- 4. Network deny natively (sbx setup-windows) ---------------------------------
+# An offline local account that Windows Filtering Platform filters cut off
+# from the network; `sbx run --net deny` then runs as that account natively
+# instead of in WSL2. Needs administrator rights once. See crates\sandbox\README.md.
+$sbxExe = Join-Path $bin "sbx.exe"
+if (Test-Admin) {
+    $answer = "y"
+    if (-not $SetupNative) {
+        Say "sbx setup-windows creates a local account, sbx-offline, that firewall filters"
+        Say "cut off from the network, so network deny runs natively (without WSL2)."
+        $answer = Read-Host "Run sbx setup-windows now? [y/N]"
+    }
+    if ($answer -match '^(y|yes)$') {
+        & $sbxExe setup-windows
+        if ($LASTEXITCODE -ne 0) {
+            Say "sbx setup-windows failed (exit $LASTEXITCODE); network deny still needs WSL2."
+        }
+    }
+} else {
+    if ($SetupNative) {
+        Say "-SetupNative needs an elevated prompt (Run as administrator); skipped."
+    }
+    Say "For network deny natively (without WSL2), run 'sbx setup-windows' once from an"
+    Say "elevated prompt (Run as administrator)."
+}
+
+# --- 5. What is enforced --------------------------------------------------------
 if ($Distro -ne "Ubuntu") { $env:SBX_WSL_DISTRO = $Distro }
 Say "Checking the sandbox:"
-& (Join-Path $bin "sbx.exe") doctor
-Say "Done. 'sbx run -w . -- <command>' now runs <command> sandboxed inside WSL2."
-if ($Distro -ne "Ubuntu") {
+& $sbxExe doctor
+if ($NativeOnly) {
+    Say "Done. 'sbx run -w . -- <command>' runs <command> sandboxed natively."
+} else {
+    Say "Done. 'sbx run -w . -- <command>' runs <command> sandboxed, natively or inside WSL2."
+}
+if ($Distro -ne "Ubuntu" -and -not $NativeOnly) {
     Say "Set SBX_WSL_DISTRO=$Distro in your environment so sbx.exe uses it."
 }

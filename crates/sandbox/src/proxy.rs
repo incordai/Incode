@@ -221,7 +221,40 @@ impl Proxy {
     /// # Errors
     /// When no port can be bound.
     pub fn start(allowlist: Allowlist, upstream: Option<Upstream>) -> io::Result<Self> {
-        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        Self::listen_on(TcpListener::bind(("127.0.0.1", 0))?, allowlist, upstream)
+    }
+
+    /// Start listening on 127.0.0.1 on the first free port in `ports`
+    /// (inclusive): on Windows under network deny the command may reach only
+    /// those ([`crate::windows::offline`]).
+    ///
+    /// # Errors
+    /// When every port in the range is taken (one per concurrent run).
+    pub fn start_in(
+        allowlist: Allowlist,
+        upstream: Option<Upstream>,
+        ports: (u16, u16),
+    ) -> io::Result<Self> {
+        let listener = (ports.0..=ports.1)
+            .find_map(|p| TcpListener::bind(("127.0.0.1", p)).ok())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    format!(
+                        "every port in {}-{} is taken (one per proxy run at once; \
+                         `sbx setup-windows --proxy-ports` widens the range)",
+                        ports.0, ports.1
+                    ),
+                )
+            })?;
+        Self::listen_on(listener, allowlist, upstream)
+    }
+
+    fn listen_on(
+        listener: TcpListener,
+        allowlist: Allowlist,
+        upstream: Option<Upstream>,
+    ) -> io::Result<Self> {
         let port = listener.local_addr()?.port();
         let decisions = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -604,6 +637,25 @@ mod tests {
         assert!(l.allows("example.com", 8443));
         assert!(!l.allows("example.com", 443));
         assert!(l.allows("any.dev", 5432));
+    }
+
+    #[test]
+    fn a_proxy_listens_within_its_port_range_or_says_it_is_full() {
+        // A port that was free a moment ago, and one held now.
+        let free = TcpListener::bind(("127.0.0.1", 0))
+            .and_then(|l| l.local_addr())
+            .expect("binds")
+            .port();
+        let held = TcpListener::bind(("127.0.0.1", 0)).expect("binds");
+        let held_port = held.local_addr().expect("addr").port();
+        let full = Proxy::start_in(list(&["x.dev"]), None, (held_port, held_port));
+        assert!(full.is_err_and(
+            |e| e.kind() == io::ErrorKind::AddrInUse && e.to_string().contains("--proxy-ports")
+        ));
+        if let Ok(p) = Proxy::start_in(list(&["x.dev"]), None, (free, free)) {
+            assert_eq!(p.port(), free);
+            assert_eq!(p.url(), format!("http://127.0.0.1:{free}"));
+        }
     }
 
     #[test]

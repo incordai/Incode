@@ -11,6 +11,9 @@
   Run from the incode folder; needs Rust (https://rustup.rs). Nothing is
   installed and nothing outside a temp folder is changed. The report is
   sbx-windows-report.txt in the incode folder.
+  The network-deny tests run only if `sbx setup-windows` was run first (from
+  an elevated prompt; `sbx setup-windows --remove` undoes it); otherwise they
+  say SKIPPED.
 
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File scripts\test-windows.ps1

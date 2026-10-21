@@ -31,7 +31,7 @@ an email (`git config --global user.name ...`, `user.email ...`).
 |---|---|---|
 | rust | `cargo fmt --all -- --check` · `cargo clippy --all-targets -- -D warnings` · `cargo test --lib` · `cargo test --bins` | incode itself: about 2,100 library and 50 binary tests |
 | rust | `cargo test --test sbx_engine` | Real shell commands run under `sandbox_engine = "sbx"`: a write outside the workspace refused (with an unconfined control), a planted git hook undone, `GIT_DIR` stripped. Linux; says it skipped elsewhere |
-| sbx | `cargo clippy -p incord-sandbox --all-targets -- -D warnings` · `cargo test -p incord-sandbox` | The standalone sandbox: escape tests per OS, the MCP server, `.git` protection, WSL path translation |
+| sbx | `cargo clippy -p incord-sandbox --all-targets -- -D warnings` · `cargo test -p incord-sandbox` | The standalone sandbox: escape tests per OS, the MCP server, `.git` protection, WSL path translation. On Windows CI, `sbx setup-windows` runs first so the native network-deny tests run |
 | python | `python3 -m unittest discover sdk/python/tests` | The Python SDK, against a fake incode |
 | ts | `cd sdk/typescript && npm install && npm test` | The TypeScript SDK, against the same fake |
 | vscode | `cd editors/vscode && npm install && npm run compile && npm test` | The VS Code extension's ACP client, against a fake agent |
@@ -53,6 +53,13 @@ processes, the time, CPU and memory limits, killing `sbx`, the environment,
 exit codes, the MCP server) and writes `sbx-windows-report.txt`. These need
 real Windows: Wine cannot check Windows' own security. Nothing is installed
 and nothing outside a temp folder is changed.
+
+The network tests (deny and proxy natively: TCP, UDP, the offline account's
+grants, concurrent runs, the proxy's allowlist) run only where
+`sbx setup-windows` has been run, from an elevated prompt (it makes a local
+account and firewall filters; `sbx setup-windows --remove` undoes it);
+elsewhere they print SKIPPED. CI runs the setup on `windows-latest` before
+`cargo test -p incord-sandbox`, so they always run there.
 
 The whole Rust suite runs on Windows too (`cargo test --lib`, `cargo test --bins`).
 

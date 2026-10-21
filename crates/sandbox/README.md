@@ -61,8 +61,8 @@ An unknown key is an error, so a misspelt `wirte` can't silently do nothing.
 |---|---|---|---|
 | filesystem: write | Landlock (5.13+) | Seatbelt | write-restricted token + a per-run ACE on each root |
 | filesystem: `deny_read` | Landlock | Seatbelt | **not enforced** (WSL2 does it) |
-| network: `deny` | Landlock TCP (6.7+) + seccomp for every other socket | Seatbelt | **not enforced** (WSL2 does it) |
-| network: `proxy` | Landlock: TCP only to the proxy's port; seccomp as for `deny` | Seatbelt: outbound only to the proxy | **not enforced** (WSL2 does it) |
+| network: `deny` | Landlock TCP (6.7+) + seccomp for every other socket | Seatbelt | after `sbx setup-windows`: runs as an offline account WFP filters cut off; else **not enforced** (WSL2 does it) |
+| network: `proxy` | Landlock: TCP only to the proxy's port; seccomp as for `deny` | Seatbelt: outbound only to the proxy | after `sbx setup-windows`: the offline account may reach only the proxy's loopback ports; else **not enforced** (WSL2 does it) |
 | `.git/hooks`, `.git/config` | snapshotted, put back after the run | Seatbelt refuses the write | snapshotted, put back after the run |
 | signals, abstract Unix sockets | Landlock scopes (6.12+): only within the sandbox | Seatbelt default | the token cannot open other processes for writing (measured by incode) |
 | Windows programs (inside WSL2) | interop interpreter and sockets hidden, `WSL_INTEROP` removed, vsock refused | n/a | n/a |
@@ -181,16 +181,19 @@ and forwards it to the Linux `sbx` inside WSL2 when it doesn't (see
 `SBX_NATIVE=1`, the older switch, still means `native`. `sbx doctor` shows
 what native enforces and whether WSL2 forwarding is available.
 
-So a policy that confines files, environment and time runs natively, and
-one that asks for `network: deny`/`proxy` or `deny_read` goes to WSL2.
+So a policy that confines files, environment and time runs natively. One
+that asks for `network: deny`/`proxy` runs natively too once
+[`sbx setup-windows`](#network-natively-sbx-setup-windows) has been run on
+the machine, and goes to WSL2 otherwise. `deny_read` always goes to WSL2.
 `sbx mcp` follows the same rule from its ceilings: with `--net allow` it
-runs natively, with `--net deny` (its default) or `proxy` in WSL2.
+runs natively, with `--net deny` (its default) or `proxy` natively after
+the setup and in WSL2 without it.
 
 ### Native
 
 Ported from incode's own Windows sandbox, whose authors measured it on
-Windows. **This crate's port has not run on Windows yet:** its tests
-(`tests/escape_windows.rs`) run on the `windows-latest` CI runner.
+Windows. This crate's port is checked by its tests
+(`tests/escape_windows.rs`) on the `windows-latest` CI runner.
 
 - **Writes.** The command runs under a *write-restricted token*: it reads
   anything its user can, but writes only where the user may **and** one of
@@ -224,10 +227,11 @@ Windows. **This crate's port has not run on Windows yet:** its tests
 - **Exit codes** are passed through whole (32 bits).
 
 **Not enforced natively, and why:**
-- **Network.** No token restricts the network (incode measured TCP, HTTP and
-  HTTPS all working under it). Only an AppContainer does, and an AppContainer
-  reads only what is granted to it: the workspace, your toolchains, your
-  profile. `deny` and `proxy` go to WSL2 (`auto`) or are refused (`native`).
+- **Network, until `sbx setup-windows` has run.** No token restricts the
+  network (incode measured TCP, HTTP and HTTPS all working under it). Only
+  an AppContainer does, and an AppContainer reads only what is granted to
+  it: the workspace, your toolchains, your profile. So without the setup
+  below, `deny` and `proxy` go to WSL2 (`auto`) or are refused (`native`).
 - **`deny_read`.** A write-restricted token checks its restricting SIDs only
   for writes, so no ACE can hide a path from the sandbox alone. Denying your
   own SID would hide it from you everywhere. A fully restricted token would
@@ -242,6 +246,124 @@ Windows. **This crate's port has not run on Windows yet:** its tests
   `sbx mcp` scripts default to PowerShell on Windows.
 - **Grants are visible.** While a run lasts, every object under a root
   carries the run's ACE, and the grant and revoke cost time on large trees.
+
+### Network natively: `sbx setup-windows`
+
+The Windows Filtering Platform can block a connection by the *user* who
+makes it. So, the way OpenAI Codex's Windows sandbox does it
+(`codex-rs/windows-sandbox-rs`), a one-time setup makes a local account
+that the firewall cuts off, and `deny`/`proxy` runs start the command as
+that account. From an elevated prompt (Run as administrator), once:
+
+```powershell
+sbx setup-windows                         # or: ... --read C:\Users\me\.cargo --read C:\Users\me\.rustup
+sbx doctor                                # [ok  ] offline user ...
+sbx run -w . --net deny -- cargo test     # natively now, not in WSL2
+sbx setup-windows --remove                # undoes all of it
+```
+
+What it does (each step is idempotent; running it again resets the
+password and re-adds each filter):
+
+1. **An account, `sbx-offline`**, member of `Users` only (it needs `Users`
+   to log on locally and to read `C:\Windows` and `Program Files`; it is
+   taken out of `Administrators` if anyone put it there), with a random
+   password (256 bits) that is never shown, hidden from the sign-in screen.
+2. **Its password**, DPAPI-protected with machine scope, in
+   `%ProgramData%\sbx\offline.conf`. The folder's ACL allows SYSTEM,
+   Administrators and the user who ran the setup, and nobody else: not
+   `Users`, so not the offline account, and not a sandboxed command. Machine
+   scope rather than user scope because the setup may run elevated as a
+   different administrator than the user who runs sandboxes; not LSA
+   private data because only administrators can read that back, and runs
+   are not elevated. The ACL is the protection; DPAPI makes the file
+   useless off this machine.
+3. **Persistent WFP filters** for that account's SID
+   (`FWPM_CONDITION_ALE_USER_ID`): every outbound connection and every first
+   UDP/raw packet (`ALE_AUTH_CONNECT`), every inbound connection
+   (`ALE_AUTH_RECV_ACCEPT`), IPv4 and IPv6, loopback included, and raw ICMP
+   sockets (`ALE_RESOURCE_ASSIGNMENT`), all blocked. One permit outranks
+   them: TCP to `127.0.0.1` on ports 47600-47615 (`--proxy-ports` changes
+   the range), where a `proxy` run's proxy listens. WFP directly
+   (`FwpmFilterAdd0`, in one transaction, under fixed keys), not `netsh`.
+4. `--read <DIR>` (repeatable, kept across re-runs) lets the account read a
+   folder: a toolchain under your profile (see *Reads* below).
+
+At run time (unelevated), `sbx` starts its helper a second time as the
+account with `CreateProcessWithLogonW`, the one call an unprivileged process
+can start another user's process with (`CreateProcessAsUserW` with that
+user's token needs `SeAssignPrimaryTokenPrivilege`, and
+`CreateProcessWithTokenW` `SeImpersonatePrivilege`; Codex starts its command
+runner the same way). That helper builds the write-restricted token from its
+own token, as above, and starts the command; the job object holds both, so
+limits, the wall clock, killing the tree and exit codes work as before. No
+profile is loaded for the account (Codex's runner doesn't either): it would
+create `C:\Users\sbx-offline`, a home every run would share. The command
+gets the run's computed environment.
+
+What changes for the command:
+- **Reads.** It reads what the account may read, not what you may: system
+  folders, and what each run grants it (the writable roots, the folder it
+  starts in, the `sbx` program, its private temp directory), plus folders
+  granted with `--read`. A toolchain installed under your profile
+  (`.cargo`, `.rustup`, a per-user Python or Node) needs `--read` once.
+  Narrower than without network deny, never wider. One more right: the
+  account may *list* each folder above the current folder, up to the drive
+  root or `C:\Users` (names, no contents), by one ACE per folder that
+  nothing beneath it inherits, for the run. Windows PowerShell needs it: it
+  looks every part of its starting folder up in the folder above, and
+  without it starts at `C:\` (so `Set-Content x.txt` wrote `C:\x.txt`). So
+  during a run the command can see the names in, say, your profile folder
+  and `AppData\Local\Temp` on the way to a project under them.
+- **Writes** need both the account (the token's normal check) and the run's
+  private SID (its restricted check), so each root gets an ACE for each.
+  Another run's command, also the account but with another run SID, cannot
+  write your run's roots. The account's ACE on a folder is shared by runs
+  that grant the same folder, and removed only when the last of them ends.
+  With `--fs off` the command is not write-restricted but is still the
+  account: it can write the folder it starts in and its temp directory, and
+  what the account itself may write.
+- **`sbx` itself** must be readable by the account; it is granted per run
+  when you own the file (a build under your profile), and is already when
+  installed under `Program Files`.
+
+**Known limits:**
+- **DNS answers still come back.** Name lookups go to the DNS Client
+  service, which resolves on the command's behalf as `NetworkService`, as
+  `systemd-resolved` does on Linux; a connection to the answer is blocked.
+- **SMB and WebDAV paths** (`\\host\share`) are opened by the kernel
+  redirector, not by the command, and are not stopped by the filters. The
+  account's random password authenticates nowhere else, but a server that
+  allows guest access would be reachable.
+- **Loopback is blocked under `deny`**, including a test suite talking to a
+  server it started itself, and Python's `asyncio` on Windows (its event
+  loop wakes itself through a loopback socket pair). Use `proxy` with no
+  hosts, or `allow`, for those.
+- **Under `proxy`** the command can reach any process listening on the
+  proxy port range, including another `proxy` run's proxy (with that run's
+  allowlist). The ports are below Windows' dynamic range, so nothing gets
+  one by chance.
+- **Proxies the account cannot use.** Windows PowerShell 5.1's
+  `Invoke-WebRequest` ignores `HTTP_PROXY`, and .NET Framework sends
+  requests for `localhost` past any proxy; tools that honour `HTTPS_PROXY`
+  (`curl`, `git`, `cargo`, `npm`, `pip`) work.
+- Only the user who ran the setup can use it (the record is readable by
+  that user alone). Another user's `sbx doctor` says so.
+- The thread objects of the account's helper get the account logon's default
+  DACL, which is not measured yet; its process object is locked down
+  explicitly (`D:P(A;;GA;;;SY)(A;;0x101000;;;OW)`).
+
+**Tested:** `tests/escape_windows.rs` runs on the `windows-latest` CI
+runner after `sbx setup-windows` (CI runs it; the runner is an
+administrator): TCP to a local server and to the internet refused under
+`deny` with the filesystem confined, read-only and off (and allowed without
+`deny`); UDP refused; writes confined, temp writable, exit codes and
+"not found" passed through both helpers; the account's ACE present during a
+run and gone after; two concurrent runs sharing a root (the second ending
+first leaves the first its grant, and cannot write the first's other root);
+the proxy letting through only its allowlist, a direct connection refused;
+`sbx mcp` running a deny sandbox's PowerShell script as the account.
+Without the setup these tests print SKIPPED.
 
 ### WSL2
 
@@ -323,7 +445,7 @@ Codex, incode, or your own.
 
 | Tool | What it does |
 |---|---|
-| `sandbox_create` | A private folder. Network `deny` unless the agent asks for `proxy` with hosts (or `allow`) within the server's limits. Natively on Windows only `allow` can be enforced, and asking for anything else is refused at once, saying so. |
+| `sandbox_create` | A private folder. Network `deny` unless the agent asks for `proxy` with hosts (or `allow`) within the server's limits. Natively on Windows `deny` and `proxy` need `sbx setup-windows` first; without it asking for them is refused at once, saying so. |
 | `sandbox_write_file` | Write a script or file, creating folders; `executable` sets 755. |
 | `sandbox_run` | Run `command` (argv) or `script` (text, run with `interpreter`, default `sh`; PowerShell natively on Windows) with optional `stdin`, `cwd` and `timeout_secs`. Returns `exit_code`, `stdout`, `stderr` (64 KB each), `timed_out` and `network_refused`. |
 | `sandbox_read_file` / `sandbox_list` | Read results back (256 KB at most). |
@@ -395,7 +517,9 @@ holds the proxy and the temp directory.
   program in the current folder, the wall limit and killing `sbx` taking
   the whole tree, the job's memory and CPU limits, the environment, exit
   codes, refusing what native can't enforce, `auto` without WSL, `doctor`,
-  and `sbx mcp` run natively.
+  and `sbx mcp` run natively; and, where `sbx setup-windows` has run (CI
+  runs it first), network deny and proxy natively (see
+  [above](#network-natively-sbx-setup-windows)).
 
 Each escape test skips, and says so, on a kernel that cannot enforce what
 it checks.
