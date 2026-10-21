@@ -153,11 +153,35 @@ fn an_ansi_c_quote_does_not_hide_the_command_after_it() {
     }
     let parts = split_command(r"echo $'\'' ; rm -rf x #'");
     let texts: Vec<&str> = parts.iter().map(|s| s.text.as_str()).collect();
-    assert_eq!(texts, [r"echo $'\''", "rm -rf x #'"]);
+    assert!(texts.contains(&"rm -rf x #'"), "{texts:?}");
+    assert!(parts.iter().all(|s| s.opaque), "{parts:?}");
     // `$$` is the shell's pid, and the quote after it a plain one.
     let parts = split_command(r"echo $$'\' ; rm -rf x");
     let texts: Vec<&str> = parts.iter().map(|s| s.text.as_str()).collect();
-    assert_eq!(texts, [r"echo $$'\'", "rm -rf x"]);
+    assert!(texts.contains(&"rm -rf x"), "{texts:?}");
+}
+
+/// **TWO SHELLS, TWO READINGS.** bash reads `$'…'` as ANSI-C quoting; a
+/// POSIX `sh` such as dash — what `sh -c` runs on Debian and Ubuntu — as a
+/// `$` and a plain quote. A line built so one reading hides a command must
+/// still meet the deny rules, whichever shell runs it.
+#[test]
+fn a_command_hidden_from_either_reading_of_dollar_quote_meets_the_deny_rules() {
+    let rules = set(Layer::User, &["Bash"], &[], &["Bash(rm -rf:*)"]);
+    for attempt in [
+        // dash: `$` and `'\'`, then `; rm -rf /` runs and `# '` is a comment.
+        r"echo $'\' ; rm -rf / # '",
+        // bash: `$'\'' ` is one quote; the `rm` runs.
+        r"echo $'\'' ; rm -rf / #'",
+        // bash ends `$'\c'` at its quote; `\c` does not eat it.
+        r"echo $'\c' ; rm -rf / #'",
+        r"echo $'\c\'' ; rm -rf / #'",
+        // bash stops the text at a NUL: this runs `rm`.
+        r"$'rm\0x' -rf /",
+        r"$'rm\x00x' -rf /",
+    ] {
+        assert_eq!(bash(&rules, attempt), Some(Effect::Deny), "`{attempt}`");
+    }
 }
 
 /// A deny rule still meets a command whose name, or the script it hands to a

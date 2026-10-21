@@ -139,13 +139,29 @@ enum Program {
 /// not be read from the text, so a command wrapping this one — `bash -c`, a
 /// `$(...)` — must count its own words too: `bash -c 'rm "$1"' _ tests/x`
 /// names its target OUTSIDE the inner command.
+///
+/// A command with `$'` is read twice: as bash reads it (ANSI-C quoting) and as
+/// a POSIX `sh` such as dash does (a `$` and a plain quote). incode runs
+/// `sh -c`, which is dash on Debian and Ubuntu, and the two readings can end
+/// the quote in different places; a write either one sees is a target.
+/// `permissions::rules::split_into` does the same.
 #[must_use]
 fn collect(command: &str, depth: usize, out: &mut Vec<String>) -> bool {
     if depth > MAX_DEPTH {
         out.extend(pieces(command));
         return true;
     }
-    let lexed = lex(command);
+    let mut unresolved = collect_reading(command, depth, out, true);
+    if command.contains("$'") {
+        unresolved |= collect_reading(command, depth, out, false);
+    }
+    unresolved
+}
+
+/// [`collect`] for one reading: with `ansi_c`, `$'…'` as bash reads it.
+#[must_use]
+fn collect_reading(command: &str, depth: usize, out: &mut Vec<String>, ansi_c: bool) -> bool {
+    let lexed = lex(command, ansi_c);
     let mut unresolved = false;
     for inner in &lexed.substitutions {
         unresolved |= collect(inner, depth + 1, out);
@@ -446,9 +462,12 @@ fn pieces(text: &str) -> Vec<String> {
 
 /// Read a command roughly as the shell does: quotes, operators, comments,
 /// command substitutions and heredoc bodies.
-fn lex(text: &str) -> Lexed {
+fn lex(text: &str, ansi_c: bool) -> Lexed {
     let chars: Vec<char> = text.chars().collect();
-    let mut lexer = Lexer::default();
+    let mut lexer = Lexer {
+        ansi_c,
+        ..Lexer::default()
+    };
     let mut index = 0;
     while index < chars.len() {
         let c = chars[index];
@@ -506,7 +525,7 @@ fn lex(text: &str) -> Lexed {
             }
             // `$'…'`: escapes decoded, ending where bash ends it
             // (`crate::ansi_c`) — a backslash escapes the quote.
-            '$' if next == Some('\'') => {
+            '$' if lexer.ansi_c && next == Some('\'') => {
                 let (text, end) = crate::ansi_c::quoted(&chars, index + 2);
                 lexer.word.push_str(&text);
                 lexer.started = true;
@@ -607,6 +626,8 @@ fn lex(text: &str) -> Lexed {
 #[derive(Default)]
 struct Lexer {
     lexed: Lexed,
+    /// `$'…'` read as bash reads it, not as a POSIX `sh` does ([`collect`]).
+    ansi_c: bool,
     word: String,
     /// A word has begun, even if it is empty so far (`""`).
     started: bool,
@@ -668,7 +689,7 @@ impl Lexer {
                 index += 2;
                 continue;
             }
-            if c == '$' && chars.get(index + 1) == Some(&'\'') {
+            if self.ansi_c && c == '$' && chars.get(index + 1) == Some(&'\'') {
                 index = crate::ansi_c::quoted(chars, index + 2).1;
                 continue;
             }
@@ -792,10 +813,12 @@ mod tests {
             r"echo $'it\'s' && echo x >tests/a.rs #'",
             r"echo $(echo $'\'') ; echo x > tests/a.rs #'",
         ] {
-            assert_eq!(
-                targets(command),
-                vec!["tests/a.rs".to_string()],
-                "{command}"
+            // Each reading of `$'` may find it; the caller asks only whether
+            // any target is protected.
+            assert!(
+                targets(command).contains(&"tests/a.rs".to_string()),
+                "{command}: {:?}",
+                targets(command)
             );
         }
         assert!(
@@ -804,18 +827,38 @@ mod tests {
         );
     }
 
-    /// A target spelled with `$'…'` or `$"…"` is the file bash writes.
+    /// A target spelled with `$'…'` or `$"…"` is the file bash writes; a NUL
+    /// ends it (`> $'a.txt\0junk'` writes `a.txt`).
     #[test]
     fn a_target_in_ansi_c_or_locale_quotes_is_the_file_written() {
         for command in [
             r"echo x > $'tests/a.rs'",
             r"echo x > $'tests\x2fa.rs'",
             r#"echo x > $"tests/a.rs""#,
+            r"echo x > $'tests/a.rs\0junk'",
         ] {
-            assert_eq!(
-                targets(command),
-                vec!["tests/a.rs".to_string()],
-                "{command}"
+            assert!(
+                targets(command).contains(&"tests/a.rs".to_string()),
+                "{command}: {:?}",
+                targets(command)
+            );
+        }
+    }
+
+    /// **TWO SHELLS, TWO READINGS.** dash — what `sh -c` runs on Debian and
+    /// Ubuntu — reads `$'` as a `$` and a plain quote, and bash ends `$'\c'`
+    /// at its quote. A write hidden from either reading is still seen.
+    #[test]
+    fn a_redirect_hidden_from_either_reading_of_dollar_quote_is_seen() {
+        for command in [
+            r"echo $'\' ; echo x > tests/a.rs # '",
+            r"echo $'\c' ; echo x > tests/a.rs #'",
+            r"echo $'\c\'' ; echo x > tests/a.rs #'",
+        ] {
+            assert!(
+                targets(command).contains(&"tests/a.rs".to_string()),
+                "{command}: {:?}",
+                targets(command)
             );
         }
     }

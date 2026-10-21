@@ -343,6 +343,15 @@ pub fn split_command(line: &str) -> Vec<Segment> {
 /// How deep `sh -c "sh -c '…'"` is followed before the rest is simply opaque.
 const MAX_DEPTH: usize = 8;
 
+/// `line`'s parts, appended to `out`.
+///
+/// `$'…'` is ANSI-C quoting to bash, zsh and ksh, but a `$` and a plain
+/// quote to a POSIX `sh` such as dash — the `sh` of Debian and Ubuntu, and
+/// incode runs `sh -c` (`tools::shell_choice`). The two readings can end the
+/// quote in different places, so a command can hide from one of them. Which
+/// shell runs is not known here, so a line with `$'` is read BOTH ways: a deny
+/// or ask rule meets the parts of either, and every part is opaque, so no
+/// allow rule passes it. `guards::shell::write_targets` does the same.
 fn split_into(line: &str, out: &mut Vec<Segment>, depth: usize) {
     if depth > MAX_DEPTH {
         out.push(Segment {
@@ -352,6 +361,19 @@ fn split_into(line: &str, out: &mut Vec<Segment>, depth: usize) {
         });
         return;
     }
+    let first = out.len();
+    split_reading(line, out, depth, true);
+    if line.contains("$'") {
+        split_reading(line, out, depth, false);
+        for segment in &mut out[first..] {
+            segment.opaque = true;
+        }
+    }
+}
+
+/// One reading of `line`: with `ansi_c`, `$'…'` as bash reads it; without,
+/// as a POSIX `sh` does.
+fn split_reading(line: &str, out: &mut Vec<Segment>, depth: usize, ansi_c: bool) {
     let chars: Vec<char> = line.chars().collect();
     let mut i = 0;
     // The current part, as written; and with quoted text blanked, to look
@@ -408,7 +430,7 @@ fn split_into(line: &str, out: &mut Vec<Segment>, depth: usize) {
                 }
                 // Substitution happens inside double quotes too.
                 if (c == '$' && next == Some('(')) || c == '`' {
-                    let (body, end) = substitution(&chars, i);
+                    let (body, end) = substitution(&chars, i, ansi_c);
                     raw.extend(&chars[i..end]);
                     bare.push('_');
                     inner.push(body);
@@ -441,7 +463,7 @@ fn split_into(line: &str, out: &mut Vec<Segment>, depth: usize) {
             // `$'…'`: a backslash escapes the quote, so it ends where bash
             // says (`crate::ansi_c`). What it spells is decided by escapes,
             // so no allow rule passes the part.
-            '$' if next == Some('\'') => {
+            '$' if ansi_c && next == Some('\'') => {
                 let (_, end) = crate::ansi_c::quoted(&chars, i + 2);
                 raw.extend(&chars[i..end]);
                 bare.extend(std::iter::repeat_n('_', end - i));
@@ -463,7 +485,7 @@ fn split_into(line: &str, out: &mut Vec<Segment>, depth: usize) {
                 i += 1;
             }
             '$' if next == Some('(') => {
-                let (body, end) = substitution(&chars, i);
+                let (body, end) = substitution(&chars, i, ansi_c);
                 raw.extend(&chars[i..end]);
                 bare.push('_');
                 inner.push(body);
@@ -471,7 +493,7 @@ fn split_into(line: &str, out: &mut Vec<Segment>, depth: usize) {
                 i = end;
             }
             '`' => {
-                let (body, end) = substitution(&chars, i);
+                let (body, end) = substitution(&chars, i, ansi_c);
                 raw.extend(&chars[i..end]);
                 bare.push('_');
                 inner.push(body);
@@ -479,7 +501,7 @@ fn split_into(line: &str, out: &mut Vec<Segment>, depth: usize) {
                 i = end;
             }
             '<' | '>' if next == Some('(') => {
-                let (body, end) = substitution(&chars, i + 1);
+                let (body, end) = substitution(&chars, i + 1, ansi_c);
                 raw.extend(&chars[i..end]);
                 bare.push('_');
                 inner.push(body);
@@ -524,7 +546,8 @@ fn split_into(line: &str, out: &mut Vec<Segment>, depth: usize) {
 
 /// The body of the substitution that starts at `start` (`$(`, `(` or a
 /// backtick), and the index just past its end. Unterminated: the rest.
-fn substitution(chars: &[char], start: usize) -> (String, usize) {
+/// `ansi_c`: whether `$'…'` is read as bash reads it ([`split_into`]).
+fn substitution(chars: &[char], start: usize, ansi_c: bool) -> (String, usize) {
     if chars[start] == '`' {
         let mut i = start + 1;
         let mut body = String::new();
@@ -569,7 +592,7 @@ fn substitution(chars: &[char], start: usize) -> (String, usize) {
                     i += 2;
                     continue;
                 }
-                '$' if chars.get(i + 1) == Some(&'\'') => {
+                '$' if ansi_c && chars.get(i + 1) == Some(&'\'') => {
                     i = crate::ansi_c::quoted(chars, i + 2).1;
                     continue;
                 }
