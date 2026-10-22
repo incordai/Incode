@@ -1,0 +1,44 @@
+name: Bug report
+description: Something incode did wrong. `/bug <what happened>` in a session fills in the first fields.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Please check that nothing below is private: `/bug` removes tokens and your home folder from what it fills in, but not everything secret looks like a secret.
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what incode did instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The commands or prompts, in order, from a fresh start if you can.
+      placeholder: |
+        1. incode -w my-project
+        2. /compact
+        3. …
+  - type: input
+    id: version
+    attributes:
+      label: Version and platform
+      description: "`incode --version`, and the OS. `/bug` fills this in."
+      placeholder: incode 0.1.0 on linux x86_64
+    validations:
+      required: true
+  - type: input
+    id: setup
+    attributes:
+      label: Model and permission mode
+      description: The agent or model in use, and `-p`. `/bug` fills this in.
+      placeholder: "model: claude / opus; permission mode: workspace-write"
+  - type: textarea
+    id: logs
+    attributes:
+      label: Output or trace
+      description: What incode printed, or a trace from `INCODE_TRACE=1`. Remove anything private before pasting.
+      render: text

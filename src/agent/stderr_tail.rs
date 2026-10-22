@@ -128,19 +128,26 @@ impl StderrTail {
     }
 }
 
-/// One line as it may be stored: colour codes gone, credentials redacted,
-/// then cut to [`MAX_LINE_BYTES`] — in that order, so a cut can never leave
-/// half a secret behind.
+/// One line as it may be stored: [`redact`]ed, then cut to
+/// [`MAX_LINE_BYTES`] — in that order, so a cut can never leave half a secret
+/// behind.
 #[must_use]
 pub fn clean(line: &str) -> String {
+    crate::text::head_bytes(&redact(line), MAX_LINE_BYTES).to_string()
+}
+
+/// `text` with colour codes gone and credentials redacted, whole: for text
+/// that is shown in full, such as a bug report (`crate::bug_report`).
+#[must_use]
+pub fn redact(text: &str) -> String {
     let mut out = match ansi() {
-        Some(ansi) => ansi.replace_all(line, "").into_owned(),
-        None => line.to_string(),
+        Some(ansi) => ansi.replace_all(text, "").into_owned(),
+        None => text.to_string(),
     };
     for (pattern, replacement) in secrets() {
         out = pattern.replace_all(&out, *replacement).into_owned();
     }
-    crate::text::head_bytes(&out, MAX_LINE_BYTES).to_string()
+    out
 }
 
 const ANSI_PATTERN: &str = r"\x1b\[[0-9;?]*[ -/]*[@-~]";
