@@ -139,21 +139,23 @@ impl LifecycleHooks {
     }
 }
 
-/// `command` with every character that could make it LOOK like something
-/// else written as an escape: control characters (a carriage return or an
-/// ANSI sequence could redraw the line over the real command) and the
-/// Unicode direction overrides (which reorder what the eye reads).
+/// `command` as it can only be read one way: printable ASCII and the space
+/// as they are, every other character as an escape. A control character (a
+/// carriage return, an ANSI sequence) could redraw the line over the real
+/// command; a direction override, zero-width or other format character could
+/// reorder or hide part of it. Escaping ALL of them, rather than a list of
+/// the dangerous ones, leaves nothing a list could miss; a shell command is
+/// ASCII in all but rare cases, and those stay readable as `\u{..}`.
 fn visible(command: &str) -> String {
     command
         .chars()
         .map(|c| {
-            let reorders = matches!(c, '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}');
-            if c.is_control() {
-                c.escape_default().to_string()
-            } else if reorders {
-                c.escape_unicode().to_string()
-            } else {
+            if c == ' ' || c.is_ascii_graphic() {
                 c.to_string()
+            } else if c.is_ascii() {
+                c.escape_default().to_string()
+            } else {
+                c.escape_unicode().to_string()
             }
         })
         .collect()
@@ -450,6 +452,19 @@ mod tests {
         let (_, note) = usable(project.path(), data.path());
         let note = note.expect("not approved");
         assert!(!note.contains('\r') && note.contains(r"\r"), "{note:?}");
+
+        // No list to fall short of: every character that is not printable
+        // ASCII is escaped — the Arabic letter mark, a zero-width space, a
+        // line separator, a byte-order mark among them.
+        for hidden in ['\u{061c}', '\u{200b}', '\u{2028}', '\u{feff}', '\u{2060}'] {
+            let shown = visible(&format!("rm -rf ~{hidden}/x"));
+            assert!(!shown.contains(hidden), "{hidden:?} survived: {shown:?}");
+            assert!(shown.starts_with("rm -rf ~\\u{"), "{shown:?}");
+        }
+        assert_eq!(
+            visible("npm install && cargo fmt"),
+            "npm install && cargo fmt"
+        );
     }
 
     /// An approval is for ONE workspace: the same commands in another
