@@ -199,8 +199,30 @@ impl Toolbox {
                 said.push_str(text);
             }
         });
+        let end = self.end_of(&outcome, &said);
         if let Some(tap) = tap.as_mut() {
-            tap.ended(self.end_of(&outcome, &said));
+            tap.ended(end);
+        }
+        // The operator's `subagent_stop` commands: told how it ended, never
+        // asked whether it may. What they print is traced.
+        if let Some(hooks) = &self.hooks {
+            let named = match (definition.as_ref(), role.is_empty()) {
+                (Some(def), _) => def.name.clone(),
+                (None, true) => "sub-agent".to_string(),
+                (None, false) => role.to_string(),
+            };
+            let stopped = crate::hooks::SubagentStopped {
+                agent: &named,
+                task,
+                last_message: &said,
+                outcome: end.as_str(),
+            };
+            for told in hooks
+                .subagent_stop(&stopped, &self.session, Some(&self.workspace))
+                .messages()
+            {
+                crate::trace!("hooks", "subagent_stop hook: {told}");
+            }
         }
         // Its work is over however it ended: what it claimed, read and
         // announced is let go now, not when a lease runs out.
@@ -479,6 +501,99 @@ mod tests {
             parent.api_child(inherited, &plain).model(),
             Some("main-model")
         );
+    }
+
+    /// A model service on 127.0.0.1 answering each of `times` requests with
+    /// `reply` as a whole (not streamed) message: its endpoint.
+    fn model_service(reply: &'static str, times: usize) -> String {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(times) {
+                let Ok(mut stream) = stream else { continue };
+                let mut seen = Vec::new();
+                let mut buf = [0u8; 8192];
+                // Headers, then the body its content-length names.
+                while let Ok(n) = stream.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    seen.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&seen).to_string();
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let length = text[..end]
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        if seen.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                let body = serde_json::json!({
+                    "content": [{"type": "text", "text": reply}],
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 5, "output_tokens": 7}
+                })
+                .to_string();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+                     connection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        format!("http://127.0.0.1:{port}/v1/messages")
+    }
+
+    /// **WHEN A SUB-AGENT FINISHES, THE OPERATOR'S `subagent_stop` IS TOLD**:
+    /// which agent it was, what it was handed, what it reported and how it
+    /// ended — run in the workspace, after the real `Agent` tool ran it.
+    #[test]
+    fn a_finished_sub_agent_runs_the_operators_subagent_stop_hook() {
+        let ws = tempfile::tempdir().expect("ws");
+        let save_event = if cfg!(windows) {
+            "more > subagent-event.json"
+        } else {
+            "cat > subagent-event.json"
+        };
+        let mut parent = Toolbox::new(ws.path(), true).with_operator_hooks(Some(
+            crate::hooks::HookRunner::new(crate::hooks::HookConfig {
+                subagent_stop: vec![save_event.to_string()],
+                ..crate::hooks::HookConfig::default()
+            }),
+        ));
+        parent.set_api_route(crate::agent::api::Settings {
+            endpoint: model_service("the parser is in src/plan.rs", 4),
+            key: "k".to_string(),
+            model: "m".to_string(),
+            route: "local".to_string(),
+            ..Default::default()
+        });
+        let said = parent
+            .run_subagent(&serde_json::json!({"task": "find the parser", "role": "explore"}))
+            .expect("the sub-agent reported");
+        assert_eq!(said, "the parser is in src/plan.rs");
+
+        let event: Value = serde_json::from_str(
+            &std::fs::read_to_string(ws.path().join("subagent-event.json"))
+                .expect("the subagent_stop hook did not run"),
+        )
+        .expect("one JSON event");
+        assert_eq!(event["hook_event_name"], "SubagentStop");
+        assert_eq!(event["agent_type"], "explore");
+        assert_eq!(event["task"], "find the parser");
+        assert_eq!(
+            event["last_assistant_message"],
+            "the parser is in src/plan.rs"
+        );
+        assert_eq!(event["outcome"], "completed");
     }
 
     /// A sub-agent never gets a tool its parent was not given: a definition's

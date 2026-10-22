@@ -48,6 +48,7 @@ fn hooked(ws: &Path, pre: String, post: Vec<String>) -> Toolbox {
             notification: Vec::new(),
             session_start: Vec::new(),
             session_end: Vec::new(),
+            subagent_stop: Vec::new(),
         },
     )))
 }

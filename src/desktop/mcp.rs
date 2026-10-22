@@ -1759,6 +1759,7 @@ mod tests {
                     notification: Vec::new(),
                     session_start: Vec::new(),
                     session_end: Vec::new(),
+                    subagent_stop: Vec::new(),
                 },
             );
 
@@ -1801,6 +1802,7 @@ mod tests {
                     notification: Vec::new(),
                     session_start: Vec::new(),
                     session_end: Vec::new(),
+                    subagent_stop: Vec::new(),
                 },
             );
 

@@ -153,6 +153,10 @@ pub struct HookConfig {
     /// shown where there is still somewhere to show it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub session_end: Vec<String>,
+    /// Commands run when a sub-agent (the `Agent` tool) has finished. They
+    /// cannot keep it working; what they print is traced, not shown.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subagent_stop: Vec<String>,
 }
 
 impl HookConfig {
@@ -170,6 +174,7 @@ impl HookConfig {
             && self.notification.is_empty()
             && self.session_start.is_empty()
             && self.session_end.is_empty()
+            && self.subagent_stop.is_empty()
     }
 
     /// How many commands, over every event. Used where a plugin's hooks are
@@ -184,6 +189,7 @@ impl HookConfig {
             + self.notification.len()
             + self.session_start.len()
             + self.session_end.len()
+            + self.subagent_stop.len()
     }
 
     /// `other`'s commands after these, event by event (a plugin's after the
@@ -197,6 +203,7 @@ impl HookConfig {
         self.notification.extend(other.notification);
         self.session_start.extend(other.session_start);
         self.session_end.extend(other.session_end);
+        self.subagent_stop.extend(other.subagent_stop);
     }
 }
 
@@ -511,6 +518,47 @@ impl HookRunner {
     }
 }
 
+impl HookRunner {
+    /// The `subagent_stop` commands, once a sub-agent has finished: `agent`
+    /// names it (its definition, role, or `sub-agent`), `task` is what it was
+    /// handed, `last_message` what it reported, and `outcome` how it ended
+    /// (`completed`, `failed` or `cancelled`). They cannot keep it working:
+    /// exit 2 is an ordinary exit. Each one's stdout is a message.
+    ///
+    /// Called by `toolbox::subagent` (`Toolbox::run_subagent`), the `Agent`
+    /// tool, on every route.
+    #[must_use]
+    pub fn subagent_stop(
+        &self,
+        stopped: &SubagentStopped<'_>,
+        session: &str,
+        cwd: Option<&Path>,
+    ) -> HookRunResult {
+        run_event(
+            &self.config.subagent_stop,
+            "SubagentStop",
+            json!({
+                "agent_type": stopped.agent,
+                "task": stopped.task,
+                "last_assistant_message": stopped.last_message,
+                "outcome": stopped.outcome,
+            }),
+            session,
+            cwd,
+            false,
+        )
+    }
+}
+
+/// A sub-agent that has finished, as a `subagent_stop` hook is told it.
+#[derive(Debug, Clone, Copy)]
+pub struct SubagentStopped<'a> {
+    pub agent: &'a str,
+    pub task: &'a str,
+    pub last_message: &'a str,
+    pub outcome: &'a str,
+}
+
 /// Run `commands` for one event that is not a tool call: the event as JSON on
 /// stdin — `hook_event_name`, `session_id`, `cwd` and `fields` — bounded at
 /// [`HOOK_TIMEOUT`]. With `can_refuse`, exit 2 refuses (stderr, else stdout,
@@ -700,6 +748,7 @@ mod tests {
             notification: Vec::new(),
             session_start: Vec::new(),
             session_end: Vec::new(),
+            subagent_stop: Vec::new(),
         });
         let input = json!({"path": "a.txt", "content": "hi"});
         let ran = runner.pre_tool(&call(&input, dir.path()));
@@ -729,6 +778,7 @@ mod tests {
             notification: Vec::new(),
             session_start: Vec::new(),
             session_end: Vec::new(),
+            subagent_stop: Vec::new(),
         });
         let input = json!({"path": "a.txt"});
         let pre = runner.pre_tool(&call(&input, dir.path()));
@@ -794,6 +844,40 @@ mod tests {
         assert_eq!(event["hook_event_name"], "Stop");
         assert_eq!(event["last_assistant_message"], "all done");
         assert_eq!(event["session_id"], "s-1");
+    }
+
+    /// `subagent_stop` is told, never asked: exit 2 keeps nothing working,
+    /// stdout is a message, and the event says which agent, what it was
+    /// handed, what it said and how it ended.
+    #[test]
+    fn subagent_stop_is_told_who_finished_and_how_and_cannot_refuse() {
+        let dir = tempfile::tempdir().expect("dir");
+        let runner = HookRunner::new(HookConfig {
+            subagent_stop: vec![hook(dir.path(), 2, "")],
+            ..HookConfig::default()
+        });
+        let ran = runner.subagent_stop(
+            &SubagentStopped {
+                agent: "explore",
+                task: "find the parser",
+                last_message: "it is in src/plan.rs",
+                outcome: "completed",
+            },
+            "s-3",
+            Some(dir.path()),
+        );
+        assert!(!ran.is_denied(), "a subagent_stop hook refused");
+        assert_eq!(ran.messages(), ["said"]);
+        let event: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("event.json")).expect("saved"),
+        )
+        .expect("json");
+        assert_eq!(event["hook_event_name"], "SubagentStop");
+        assert_eq!(event["agent_type"], "explore");
+        assert_eq!(event["task"], "find the parser");
+        assert_eq!(event["last_assistant_message"], "it is in src/plan.rs");
+        assert_eq!(event["outcome"], "completed");
+        assert_eq!(event["session_id"], "s-3");
     }
 
     /// `session_start` and `session_end` are told, never asked: exit 2 keeps
