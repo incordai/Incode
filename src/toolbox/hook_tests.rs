@@ -43,6 +43,8 @@ fn hooked(ws: &Path, pre: String, post: Vec<String>) -> Toolbox {
             pre_tool_use: vec![pre],
             post_tool_use: post,
             user_prompt_submit: Vec::new(),
+            pre_compact: Vec::new(),
+            stop: Vec::new(),
         },
     )))
 }
