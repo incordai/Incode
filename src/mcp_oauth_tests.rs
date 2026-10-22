@@ -689,7 +689,7 @@ fn browse(address: &str) {
     let address = address.to_string();
     std::thread::spawn(move || {
         let location = crate::runtime::http::run_async(async move {
-            let client = crate::runtime::http::no_redirect_client()?;
+            let client = crate::runtime::http::no_redirect_client(&address)?;
             let answer = client
                 .get(&address)
                 .send()

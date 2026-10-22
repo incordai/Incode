@@ -125,7 +125,7 @@ impl EditLedger for EngineLedger {
         );
         let body = body.clone();
         let answered = crate::runtime::http::run_async(async move {
-            let response = match crate::runtime::http::SHARED_CLIENT
+            let response = match crate::runtime::http::client_for(&url)
                 .post(&url)
                 .timeout(CALL_BOUND)
                 .json(&body)

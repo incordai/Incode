@@ -1613,13 +1613,13 @@ fn fields_not_stored(update: &BriefUpdate, saved: &ProjectBrief) -> Vec<&'static
     }
     lost
 }
-use crate::runtime::http::{run_async, SHARED_CLIENT as HTTP_CLIENT};
+use crate::runtime::http::{client_for, run_async};
 
 /// Fetch a URL reusing the pooled HTTP client and ambient/shared runtime, returning body and optional ETag.
 fn fetch_with_etag(url: &str) -> Result<(String, Option<String>), String> {
     let url = url.to_string();
     run_async(async move {
-        let response = HTTP_CLIENT
+        let response = client_for(&url)
             .get(&url)
             .timeout(FETCH_TIMEOUT)
             .send()
@@ -1648,7 +1648,7 @@ fn post_with_etag(url: &str, body: String, etag: Option<&str>) -> Result<bool, S
     let url = url.to_string();
     let etag_owned = etag.map(str::to_string);
     run_async(async move {
-        let mut req = HTTP_CLIENT
+        let mut req = client_for(&url)
             .post(&url)
             .timeout(FETCH_TIMEOUT)
             .header("content-type", "application/json")

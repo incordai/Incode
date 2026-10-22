@@ -102,7 +102,7 @@ impl HttpLink {
         what: &str,
     ) -> Result<Self, String> {
         crate::agent::catalogue::key_may_travel_to(url)?;
-        crate::runtime::http::no_redirect_client()?;
+        crate::runtime::http::no_redirect_client(url)?;
         let mut map = HeaderMap::new();
         for (index, (name, value)) in headers.iter().enumerate() {
             // Neither the name nor the value goes into the message: a value
@@ -160,7 +160,7 @@ impl HttpLink {
 
 impl Link for HttpLink {
     fn send(&mut self, line: &str) -> Result<(), String> {
-        let client = crate::runtime::http::no_redirect_client()?;
+        let client = crate::runtime::http::no_redirect_client(&self.url)?;
         // A request has an id and must be answered; a notification has none.
         let id = serde_json::from_str::<Value>(line)
             .ok()
@@ -242,7 +242,7 @@ impl Drop for HttpLink {
         let Some(session) = lock(&self.session).take() else {
             return;
         };
-        let Ok(client) = crate::runtime::http::no_redirect_client() else {
+        let Ok(client) = crate::runtime::http::no_redirect_client(&self.url) else {
             return;
         };
         let mut headers = self.headers.clone();
