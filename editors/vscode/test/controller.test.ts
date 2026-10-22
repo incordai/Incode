@@ -373,3 +373,146 @@ describe("Controller with an agent that offers neither session/load nor images",
     assert.ok(posted.some((m) => m.type === "agentText" && m.text === "echo: hi"));
   });
 });
+
+// Each of these was a defect found in review: a draft lost on refusal, a new
+// session that was the loading one, a dead process's session id, a failed
+// load leaving nothing said, a stray turn end in a reopened session, two
+// sends both getting through.
+describe("Controller: refusals, races and restarts", () => {
+  let ws: string;
+  let controller: InstanceType<typeof Controller>;
+  const posted: ToView[] = [];
+  const { until, said, notices } = harness(posted);
+  const answers = () => posted.filter((m) => m.type === "sent" || m.type === "notSent");
+  const fresh = (): InstanceType<typeof Controller> => {
+    const output = { append: () => undefined, appendLine: () => undefined, show: () => undefined };
+    const c = new Controller(output as never, "0.0.0-test");
+    c.attach({ post: (m) => posted.push(m), reveal: async () => undefined });
+    return c;
+  };
+
+  before(async () => {
+    ws = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "incode-vscode-ctl-")));
+    state.roots = [ws];
+    state.config.args = [];
+  });
+  after(async () => {
+    controller?.dispose();
+    await new Promise((r) => setTimeout(r, 100));
+    await fs.rm(ws, { recursive: true, force: true });
+  });
+
+  it("two sends while the session is still opening: the second is refused, not sent beside the first", async () => {
+    controller = fresh();
+    posted.length = 0;
+    await Promise.all([controller.send("hi"), controller.send("again")]);
+    assert.deepEqual(notices(), ["info: Not sent: a turn is still running. Stop it first, or wait for it to finish."]);
+    assert.equal(said(), "echo: hi");
+    assert.deepEqual(posted.filter((m) => m.type === "user").map((m) => (m as { text: string }).text), ["hi"]);
+  });
+
+  it("every send with a draft id is answered: sent, or notSent with the reason (the page restores the draft)", async () => {
+    posted.length = 0;
+    await controller.onMessage({ type: "send", text: "hi", draft: 1 });
+    // A WebP named .png passes the page's file.type but not the byte check.
+    const webp = Buffer.from("RIFF\x24\x00\x00\x00WEBPVP8 ", "latin1").toString("base64");
+    await controller.onMessage({ type: "send", text: "look", images: [{ name: "shot.png", mimeType: "image/png", data: webp }], draft: 2 });
+    const turn = controller.onMessage({ type: "send", text: "hang", draft: 3 });
+    await until(() => said().includes("working"), "the hanging turn");
+    await controller.onMessage({ type: "send", text: "meanwhile", draft: 4 });
+    controller.stop();
+    await turn;
+    assert.deepEqual(answers(), [
+      { type: "sent", draft: 1 },
+      { type: "notSent", draft: 2, reason: "shot.png does not hold the image/png picture it claims to" },
+      { type: "sent", draft: 3 },
+      { type: "notSent", draft: 4, reason: "a turn is still running. Stop it first, or wait for it to finish" },
+    ]);
+    assert.ok(!posted.some((m) => m.type === "user" && m.text === "meanwhile"));
+  });
+
+  it("no session can be opened: the send is refused with a notice, not dropped silently", async () => {
+    const roots = state.roots;
+    state.roots = [];
+    const c = fresh();
+    try {
+      posted.length = 0;
+      await c.onMessage({ type: "send", text: "hi", draft: 7 });
+    } finally {
+      state.roots = roots;
+      c.dispose();
+    }
+    const reason = "no session could be opened (Open a folder first: incode works in a workspace folder.)";
+    assert.deepEqual(answers(), [{ type: "notSent", draft: 7, reason }]);
+    assert.deepEqual(notices(), [`error: Not sent: ${reason}.`]);
+  });
+
+  it("Send Selection with sendSelectionImmediately, refused (a turn running): the selection goes to the input", async () => {
+    posted.length = 0;
+    const turn = controller.onMessage({ type: "send", text: "hang" });
+    await until(() => said().includes("working"), "the hanging turn");
+    posted.length = 0;
+    state.config.sendSelectionImmediately = true;
+    try {
+      await controller.sendSelection("a.ts:1\n```ts\nx\n```\n");
+    } finally {
+      delete state.config.sendSelectionImmediately;
+      controller.stop();
+      await turn;
+    }
+    assert.ok(posted.some((m) => m.type === "prefill" && m.text === "a.ts:1\n```ts\nx\n```\n"));
+    assert.match(notices()[0], /^info: Not sent: a turn is still running.* The selection was put in the input instead\.$/);
+  });
+
+  it("reopening while a turn runs is refused; a New Session's cancelled turn ends without a stray stop reason", async () => {
+    posted.length = 0;
+    const turn = controller.onMessage({ type: "send", text: "hang" });
+    await until(() => said().includes("working"), "the hanging turn");
+    posted.length = 0;
+    await controller.loadSession("kept-2");
+    assert.deepEqual(notices(), ["info: A turn is still running. Stop it first, then open the session."]);
+    assert.ok(!posted.some((m) => m.type === "reset"), "nothing was reopened");
+
+    posted.length = 0;
+    await controller.newSession();
+    await turn;
+    const ends = posted.filter((m): m is Extract<ToView, { type: "turn" }> => m.type === "turn" && !m.running);
+    assert.deepEqual(ends, [{ type: "turn", running: false }], "the spinner stops, but 'cancelled' is not said in the new session");
+  });
+
+  it("New Session while a load is in flight opens a genuinely new session", async () => {
+    posted.length = 0;
+    const load = controller.loadSession("kept-slow");
+    await until(() => posted.some((m) => m.type === "user" && m.text === "slow one"), "the slow load's replay");
+    await controller.newSession();
+    await load;
+    posted.length = 0;
+    await controller.send("whoami");
+    assert.match(said(), /^session sess-\d+$/, "a session/new session, not the one being loaded");
+  });
+
+  it("a restart while a load is in flight: the dead process's late answer does not become the new process's session", async () => {
+    posted.length = 0;
+    const load = controller.loadSession("kept-slow");
+    await until(() => posted.some((m) => m.type === "user" && m.text === "slow one"), "the slow load's replay");
+    await controller.restart();
+    await load;
+    posted.length = 0;
+    await controller.send("whoami");
+    assert.match(said(), /^session sess-\d+$/, "a session/new session, not the one being loaded");
+  });
+
+  it("a failed load clears its partial history and says the next message starts a new session", async () => {
+    posted.length = 0;
+    await controller.loadSession("kept-broken");
+    const kinds = posted.map((m) => m.type);
+    assert.ok(kinds.lastIndexOf("reset") > kinds.indexOf("user"), `the half history is cleared: ${JSON.stringify(kinds)}`);
+    assert.deepEqual(notices(), ["info: The session was not opened. The next message starts a new session."]);
+    posted.length = 0;
+    await controller.onMessage({ type: "ready" });
+    assert.ok(!posted.some((m) => m.type === "user"), "nor is it replayed into a reopened view");
+    posted.length = 0;
+    await controller.send("whoami");
+    assert.match(said(), /^session sess-\d+$/, "a session/new session, not the one being loaded");
+  });
+});

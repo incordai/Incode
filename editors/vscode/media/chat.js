@@ -33,6 +33,8 @@
   var MAX_TOTAL_IMAGE_BYTES = 5 * 1024 * 1024;
   var imagesAllowed = false;
   var attachments = []; // { name, mimeType, data (base64), size }
+  var draftSeq = 0;
+  var pending = null; // { draft, text, attachments }: sent, not yet answered
 
   var commands = [];
   var running = false;
@@ -340,7 +342,10 @@
       if (attachments.length > 0) localNotice("info", "Add a question to go with the picture.");
       return;
     }
-    var message = { type: "send", text: text };
+    // The draft is kept until the extension says it went: a refusal (a turn
+    // running, no session, a picture the agent cannot take) puts it back.
+    pending = { draft: ++draftSeq, text: text, attachments: attachments };
+    var message = { type: "send", text: text, draft: pending.draft };
     if (attachments.length > 0) {
       message.images = attachments.map(function (a) {
         return { name: a.name, mimeType: a.mimeType, data: a.data };
@@ -351,6 +356,18 @@
     attachments = [];
     renderAttachments();
     updateCompletions();
+  }
+
+  /** The extension refused draft `m.draft`: restore what has not been replaced since. */
+  function restoreDraft(m) {
+    if (!pending || pending.draft !== m.draft) return;
+    var draft = pending;
+    pending = null;
+    if (!input.value.trim()) input.value = draft.text;
+    if (attachments.length === 0 && draft.attachments.length > 0) {
+      attachments = draft.attachments;
+      renderAttachments();
+    }
   }
 
   // ----- pictures -----------------------------------------------------------
@@ -508,6 +525,12 @@
           attachments = [];
           renderAttachments();
         }
+        break;
+      case "sent":
+        if (pending && pending.draft === m.draft) pending = null;
+        break;
+      case "notSent":
+        restoreDraft(m);
         break;
       case "attachment":
         if (m.image) {

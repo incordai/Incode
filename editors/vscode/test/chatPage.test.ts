@@ -227,7 +227,7 @@ describe("pictures in the chat input (media/chat.js)", () => {
     input.value = "what is this?";
     page.byId.get("send")!.dispatch("click");
     assert.deepEqual(page.sent, [
-      { type: "send", text: "what is this?", images: [{ name: "dot.png", mimeType: "image/png", data: PNG.toString("base64") }] },
+      { type: "send", text: "what is this?", draft: 1, images: [{ name: "dot.png", mimeType: "image/png", data: PNG.toString("base64") }] },
     ]);
     assert.equal(page.thumbs().length, 0, "the input is cleared");
     assert.equal(page.byId.get("attachments")!.hidden, true);
@@ -304,6 +304,35 @@ describe("pictures in the chat input (media/chat.js)", () => {
     const user = page.byId.get("log")!.all().find((e) => e.className === "msg user")!;
     assert.equal(user.textContent, "what is this?");
     assert.equal(user.children[0].textContent, "Attached: dot.png");
+  });
+
+  it("a draft the extension refuses comes back (text and pictures); one it took does not; newer typing is kept", async () => {
+    page.receive({ type: "capabilities", images: true, reopen: true });
+    const input = page.byId.get("input")!;
+    const send = (text: string): number => {
+      input.value = text;
+      page.byId.get("send")!.dispatch("click");
+      return page.sent.at(-1)!.draft as number;
+    };
+    paste(page, [file("dot.png", "image/png", PNG)]);
+    await page.tick();
+    const first = send("what is this?");
+    assert.equal(input.value, "");
+    assert.equal(page.thumbs().length, 0);
+    page.receive({ type: "notSent", draft: first, reason: "a turn is still running" });
+    assert.equal(input.value, "what is this?", "the text is back");
+    assert.deepEqual(page.thumbs().map((t) => t.title.split(" ")[0]), ["dot.png"], "the picture is back");
+
+    const second = send("what is this?");
+    page.receive({ type: "sent", draft: second });
+    page.receive({ type: "notSent", draft: second, reason: "late" });
+    assert.equal(input.value, "", "a draft that was sent is not restored");
+    assert.equal(page.thumbs().length, 0);
+
+    const third = send("first try");
+    input.value = "something new";
+    page.receive({ type: "notSent", draft: third, reason: "no session" });
+    assert.equal(input.value, "something new", "what was typed since is not overwritten");
   });
 
   it("an agent that loses the capability (a restart) drops what was attached", async () => {

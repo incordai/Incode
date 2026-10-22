@@ -12,6 +12,7 @@
 //   unknown           sends the client a request for a method it does not have
 //   exit              exits with code 3 in the middle of the turn
 //   images            says what image blocks the prompt carried
+//   whoami            says which session the prompt was sent to
 //
 // Kept sessions, as incode keeps them: `session/list` names two, one per
 // page (to exercise the cursor), and `session/load` replays one's history as
@@ -45,12 +46,21 @@ const KEPT = [
     history: [{ sessionUpdate: "user_message_chunk", content: { type: "text", text: "write the docs" } }],
   },
 ];
+// Loadable but not listed: `kept-slow` answers its load 150 ms late (and an
+// agent told to stop answers it before exiting, as a process would that was
+// mid-write); `kept-broken` replays part of its history, then fails.
+const UNLISTED = [
+  { sessionId: "kept-slow", history: [{ sessionUpdate: "user_message_chunk", content: { type: "text", text: "slow one" } }] },
+  { sessionId: "kept-broken", history: [{ sessionUpdate: "user_message_chunk", content: { type: "text", text: "half a history" } }] },
+];
+let slowLoad = null; // a promise while kept-slow's answer is pending
 const open = new Set(); // session ids open on this connection
 let buffer = "";
 let nextId = 1;
 const waiting = new Map(); // our request id -> resolve
 let running = null; // { id, onCancel }
 let current = SESSION; // the session the running prompt speaks for
+let opened = 0; // session/new calls so far
 
 function send(message) {
   process.stdout.write(JSON.stringify(message) + "\n");
@@ -125,7 +135,7 @@ async function prompt(id, params) {
     case "permission":
     case "permission-hang": {
       const asked = ask("session/request_permission", {
-        sessionId: SESSION,
+        sessionId: current,
         toolCall: { toolCallId: "t2", title: "Run `rm -rf build`", kind: "execute", status: "pending" },
         options: [
           { optionId: "allow", name: "Allow", kind: "allow_once" },
@@ -146,7 +156,7 @@ async function prompt(id, params) {
     }
     case "read": {
       const [path, line, limit] = rest;
-      const p = { sessionId: SESSION, path };
+      const p = { sessionId: current, path };
       if (line) p.line = Number(line);
       if (limit) p.limit = Number(limit);
       const reply = await ask("fs/read_text_file", p);
@@ -155,7 +165,7 @@ async function prompt(id, params) {
     }
     case "write": {
       const [path, ...words] = rest;
-      const reply = await ask("fs/write_text_file", { sessionId: SESSION, path, content: words.join(" ") });
+      const reply = await ask("fs/write_text_file", { sessionId: current, path, content: words.join(" ") });
       say(reply.error ? `error ${reply.error.code}: ${reply.error.data}` : `wrote ${JSON.stringify(reply.result)}`);
       return done("end_turn");
     }
@@ -180,6 +190,9 @@ async function prompt(id, params) {
       say("bye");
       setTimeout(() => process.exit(3), 20);
       return undefined;
+    case "whoami":
+      say(`session ${current}`);
+      return done("end_turn");
     case "images":
       say(
         `${images.length} image(s): ` +
@@ -220,10 +233,13 @@ function handle(line) {
         authMethods: [],
         agentInfo: { name: "fake", version: "0.0.1", clientCapabilitiesSeen: params.clientCapabilities },
       });
-    case "session/new":
-      open.add(SESSION);
-      respond(id, { sessionId: SESSION, modes: modes(), configOptions: configOptions("claude-code") });
-      return update({ sessionUpdate: "available_commands_update", availableCommands: [{ name: "undo", description: "Undo" }] }, SESSION);
+    case "session/new": {
+      // sess-1, sess-2, …: each new session its own id, as incode's are.
+      const sid = `sess-${++opened}`;
+      open.add(sid);
+      respond(id, { sessionId: sid, modes: modes(), configOptions: configOptions("claude-code") });
+      return update({ sessionUpdate: "available_commands_update", availableCommands: [{ name: "undo", description: "Undo" }] }, sid);
+    }
     case "session/list": {
       if (NO_REOPEN) return fail(id, -32601, "Method not found");
       if (!params || typeof params.cwd !== "string") return fail(id, -32602, "Invalid params", "cwd is required");
@@ -236,15 +252,21 @@ function handle(line) {
     }
     case "session/load": {
       if (NO_REOPEN) return fail(id, -32601, "Method not found");
-      const kept = KEPT.find((s) => s.sessionId === params.sessionId);
+      const kept = [...KEPT, ...UNLISTED].find((s) => s.sessionId === params.sessionId);
       if (!kept || typeof params.cwd !== "string" || !Array.isArray(params.mcpServers)) {
         return fail(id, -32602, "Invalid params", `no session \`${params.sessionId}\` is kept`);
       }
       if (open.has(kept.sessionId)) return fail(id, -32600, "Invalid request", `session \`${kept.sessionId}\` is already open`);
-      open.add(kept.sessionId);
       for (const u of kept.history) update(u, kept.sessionId);
-      respond(id, { modes: modes(), configOptions: configOptions("codex") });
-      return update({ sessionUpdate: "available_commands_update", availableCommands: [{ name: "undo", description: "Undo" }] }, kept.sessionId);
+      if (kept.sessionId === "kept-broken") return fail(id, -32603, "Internal error", "the transcript could not be read");
+      open.add(kept.sessionId);
+      const answer = () => {
+        respond(id, { modes: modes(), configOptions: configOptions("codex") });
+        update({ sessionUpdate: "available_commands_update", availableCommands: [{ name: "undo", description: "Undo" }] }, kept.sessionId);
+      };
+      if (kept.sessionId !== "kept-slow") return answer();
+      slowLoad = new Promise((resolve) => setTimeout(() => (answer(), (slowLoad = null), resolve()), 150));
+      return undefined;
     }
     case "session/prompt":
       if (running) return fail(id, -32600, "Invalid request", "a prompt is already running");
@@ -275,5 +297,5 @@ process.stdin.on("data", (chunk) => {
     if (line.trim()) handle(line);
   }
 });
-process.stdin.on("end", () => process.exit(0));
+process.stdin.on("end", () => (slowLoad ? slowLoad.then(() => setTimeout(() => process.exit(0), 20)) : process.exit(0)));
 process.stderr.write("fake agent ready\n");
