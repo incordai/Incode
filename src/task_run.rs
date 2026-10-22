@@ -436,13 +436,28 @@ fn run_task_reporting(
         turn.as_deref(),
         spec_gate,
     );
+    // The output style (`crate::styles`), as a session has it. On stderr,
+    // which a JSON run keeps apart from its output.
+    let admin_style =
+        match crate::admin::AdminConfig::load(&crate::admin::AdminConfig::default_dir()) {
+            Ok(admin) => admin.output_style,
+            Err(e) => {
+                eprintln!("incode: {e}; no output style is read from it");
+                None
+            }
+        };
+    let style = crate::styles::for_session(workspace, admin_style.as_deref());
+    for line in style.notes.iter().chain(&style.warnings) {
+        eprintln!("incode: {line}");
+    }
     // What rides the system context rather than the prompt: the project's
-    // own instruction files, the harness's standing instructions, and the
-    // engine's session-start block.
+    // own instruction files, the harness's standing instructions, the
+    // engine's session-start block, and the output style, last.
     let system: Vec<String> = crate::instructions::project_block(workspace)
         .into_iter()
         .chain(crate::harness::instructions_block())
         .chain(start)
+        .chain(style.block)
         .collect();
     let task = Task {
         workspace,

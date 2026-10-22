@@ -621,6 +621,16 @@ impl AgentSession {
         }
     }
 
+    /// The output style for the following turns (`crate::styles`): the old
+    /// block out of the standing context, `block` in — last, as the session
+    /// started with it — and every backend told. `None` leaves no style.
+    pub fn set_output_style(&mut self, block: Option<String>) {
+        self.base_context
+            .retain(|existing| !crate::styles::is_block(existing));
+        self.base_context.extend(block);
+        self.carry_context();
+    }
+
     /// How much the agent may do on its own for the following turns.
     pub fn set_permission_mode(&mut self, mode: &str) {
         self.mode = Some(mode.to_string());
@@ -1844,6 +1854,54 @@ mod tests {
             "startup",
         );
         s
+    }
+
+    /// **`/style` REACHES THE AGENT.** The old style's block goes, the new one
+    /// comes, the rest of the standing context stays, and there is never more
+    /// than one style.
+    #[test]
+    fn an_output_style_swap_reaches_the_backend_and_keeps_the_rest() {
+        let ws = tempfile::tempdir().expect("ws");
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let style = |name: &str, body: &str| {
+            crate::styles::block(&crate::styles::Style {
+                name: name.into(),
+                description: None,
+                body: body.into(),
+                source: PathBuf::from(format!("{name}.md")),
+                origin: crate::styles::Origin::Operator,
+            })
+        };
+        let mut s = AgentSession::new(
+            ws.path().to_path_buf(),
+            "claude-code",
+            "claude".to_string(),
+            &crate::guards::Guards::default(),
+            vec!["BASE".to_string(), style("concise", "Be brief.")],
+        )
+        .with_backend(Box::new(Recording {
+            seen: Arc::clone(&seen),
+            on_run: Box::new(|_| {}),
+        }));
+        let styles_in = |seen: &Arc<Mutex<Seen>>| {
+            seen.lock()
+                .expect("seen")
+                .context
+                .iter()
+                .filter(|b| crate::styles::is_block(b))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+
+        s.set_output_style(Some(style("teacher", "Explain why.")));
+        let found = styles_in(&seen);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("Explain why."), "{found:?}");
+        assert_eq!(seen.lock().expect("seen").context[0], "BASE");
+
+        s.set_output_style(None);
+        assert!(styles_in(&seen).is_empty());
+        assert_eq!(seen.lock().expect("seen").context, ["BASE"]);
     }
 
     fn start_context(text: &str) -> String {

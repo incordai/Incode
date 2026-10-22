@@ -149,6 +149,8 @@ pub(crate) struct Prepared {
     pub(crate) lifecycle_hooks: LifecycleHooks,
     pub(crate) git_context: Option<git_context::GitContext>,
     pub(crate) system_prompt: Vec<String>,
+    /// The output style the session started with, by name.
+    pub(crate) output_style: Option<String>,
     pub(crate) catalogue: crate::agent::catalogue::Catalogue,
     pub(crate) agent: crate::agent::DetectedAgent,
     pub(crate) fleet: crate::fleet::Fleet,
@@ -527,6 +529,20 @@ pub(crate) fn prepare_session(
     if let Some(block) = roles.prompt_block() {
         system_prompt.push(block);
     }
+    // The answering style the person chose (`crate::styles`). Pushed LAST
+    // and kept last — the guards and the intake are inserted earlier — after
+    // every block it is weighed against: it shapes how replies read, and its
+    // own words say the rules above it win.
+    let style = crate::styles::for_session(&workspace, admin.output_style.as_deref());
+    for note in &style.notes {
+        render::print_info(note);
+    }
+    for warning in &style.warnings {
+        render::print_error(warning);
+    }
+    if let Some(block) = &style.block {
+        system_prompt.push(block.clone());
+    }
     // The agent that will do the work.
     //
     // TWO ROUTES, and this harness keeps the judging on both — the ledger,
@@ -683,6 +699,7 @@ pub(crate) fn prepare_session(
         lifecycle_hooks,
         git_context,
         system_prompt,
+        output_style: style.name,
         catalogue,
         agent,
         fleet,
@@ -707,11 +724,14 @@ impl CliApp {
             lifecycle_hooks,
             git_context,
             system_prompt,
+            output_style,
             catalogue,
             agent,
             fleet,
             mut session,
         } = prepared;
+        // `/style` changes it for this session.
+        let mut output_style = output_style;
         let turn_cancel = cancel.clone();
         tokio::spawn(async move {
             loop {
@@ -933,6 +953,15 @@ impl CliApp {
                     }
                     SlashCommand::Help => slash_commands::handle_help(),
                     SlashCommand::Cost => ux::print_cost(&session),
+                    SlashCommand::Style(name) => {
+                        if let Some(block) = slash_commands::handle_style(
+                            name.as_deref(),
+                            &workspace,
+                            &mut output_style,
+                        ) {
+                            session.set_output_style(block);
+                        }
+                    }
                     SlashCommand::Bug(description) => slash_commands::handle_bug(
                         &display_model,
                         permission_mode.as_str(),

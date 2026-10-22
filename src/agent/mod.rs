@@ -411,6 +411,7 @@ pub fn budget_for_spawn(
             || lower.contains("<asking>")
             || lower.contains("<roles>")
             || lower.contains("<project-instructions")
+            || lower.contains(crate::styles::TAG)
             || lower.contains("disallowedtools")
         {
             high_priority.push(trimmed);

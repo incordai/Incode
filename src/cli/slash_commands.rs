@@ -20,6 +20,8 @@ pub enum SlashCommand {
     Review(Option<String>),
     /// A prefilled GitHub issue link for what happened; sends nothing.
     Bug(Option<String>),
+    /// List the output styles, or switch to one (`off`: none).
+    Style(Option<String>),
     /// The tools incode runs, or with an argument the external tools:
     /// `add <name>…`, `update [name]`, `remove <name>`.
     Tools(Option<String>),
@@ -112,6 +114,7 @@ impl SlashCommand {
             "/compact" => Self::Compact(arg.filter(|a| !a.is_empty())),
             "/review" => Self::Review(arg.filter(|a| !a.is_empty())),
             "/bug" | "/feedback" => Self::Bug(arg.filter(|a| !a.is_empty())),
+            "/style" => Self::Style(arg.filter(|a| !a.is_empty())),
             "/cost" => Self::Cost,
             "/vim" => Self::Vim,
             "/undo" | "/u" => Self::Undo,
@@ -209,6 +212,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/help", "Show this help message"),
     ("/status", "Session info, token usage, model"),
     ("/cost", "Tokens and estimated cost, per model"),
+    (
+        "/style [name|off]",
+        "List the output styles (.incode/styles, ~/.incode/styles), or answer in one from now on",
+    ),
     (
         "/bug [what happened]",
         "A prefilled GitHub issue link: version, OS, model, your words scrubbed. Sends nothing",
@@ -1533,6 +1540,79 @@ fn handle_pull_request_merge(words: &[&str], workspace: &std::path::Path) {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
+// Output style handler
+// ---------------------------------------------------------------------------
+
+/// `/style [name|off]`: with no name, list the styles and the one in force;
+/// with one, switch to it. Returns the session's new style block when it
+/// changes (`Some(None)`: none); the caller hands it to
+/// `AgentSession::set_output_style`. `current` is the style's name.
+pub fn handle_style(
+    arg: Option<&str>,
+    workspace: &std::path::Path,
+    current: &mut Option<String>,
+) -> Option<Option<String>> {
+    let styles = crate::styles::load(workspace);
+    for problem in &styles.problems {
+        render::print_error(problem);
+    }
+    let Some(name) = arg.map(str::trim) else {
+        render::print_header("Output styles");
+        if styles.styles.is_empty() {
+            outln!(
+                "  none yet: write one as a Markdown file in {}/ or ~/.incode/{}/",
+                crate::styles::PROJECT_DIR,
+                crate::styles::USER_DIR
+            );
+        }
+        for style in &styles.styles {
+            let mark = if current.as_deref() == Some(style.name.as_str()) {
+                "*"
+            } else {
+                " "
+            };
+            // Said beside each: a project's style came with the repository.
+            let from = match style.origin {
+                crate::styles::Origin::Operator => "yours",
+                crate::styles::Origin::Project => "this project",
+            };
+            outln!(
+                "  {mark} {:<16} {:<13} {}",
+                style.name,
+                from,
+                style.description.as_deref().unwrap_or("")
+            );
+        }
+        outln!();
+        render::print_info("/style <name> to answer in one, /style off for none.");
+        return None;
+    };
+    if name.eq_ignore_ascii_case("off") || name.eq_ignore_ascii_case("none") {
+        *current = None;
+        render::print_info("No output style from the next reply.");
+        return Some(None);
+    }
+    match styles.find(name) {
+        Some(style) => {
+            *current = Some(style.name.clone());
+            render::print_info(&format!(
+                "Output style `{}` from the next reply, for this session.",
+                style.name
+            ));
+            Some(Some(crate::styles::block(style)))
+        }
+        None => {
+            render::print_error(&format!(
+                "No style `{name}` in {}/ or ~/.incode/{}/. /style lists them.",
+                crate::styles::PROJECT_DIR,
+                crate::styles::USER_DIR
+            ));
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Bug report handler
 // ---------------------------------------------------------------------------
 
@@ -1778,6 +1858,14 @@ mod tests {
             Some(SlashCommand::Compact(Some("keep the API notes".into())))
         );
         assert_eq!(SlashCommand::parse("/bug"), Some(SlashCommand::Bug(None)));
+        assert_eq!(
+            SlashCommand::parse("/style"),
+            Some(SlashCommand::Style(None))
+        );
+        assert_eq!(
+            SlashCommand::parse("/style teacher"),
+            Some(SlashCommand::Style(Some("teacher".into())))
+        );
         assert_eq!(
             SlashCommand::parse("/feedback the footer flickers"),
             Some(SlashCommand::Bug(Some("the footer flickers".into())))

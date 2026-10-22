@@ -583,6 +583,7 @@ All optional, in `~/.incode/admin.json`:
 
 - **`notify`** — when a turn that ran longer than `notify_after_secs` (default 10) finishes, or the agent stops to ask for permission or an answer: `auto` (default) sends an OSC 9 notification on terminals known to show one (iTerm2, WezTerm, Windows Terminal, kitty, Ghostty) and a bell elsewhere; `bell`; `desktop` (`notify-send` on Linux, `osascript` on macOS, a BurntToast or WinRT toast through PowerShell on Windows, a bell when that cannot start); `off`. `notify_command` also runs, with `INCODE_EVENT` (`done` or `input`) and `INCODE_MESSAGE` set. Nothing waits on either.
 - **`statusline_command`** — run at start and after each turn with the session as JSON on stdin (`cwd`, `workspace`, `model`, `session_id`, `git_branch`, `git_dirty`, `tokens` {`input`, `output`, `cache_write`, `cache_read`, `total`}, `cost_usd`, null when a model is unpriced). Its first line replaces the facts on the input box's top rule. It gets 1.5 s; a slow or failing run keeps the last good line.
+- **`output_style`** — the [output style](#output-styles) sessions start with; `INCODE_OUTPUT_STYLE` overrides it, `/style` switches it.
 - **`editing_mode`** — `emacs` (default) or `vi`. In vi mode Esc enters normal mode (`h l w b e 0 ^ $ x X D C s S dd cc i a I A j k`) and Enter submits from either mode.
 - **`~/.incode/keybindings.toml`** — flat `"key" = "action"` lines, checked before the built-in keys. Keys: `ctrl-`, `alt-`, `shift-` plus a character, `enter`, `tab`, `esc`, `backspace`, `delete`, arrows, `home`, `end`, `space`, `f1`–`f12`. Actions: `clear-line`, `kill-to-start`, `kill-to-end`, `delete-word`, `line-start`, `line-end`, `char-left`, `char-right`, `word-left`, `word-right`, `history-prev`, `history-next`, `newline`, `submit`, `complete`.
 
@@ -685,6 +686,39 @@ fresh copy of the folder — then swaps it in, printing the old and new
 A plugin's hooks and servers run with your authority; install only what you
 would run yourself. Skills and hooks are read for the directory incode was
 started in.
+
+### Output styles
+
+An output style is a way of answering you choose: a Markdown file whose body
+the agent is told to follow in every reply, in `~/.incode/styles/<name>.md`
+(yours) or `.incode/styles/<name>.md` (this project's). **Yours wins a
+clash**: a project's styles arrive with whatever you cloned, so a repository
+cannot replace the style you named, and the prompt, `/style` and `--admin` all
+say which folder the text came from. A symbolic link is refused in either
+folder. An optional front matter gives `/style` a line to show:
+
+```markdown
+---
+description: Short answers, no preamble
+---
+Answer in three sentences or fewer. Lead with the answer.
+```
+
+- **Which one:** `INCODE_OUTPUT_STYLE`, else `"output_style": "<name>"` in
+  `~/.incode/admin.json`, else none (`off` or `none` say none on purpose).
+  `--admin` shows it and where it came from; a name no folder has is said, not
+  ignored.
+- **`/style`** lists them, `/style <name>` answers in one from the next reply,
+  `/style off` stops. It holds for that session. This is the REPL's command:
+  `--acp` runs built-in commands only from its `OFFERED` list
+  (`src/acp_agent/commands.rs`), which does not include `/style`, so an ACP
+  session keeps the style it was started with.
+- It reaches every route — the API, claude, codex and agy — and `-t` runs. It
+  goes after every other block of the prompt and says those still win: a
+  style changes how answers read, never what the agent may do. It is kept
+  when a long prompt has to be cut to fit a command line.
+- None ships with incode; a file of more than 64 KB, an empty one, or one with
+  an unknown front-matter key is left out and said so.
 
 ## Tools
 
