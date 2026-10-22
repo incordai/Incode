@@ -156,6 +156,17 @@ impl HookConfig {
             && self.stop.is_empty()
     }
 
+    /// How many commands, over every event. Used where a plugin's hooks are
+    /// shown for approval (`plugins::contents`), so none is left uncounted.
+    #[must_use]
+    pub fn count(&self) -> usize {
+        self.pre_tool_use.len()
+            + self.post_tool_use.len()
+            + self.user_prompt_submit.len()
+            + self.pre_compact.len()
+            + self.stop.len()
+    }
+
     /// `other`'s commands after these, event by event (a plugin's after the
     /// operator's).
     pub fn extend(&mut self, other: Self) {

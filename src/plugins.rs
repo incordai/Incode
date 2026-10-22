@@ -446,23 +446,29 @@ fn hooks_of(plugins: &[Plugin]) -> crate::hooks::HookConfig {
     let mut all = crate::hooks::HookConfig::default();
     for plugin in plugins {
         match plugin.hooks() {
-            // Every event, not a list of them: a field added to `HookConfig`
-            // reaches plugins without this needing to know.
-            //
-            // Except `user_prompt_submit` from a PROJECT plugin: that folder
-            // arrives with whatever was cloned, and this event runs on the
-            // first line typed, before any tool. It is taken from admin.json
-            // and the operator's own plugins only.
-            Ok(mut config) => {
-                if plugin.scope == Scope::Project && !config.user_prompt_submit.is_empty() {
+            // The operator's own plugin: every event, so a field added to
+            // `HookConfig` reaches it without this needing to know.
+            Ok(config) if plugin.scope == Scope::User => all.extend(config),
+            // A PROJECT's plugin — approved, or it would not be here — gives
+            // only the tool events, by an allowlist: an event added later is
+            // refused to it by default. Its folder arrives with whatever was
+            // cloned, and the session events (a line typed, a turn ending, a
+            // compaction) run with no tool call to weigh them against.
+            Ok(config) => {
+                let tool_only = crate::hooks::HookConfig {
+                    pre_tool_use: config.pre_tool_use.clone(),
+                    post_tool_use: config.post_tool_use.clone(),
+                    ..crate::hooks::HookConfig::default()
+                };
+                if config.count() > tool_only.count() {
                     crate::trace!(
                         "plugins",
-                        "{}: user_prompt_submit is not run from a project's plugin",
+                        "{}: a project's plugin may run only pre_tool_use and post_tool_use \
+                         hooks; its others are left out",
                         plugin.root.display()
                     );
-                    config.user_prompt_submit.clear();
                 }
-                all.extend(config);
+                all.extend(tool_only);
             }
             Err(why) => crate::trace!("plugins", "{why}"),
         }
@@ -623,7 +629,8 @@ fn contents(plugin: &Plugin) -> String {
     let skills = plugin.skills().len();
     let hooks = plugin
         .hooks()
-        .map(|h| h.pre_tool_use.len() + h.post_tool_use.len())
+        // Every event's commands: this is what an approval is shown.
+        .map(|h| h.count())
         .unwrap_or(0);
     let servers = plugin.servers().map(|s| s.len()).unwrap_or(0);
     format!("{commands} command(s), {skills} skill(s), {hooks} hook(s), {servers} MCP server(s)")
@@ -1058,7 +1065,8 @@ mod tests {
     #[test]
     fn a_project_plugins_prompt_hook_is_not_run_and_a_users_is() {
         let dir = tempfile::tempdir().expect("dir");
-        let hooks = r#"{"pre_tool_use": ["tool-check"], "user_prompt_submit": ["prompt-check"]}"#;
+        let hooks = r#"{"pre_tool_use": ["tool-check"], "user_prompt_submit": ["prompt-check"],
+            "stop": ["stop-check"], "pre_compact": ["compact-check"]}"#;
         let project = plugin(&dir.path().join("project"), "cloned", "d");
         write(&project.join("hooks.json"), hooks);
         let user = plugin(&dir.path().join("user"), "mine", "d");
@@ -1073,8 +1081,16 @@ mod tests {
             "only the user's"
         );
         assert_eq!(merged.pre_tool_use, ["tool-check", "tool-check"]);
+        // Only the tool events, by allowlist: a project's plugin gives none
+        // of the session events, now or added later.
+        assert_eq!(merged.stop, ["stop-check"], "only the user's");
+        assert_eq!(merged.pre_compact, ["compact-check"], "only the user's");
         let project_only = hooks_of(&[load_one(&project, Scope::Project).expect("project plugin")]);
-        assert!(project_only.user_prompt_submit.is_empty());
+        assert_eq!(project_only.count(), 1, "{project_only:?}");
+        assert_eq!(project_only.pre_tool_use, ["tool-check"]);
+        // What an approval is shown counts every event's commands.
+        let shown = contents(&load_one(&project, Scope::Project).expect("project plugin"));
+        assert!(shown.contains("4 hook(s)"), "{shown}");
     }
 
     #[test]
