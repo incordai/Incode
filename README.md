@@ -687,6 +687,15 @@ A plugin's hooks and servers run with your authority; install only what you
 would run yourself. Skills and hooks are read for the directory incode was
 started in.
 
+**A project's plugins must be approved.** A plugin in the workspace's
+`.incode/plugins/` arrives with whatever you cloned, so none of it — hooks,
+MCP servers, skills, commands — is used until you run `incode plugin approve
+<name>`, which approves it as its files are now (a fingerprint of every file,
+`.git` left out). Any change to it afterwards leaves it out again until you
+approve it again. A session says which were left out; `incode plugin list`
+shows each one's state. Yours in `~/.incode/plugins/` need no approval.
+Approvals are kept in `~/.incode/plugin-approvals.json`.
+
 ### Output styles
 
 An output style is a way of answering you choose: a Markdown file whose body

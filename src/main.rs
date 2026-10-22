@@ -249,7 +249,7 @@ const COMPLETION: completions::Command = {
                     Value::None,
                     "In this workspace's .incode/plugins",
                 )],
-                verbs: &["list", "add", "update", "remove", "help"],
+                verbs: &["list", "add", "update", "remove", "approve", "help"],
                 subcommands: &[],
             },
             Command {
