@@ -39,6 +39,7 @@ pub mod owner;
 pub mod parallel;
 pub mod permissions;
 pub mod plan;
+pub mod plugin_approvals;
 pub mod plugins;
 pub mod recall;
 pub mod recorder;

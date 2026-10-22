@@ -121,13 +121,29 @@ pub fn discover(workspace: &Path) -> Found {
     discover_in(Some(&project_dir(workspace)), &user_dir())
 }
 
-/// The plugins for the process's own directory — for the loaders that are
-/// not handed a workspace (skills, hooks).
+/// The plugins of `workspace` that may be USED: the operator's own, and a
+/// project's only as approved (`crate::plugin_approvals::usable`). Each one
+/// left out is a problem line saying how to approve it.
+///
+/// Every consumer of a plugin's content goes through this: `session_hooks`,
+/// `session_servers`, `session_skills` and `custom_commands::Registry::load`
+/// (whose warnings are where the left-out lines are shown, once).
 #[must_use]
-pub fn discover_here() -> Found {
+pub fn discover_usable(workspace: &Path) -> Found {
+    let found = discover(workspace);
+    let (plugins, left_out) =
+        crate::plugin_approvals::usable(&crate::admin::AdminConfig::default_dir(), found.plugins);
+    Found {
+        plugins,
+        problems: found.problems.into_iter().chain(left_out).collect(),
+    }
+}
+
+/// [`discover_usable`] for the process's own directory.
+fn usable_here() -> Vec<Plugin> {
     match std::env::current_dir() {
-        Ok(cwd) => discover(&cwd),
-        Err(_) => discover_in(None, &user_dir()),
+        Ok(cwd) => discover_usable(&cwd).plugins,
+        Err(_) => discover_in(None, &user_dir()).plugins,
     }
 }
 
@@ -415,18 +431,14 @@ impl Plugin {
 /// Every plugin's skills, for the process's own directory.
 #[must_use]
 pub fn session_skills() -> Vec<crate::skills::Skill> {
-    discover_here()
-        .plugins
-        .iter()
-        .flat_map(Plugin::skills)
-        .collect()
+    usable_here().iter().flat_map(Plugin::skills).collect()
 }
 
 /// Every plugin's hook commands, for the process's own directory. A plugin
 /// whose `hooks.json` does not parse contributes none, and is traced.
 #[must_use]
 pub fn session_hooks() -> crate::hooks::HookConfig {
-    hooks_of(&discover_here().plugins)
+    hooks_of(&usable_here())
 }
 
 /// The hook commands of `plugins`, merged in order.
@@ -464,7 +476,9 @@ fn hooks_of(plugins: &[Plugin]) -> crate::hooks::HookConfig {
 pub(crate) fn session_servers(workspace: &Path) -> (Vec<crate::toolbox::ServerSpec>, Vec<String>) {
     let mut specs = Vec::new();
     let mut said = Vec::new();
-    for plugin in discover(workspace).plugins {
+    // Unapproved project plugins are left out here and SAID by
+    // `custom_commands::Registry::load`, so the line appears once.
+    for plugin in discover_usable(workspace).plugins {
         match plugin.servers() {
             Ok(found) => specs.extend(found),
             Err(why) => said.push(format!("plugin `{}`: {why}", plugin.manifest.name)),
@@ -483,6 +497,12 @@ USAGE:
     incode plugin add <git-url | path> [--project]
     incode plugin update [name] [--project]
     incode plugin remove <name> [--project]
+    incode plugin approve <name>
+
+`approve` lets a plugin in this workspace's .incode/plugins/ be used, as its
+files are now: until then its hooks, servers, skills and commands are left
+out, and any change to it needs approving again. Yours in ~/.incode/plugins/
+need no approval.
 
 `update` fetches a plugin again from where it was added: a fresh clone of
 its git URL, or a fresh copy of its folder. With no name, every plugin in
@@ -520,9 +540,36 @@ pub fn cli(args: &[String], workspace: &Path) -> Result<String, String> {
         ["remove", name] | ["rm", name] => {
             remove(name, &target).map(|path| format!("removed {}", path.display()))
         }
+        ["approve", name] => approve_named(
+            name,
+            &discover(workspace),
+            &crate::admin::AdminConfig::default_dir(),
+        ),
         ["-h"] | ["--help"] | ["help"] => Ok(USAGE.to_string()),
         _ => Err(USAGE.to_string()),
     }
+}
+
+/// `incode plugin approve <name>`: approve the project's plugin `name` as its
+/// files are now (`crate::plugin_approvals`).
+fn approve_named(name: &str, found: &Found, data_dir: &Path) -> Result<String, String> {
+    let Some(plugin) = found.plugins.iter().find(|p| p.manifest.name == name) else {
+        return Err(format!(
+            "no plugin `{name}` here; `incode plugin list` lists them"
+        ));
+    };
+    if plugin.scope == Scope::User {
+        return Ok(format!(
+            "`{name}` is yours ({}): it needs no approval",
+            plugin.root.display()
+        ));
+    }
+    crate::plugin_approvals::approve(data_dir, plugin)?;
+    Ok(format!(
+        "approved `{name}` as its files are now ({}); a change to it needs approving again\n{}",
+        plugin.root.display(),
+        contents(plugin)
+    ))
 }
 
 /// What `incode plugin list` prints.
@@ -532,10 +579,23 @@ pub fn listing(found: &Found) -> String {
     if found.plugins.is_empty() {
         out.push_str("No plugins installed.\n");
     }
+    let data_dir = crate::admin::AdminConfig::default_dir();
     for plugin in &found.plugins {
         let m = &plugin.manifest;
+        let approval = match crate::plugin_approvals::state(&data_dir, plugin) {
+            crate::plugin_approvals::State::Own => String::new(),
+            crate::plugin_approvals::State::Approved => "    approved as it is\n".to_string(),
+            crate::plugin_approvals::State::NotApproved => format!(
+                "    NOT APPROVED, so not used — `incode plugin approve {}` once you have \
+                 read it\n",
+                m.name
+            ),
+            crate::plugin_approvals::State::Unknown(why) => {
+                format!("    approval could not be checked: {why}\n")
+            }
+        };
         out.push_str(&format!(
-            "{} {} ({}) — {}\n    {}\n    {}\n",
+            "{} {} ({}) — {}\n    {}\n    {}\n{approval}",
             m.name,
             if m.version.is_empty() {
                 "-"
@@ -935,6 +995,59 @@ mod tests {
         assert_eq!(found.problems.len(), 2, "{:?}", found.problems);
         assert!(found.problems.iter().any(|p| p.contains("shadowed")));
         assert!(found.problems.iter().any(|p| p.contains("broken")));
+    }
+
+    /// **A CLONED REPOSITORY'S PLUGIN IS NOT USED UNTIL APPROVED.** Through
+    /// the real gate (`discover_usable`, the data dir pointed at a temp
+    /// folder): left out and said, used once `plugin approve` is run, left
+    /// out again when its hooks change. The operator's own is used as is.
+    #[test]
+    fn a_project_plugin_is_used_only_once_approved_as_it_is() {
+        let ws = tempfile::tempdir().expect("ws");
+        let data = tempfile::tempdir().expect("data");
+        let root = plugin(&project_dir(ws.path()), "cloned", "d");
+        write(&root.join("hooks.json"), r#"{"pre_tool_use": ["check"]}"#);
+        let mine = plugin(&data.path().join(PLUGINS_DIR), "mine", "d");
+        write(&mine.join("hooks.json"), r#"{"pre_tool_use": ["mine"]}"#);
+
+        let _guard = crate::brief::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var_os(crate::admin::DATA_DIR_ENV);
+        std::env::set_var(crate::admin::DATA_DIR_ENV, data.path());
+        let names = |found: &Found| -> Vec<String> {
+            found
+                .plugins
+                .iter()
+                .map(|p| p.manifest.name.clone())
+                .collect()
+        };
+
+        let before = discover_usable(ws.path());
+        let left_out = before.problems.join("\n");
+        let approved = approve_named("cloned", &discover(ws.path()), data.path());
+        let after = discover_usable(ws.path());
+        write(
+            &root.join("hooks.json"),
+            r#"{"pre_tool_use": ["curl evil"]}"#,
+        );
+        let changed = discover_usable(ws.path());
+        let mine_needs_none = approve_named("mine", &discover(ws.path()), data.path());
+
+        match saved {
+            Some(value) => std::env::set_var(crate::admin::DATA_DIR_ENV, value),
+            None => std::env::remove_var(crate::admin::DATA_DIR_ENV),
+        }
+        assert_eq!(names(&before), ["mine"]);
+        assert!(
+            left_out.contains("incode plugin approve cloned"),
+            "{left_out}"
+        );
+        assert!(approved.expect("approve").starts_with("approved `cloned`"));
+        assert_eq!(names(&after), ["cloned", "mine"]);
+        assert_eq!(names(&changed), ["mine"], "a changed plugin was still used");
+        assert!(mine_needs_none.expect("own").contains("needs no approval"));
+        assert!(approve_named("nope", &discover(ws.path()), data.path()).is_err());
     }
 
     /// **A CLONED REPOSITORY'S PLUGIN DOES NOT CHECK YOUR PROMPTS.** A

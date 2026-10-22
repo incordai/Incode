@@ -139,7 +139,9 @@ impl Registry {
     /// The commands for this workspace, this operator and their plugins.
     #[must_use]
     pub fn load(workspace: &Path) -> Self {
-        let plugins = crate::plugins::discover(workspace);
+        // Only plugins that may be used (a project's must be approved); the
+        // ones left out arrive as problems and are said with the warnings.
+        let plugins = crate::plugins::discover_usable(workspace);
         let mut registry = Self::load_from(
             &workspace.join(PROJECT_DIR),
             &crate::admin::AdminConfig::default_dir().join(USER_DIR),
