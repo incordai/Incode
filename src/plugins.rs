@@ -426,12 +426,32 @@ pub fn session_skills() -> Vec<crate::skills::Skill> {
 /// whose `hooks.json` does not parse contributes none, and is traced.
 #[must_use]
 pub fn session_hooks() -> crate::hooks::HookConfig {
+    hooks_of(&discover_here().plugins)
+}
+
+/// The hook commands of `plugins`, merged in order.
+fn hooks_of(plugins: &[Plugin]) -> crate::hooks::HookConfig {
     let mut all = crate::hooks::HookConfig::default();
-    for plugin in discover_here().plugins {
+    for plugin in plugins {
         match plugin.hooks() {
             // Every event, not a list of them: a field added to `HookConfig`
             // reaches plugins without this needing to know.
-            Ok(config) => all.extend(config),
+            //
+            // Except `user_prompt_submit` from a PROJECT plugin: that folder
+            // arrives with whatever was cloned, and this event runs on the
+            // first line typed, before any tool. It is taken from admin.json
+            // and the operator's own plugins only.
+            Ok(mut config) => {
+                if plugin.scope == Scope::Project && !config.user_prompt_submit.is_empty() {
+                    crate::trace!(
+                        "plugins",
+                        "{}: user_prompt_submit is not run from a project's plugin",
+                        plugin.root.display()
+                    );
+                    config.user_prompt_submit.clear();
+                }
+                all.extend(config);
+            }
             Err(why) => crate::trace!("plugins", "{why}"),
         }
     }
@@ -915,6 +935,33 @@ mod tests {
         assert_eq!(found.problems.len(), 2, "{:?}", found.problems);
         assert!(found.problems.iter().any(|p| p.contains("shadowed")));
         assert!(found.problems.iter().any(|p| p.contains("broken")));
+    }
+
+    /// **A CLONED REPOSITORY'S PLUGIN DOES NOT CHECK YOUR PROMPTS.** A
+    /// project plugin's `user_prompt_submit` is dropped — that folder comes
+    /// with whatever was cloned, and the event runs on the first line typed —
+    /// while the operator's own plugin's is kept, and the project's tool hooks
+    /// are merged as before.
+    #[test]
+    fn a_project_plugins_prompt_hook_is_not_run_and_a_users_is() {
+        let dir = tempfile::tempdir().expect("dir");
+        let hooks = r#"{"pre_tool_use": ["tool-check"], "user_prompt_submit": ["prompt-check"]}"#;
+        let project = plugin(&dir.path().join("project"), "cloned", "d");
+        write(&project.join("hooks.json"), hooks);
+        let user = plugin(&dir.path().join("user"), "mine", "d");
+        write(&user.join("hooks.json"), hooks);
+        let merged = hooks_of(&[
+            load_one(&project, Scope::Project).expect("project plugin"),
+            load_one(&user, Scope::User).expect("user plugin"),
+        ]);
+        assert_eq!(
+            merged.user_prompt_submit,
+            ["prompt-check"],
+            "only the user's"
+        );
+        assert_eq!(merged.pre_tool_use, ["tool-check", "tool-check"]);
+        let project_only = hooks_of(&[load_one(&project, Scope::Project).expect("project plugin")]);
+        assert!(project_only.user_prompt_submit.is_empty());
     }
 
     #[test]

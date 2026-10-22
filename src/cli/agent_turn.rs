@@ -593,9 +593,7 @@ impl AgentSession {
         Ok(ran
             .messages()
             .iter()
-            .map(|said| {
-                format!("<operator-hook event=\"UserPromptSubmit\">\n{said}\n</operator-hook>")
-            })
+            .map(|said| crate::hooks::prompt_context_block(said))
             .collect())
     }
 
