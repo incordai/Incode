@@ -32,9 +32,46 @@ from .events import (
 )
 from .fs import INTERNAL_ERROR, INVALID_PARAMS, RESOURCE_NOT_FOUND, FsError, WorkspaceFS
 
-__all__ = ["Session", "PromptStream", "reject_all", "allow_all", "PROTOCOL_VERSION"]
+__all__ = ["Session", "PromptStream", "SessionInfo", "reject_all", "allow_all", "PROTOCOL_VERSION"]
 
 PROTOCOL_VERSION = 1
+
+
+class SessionInfo:
+    """One session incode kept, as ``session/list`` names it (src/acp_agent
+    ``history::list_in``): ``session_id`` to pass to ``Session.load``, the
+    workspace it ran in (``cwd``), its ``title`` (its first line) and when it
+    was last ``updated_at`` (RFC 3339), either of those ``None`` when incode
+    did not say. ``raw`` is the object as sent."""
+
+    __slots__ = ("session_id", "cwd", "title", "updated_at", "raw")
+
+    def __init__(self, session_id: str, cwd: str, title: Optional[str], updated_at: Optional[str], raw: Dict[str, Any]):
+        self.session_id = session_id
+        self.cwd = cwd
+        self.title = title
+        self.updated_at = updated_at
+        self.raw = raw
+
+    @classmethod
+    def from_json(cls, data: Mapping[str, Any]) -> "SessionInfo":
+        title = data.get("title")
+        updated = data.get("updatedAt")
+        return cls(
+            session_id=str(data.get("sessionId") or ""),
+            cwd=str(data.get("cwd") or ""),
+            title=title if isinstance(title, str) else None,
+            updated_at=updated if isinstance(updated, str) else None,
+            raw=dict(data),
+        )
+
+    def __repr__(self) -> str:
+        return "SessionInfo(session_id=%r, cwd=%r, title=%r, updated_at=%r)" % (
+            self.session_id,
+            self.cwd,
+            self.title,
+            self.updated_at,
+        )
 METHOD_NOT_FOUND = -32601
 STDERR_TAIL_BYTES = 64 * 1024
 
@@ -462,8 +499,19 @@ class Session:
         return self.config_options
 
     def list_sessions(self) -> List[Dict[str, Any]]:
-        """``session/list`` for this workspace."""
+        """``session/list`` for this workspace, as incode answered it."""
         return list(self.request("session/list", {"cwd": self.workspace}).get("sessions") or [])
+
+    def sessions(self, all_workspaces: bool = False) -> List["SessionInfo"]:
+        """The sessions incode has kept, as :class:`SessionInfo`: this
+        workspace's, or with ``all_workspaces`` every workspace an ACP session
+        was recorded in. Most recently updated first. A session listed here
+        can be reopened with ``Session.load``."""
+        params: Dict[str, Any] = {} if all_workspaces else {"cwd": self.workspace}
+        listed = self.request("session/list", params).get("sessions") or []
+        infos = [SessionInfo.from_json(item) for item in listed if isinstance(item, dict)]
+        infos.sort(key=lambda info: info.updated_at or "", reverse=True)
+        return infos
 
     # ------------------------------------------------------------ reader side
 

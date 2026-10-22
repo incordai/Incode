@@ -145,6 +145,7 @@ class Agent:
         self.waiting = {}  # request id -> queue for the client's answer
         self.waiting_lock = threading.Lock()
         self.sessions = {}  # id -> dict(mode, agent, role, cancel Event, busy)
+        self.cwds = {}  # id of a session/new -> its cwd, for session/list
 
     # -- output
     def write_raw(self, text):
@@ -280,6 +281,7 @@ class Agent:
             return
         sid = "fake-session-%d" % (len(self.sessions) + 1)
         s = self.open_session(sid, START_MODE)
+        self.cwds[sid] = params["cwd"]
         self.respond(rid, self.session_answer(sid, s))
         self.update(
             sid,
@@ -288,6 +290,23 @@ class Agent:
                 "availableCommands": [{"name": "run", "description": "Work the ledger"}],
             },
         )
+
+    def m_session_list(self, rid, params):
+        """``session/list``, as src/acp_agent does: the sessions kept in
+        ``cwd``, or with none named every session this process opened. The
+        loadable ``kept-session`` is kept in whichever ``cwd`` is asked about."""
+        cwd = params.get("cwd")
+        sessions = [
+            {"sessionId": sid, "cwd": where, "title": "fake work", "updatedAt": "2026-10-22T12:00:00Z"}
+            for sid, where in self.cwds.items()
+            if cwd is None or where == cwd
+        ]
+        if cwd is not None:
+            sessions.insert(
+                0,
+                {"sessionId": "kept-session", "cwd": cwd, "title": "an earlier session", "updatedAt": "2026-10-21T09:00:00Z"},
+            )
+        self.respond(rid, {"sessions": sessions})
 
     def m_session_load(self, rid, params):
         if not self.check_cwd(rid, params):

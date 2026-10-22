@@ -30,7 +30,7 @@ from .events import (  # noqa: E402
     WriteFileRequest,
 )
 from .fs import FsAccessDenied, FsError, WorkspaceFS  # noqa: E402
-from .session import PromptStream, Session, allow_all, reject_all  # noqa: E402
+from .session import PromptStream, Session, SessionInfo, allow_all, reject_all  # noqa: E402
 from .task import TaskEvent, TaskResult, TaskStream, TaskUsage, run_task, stream_task  # noqa: E402
 
 __all__ = [
@@ -42,6 +42,7 @@ __all__ = [
     "TaskResult",
     "TaskUsage",
     "Session",
+    "SessionInfo",
     "PromptStream",
     "allow_all",
     "reject_all",
