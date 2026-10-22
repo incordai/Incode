@@ -54,16 +54,35 @@ pub fn names_loopback(url: &str) -> bool {
 /// The base every outbound client is built from: the operator's extra CA
 /// certificates added, and, for a client that only talks to this machine
 /// (`loopback`), no proxy. See the module docs.
+///
+/// A client with no proxy follows a redirect only while it STAYS on this
+/// machine: one that led elsewhere would be fetched without the proxy, past
+/// whatever the proxy is there to enforce. A caller that follows none sets
+/// its own policy over this one.
 pub fn builder(loopback: bool) -> reqwest::ClientBuilder {
     let mut builder = reqwest::Client::builder();
     for certificate in EXTRA_ROOTS.iter() {
         builder = builder.add_root_certificate(certificate.clone());
     }
     if loopback {
-        builder = builder.no_proxy();
+        builder = builder
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                if !is_loopback(attempt.url()) {
+                    attempt.error("a redirect from this machine to another is not followed")
+                } else if attempt.previous().len() >= MAX_LOCAL_REDIRECTS {
+                    attempt.stop()
+                } else {
+                    attempt.follow()
+                }
+            }));
     }
     builder
 }
+
+/// How many redirects a client for this machine follows, as reqwest's own
+/// default does.
+const MAX_LOCAL_REDIRECTS: usize = 10;
 
 /// The operator's extra certificate authorities, read once.
 static EXTRA_ROOTS: LazyLock<Vec<reqwest::Certificate>> = LazyLock::new(|| {
@@ -293,6 +312,47 @@ mod tests {
         ] {
             assert!(!names_loopback(url), "{url}");
         }
+    }
+
+    /// **THE CLIENT IS CHOSEN FOR EACH ADDRESS**: one on this machine gets
+    /// the direct client, anything else the proxied one — so a caller that
+    /// reaches two hosts must ask for each (`mcp_oauth::fetch_json`).
+    #[test]
+    fn the_client_is_chosen_by_the_address_it_is_for() {
+        let local = "http://127.0.0.1:9180/x";
+        let remote = "https://auth.example.com/.well-known/oauth-authorization-server";
+        assert!(std::ptr::eq(client_for(local), &*SHARED_DIRECT));
+        assert!(std::ptr::eq(client_for(remote), &*SHARED_CLIENT));
+        let (Ok(direct), Ok(proxied)) = (no_redirect_client(local), no_redirect_client(remote))
+        else {
+            panic!("no client");
+        };
+        assert!(!std::ptr::eq(direct, proxied));
+        assert!(std::ptr::eq(
+            direct,
+            no_redirect_client("http://localhost/").expect("client")
+        ));
+    }
+
+    /// **A CLIENT FOR THIS MACHINE DOES NOT FOLLOW A REDIRECT OFF IT**: it
+    /// has no proxy, so following would reach the other host past the proxy.
+    #[test]
+    fn a_redirect_from_this_machine_to_another_is_not_followed() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            if let Some(Ok(mut stream)) = listener.incoming().next() {
+                read_head(&mut stream);
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 302 Found\r\nlocation: http://incode-redirect-probe.invalid/\r\n\
+                     content-length: 0\r\nconnection: close\r\n\r\n"
+                );
+            }
+        });
+        let url = format!("http://127.0.0.1:{port}/");
+        let said = request_text(move |c| c.get(&url), "test service").expect_err("redirected");
+        assert!(said.contains("is not followed"), "{said}");
     }
 
     /// A private certificate authority and a server certificate for

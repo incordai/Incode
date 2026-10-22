@@ -461,9 +461,11 @@ pub(crate) struct Discovered {
     pub(crate) scopes: Vec<String>,
 }
 
-/// A JSON document at `url`: `None` for an answer that is not a success.
-async fn fetch_json(client: &reqwest::Client, url: &str) -> Result<Option<String>, String> {
-    let response = client
+/// A JSON document at `url`: `None` for an answer that is not a success. The
+/// client is chosen for `url` itself — metadata can live on another host than
+/// the server, and only an address on this machine skips the proxy.
+async fn fetch_json(url: &str) -> Result<Option<String>, String> {
+    let response = crate::runtime::http::no_redirect_client(url)?
         .get(url)
         .header(ACCEPT, "application/json")
         .timeout(HTTP_BOUND)
@@ -495,6 +497,7 @@ async fn read_bounded(mut response: reqwest::Response) -> Result<String, String>
 /// Find the authorization server for the MCP server at `server`.
 async fn discover(server: String) -> Result<Discovered, String> {
     checked(&server, "the server's address")?;
+    // For the server only: each metadata document picks its own (`fetch_json`).
     let client = crate::runtime::http::no_redirect_client(&server)?;
     let hello = json!({"jsonrpc": "2.0", "id": 0, "method": "initialize",
                        "params": {"protocolVersion": crate::mcp_stdio::PROTOCOL_VERSION,
@@ -530,7 +533,7 @@ async fn discover(server: String) -> Result<Discovered, String> {
     candidates.extend(resource_metadata_candidates(&server)?);
     let mut resource_metadata = None;
     for candidate in &candidates {
-        if let Some(text) = fetch_json(client, candidate).await? {
+        if let Some(text) = fetch_json(candidate).await? {
             resource_metadata = Some(parse_resource_metadata(&text, &server)?);
             break;
         }
@@ -561,7 +564,7 @@ async fn discover(server: String) -> Result<Discovered, String> {
         }
     };
     for candidate in as_metadata_candidates(&issuer)? {
-        if let Some(text) = fetch_json(client, &candidate).await? {
+        if let Some(text) = fetch_json(&candidate).await? {
             return Ok(Discovered {
                 server: parse_server_metadata(&text, &issuer)?,
                 resource,
