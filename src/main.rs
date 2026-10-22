@@ -2283,6 +2283,18 @@ mod tests {
             .find(|candidate| candidate.is_file())
     }
 
+    /// A shell test with no shell to run: skipped, and said — unless
+    /// `INCODE_TEST_SHELLS` (CI sets it per runner) lists that shell, when a
+    /// skip would hide that the script was never run, so it fails.
+    fn skip(test: &str, shell: &str) {
+        let required = std::env::var("INCODE_TEST_SHELLS").unwrap_or_default();
+        assert!(
+            !required.split(',').any(|s| s.trim() == shell),
+            "{test}: {shell} is required here (INCODE_TEST_SHELLS={required}) and was not found"
+        );
+        eprintln!("{test}: SKIPPED (no {shell})");
+    }
+
     fn script_for(shell: completions::Shell) -> String {
         completions::script(shell, &COMPLETION).expect("a script")
     }
@@ -2291,7 +2303,7 @@ mod tests {
     #[test]
     fn bash_completes_from_the_table() {
         let Some(bash) = shell_program("bash") else {
-            eprintln!("bash_completes_from_the_table: SKIPPED (no bash)");
+            skip("bash_completes_from_the_table", "bash");
             return;
         };
         let dir = tempfile::tempdir().expect("empty dir");
@@ -2312,7 +2324,7 @@ mod tests {
     #[test]
     fn powershell_completes_from_the_table() {
         let Some(program) = shell_program("pwsh").or_else(|| shell_program("powershell")) else {
-            eprintln!("powershell_completes_from_the_table: SKIPPED (no PowerShell)");
+            skip("powershell_completes_from_the_table", "powershell");
             return;
         };
         let dir = tempfile::tempdir().expect("empty dir");
@@ -2349,7 +2361,7 @@ mod tests {
     #[test]
     fn fish_completes_from_the_table() {
         let Some(fish) = shell_program("fish") else {
-            eprintln!("fish_completes_from_the_table: SKIPPED (no fish)");
+            skip("fish_completes_from_the_table", "fish");
             return;
         };
         let dir = tempfile::tempdir().expect("empty dir");
@@ -2374,7 +2386,7 @@ mod tests {
     #[test]
     fn zsh_completes_from_the_table() {
         let Some(zsh) = shell_program("zsh") else {
-            eprintln!("zsh_completes_from_the_table: SKIPPED (no zsh)");
+            skip("zsh_completes_from_the_table", "zsh");
             return;
         };
         let dir = tempfile::tempdir().expect("empty dir");

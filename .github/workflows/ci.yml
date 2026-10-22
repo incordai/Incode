@@ -84,7 +84,11 @@ jobs:
           git config --global user.name "ci"
       - run: cargo clippy --all-targets
       - run: cargo test --lib
+      # The completion tests skip a shell that is missing; here every shell
+      # the runner has is required, so a skip cannot pass for a run.
       - run: cargo test --bins
+        env:
+          INCODE_TEST_SHELLS: ${{ runner.os == 'Linux' && 'bash,fish,zsh,powershell' || runner.os == 'macOS' && 'bash,zsh,powershell' || 'bash,powershell' }}
       # incode's commands under `sandbox_engine = "sbx"`, for real (Linux;
       # it says it skipped elsewhere).
       - run: cargo test --test sbx_engine
