@@ -24,6 +24,47 @@ fn every_advertised_tool_can_actually_be_run() {
     }
 }
 
+/// **EVERY CALL IS COUNTED BY WHAT WAS DECIDED, NOT BY HOW IT ENDED**
+/// (`crate::telemetry`): refused before it ran is `denied`; ran is
+/// `allowed`, a read of a missing file included — the tool ran and failed.
+#[test]
+fn a_tool_call_is_counted_allowed_when_it_ran_and_denied_when_refused() {
+    let dir = tempfile::tempdir().expect("tmp");
+    std::fs::write(dir.path().join("here.txt"), "hi").expect("write");
+    let mut tools = toolbox(dir.path());
+    tools.restrict_tools(vec!["Read".to_string()]);
+    let ((), metrics, _) = crate::telemetry::tests::captured(|| {
+        tools
+            .run("Write", &json!({"path": "x.txt", "content": "no"}))
+            .expect_err("Write is not in this toolbox's list");
+        tools
+            .run("Read", &json!({"path": "here.txt"}))
+            .expect("read");
+        tools
+            .run("Read", &json!({"path": "missing.txt"}))
+            .expect_err("no such file");
+    });
+    let metrics = metrics.expect("calls were counted");
+    let count = |tool, outcome| {
+        crate::telemetry::tests::sum_of(
+            &metrics,
+            "incode.tool.calls",
+            &[("tool", tool), ("outcome", outcome)],
+        )
+    };
+    assert_eq!(count("Write", "denied"), 1.0, "{metrics}");
+    assert_eq!(count("Read", "allowed"), 2.0, "{metrics}");
+    assert_eq!(
+        count("Read", "denied"),
+        0.0,
+        "a failed read is not a refusal"
+    );
+    assert!(
+        !std::path::Path::new(&dir.path().join("x.txt")).exists(),
+        "the refused write ran"
+    );
+}
+
 #[test]
 fn an_unknown_tool_is_an_error_the_model_can_read() {
     let dir = tempfile::tempdir().expect("tmp");

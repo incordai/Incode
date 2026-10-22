@@ -350,6 +350,11 @@ pub struct AdminConfig {
         skip_serializing_if = "crate::permissions::rules::RuleLists::is_empty"
     )]
     pub permissions: crate::permissions::rules::RuleLists,
+    /// Export usage to an OpenTelemetry collector ([`crate::telemetry`]):
+    /// `true` turns it on (as `INCODE_TELEMETRY=1` does), given an
+    /// `OTEL_EXPORTER_OTLP_ENDPOINT`. Off when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry: Option<bool>,
 }
 
 /// One service that serves API agents and lists them on request.
@@ -1133,6 +1138,10 @@ impl AdminConfig {
             codex_tools.value.as_str(),
             codex_tools.source.as_str()
         ));
+        out.push_str(&format!(
+            "  telemetry      {}\n",
+            crate::telemetry::describe(self.telemetry)
+        ));
 
         let env_style = std::env::var(crate::styles::ENV).ok();
         out.push_str(&match crate::styles::chosen(
@@ -1631,6 +1640,8 @@ mod tests {
                 ask: vec!["Bash(git push:*)".to_string()],
                 deny: vec!["Read(.env)".to_string()],
             },
+            // Telemetry the owner turned on must stay on.
+            telemetry: Some(true),
         };
         admin.save(dir.path()).expect("saves");
 

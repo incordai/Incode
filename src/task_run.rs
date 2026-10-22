@@ -463,6 +463,10 @@ fn run_task_hooked(
         }
         None => Vec::new(),
     };
+    // The operator's collector, when telemetry is on (`crate::telemetry`).
+    crate::telemetry::session_started("task");
+    crate::telemetry::user_prompt(instruction);
+    let begun = std::time::Instant::now();
     // The owner's installed external tools, started as MCP servers now, in
     // the background, so they connect while the memory session opens.
     let tools = connect_ext_tools(workspace);
@@ -548,6 +552,15 @@ fn run_task_hooked(
     let ran = drive(&task, &mut memory, report);
     memory.end("other");
     operator_end();
+    // The run is one turn. Exported now, before this process ends: a thread
+    // of its own would end with it.
+    let model = report
+        .model
+        .clone()
+        .or_else(|| report.agent.clone())
+        .unwrap_or_default();
+    crate::telemetry::turn_finished(&model, &report.spent(), begun.elapsed().as_secs_f64());
+    crate::telemetry::export_now();
     ran
 }
 

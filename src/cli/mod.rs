@@ -78,6 +78,7 @@ impl CliApp {
         // makes one for each `session/new`.
         let session_id = uuid::Uuid::new_v4().to_string();
         let mut prepared = prepare_session(&self.config, cancel.clone(), booted_at, &session_id)?;
+        crate::telemetry::session_started("repl");
         connect_ext_tools(&prepared);
         // Someone is at the keyboard only when both ends are a terminal; piped,
         // a mid-turn question would wait on input nobody can give.
@@ -1854,6 +1855,9 @@ pub(crate) fn plan_turn(
         Ok(added) => added,
         Err(why) => return TurnPlan::Refused(why),
     };
+    // Its length to the operator's collector; its text only when they asked
+    // for prompts (`crate::telemetry`).
+    crate::telemetry::user_prompt(line);
     match session.memory_prompt(line) {
         Some(block) => context.push(block),
         None => {

@@ -62,6 +62,7 @@ pub mod subagents;
 pub mod task_run;
 pub mod team;
 pub mod team_mcp;
+pub mod telemetry;
 pub mod text;
 pub mod tool_bridge;
 pub mod toolbox;

@@ -971,6 +971,7 @@ impl ApiBackend {
         match self.compact_with(transport, "", super::compact::KEEP_TURNS) {
             Ok(Some(done)) => {
                 crate::trace!("compact", "{}", done.describe());
+                crate::telemetry::compaction("auto", done.tokens_before, done.tokens_after);
                 // Shown apart from the reply, and never heard by the
                 // transcript or the stop hook: it is the harness speaking.
                 on_event(&AgentEvent::Thinking(format!(
@@ -1371,7 +1372,10 @@ impl AgentBackend for ApiBackend {
             .map_err(|e| e.to_string())
             .and_then(|transport| self.compact_with(&transport, instructions, 0));
         Some(ran.map(|done| match done {
-            Some(done) => done.describe(),
+            Some(done) => {
+                crate::telemetry::compaction("manual", done.tokens_before, done.tokens_after);
+                done.describe()
+            }
             None => "Nothing to compact yet: the conversation is empty.".to_string(),
         }))
     }

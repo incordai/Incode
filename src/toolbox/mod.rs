@@ -468,6 +468,13 @@ enum Gate {
 /// characters. The whole reason is still the call's result.
 const MAX_DECISION_REASON_CHARS: usize = 500;
 
+thread_local! {
+    /// Set when the call [`Toolbox::run_call`] is deciding reaches the tool
+    /// itself: every gate passed. Read by `run_call` to count it `allowed` or
+    /// `denied` (`crate::telemetry`).
+    static CALL_RAN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Why the operator's guards refused a call: the reason the model is told,
 /// and the protected pattern and the path when one matched.
 struct Refusal {
@@ -1339,6 +1346,14 @@ impl Toolbox {
             "tool",
             "{name}: protected `{rule}` put to a person: {answer:?}"
         );
+        crate::telemetry::permission_prompt(
+            name,
+            match &answer {
+                Some(crate::hooks::engine::Verdict::Allow) => "allow",
+                Some(crate::hooks::engine::Verdict::Deny(_)) => "deny",
+                None => "unanswered",
+            },
+        );
         answer
     }
 
@@ -1650,7 +1665,27 @@ impl Toolbox {
     /// [`Self::run`], for the call the model numbered `call_id` — the id a
     /// person is shown if the call has to be confirmed — with the answer's
     /// pictures kept, for a caller that can send them on.
+    ///
+    /// Its outcome goes to the operator's collector when telemetry is on
+    /// (`crate::telemetry::tool_call`): `allowed` when every gate passed and
+    /// the tool ran (however it then ended), `denied` when one refused it.
     pub fn run_call(&self, call_id: &str, name: &str, input: &Value) -> Result<ToolOutput, String> {
+        // Saved and put back, so a sub-agent's calls made inside this one
+        // (on this thread) cannot change how this one is counted.
+        let outer = CALL_RAN.with(|ran| ran.replace(false));
+        let result = self.decide_and_run(call_id, name, input);
+        let ran = CALL_RAN.with(|ran| ran.replace(outer));
+        crate::telemetry::tool_call(name, if ran { "allowed" } else { "denied" });
+        result
+    }
+
+    /// Every gate, then the tool: [`Self::run_call`]'s body.
+    fn decide_and_run(
+        &self,
+        call_id: &str,
+        name: &str,
+        input: &Value,
+    ) -> Result<ToolOutput, String> {
         // A name nobody classified is not a tool: refused before a guard, a
         // person or the engine is asked about it. A tool of the client's MCP
         // servers RUNS something nobody here can inspect, so it is `run`:
@@ -1860,6 +1895,8 @@ impl Toolbox {
                 },
             );
         }
+        // Every gate passed: the call RUNS, whatever it then returns.
+        CALL_RAN.with(|ran| ran.set(true));
         let outcome = self.dispatch(call_id, name, input, reach);
         // Confirmed or cancelled as it came out; a read recorded once it was
         // shown, so the next write's check knows what this session saw.
@@ -2149,11 +2186,19 @@ impl Toolbox {
                 .as_ref()
                 .is_some_and(crate::runtime::cancel::CancelToken::is_cancelled)
         };
-        match self
+        let answer = self
             .prompter
             .as_ref()
-            .and_then(|p| p.confirm(&ask, &stopped))
-        {
+            .and_then(|p| p.confirm(&ask, &stopped));
+        crate::telemetry::permission_prompt(
+            name,
+            match &answer {
+                Some(crate::hooks::engine::Verdict::Allow) => "allow",
+                Some(crate::hooks::engine::Verdict::Deny(_)) => "deny",
+                None => "unanswered",
+            },
+        );
+        match answer {
             Some(crate::hooks::engine::Verdict::Allow) => Ok(()),
             Some(crate::hooks::engine::Verdict::Deny(why)) => Err(why),
             None => Err(format!("NOT RUN — {reason}, and nobody could be asked.")),
