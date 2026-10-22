@@ -7,8 +7,8 @@
 
 export { AcpError, AgentCrashed, IncodeError, IncodeTimeout, ProtocolError, TaskFailed } from "./errors.js";
 export type { ErrorDetails } from "./errors.js";
-export { buildTaskArgv, parseTaskResult, runTask } from "./task.js";
-export type { IncodePath, RunTaskOptions, TaskResult, TaskUsage } from "./task.js";
+export { buildTaskArgv, parseTaskResult, runTask, streamTask } from "./task.js";
+export type { IncodePath, RunTaskOptions, TaskEvent, TaskResult, TaskStream, TaskUsage } from "./task.js";
 export { parseUpdate, PermissionRequest } from "./events.js";
 export type {
   AvailableCommands,

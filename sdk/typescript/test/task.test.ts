@@ -3,7 +3,16 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 
-import { buildTaskArgv, IncodeError, IncodeTimeout, parseTaskResult, ProtocolError, runTask, TaskFailed } from "../src/index.js";
+import {
+  buildTaskArgv,
+  IncodeError,
+  IncodeTimeout,
+  parseTaskResult,
+  ProtocolError,
+  runTask,
+  streamTask,
+  TaskFailed,
+} from "../src/index.js";
 import { FAKE, tempDirs, type TempDirs } from "./support.js";
 
 describe("runTask", () => {
@@ -113,5 +122,58 @@ describe("runTask", () => {
 
   it("builds the argv", () => {
     assert.deepEqual(buildTaskArgv("hi"), ["incode", "-t", "hi", "--output-format", "json"]);
+    assert.deepEqual(buildTaskArgv("hi", {}, "stream-json"), ["incode", "-t", "hi", "--output-format", "stream-json"]);
+  });
+});
+
+describe("streamTask", () => {
+  let dirs: TempDirs;
+  beforeEach(() => {
+    dirs = tempDirs();
+  });
+  afterEach(() => dirs.cleanup());
+
+  it("yields each event in order, then the result", async () => {
+    const argvFile = path.join(dirs.root, "argv.json");
+    const stream = streamTask("add a test", { workspace: dirs.ws, incodePath: FAKE, env: { FAKE_INCODE_ARGV: argvFile } });
+    const types: string[] = [];
+    let text = "";
+    for await (const event of stream) {
+      types.push(event.type);
+      if (event.type === "text") text = String(event.data["text"]);
+    }
+    assert.deepEqual(types, ["init", "text", "tool_use", "tool_result", "usage"]);
+    assert.equal(text, "working on: add a test");
+    const result = await stream.result;
+    assert.equal(result.result, "done: add a test");
+    assert.equal(result.usage.inputTokens, 120);
+    assert.ok((JSON.parse(fs.readFileSync(argvFile, "utf8")) as string[]).includes("stream-json"));
+  });
+
+  it("rejects a failed run at the end of iteration, after its events", async () => {
+    const seen: string[] = [];
+    await assert.rejects(
+      (async () => {
+        for await (const event of streamTask("fail now", { workspace: dirs.ws, incodePath: FAKE })) seen.push(event.type);
+      })(),
+      TaskFailed,
+    );
+    assert.equal(seen[0], "init");
+  });
+
+  it("rejects a line that is not JSON", async () => {
+    await assert.rejects(streamTask("events-garbage", { workspace: dirs.ws, incodePath: FAKE }).result, ProtocolError);
+  });
+
+  it("rejects a crash with incode's stderr", async () => {
+    await assert.rejects(streamTask("crash", { workspace: dirs.ws, incodePath: FAKE }).result, (e: unknown) => {
+      assert.ok(e instanceof IncodeError);
+      assert.match(e.stderr ?? "", /could not start/);
+      return true;
+    });
+  });
+
+  it("kills a run that takes too long", async () => {
+    await assert.rejects(streamTask("sleep", { workspace: dirs.ws, incodePath: FAKE, timeoutMs: 1000 }).result, IncodeTimeout);
   });
 });

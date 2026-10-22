@@ -27,21 +27,35 @@ jobs:
           components: rustfmt
       - run: cargo fmt --check
 
-  # The SDKs and the VS Code extension, against their fake incode/agent.
+  # The SDKs and the VS Code extension, against their fake incode/agent. The
+  # SDKs on the oldest runtimes they promise (Node 18, Python 3.9) as well as
+  # current ones; the extension on the Node VS Code ships. Python 3.9 is past
+  # its end of life and setup-python has no build of it for the Ubuntu
+  # `ubuntu-latest` now is (26.04: "The version '3.9' ... was not found"), so
+  # that leg runs on 22.04.
   sdk-and-editor:
-    runs-on: ubuntu-latest
+    name: sdk-and-editor (node ${{ matrix.node }}, python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { node: 18, python: "3.9", os: ubuntu-22.04 }
+          - { node: 20, python: "3.12", os: ubuntu-latest }
+          - { node: 22, python: "3.12", os: ubuntu-latest }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: ${{ matrix.node }}
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python }}
       - run: python3 -m unittest discover sdk/python/tests
       - run: npm ci && npm test
         working-directory: sdk/typescript
       - run: npm ci && npm run compile && npm test
+        if: matrix.node == 22
         working-directory: editors/vscode
 
   test:

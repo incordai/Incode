@@ -13,6 +13,10 @@ It speaks just enough of the two interfaces the SDKs drive:
   ``sleep``    -> sleeps 30 s (for timeouts)
   otherwise    -> success, ``result`` is ``"done: <task>"``
 
+  With ``--output-format stream-json``, the events ``init``, ``text``,
+  ``tool_use``, ``tool_result`` and ``usage`` come first, one per line
+  (``events-garbage`` adds a line that is not JSON after them).
+
 * ``fake_incode.py --acp`` speaks ACP (newline-delimited JSON-RPC 2.0) on
   stdin/stdout, mirroring ``src/acp_agent``: ``initialize``, ``session/new``,
   ``session/load``, ``session/prompt``, ``session/cancel``, ``session/set_mode``,
@@ -108,6 +112,21 @@ def run_task(args):
         result["error"] = "nothing to do: the instruction is empty" if not task.strip() else "the agent failed: fake failure"
     else:
         result["result"] = "done: " + task
+    if fmt == "stream-json":
+        # The events src/task_run.rs `Report::init` / `Report::event` write
+        # before the result, one JSON object per line.
+        for event in (
+            {"type": "init", "session_id": result["session_id"], "agent": "claude-code", "model": result["model"]},
+            {"type": "text", "text": "working on: " + task},
+            {"type": "tool_use", "id": "t1", "name": "Read", "input": {"path": "README.md"}},
+            {"type": "tool_result", "id": "t1", "output": "read it", "is_error": False},
+            {"type": "usage", "input_tokens": 120, "output_tokens": 45, "cache_creation_tokens": 7, "cache_read_tokens": 300},
+        ):
+            sys.stdout.write(json.dumps(event) + "\n")
+            sys.stdout.flush()
+        if word == "events-garbage":
+            sys.stdout.write("this is not json\n")
+            sys.stdout.flush()
     if fmt in ("json", "stream-json"):
         sys.stdout.write(json.dumps(result) + "\n")
     else:
