@@ -714,6 +714,14 @@ pub trait TaskWorker {
     /// work — a script, a stub, a test — is unaffected.
     fn brief(&mut self, _handoffs: &[Handoff]) {}
 
+    /// What the operator's `user_prompt_submit` hooks printed for the next
+    /// task's instruction, each an `<operator-hook>` block, to ride its turn.
+    /// Replaced on every call; given by `cli::run_memory::Remembered` just
+    /// before each `work`.
+    ///
+    /// Defaulted to ignoring it, for a worker with no agent turn to add it to.
+    fn operator_context(&mut self, _blocks: &[String]) {}
+
     /// Who did the last attempt, and what they actually ran on.
     ///
     /// Defaulted to the harness itself: a worker that does not delegate is still

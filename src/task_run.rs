@@ -145,6 +145,7 @@ impl Report {
         let line = match event {
             AgentEvent::Text(text) => json!({"type": "text", "text": text}),
             AgentEvent::Thinking(text) => json!({"type": "thinking", "text": text}),
+            AgentEvent::Notice(text) => json!({"type": "notice", "text": text}),
             AgentEvent::ToolUse { id, name, input } => json!({
                 "type": "tool_use",
                 "id": id,
@@ -966,6 +967,7 @@ fn show(
             );
         }
         AgentEvent::Quota { status, .. } => outln!("  · quota: {status}"),
+        AgentEvent::Notice(note) => outln!("  · {note}"),
         AgentEvent::ToolResult {
             id,
             output,

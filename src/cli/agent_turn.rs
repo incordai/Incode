@@ -1086,6 +1086,16 @@ impl AgentSession {
                     AgentEvent::Quota {
                         status, resets_at, ..
                     } => *turn_quota = Some((status.clone(), *resets_at)),
+                    // incode speaking mid-turn: a line of its own, never part
+                    // of the reply. An observer presents it itself (`--acp`,
+                    // as a thought), so it is not drawn into the reply too.
+                    AgentEvent::Notice(note) if observer.is_none() => {
+                        if *mid_line {
+                            on_text("\n");
+                            *mid_line = false;
+                        }
+                        on_text(&format!("{note}\n"));
+                    }
                     AgentEvent::Usage {
                         input_tokens,
                         output_tokens,
@@ -1224,8 +1234,12 @@ impl AgentSession {
                             observe(event, &start);
                         }
                         replied.hear(event);
-                        if let AgentEvent::TextDelta(fragment) = event {
-                            on_text(fragment);
+                        match event {
+                            AgentEvent::TextDelta(fragment) => on_text(fragment),
+                            AgentEvent::Notice(note) if observer.is_none() => {
+                                on_text(&format!("\n{note}\n"));
+                            }
+                            _ => {}
                         }
                     });
                 if !replied.last().is_empty() {
@@ -1938,6 +1952,64 @@ mod tests {
         }
     }
 
+    /// A backend that starts its reply, has incode say something mid-turn,
+    /// and finishes the reply.
+    struct Noticing;
+
+    impl AgentBackend for Noticing {
+        fn id(&self) -> &str {
+            "claude-code"
+        }
+        fn run_turn(
+            &mut self,
+            _prompt: &str,
+            on_event: &mut dyn FnMut(&AgentEvent),
+        ) -> Result<TurnOutcome, crate::agent::AgentError> {
+            on_event(&AgentEvent::TextDelta("half a ".to_string()));
+            on_event(&AgentEvent::Notice("[pre_compact hook] noted".to_string()));
+            on_event(&AgentEvent::TextDelta("reply".to_string()));
+            on_event(&AgentEvent::Text("half a reply".to_string()));
+            Ok(TurnOutcome {
+                session_id: String::new(),
+                stop_reason: "end_turn".to_string(),
+                is_error: false,
+                detail: None,
+                served_by: Vec::new(),
+            })
+        }
+        fn session_id(&self) -> Option<&str> {
+            None
+        }
+    }
+
+    /// **incode's NOTICE IS SHOWN ON A LINE OF ITS OWN**, even when it lands
+    /// mid-reply, and is not part of the reply.
+    #[test]
+    fn a_notice_mid_turn_is_shown_on_its_own_line() {
+        let ws = tempfile::tempdir().expect("ws");
+        let mut s = AgentSession::new(
+            ws.path().to_path_buf(),
+            "claude-code",
+            "claude".to_string(),
+            &crate::guards::Guards::default(),
+            Vec::new(),
+        )
+        .with_backend(Box::new(Noticing));
+        let mut shown = String::new();
+        let outcome = s.turn(
+            ws.path(),
+            "go",
+            &[],
+            &mut |t| shown.push_str(t),
+            &mut |_| {},
+        );
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert!(
+            shown.contains("half a \n[pre_compact hook] noted\nreply"),
+            "{shown:?}"
+        );
+    }
+
     /// A session over `ws` whose backend records into `seen`, with the
     /// memory lifecycle opened on the fake engine in `engine`.
     fn with_memory(
@@ -2061,6 +2133,64 @@ mod tests {
                 assert_eq!(heard, 1, "the engine did not hear an allowed line");
             }
             assert!(seen.lock().expect("seen").prompts.is_empty());
+        }
+    }
+
+    /// A repository with one commit and one untracked file: a change to
+    /// review.
+    fn repo_with_a_change() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("ws");
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .status()
+                .expect("git runs");
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(dir.path().join("a.txt"), "one\n").expect("write");
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "first"]);
+        std::fs::write(dir.path().join("new.rs"), "fn new() {}\n").expect("write");
+        dir
+    }
+
+    /// **`/review` GOES THROUGH THE OPERATOR'S PROMPT HOOK.** Exit 2 sends
+    /// nothing to the agent and says why; allowed, the hook's output rides
+    /// the review turn.
+    #[test]
+    fn a_review_refused_by_the_operators_hook_reaches_no_agent() {
+        for (code, refused) in [(2, true), (0, false)] {
+            let ws = repo_with_a_change();
+            let engine = tempfile::tempdir().expect("engine");
+            let seen = Arc::new(Mutex::new(Seen::default()));
+            let mut s = with_memory(ws.path(), engine.path(), &[], &seen, Box::new(|_| {}));
+            s.set_operator_hooks(Some(crate::hooks::HookRunner::new(
+                crate::hooks::HookConfig {
+                    user_prompt_submit: vec![operator_hook("checked", "no secrets", code)],
+                    ..crate::hooks::HookConfig::default()
+                },
+            )));
+            let ran = crate::cli::review_turn(&mut s, ws.path(), None);
+            let prompts = seen.lock().expect("seen").prompts.clone();
+            if refused {
+                let why = ran.expect_err("exit 2 did not refuse the review");
+                assert!(why.contains("no secrets"), "{why}");
+                assert!(prompts.is_empty(), "a refused review reached the agent");
+            } else {
+                assert!(ran.is_ok(), "{ran:?}");
+                assert_eq!(prompts.len(), 1, "{prompts:?}");
+                assert!(
+                    prompts[0].contains("new.rs") && prompts[0].contains("checked"),
+                    "{}",
+                    prompts[0]
+                );
+            }
         }
     }
 

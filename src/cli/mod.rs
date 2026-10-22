@@ -1003,23 +1003,8 @@ impl CliApp {
                         }
                     }
                     SlashCommand::Review(base) => {
-                        match crate::review::collect(&workspace, base.as_deref()) {
-                            Ok(change) if change.is_empty() => render::print_info(&format!(
-                                "No changes to review against {}.",
-                                change.base
-                            )),
-                            Ok(change) => {
-                                let ask = crate::review::prompt(&change);
-                                if let Err(e) = one_turn_with_context(
-                                    &mut session,
-                                    &workspace,
-                                    &ask,
-                                    Vec::new(),
-                                ) {
-                                    render::print_error(&e);
-                                }
-                            }
-                            Err(why) => render::print_error(&why),
+                        if let Err(why) = review_turn(&mut session, &workspace, base.as_deref()) {
+                            render::print_error(&why);
                         }
                     }
                     SlashCommand::Tools(arg) => {
@@ -1873,6 +1858,30 @@ pub(crate) fn plan_turn(
         instruction: augmented.to_string(),
         context,
     }
+}
+
+/// `/review [base]`: the change in `workspace` against `base`, as one turn
+/// for the agent. The operator's `user_prompt_submit` hooks see the review
+/// prompt first, as they see a typed line: one that refuses it stops it here,
+/// and what they print rides the turn. The memory engine is not told it — it
+/// is incode's prompt, not the person's line.
+///
+/// Called by the REPL's `/review` (`--acp` does not offer it).
+pub(crate) fn review_turn(
+    session: &mut crate::cli::agent_turn::AgentSession,
+    workspace: &Path,
+    base: Option<&str>,
+) -> Result<(), String> {
+    let change = crate::review::collect(workspace, base)?;
+    if change.is_empty() {
+        render::print_info(&format!("No changes to review against {}.", change.base));
+        return Ok(());
+    }
+    let ask = crate::review::prompt(&change);
+    let context = session.prompt_hooks(&ask).map_err(|why| {
+        format!("Not sent: the operator's user_prompt_submit hook refused it. {why}")
+    })?;
+    one_turn_with_context(session, workspace, &ask, context)
 }
 
 /// The turn itself: spinner, streaming, and what the outcome means.

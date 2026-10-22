@@ -207,6 +207,12 @@ impl MemoryHooks {
         &self.session
     }
 
+    /// The workspace this session works in.
+    #[must_use]
+    pub fn cwd(&self) -> &Path {
+        &self.cwd
+    }
+
     fn at(&self) -> Conversation<'_> {
         Conversation {
             session: &self.session,

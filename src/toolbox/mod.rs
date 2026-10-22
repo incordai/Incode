@@ -714,6 +714,22 @@ impl Toolbox {
         self
     }
 
+    /// The operator's `pre_compact` commands for this toolbox's session, in
+    /// its workspace: what they printed. Told, never asked.
+    ///
+    /// Called by `agent::api::ApiBackend::compact_if_near_window`, before the
+    /// route compacts on its own (`trigger` `auto`); a `/compact` by hand
+    /// fires them in `cli::agent_turn::AgentSession::compact` instead.
+    #[must_use]
+    pub fn operator_pre_compact(&self, trigger: &str) -> Vec<String> {
+        self.hooks.as_ref().map_or_else(Vec::new, |hooks| {
+            hooks
+                .pre_compact(trigger, "", &self.session, Some(&self.workspace))
+                .messages()
+                .to_vec()
+        })
+    }
+
     /// Offer and run only `names` from now on — narrowed further when a list
     /// is already in force, never widened. A call to any other tool is refused
     /// by [`Self::run_call`]'s gate before anything else is asked.
