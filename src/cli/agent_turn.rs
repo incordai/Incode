@@ -1379,15 +1379,19 @@ impl AgentSession {
         self.usage.output_tokens += turn_usage.output_tokens;
         self.usage.cache_creation_input_tokens += turn_usage.cache_creation_input_tokens;
         self.usage.cache_read_input_tokens += turn_usage.cache_read_input_tokens;
+        let model = self
+            .model()
+            .map_or_else(|| self.backend_id().to_string(), str::to_string);
         if turn_usage.total_tokens() > 0 {
-            let model = self
-                .model()
-                .map_or_else(|| self.backend_id().to_string(), str::to_string);
             match self.usage_by_model.iter_mut().find(|(m, _)| *m == model) {
                 Some((_, used)) => *used = used.plus(turn_usage),
-                None => self.usage_by_model.push((model, turn_usage)),
+                None => self.usage_by_model.push((model.clone(), turn_usage)),
             }
         }
+        // The operator's collector, when telemetry is on (`crate::telemetry`):
+        // the turn's usage and time, exported without anyone waiting.
+        crate::telemetry::turn_finished(&model, &turn_usage, started.elapsed().as_secs_f64());
+        crate::telemetry::export_in_background();
 
         // THE TURN'S CHECKPOINT IS SEALED: only what changed is kept, what
         // the turn created is added, and — when the session keeps its
@@ -1980,6 +1984,70 @@ mod tests {
         fn session_id(&self) -> Option<&str> {
             None
         }
+    }
+
+    /// A backend whose turn uses 100 tokens in and 20 out.
+    struct Spending;
+
+    impl AgentBackend for Spending {
+        fn id(&self) -> &str {
+            "claude-code"
+        }
+        fn run_turn(
+            &mut self,
+            _prompt: &str,
+            on_event: &mut dyn FnMut(&AgentEvent),
+        ) -> Result<TurnOutcome, crate::agent::AgentError> {
+            on_event(&AgentEvent::Usage {
+                input_tokens: 100,
+                output_tokens: 20,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+            });
+            on_event(&AgentEvent::Text("done".to_string()));
+            Ok(TurnOutcome {
+                session_id: String::new(),
+                stop_reason: "end_turn".to_string(),
+                is_error: false,
+                detail: None,
+                served_by: Vec::new(),
+            })
+        }
+        fn session_id(&self) -> Option<&str> {
+            None
+        }
+    }
+
+    /// **A FINISHED TURN'S USAGE GOES TO THE OPERATOR'S COLLECTOR**
+    /// (`crate::telemetry`), under the model that served it, as one turn.
+    #[test]
+    fn a_finished_turn_records_its_tokens_and_one_turn() {
+        let ws = tempfile::tempdir().expect("ws");
+        let mut s = AgentSession::new(
+            ws.path().to_path_buf(),
+            "claude-code",
+            "claude".to_string(),
+            &crate::guards::Guards::default(),
+            Vec::new(),
+        )
+        .with_backend(Box::new(Spending));
+        let (outcome, metrics, _) = crate::telemetry::tests::captured(|| {
+            s.turn(ws.path(), "go", &[], &mut |_| {}, &mut |_| {})
+        });
+        assert!(outcome.is_ok(), "{outcome:?}");
+        let metrics = metrics.expect("the turn was recorded");
+        let sum =
+            |name, pairs: &[(&str, &str)]| crate::telemetry::tests::sum_of(&metrics, name, pairs);
+        assert_eq!(
+            sum(
+                "incode.token.usage",
+                &[("type", "input"), ("model", "claude-code")]
+            ),
+            100.0,
+            "{metrics}"
+        );
+        assert_eq!(sum("incode.token.usage", &[("type", "output")]), 20.0);
+        assert_eq!(sum("incode.turn.count", &[]), 1.0);
     }
 
     /// **incode's NOTICE IS SHOWN ON A LINE OF ITS OWN**, even when it lands

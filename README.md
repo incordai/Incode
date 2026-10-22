@@ -1420,6 +1420,33 @@ there gives way), and the memory
 engine's files stay where they are. `INCODE_TRACE` (area `migrate`) says what
 moved. The old `INCORD_*` variables are not read any more: rename them.
 
+### Telemetry (OpenTelemetry)
+
+Off unless you turn it on. Set `INCODE_TELEMETRY=1` (or `"telemetry": true` in
+admin.json) **and** name a collector:
+
+```sh
+export INCODE_TELEMETRY=1
+export OTEL_EXPORTER_OTLP_ENDPOINT=https://otel.example.com   # /v1/metrics and /v1/logs are added
+export OTEL_EXPORTER_OTLP_HEADERS="authorization=Bearer%20<token>"
+```
+
+incode sends OTLP over HTTP as JSON (`OTEL_EXPORTER_OTLP_PROTOCOL` unset or
+`http/json`; any other protocol is reported and nothing is sent), only to
+`https` or to this machine, after every turn and at the end of `-t`. The
+per-signal `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` / `..._LOGS_ENDPOINT` override
+the base. `incode --admin` shows whether it is on and where it goes.
+
+- **Metrics** (delta sums): `incode.session.count` (`mode`),
+  `incode.token.usage` (`type`, `model`), `incode.cost.usage` (USD, priced
+  models), `incode.tool.calls` (`tool`, `outcome`: `allowed` or `denied`),
+  `incode.turn.count` and `incode.turn.duration` (seconds).
+- **Events** (log records): `incode.permission_prompt` (`tool`, `answer`),
+  `incode.compaction` (`trigger`, tokens before and after),
+  `incode.user_prompt` (`prompt_length`).
+- **Never sent:** the text of a prompt, a file, or a tool's input or output. A
+  prompt's text is added to its event only with `OTEL_LOG_USER_PROMPTS=1`.
+
 ### Proxies and certificates
 
 Behind a corporate proxy, every outbound request — the model API, web fetch and

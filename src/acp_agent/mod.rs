@@ -233,6 +233,7 @@ impl SessionFactory for CliSessions {
         config.resume_session = loading.then(|| session_id.to_string());
         let prepared = crate::cli::prepare_session(&config, cancel, Instant::now(), session_id)
             .map_err(|e| e.to_string())?;
+        crate::telemetry::session_started("acp");
         let mut session = prepared.session;
         // Kept whether or not an engine reads it: it is what `session/load`
         // replays.
