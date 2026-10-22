@@ -24,6 +24,8 @@ USAGE:
     incode mcp <list|get|add|remove|approve> ...   (see `incode mcp help`)
     incode lifecycle <show|approve>   This project's lifecycle commands, which run
                               only once approved (see `incode lifecycle help`)
+    incode remote <run|list|logs> ...   Run a task with `incode -t` on GitHub
+                              Actions and print its result (see `incode remote help`)
     incode completions <bash|zsh|fish|powershell>   Print a completion script
                               for that shell (the script says how to load it)
 
@@ -261,6 +263,24 @@ const COMPLETION: completions::Command = {
                 subcommands: &[],
             },
             Command {
+                name: "remote",
+                flags: &[
+                    flag(
+                        "--repo",
+                        Some("-R"),
+                        Value::Text,
+                        "GitHub repository owner/name",
+                    ),
+                    flag("--ref", None, Value::Text, "Branch to run on"),
+                    flag("--model", Some("-m"), Value::Text, "Model for the run"),
+                    flag("--timeout", None, Value::Text, "Minutes to wait"),
+                    flag("--no-wait", None, Value::None, "Return once started"),
+                    HELP,
+                ],
+                verbs: &["run", "list", "logs", "help"],
+                subcommands: &[],
+            },
+            Command {
                 name: "mcp",
                 flags: &[HELP],
                 verbs: &[
@@ -347,6 +367,19 @@ fn main() -> anyhow::Result<()> {
             )
             .map_err(|e| anyhow::anyhow!(e))?;
             println!("{}", said.trim_end());
+            return Ok(());
+        }
+        // `incode remote ...`: run a task on GitHub Actions and print its
+        // result; non-zero when the run or the task failed, or the wait ran
+        // out.
+        if raw.first().map(String::as_str) == Some("remote") {
+            let workspace = std::env::current_dir()?;
+            let outcome =
+                incord_code::remote::cli(&raw[1..], &workspace).map_err(|e| anyhow::anyhow!(e))?;
+            println!("{}", outcome.text.trim_end());
+            if !outcome.ok {
+                std::process::exit(1);
+            }
             return Ok(());
         }
     }
@@ -2111,6 +2144,28 @@ mod tests {
                 assert!(!e.starts_with("unknown"), "lifecycle {verb}: {e}");
             }
         }
+        // `incode remote`: every verb and every flag (with its value) is read
+        // by the parser in full before `--help` answers, so this checks them
+        // without reading a token or reaching GitHub.
+        let remote = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+            incord_code::remote::cli(&args, ws.path())
+        };
+        for verb in sub("remote").verbs {
+            let said = remote(&[verb, "--help"]).unwrap_or_else(|e| panic!("remote {verb}: {e}"));
+            assert_eq!(said.text, incord_code::remote::USAGE, "remote {verb}");
+        }
+        for flag in sub("remote").flags {
+            for spelling in std::iter::once(flag.long).chain(flag.short) {
+                for args in with_values(flag, spelling) {
+                    let args = [&["run", "a task"][..], &args, &["--help"]].concat();
+                    remote(&args).unwrap_or_else(|e| panic!("remote {args:?}: {e}"));
+                }
+            }
+        }
+        assert!(remote(&["launch"])
+            .expect_err("an unknown verb")
+            .starts_with("unknown"));
         for verb in sub("mcp").verbs {
             if let Err(e) =
                 incord_code::mcp_config::command(&[(*verb).to_string()], ws.path(), data.path())

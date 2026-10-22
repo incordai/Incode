@@ -614,6 +614,15 @@ pushing any change to a new branch), or reviews each pull request as it opens.
 Setup, inputs and the safety defaults are in
 [docs/github-action.md](docs/github-action.md).
 
+`incode remote run "<task>"` runs a task with `incode -t` on GitHub Actions
+instead of here: it dispatches the repository's `incode-remote.yml` workflow,
+waits for it (60 minutes by default, `--timeout`), and prints the result as
+`-t --output-format json` does, with the branch `incode/remote-<id>` the
+changes were pushed to. `incode remote list` and `incode remote logs <run-id>`
+show past runs. The workflow to copy, the secrets it needs and the token
+`incode remote` reads (`GH_TOKEN` / `GITHUB_TOKEN`) are in
+[docs/remote-runs.md](docs/remote-runs.md).
+
 ## Custom commands and plugins
 
 A markdown file is a slash command. Put it in `.incode/commands/` (the

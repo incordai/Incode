@@ -1,0 +1,154 @@
+# The workflow `incode remote run` dispatches. Copy it to
+# .github/workflows/incode-remote.yml on your repository's default branch and
+# add the secret ANTHROPIC_API_KEY (or change the "Configure the model" step
+# for another provider) and the variable INCODE_MODEL. See docs/remote-runs.md.
+#
+# What `incode remote` relies on, so keep these as they are: the inputs
+# `task`, `model` and `id`; the run's title, `incode remote <id>`, by which
+# the run is found; the branch `incode/remote-<id>`; and the artifact
+# `incode-result` holding `result.json`.
+#
+# The task is untrusted text: it reaches the shell only through environment
+# variables, never spliced into a script.
+name: incode remote
+run-name: "incode remote ${{ inputs.id }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      task:
+        description: The instruction for `incode -t`.
+        required: true
+        type: string
+      model:
+        description: The model id to use. Blank uses the INCODE_MODEL variable.
+        required: false
+        type: string
+        default: ""
+      id:
+        description: Set by `incode remote run`; names the run and its branch.
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Check the id
+        env:
+          ID: ${{ inputs.id }}
+        run: |
+          set -euo pipefail
+          case "$ID" in
+            "" | *[!A-Za-z0-9-]* ) echo "::error::incode remote: the id must be letters, digits and dashes."; exit 1 ;;
+          esac
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install incode
+        env:
+          INCODE_VERSION: latest
+          INCODE_INSTALL_DIR: ${{ runner.temp }}/incode-bin
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -fsSL \
+            https://raw.githubusercontent.com/incordai/incode/main/scripts/install.sh | sh
+          echo "$INCODE_INSTALL_DIR" >> "$GITHUB_PATH"
+
+      # The same one-route admin.json the incode GitHub Action writes
+      # (.github/actions/incode): the key's variable NAME only, in a private
+      # INCODE_DIR.
+      - name: Configure the model
+        env:
+          API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          KEY_ENV: ANTHROPIC_API_KEY
+          API_URL: https://api.anthropic.com/v1/messages
+          API_FORMAT: anthropic
+          MODEL: ${{ inputs.model || vars.INCODE_MODEL }}
+        run: |
+          set -euo pipefail
+          if [ -z "$API_KEY" ]; then
+            echo "::error::incode remote: the ANTHROPIC_API_KEY secret is not set."
+            exit 1
+          fi
+          if [ -z "$MODEL" ]; then
+            echo "::error::incode remote: no model: pass -m, or set the INCODE_MODEL variable."
+            exit 1
+          fi
+          echo "::add-mask::$API_KEY"
+          incode_dir="$RUNNER_TEMP/incode-home"
+          mkdir -p "$incode_dir"
+          jq -n --arg url "$API_URL" --arg format "$API_FORMAT" \
+            --arg key_env "$KEY_ENV" --arg model "$MODEL" \
+            '{agent: "ci",
+              api_models: [{name: "ci", format: $format, url: $url,
+                            key_env: $key_env, model: $model}]}' \
+            > "$incode_dir/admin.json"
+          {
+            echo "INCODE_DIR=$incode_dir"
+            echo "INCODE_AGENT=ci"
+            echo "$KEY_ENV=$API_KEY"
+          } >> "$GITHUB_ENV"
+
+      # The result is written outside the checkout, so it is never committed.
+      # A failed task does not stop the job here: its changes are still
+      # pushed and its result uploaded, and the last step fails the job.
+      - name: Run the task
+        id: task
+        env:
+          TASK: ${{ inputs.task }}
+        run: |
+          set -uo pipefail
+          set +e
+          mkdir -p "$RUNNER_TEMP/incode-result"
+          result="$RUNNER_TEMP/incode-result/result.json"
+          incode -t "$TASK" --spec-gate off --output-format json > "$result"
+          echo "exit=$?" >> "$GITHUB_OUTPUT"
+          if ! jq -e 'type == "object"' "$result" > /dev/null 2>&1; then
+            jq -n '{type: "result", is_error: true,
+                    error: "incode did not report a result; see the workflow log"}' > "$result"
+          fi
+
+      - name: Push the changes
+        env:
+          ID: ${{ inputs.id }}
+          TASK: ${{ inputs.task }}
+        run: |
+          set -euo pipefail
+          result="$RUNNER_TEMP/incode-result/result.json"
+          branch=""
+          if [ -n "$(git status --porcelain)" ]; then
+            branch="incode/remote-$ID"
+            git config user.name "incode[bot]"
+            git config user.email "incode[bot]@users.noreply.github.com"
+            git checkout -b "$branch"
+            git add -A
+            git commit -q -m "incode remote $ID" -m "$TASK"
+            git push -q origin "$branch"
+          fi
+          jq --arg branch "$branch" '. + {branch: (if $branch == "" then null else $branch end)}' \
+            "$result" > "$result.tmp"
+          mv "$result.tmp" "$result"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: incode-result
+          path: ${{ runner.temp }}/incode-result/result.json
+          if-no-files-found: ignore
+
+      - name: Fail when the task failed
+        env:
+          EXIT: ${{ steps.task.outputs.exit }}
+        run: |
+          set -euo pipefail
+          if [ "$EXIT" != "0" ] || jq -e '.is_error == true' "$RUNNER_TEMP/incode-result/result.json" > /dev/null; then
+            echo "::error::incode remote: the task did not succeed; see result.json in the incode-result artifact."
+            exit 1
+          fi
