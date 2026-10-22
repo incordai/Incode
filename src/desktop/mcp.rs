@@ -1753,6 +1753,7 @@ mod tests {
                 crate::hooks::HookConfig {
                     pre_tool_use: vec![deny.to_string()],
                     post_tool_use: Vec::new(),
+                    user_prompt_submit: Vec::new(),
                 },
             );
 
@@ -1789,6 +1790,7 @@ mod tests {
                 crate::hooks::HookConfig {
                     pre_tool_use: vec![allow.to_string()],
                     post_tool_use: Vec::new(),
+                    user_prompt_submit: Vec::new(),
                 },
             );
 

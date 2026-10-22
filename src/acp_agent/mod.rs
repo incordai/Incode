@@ -1343,6 +1343,15 @@ fn run_prompt(
             say_text(&reply);
             return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
         }
+        crate::cli::TurnPlan::Refused(why) => {
+            if pictures {
+                let _ = session.attach_images(Vec::new());
+            }
+            say_text(&format!(
+                "Not sent: the operator's user_prompt_submit hook refused it. {why}"
+            ));
+            return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
+        }
         crate::cli::TurnPlan::Agent {
             instruction,
             context,

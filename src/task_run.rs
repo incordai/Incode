@@ -398,6 +398,23 @@ fn run_task_reporting(
     // takes the person's line, stops, and ends.
     let session_id = uuid::Uuid::new_v4().to_string();
     report.session.clone_from(&session_id);
+    // The operator's `user_prompt_submit` hooks see the instruction first,
+    // as in a session (`cli::plan_turn`): one that refuses it stops the run
+    // before the memory engine or an agent hears it. What they print rides
+    // the turn as context.
+    let hooked: Vec<String> = match crate::hooks::HookRunner::from_settings() {
+        Some(hooks) => {
+            let ran = hooks.user_prompt_submit(instruction, &session_id, Some(workspace));
+            if ran.is_denied() {
+                return Err(format!(
+                    "not run: the operator's user_prompt_submit hook refused it. {}",
+                    ran.messages().join("\n")
+                ));
+            }
+            ran.messages().to_vec()
+        }
+        None => Vec::new(),
+    };
     // The owner's installed external tools, started as MCP servers now, in
     // the background, so they connect while the memory session opens.
     let tools = connect_ext_tools(workspace);
@@ -420,6 +437,15 @@ fn run_task_reporting(
     );
     let start = memory.start("startup");
     let turn = memory.prompt(instruction);
+    // The hooks' context, then the engine's: one block for the turn.
+    let turn = {
+        let mut blocks: Vec<String> = hooked
+            .iter()
+            .map(|said| crate::hooks::prompt_context_block(said))
+            .collect();
+        blocks.extend(turn);
+        (!blocks.is_empty()).then(|| blocks.join("\n\n"))
+    };
     let spec_gate = crate::spec::for_this_run();
     if spec_gate == crate::spec::SpecGate::Off {
         // The text run's record of it, and stderr's under the JSON forms,

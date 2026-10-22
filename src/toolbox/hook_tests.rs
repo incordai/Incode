@@ -42,6 +42,7 @@ fn hooked(ws: &Path, pre: String, post: Vec<String>) -> Toolbox {
         crate::hooks::HookConfig {
             pre_tool_use: vec![pre],
             post_tool_use: post,
+            user_prompt_submit: Vec::new(),
         },
     )))
 }
