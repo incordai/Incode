@@ -1756,6 +1756,7 @@ mod tests {
                     user_prompt_submit: Vec::new(),
                     pre_compact: Vec::new(),
                     stop: Vec::new(),
+                    notification: Vec::new(),
                 },
             );
 
@@ -1795,6 +1796,7 @@ mod tests {
                     user_prompt_submit: Vec::new(),
                     pre_compact: Vec::new(),
                     stop: Vec::new(),
+                    notification: Vec::new(),
                 },
             );
 
