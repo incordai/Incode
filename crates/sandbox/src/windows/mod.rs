@@ -646,10 +646,101 @@ impl JobLimits {
     }
 }
 
+// ---- Starting as the offline account. ----
+
+/// `ERROR_SERVICE_ALREADY_RUNNING` (Win32 error 1056).
+///
+/// # The root cause this exists for
+///
+/// A network-deny run starts its command as the offline account through
+/// `CreateProcessWithLogonW`, and that call is served by the Secondary Logon
+/// service (seclogon), which is demand-start: it is not running until the
+/// first such call starts it. When two runs make that first call at the same
+/// time, the one whose call arrives while the other's start of seclogon is
+/// still in progress is refused with this error instead of waiting for it —
+/// and its command is not run. Observed on the `windows-latest` runner
+/// (`sbx: the command could not be started as sbx-offline … Win32 error
+/// 1056`), in the escape tests that start several network-deny runs at once
+/// right after `setup-windows`; the race is inferred from that, not
+/// reproduced on a machine where seclogon was already up.
+pub const SECLOGON_STARTING: u32 = 1056;
+
+/// How many more times a start refused while seclogon was starting is made.
+pub const SECLOGON_RETRIES: u32 = 5;
+
+/// How long to let seclogon finish starting before the start is made again.
+pub const SECLOGON_START_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Make the start `attempt` until it succeeds or fails with anything but
+/// [`SECLOGON_STARTING`] — the refusal while seclogon is still starting — at
+/// most `1 + SECLOGON_RETRIES` times, calling `wait(n)` before attempt
+/// `n + 1`. Its last result: any other error, or seclogon still not up after
+/// every wait, is the caller's to report.
+///
+/// Called by `windows::helper::launch_offline` around
+/// `CreateProcessWithLogonW`, the one start that goes through seclogon.
+pub fn start_once_seclogon_is_up<T>(
+    mut attempt: impl FnMut() -> Result<T, u32>,
+    mut wait: impl FnMut(u32),
+) -> Result<T, u32> {
+    let mut waited = 0;
+    loop {
+        match attempt() {
+            Err(SECLOGON_STARTING) if waited < SECLOGON_RETRIES => {
+                waited += 1;
+                wait(waited);
+            }
+            other => return other,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::policy::Limits;
+
+    /// **A START REFUSED WHILE SECLOGON WAS STILL STARTING IS MADE AGAIN**,
+    /// a bounded number of times; any other refusal is reported at once.
+    #[test]
+    fn a_start_refused_while_seclogon_starts_is_made_again_and_nothing_else_is() {
+        // Refused twice while seclogon came up, then started.
+        let mut answers = vec![
+            Err(SECLOGON_STARTING),
+            Err(SECLOGON_STARTING),
+            Ok("started"),
+        ];
+        answers.reverse();
+        let mut waits = Vec::new();
+        let got = start_once_seclogon_is_up(
+            || answers.pop().expect("asked too often"),
+            |n| waits.push(n),
+        );
+        assert_eq!(got, Ok("started"));
+        assert_eq!(waits, [1, 2]);
+
+        // Any other refusal is not retried: a wrong password is wrong again.
+        let mut calls = 0;
+        let got: Result<(), u32> = start_once_seclogon_is_up(
+            || {
+                calls += 1;
+                Err(1326)
+            },
+            |_| panic!("waited for a refusal that is not seclogon starting"),
+        );
+        assert_eq!((got, calls), (Err(1326), 1));
+
+        // seclogon never up: 1 + SECLOGON_RETRIES starts, then the error stands.
+        let mut calls = 0;
+        let got: Result<(), u32> = start_once_seclogon_is_up(
+            || {
+                calls += 1;
+                Err(SECLOGON_STARTING)
+            },
+            |_| {},
+        );
+        assert_eq!((got, calls), (Err(SECLOGON_STARTING), SECLOGON_RETRIES + 1));
+    }
 
     fn w(s: &str) -> Vec<u16> {
         s.encode_utf16().collect()
