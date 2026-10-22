@@ -28,6 +28,9 @@ export class Uri {
   static file(p: string): Uri {
     return new Uri("file", path.resolve(p), `file://${p}`);
   }
+  static joinPath(base: Uri, ...parts: string[]): Uri {
+    return Uri.file(path.join(base.fsPath, ...parts));
+  }
   static parse(s: string): Uri {
     const m = /^([a-z][a-z0-9+.-]*):/i.exec(s);
     if (!m) throw new Error("no scheme");
@@ -90,6 +93,21 @@ export interface FakeState {
   documents: FakeDocument[];
   applied: WorkspaceEdit[];
   opened: string[];
+  /** `window.showInformationMessage` texts. */
+  infos?: string[];
+  /** What `window.showQuickPick` was offered, and which item it answers (undefined: dismissed). */
+  quickPicks?: unknown[][];
+  pick?: (items: unknown[]) => unknown;
+  /** What `window.showOpenDialog` answers, as paths. */
+  openDialog?: string[];
+  /** `setContext` keys and values. */
+  contexts?: Record<string, unknown>;
+  /** `commands.registerCommand` handlers by id. */
+  commands?: Map<string, (...args: unknown[]) => unknown>;
+  /** `window.activeTextEditor`. */
+  activeTextEditor?: unknown;
+  /** `window.registerWebviewViewProvider` providers by view id. */
+  views?: Map<string, unknown>;
 }
 
 export function makeFakeVscode(state: FakeState): Record<string, unknown> {
@@ -102,6 +120,11 @@ export function makeFakeVscode(state: FakeState): Record<string, unknown> {
       return state.documents;
     },
     getConfiguration: () => ({ get: (k: string) => state.config[k] }),
+    onDidChangeConfiguration: () => ({ dispose: () => undefined }),
+    asRelativePath: (uri: Uri) => {
+      const root = state.roots.find((r) => uri.fsPath.startsWith(r + path.sep));
+      return root ? path.relative(root, uri.fsPath).split(path.sep).join("/") : uri.fsPath;
+    },
     fs: {
       stat: async (uri: Uri) => fs.stat(uri.fsPath),
       readFile: async (uri: Uri) => new Uint8Array(await fs.readFile(uri.fsPath)),
@@ -141,9 +164,53 @@ export function makeFakeVscode(state: FakeState): Record<string, unknown> {
     WorkspaceEdit,
     workspace,
     env: { openExternal: async (u: Uri) => (state.opened.push(u.toString()), true) },
-    commands: { executeCommand: async () => undefined },
-    window: {},
+    commands: {
+      executeCommand: async (id: string, ...args: unknown[]) => {
+        if (id === "setContext") (state.contexts ??= {})[String(args[0])] = args[1];
+        return undefined;
+      },
+      registerCommand: (id: string, handler: (...args: unknown[]) => unknown) => {
+        (state.commands ??= new Map()).set(id, handler);
+        return { dispose: () => state.commands?.delete(id) };
+      },
+    },
+    window: {
+      get activeTextEditor() {
+        return state.activeTextEditor;
+      },
+      createOutputChannel: () => ({ append: () => undefined, appendLine: () => undefined, show: () => undefined, dispose: () => undefined }),
+      registerWebviewViewProvider: (id: string, provider: unknown) => {
+        (state.views ??= new Map()).set(id, provider);
+        return { dispose: () => state.views?.delete(id) };
+      },
+      showInformationMessage: async (text: string) => {
+        (state.infos ??= []).push(text);
+        return undefined;
+      },
+      showQuickPick: async (items: unknown[]) => {
+        (state.quickPicks ??= []).push(items);
+        return state.pick?.(items);
+      },
+      showOpenDialog: async () => state.openDialog?.map((p) => Uri.file(p)),
+    },
   };
+}
+
+/**
+ * Start the fake agent with node when the configured "binary" is a `.js`
+ * file. The controller spawns `incode.path` directly, which runs the fixture
+ * by its shebang on POSIX and cannot run it at all on Windows; this makes
+ * both the same. Wraps the one function, `acp.spawnAgent`, that the
+ * controller calls through the module's exports.
+ */
+export function runJsAgentsWithNode(): void {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const acp = require("../src/acp") as typeof import("../src/acp");
+  const original = acp.spawnAgent;
+  (acp as { spawnAgent: typeof original }).spawnAgent = (opts) =>
+    opts.command.endsWith(".js")
+      ? original({ ...opts, command: process.execPath, prefixArgs: [opts.command, ...(opts.prefixArgs ?? [])] })
+      : original(opts);
 }
 
 /** Make `require("vscode")` return `fake` from now on. */

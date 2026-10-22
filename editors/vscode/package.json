@@ -50,6 +50,11 @@
         "category": "incode"
       },
       {
+        "command": "incode.openSession",
+        "title": "Open Session…",
+        "category": "incode"
+      },
+      {
         "command": "incode.sendSelection",
         "title": "Send Selection to Chat",
         "category": "incode"
@@ -75,6 +80,11 @@
           "group": "navigation"
         },
         {
+          "command": "incode.openSession",
+          "when": "view == incode.chat && incode.canReopenSession",
+          "group": "navigation"
+        },
+        {
           "command": "incode.restart",
           "when": "view == incode.chat"
         }
@@ -97,6 +107,11 @@
           "default": [],
           "markdownDescription": "Extra arguments passed after `--acp`, e.g. `[\"-p\", \"read-only\"]` or `[\"-m\", \"<model>\"]`.",
           "scope": "machine-overridable"
+        },
+        "incode.sendSelectionImmediately": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "`incode: Send Selection to Chat` sends the selection as a prompt at once, instead of putting it in the chat input for you to add a question. While a turn is running it still goes to the input."
         }
       }
     }

@@ -19,6 +19,10 @@ export function activate(context: vscode.ExtensionContext): void {
       await provider.reveal();
       await controller.newSession();
     }),
+    vscode.commands.registerCommand("incode.openSession", async () => {
+      await provider.reveal();
+      await controller.pickSession();
+    }),
     vscode.commands.registerCommand("incode.restart", async () => {
       await provider.reveal();
       await controller.restart();
@@ -40,7 +44,8 @@ export function activate(context: vscode.ExtensionContext): void {
         text: doc.getText(range),
       });
       await provider.reveal();
-      controller.prefill(text);
+      // Into the input, or sent at once with `incode.sendSelectionImmediately`.
+      await controller.sendSelection(text);
     }),
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration("incode.path") || e.affectsConfiguration("incode.args")) {

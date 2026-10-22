@@ -1,3 +1,5 @@
+// The ACP client (src/acp.ts) against the fake agent
+// (test/fixtures/fake-agent.js), and its JSON-RPC layer over in-memory streams.
 import { strict as assert } from "node:assert";
 import * as path from "node:path";
 import { PassThrough } from "node:stream";
@@ -38,7 +40,7 @@ after(async () => {
   await Promise.all(started.map((a) => a.stop(200)));
 });
 
-function start(overrides: Partial<ClientHandlers> = {}): Harness {
+function start(overrides: Partial<ClientHandlers> = {}, args: string[] = []): Harness {
   const updates: SessionNotification[] = [];
   const stderr: string[] = [];
   const protocolErrors: string[] = [];
@@ -63,6 +65,7 @@ function start(overrides: Partial<ClientHandlers> = {}): Harness {
   const agent = spawnAgent({
     command: process.execPath,
     prefixArgs: [FAKE],
+    args,
     cwd: WORKSPACE,
     handlers,
     onStderr: (t) => stderr.push(t),
@@ -269,6 +272,57 @@ describe("AcpClient against the fake agent", () => {
     await assert.rejects(agent.client.initialize({ name: "t", version: "0" }), ConnectionClosedError);
     const how = await agent.exited;
     assert.ok(how.error, "the spawn error is reported");
+  });
+
+  it("session/list pages by cursor; session/load replays the history before it answers", async () => {
+    const h = start();
+    const id = await ready(h);
+    assert.equal(h.agent.client.supportsReopen, true);
+    const first = await h.agent.client.listSessions(WORKSPACE);
+    assert.deepEqual(first.sessions.map((s) => [s.sessionId, s.title, s.cwd]), [["kept-1", "fix the parser", WORKSPACE]]);
+    assert.equal(first.nextCursor, "2");
+    const second = await h.agent.client.listSessions(WORKSPACE, first.nextCursor!);
+    assert.deepEqual(second.sessions.map((s) => s.sessionId), ["kept-2"]);
+    assert.equal(second.nextCursor, null);
+
+    await h.agent.client.closeSession(id);
+    h.updates.length = 0;
+    let updatesAtAnswer = -1;
+    const loaded = await h.agent.client.loadSession("kept-1", WORKSPACE).then((r) => {
+      updatesAtAnswer = h.updates.length;
+      return r;
+    });
+    assert.equal(loaded.modes?.currentModeId, "workspace-write");
+    // Every line of one read is handled before the answer's continuation
+    // runs, so the commands that follow the answer may be counted too.
+    assert.ok(updatesAtAnswer >= 2, "the history arrives before the answer");
+    assert.deepEqual(
+      h.updates.slice(0, 2).map((u) => [u.sessionId, u.update.sessionUpdate]),
+      [
+        ["kept-1", "user_message_chunk"],
+        ["kept-1", "agent_message_chunk"],
+      ],
+      "the history, under the loaded session's id",
+    );
+    await assert.rejects(h.agent.client.loadSession("kept-1", WORKSPACE), (e: unknown) => e instanceof AcpError && e.code === -32600);
+    await assert.rejects(h.agent.client.loadSession("nope", WORKSPACE), (e: unknown) => e instanceof AcpError && e.code === -32602);
+  });
+
+  it("an image block reaches the agent as sent; an agent without the capability says so in its capabilities", async () => {
+    const h = start();
+    const id = await ready(h);
+    assert.equal(h.agent.client.supportsImages, true);
+    const data = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2]).toString("base64");
+    await h.agent.client.prompt(id, [
+      { type: "text", text: "images" },
+      { type: "image", mimeType: "image/png", data },
+    ]);
+    assert.equal(h.said(), "1 image(s): image/png 10 bytes");
+
+    const bare = start({}, ["--no-reopen", "--no-image"]);
+    await ready(bare);
+    assert.equal(bare.agent.client.supportsImages, false);
+    assert.equal(bare.agent.client.supportsReopen, false);
   });
 
   it("stop() closes stdin and the agent exits", async () => {

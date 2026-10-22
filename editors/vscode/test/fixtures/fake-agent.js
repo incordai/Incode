@@ -11,16 +11,46 @@
 //   garbage           writes malformed lines, then a valid chunk
 //   unknown           sends the client a request for a method it does not have
 //   exit              exits with code 3 in the middle of the turn
+//   images            says what image blocks the prompt carried
+//
+// Kept sessions, as incode keeps them: `session/list` names two, one per
+// page (to exercise the cursor), and `session/load` replays one's history as
+// session/update BEFORE it answers, then sends the slash commands, as incode
+// does (src/acp_agent/mod.rs, "The history first, then the answer").
+// Loading a session that is still open is refused, as incode refuses it.
 //
 // `--acp` is accepted and ignored, so the tests spawn it the way the
-// extension spawns incode.
+// extension spawns incode. `--no-reopen` takes `loadSession` and
+// `sessionCapabilities.list` away; `--no-image` takes `promptCapabilities.image`
+// away (and a prompt with an image is then refused).
 "use strict";
 
 const SESSION = "sess-1";
+const NO_REOPEN = process.argv.includes("--no-reopen");
+const NO_IMAGE = process.argv.includes("--no-image");
+const KEPT = [
+  {
+    sessionId: "kept-1",
+    title: "fix the parser",
+    updatedAt: "2026-10-01T10:00:00Z",
+    history: [
+      { sessionUpdate: "user_message_chunk", content: { type: "text", text: "fix the parser" } },
+      { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Fixed." } },
+    ],
+  },
+  {
+    sessionId: "kept-2",
+    title: "write the docs",
+    updatedAt: "2026-09-30T08:00:00Z",
+    history: [{ sessionUpdate: "user_message_chunk", content: { type: "text", text: "write the docs" } }],
+  },
+];
+const open = new Set(); // session ids open on this connection
 let buffer = "";
 let nextId = 1;
 const waiting = new Map(); // our request id -> resolve
 let running = null; // { id, onCancel }
+let current = SESSION; // the session the running prompt speaks for
 
 function send(message) {
   process.stdout.write(JSON.stringify(message) + "\n");
@@ -31,12 +61,19 @@ function respond(id, result) {
 function fail(id, code, message, data) {
   send({ jsonrpc: "2.0", id, error: { code, message, data } });
 }
-function update(u) {
-  send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: SESSION, update: u } });
+function update(u, sessionId = current) {
+  send({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update: u } });
 }
 function say(text) {
   update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text } });
 }
+const modes = () => ({
+  currentModeId: "workspace-write",
+  availableModes: [
+    { id: "read-only", name: "Read only" },
+    { id: "workspace-write", name: "Workspace write" },
+  ],
+});
 function ask(method, params) {
   const id = `agent-${nextId++}`;
   return new Promise((resolve) => {
@@ -59,7 +96,11 @@ const configOptions = (agent) => [
 ];
 
 async function prompt(id, params) {
-  const text = (params.prompt || []).map((b) => (b.type === "text" ? b.text : "")).join("");
+  const blocks = params.prompt || [];
+  const images = blocks.filter((b) => b.type === "image");
+  if (images.length > 0 && NO_IMAGE) return fail(id, -32602, "Invalid params", "images are not advertised");
+  current = params.sessionId;
+  const text = blocks.map((b) => (b.type === "text" ? b.text : "")).join("");
   const [word, ...rest] = text.trim().split(/\s+/);
   const cancelled = new Promise((resolve) => (running = { id, onCancel: resolve }));
   const done = (stopReason) => {
@@ -139,6 +180,12 @@ async function prompt(id, params) {
       say("bye");
       setTimeout(() => process.exit(3), 20);
       return undefined;
+    case "images":
+      say(
+        `${images.length} image(s): ` +
+          images.map((b) => `${b.mimeType} ${Buffer.from(String(b.data), "base64").length} bytes`).join(", "),
+      );
+      return done("end_turn");
     default:
       say(`echo: ${text}`);
       return done("end_turn");
@@ -165,23 +212,40 @@ function handle(line) {
     case "initialize":
       return respond(id, {
         protocolVersion: 1,
-        agentCapabilities: { loadSession: false, sessionCapabilities: { close: {} } },
+        agentCapabilities: {
+          loadSession: !NO_REOPEN,
+          promptCapabilities: { image: !NO_IMAGE, embeddedContext: true },
+          sessionCapabilities: NO_REOPEN ? { close: {} } : { close: {}, list: {} },
+        },
         authMethods: [],
         agentInfo: { name: "fake", version: "0.0.1", clientCapabilitiesSeen: params.clientCapabilities },
       });
     case "session/new":
-      respond(id, {
-        sessionId: SESSION,
-        modes: {
-          currentModeId: "workspace-write",
-          availableModes: [
-            { id: "read-only", name: "Read only" },
-            { id: "workspace-write", name: "Workspace write" },
-          ],
-        },
-        configOptions: configOptions("claude-code"),
+      open.add(SESSION);
+      respond(id, { sessionId: SESSION, modes: modes(), configOptions: configOptions("claude-code") });
+      return update({ sessionUpdate: "available_commands_update", availableCommands: [{ name: "undo", description: "Undo" }] }, SESSION);
+    case "session/list": {
+      if (NO_REOPEN) return fail(id, -32601, "Method not found");
+      if (!params || typeof params.cwd !== "string") return fail(id, -32602, "Invalid params", "cwd is required");
+      const page = params.cursor === "2" ? 1 : 0;
+      const s = KEPT[page];
+      return respond(id, {
+        sessions: [{ sessionId: s.sessionId, cwd: params.cwd, title: s.title, updatedAt: s.updatedAt }],
+        ...(page === 0 ? { nextCursor: "2" } : {}),
       });
-      return update({ sessionUpdate: "available_commands_update", availableCommands: [{ name: "undo", description: "Undo" }] });
+    }
+    case "session/load": {
+      if (NO_REOPEN) return fail(id, -32601, "Method not found");
+      const kept = KEPT.find((s) => s.sessionId === params.sessionId);
+      if (!kept || typeof params.cwd !== "string" || !Array.isArray(params.mcpServers)) {
+        return fail(id, -32602, "Invalid params", `no session \`${params.sessionId}\` is kept`);
+      }
+      if (open.has(kept.sessionId)) return fail(id, -32600, "Invalid request", `session \`${kept.sessionId}\` is already open`);
+      open.add(kept.sessionId);
+      for (const u of kept.history) update(u, kept.sessionId);
+      respond(id, { modes: modes(), configOptions: configOptions("codex") });
+      return update({ sessionUpdate: "available_commands_update", availableCommands: [{ name: "undo", description: "Undo" }] }, kept.sessionId);
+    }
     case "session/prompt":
       if (running) return fail(id, -32600, "Invalid request", "a prompt is already running");
       return void prompt(id, params);
@@ -193,6 +257,7 @@ function handle(line) {
     case "session/set_config_option":
       return respond(id, { configOptions: configOptions(params.value) });
     case "session/close":
+      if (!open.delete(params.sessionId)) return fail(id, -32602, "Invalid params", `no session \`${params.sessionId}\``);
       return respond(id, {});
     default:
       if (id !== undefined) return fail(id, -32601, "Method not found");

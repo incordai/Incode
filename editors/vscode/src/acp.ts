@@ -89,7 +89,13 @@ export interface ContentBlockResource {
   type: "resource";
   resource: { uri: string; text: string; mimeType?: string };
 }
-export type ContentBlock = ContentBlockText | ContentBlockResource | { type: string; [k: string]: unknown };
+/** A picture: base64 `data` and its media type. Sent only when the agent advertises `promptCapabilities.image`. */
+export interface ContentBlockImage {
+  type: "image";
+  mimeType: string;
+  data: string;
+}
+export type ContentBlock = ContentBlockText | ContentBlockResource | ContentBlockImage | { type: string; [k: string]: unknown };
 
 export interface SessionMode {
   id: string;
@@ -224,6 +230,20 @@ export interface NewSessionResult {
 export interface LoadSessionResult {
   modes?: SessionModeState | null;
   configOptions?: SessionConfigOption[] | null;
+}
+
+/** One entry of `session/list`. */
+export interface SessionInfo {
+  sessionId: string;
+  cwd: string;
+  title?: string | null;
+  /** RFC 3339. */
+  updatedAt?: string | null;
+}
+
+export interface ListSessionsResult {
+  sessions: SessionInfo[];
+  nextCursor?: string | null;
 }
 
 export type StopReason = "end_turn" | "max_tokens" | "max_turn_requests" | "refusal" | "cancelled" | string;
@@ -614,8 +634,20 @@ export class AcpClient extends EventEmitter {
     return this.connection.request<NewSessionResult>("session/new", { cwd, mcpServers });
   }
 
+  /**
+   * Open a kept session again. The agent replays its history as
+   * `session/update` notifications BEFORE it answers.
+   */
   loadSession(sessionId: string, cwd: string, mcpServers: unknown[] = []): Promise<LoadSessionResult> {
     return this.connection.request<LoadSessionResult>("session/load", { sessionId, cwd, mcpServers });
+  }
+
+  /** One page of the sessions kept in `cwd`. */
+  async listSessions(cwd: string, cursor?: string): Promise<ListSessionsResult> {
+    const params: { cwd: string; cursor?: string } = { cwd };
+    if (cursor !== undefined) params.cursor = cursor;
+    const r = await this.connection.request<ListSessionsResult>("session/list", params);
+    return { sessions: Array.isArray(r?.sessions) ? r.sessions.filter(isSessionInfo) : [], nextCursor: r?.nextCursor ?? null };
   }
 
   async prompt(sessionId: string, prompt: ContentBlock[]): Promise<StopReason> {
@@ -654,6 +686,27 @@ export class AcpClient extends EventEmitter {
     const close = this.initialized?.agentCapabilities?.sessionCapabilities?.close;
     return close !== undefined && close !== null;
   }
+
+  /**
+   * Whether a kept session can be found and opened again: `session/load`
+   * (`loadSession: true`) and `session/list` (`sessionCapabilities.list`)
+   * both, since one without the other gives the person nothing to pick from
+   * or nothing to do with the pick.
+   */
+  get supportsReopen(): boolean {
+    const caps = this.initialized?.agentCapabilities;
+    const list = caps?.sessionCapabilities?.list;
+    return caps?.loadSession === true && list !== undefined && list !== null;
+  }
+
+  /** Whether a prompt may carry `image` blocks. */
+  get supportsImages(): boolean {
+    return this.initialized?.agentCapabilities?.promptCapabilities?.image === true;
+  }
+}
+
+function isSessionInfo(s: unknown): s is SessionInfo {
+  return !!s && typeof s === "object" && typeof (s as SessionInfo).sessionId === "string";
 }
 
 export function defaultClientCapabilities(): object {
