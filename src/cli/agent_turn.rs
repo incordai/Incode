@@ -506,7 +506,30 @@ impl AgentSession {
     /// [`crate::agent::AgentBackend::compact`]. `None` when the lead is an
     /// agent CLI, which compacts its own.
     pub fn compact(&mut self, instructions: &str) -> Option<Result<String, String>> {
-        self.backend.compact(instructions)
+        // The operator's `pre_compact` commands first (`crate::hooks`): told,
+        // never asked — what they print is shown with the result.
+        let said: Vec<String> = match &self.operator_hooks {
+            Some(hooks) => hooks
+                .pre_compact(
+                    "manual",
+                    instructions,
+                    self.session_id().unwrap_or(""),
+                    Some(&self.workspace),
+                )
+                .messages()
+                .to_vec(),
+            None => Vec::new(),
+        };
+        match self.backend.compact(instructions) {
+            Some(Ok(done)) if !said.is_empty() => {
+                let lines: Vec<String> = said
+                    .iter()
+                    .map(|s| format!("[pre_compact hook] {s}"))
+                    .collect();
+                Some(Ok(format!("{}\n{done}", lines.join("\n"))))
+            }
+            other => other,
+        }
     }
 
     /// Start a fresh agent session on the next turn.
@@ -1218,6 +1241,26 @@ impl AgentSession {
                 self.memory
                     .said(crate::hooks::memory::Speaker::Agent, &said.whole());
             }
+        }
+
+        // The operator's `stop` commands, once the turn is over — after any
+        // continuation above (`crate::hooks`). Told what the agent said
+        // last; what they print joins the turn's notices. They cannot reopen
+        // the turn.
+        if outcome.is_ok() {
+            let told: Vec<String> = match &self.operator_hooks {
+                Some(hooks) => hooks
+                    .stop(
+                        said.last(),
+                        self.session_id().unwrap_or(""),
+                        Some(&self.workspace),
+                    )
+                    .messages()
+                    .to_vec(),
+                None => Vec::new(),
+            };
+            self.notices
+                .extend(told.into_iter().map(|m| format!("[stop hook] {m}")));
         }
 
         // HOW MUCH MOVED, in one line, once the turn is over.
@@ -1981,6 +2024,35 @@ mod tests {
             }
             assert!(seen.lock().expect("seen").prompts.is_empty());
         }
+    }
+
+    /// **A STOP HOOK RUNS WHEN THE TURN ENDS**, and what it prints is shown
+    /// with the turn's notices; without one, no such notice appears.
+    #[test]
+    fn a_stop_hook_runs_after_the_turn_and_its_output_is_shown() {
+        let ws = tempfile::tempdir().expect("ws");
+        let engine = tempfile::tempdir().expect("engine");
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let mut s = with_memory(ws.path(), engine.path(), &[], &seen, Box::new(|_| {}));
+        s.set_operator_hooks(Some(crate::hooks::HookRunner::new(
+            crate::hooks::HookConfig {
+                stop: vec![operator_hook("turn noted", "", 0)],
+                ..crate::hooks::HookConfig::default()
+            },
+        )));
+        one_turn(&mut s, ws.path(), "do the work");
+        let notices = s.take_notices();
+        assert!(
+            notices.iter().any(|n| n == "[stop hook] turn noted"),
+            "{notices:?}"
+        );
+
+        s.set_operator_hooks(None);
+        one_turn(&mut s, ws.path(), "again");
+        assert!(!s
+            .take_notices()
+            .iter()
+            .any(|n| n.starts_with("[stop hook]")));
     }
 
     fn start_context(text: &str) -> String {

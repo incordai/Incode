@@ -131,6 +131,15 @@ pub struct HookConfig {
     /// is added to that turn's context. The line itself is never changed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub user_prompt_submit: Vec<String>,
+    /// Commands run before `/compact` compacts the conversation. They cannot
+    /// stop it; stdout is shown with the result.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pre_compact: Vec<String>,
+    /// Commands run when a person's turn has ended (after any continuation
+    /// the memory engine asked for). They cannot reopen it; stdout is shown
+    /// with the turn's notices.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stop: Vec<String>,
 }
 
 impl HookConfig {
@@ -143,6 +152,19 @@ impl HookConfig {
         self.pre_tool_use.is_empty()
             && self.post_tool_use.is_empty()
             && self.user_prompt_submit.is_empty()
+            && self.pre_compact.is_empty()
+            && self.stop.is_empty()
+    }
+
+    /// How many commands, over every event. Used where a plugin's hooks are
+    /// shown for approval (`plugins::contents`), so none is left uncounted.
+    #[must_use]
+    pub fn count(&self) -> usize {
+        self.pre_tool_use.len()
+            + self.post_tool_use.len()
+            + self.user_prompt_submit.len()
+            + self.pre_compact.len()
+            + self.stop.len()
     }
 
     /// `other`'s commands after these, event by event (a plugin's after the
@@ -151,6 +173,8 @@ impl HookConfig {
         self.pre_tool_use.extend(other.pre_tool_use);
         self.post_tool_use.extend(other.post_tool_use);
         self.user_prompt_submit.extend(other.user_prompt_submit);
+        self.pre_compact.extend(other.pre_compact);
+        self.stop.extend(other.stop);
     }
 }
 
@@ -359,43 +383,106 @@ impl HookRunner {
         session: &str,
         cwd: Option<&Path>,
     ) -> HookRunResult {
-        let commands = &self.config.user_prompt_submit;
-        if commands.is_empty() {
-            return HookRunResult::allow(Vec::new());
-        }
-        let mut payload = json!({
-            "hook_event_name": "UserPromptSubmit",
-            "prompt": prompt,
-            "session_id": session,
-            "cwd": cwd.map(|p| p.to_string_lossy().into_owned()),
-        })
-        .to_string()
-        .into_bytes();
-        payload.push(b'\n');
-        let mut messages = Vec::new();
-        for command in commands {
-            match run_shell_command(command, &[], cwd, &payload) {
-                Ok((2, stdout, stderr)) => {
-                    let reason = if stderr.is_empty() { stdout } else { stderr };
-                    return HookRunResult {
-                        denied: true,
-                        messages: vec![if reason.is_empty() {
-                            format!("the operator's hook `{command}` refused this prompt")
-                        } else {
-                            reason
-                        }],
-                    };
-                }
-                Ok((_, stdout, _)) => {
-                    if !stdout.is_empty() {
-                        messages.push(stdout);
-                    }
-                }
-                Err(e) => messages.push(format!("Hook `{command}` failed: {e}")),
-            }
-        }
-        HookRunResult::allow(messages)
+        run_event(
+            &self.config.user_prompt_submit,
+            "UserPromptSubmit",
+            json!({ "prompt": prompt }),
+            session,
+            cwd,
+            true,
+        )
     }
+
+    /// The `pre_compact` commands, before `/compact` compacts the
+    /// conversation (`trigger` is `manual`). They cannot stop it: exit 2 is
+    /// an ordinary exit here. Each one's stdout is a message to show.
+    ///
+    /// Called by `cli::agent_turn::AgentSession::compact`.
+    #[must_use]
+    pub fn pre_compact(
+        &self,
+        trigger: &str,
+        instructions: &str,
+        session: &str,
+        cwd: Option<&Path>,
+    ) -> HookRunResult {
+        run_event(
+            &self.config.pre_compact,
+            "PreCompact",
+            json!({ "trigger": trigger, "custom_instructions": instructions }),
+            session,
+            cwd,
+            false,
+        )
+    }
+
+    /// The `stop` commands, once a person's turn has ended, told what the
+    /// agent said last. They cannot reopen the turn; each one's stdout is a
+    /// message to show.
+    ///
+    /// Called by `cli::agent_turn::AgentSession::turn_observed`.
+    #[must_use]
+    pub fn stop(&self, last_message: &str, session: &str, cwd: Option<&Path>) -> HookRunResult {
+        run_event(
+            &self.config.stop,
+            "Stop",
+            json!({ "last_assistant_message": last_message }),
+            session,
+            cwd,
+            false,
+        )
+    }
+}
+
+/// Run `commands` for one event that is not a tool call: the event as JSON on
+/// stdin — `hook_event_name`, `session_id`, `cwd` and `fields` — bounded at
+/// [`HOOK_TIMEOUT`]. With `can_refuse`, exit 2 refuses (stderr, else stdout,
+/// is the reason) and the rest are not run; otherwise exit 2 is like any
+/// other. Each command's stdout is a message.
+fn run_event(
+    commands: &[String],
+    name: &str,
+    fields: Value,
+    session: &str,
+    cwd: Option<&Path>,
+    can_refuse: bool,
+) -> HookRunResult {
+    if commands.is_empty() {
+        return HookRunResult::allow(Vec::new());
+    }
+    let mut event = json!({
+        "hook_event_name": name,
+        "session_id": session,
+        "cwd": cwd.map(|p| p.to_string_lossy().into_owned()),
+    });
+    if let (Some(event), Value::Object(fields)) = (event.as_object_mut(), fields) {
+        event.extend(fields);
+    }
+    let mut payload = event.to_string().into_bytes();
+    payload.push(b'\n');
+    let mut messages = Vec::new();
+    for command in commands {
+        match run_shell_command(command, &[], cwd, &payload) {
+            Ok((2, stdout, stderr)) if can_refuse => {
+                let reason = if stderr.is_empty() { stdout } else { stderr };
+                return HookRunResult {
+                    denied: true,
+                    messages: vec![if reason.is_empty() {
+                        format!("the operator's hook `{command}` refused this")
+                    } else {
+                        reason
+                    }],
+                };
+            }
+            Ok((_, stdout, _)) => {
+                if !stdout.is_empty() {
+                    messages.push(stdout);
+                }
+            }
+            Err(e) => messages.push(format!("Hook `{command}` failed: {e}")),
+        }
+    }
+    HookRunResult::allow(messages)
 }
 
 /// A `user_prompt_submit` command's output as the turn's context block, with
@@ -531,6 +618,8 @@ mod tests {
             pre_tool_use: vec![hook(dir.path(), 2, "no writes today")],
             post_tool_use: Vec::new(),
             user_prompt_submit: Vec::new(),
+            pre_compact: Vec::new(),
+            stop: Vec::new(),
         });
         let input = json!({"path": "a.txt", "content": "hi"});
         let ran = runner.pre_tool(&call(&input, dir.path()));
@@ -555,6 +644,8 @@ mod tests {
             pre_tool_use: vec![hook(dir.path(), 0, "fine")],
             post_tool_use: vec![hook(dir.path(), 2, "too late")],
             user_prompt_submit: Vec::new(),
+            pre_compact: Vec::new(),
+            stop: Vec::new(),
         });
         let input = json!({"path": "a.txt"});
         let pre = runner.pre_tool(&call(&input, dir.path()));
@@ -584,6 +675,42 @@ mod tests {
         );
         assert!(block.ends_with("</operator-hook>"), "{block}");
         assert!(block.contains("fine< /operator-hook>"), "{block}");
+    }
+
+    /// `pre_compact` and `stop` are told, never asked: exit 2 refuses
+    /// nothing, stdout is a message, and the event carries its own fields.
+    #[test]
+    fn pre_compact_and_stop_are_told_and_cannot_refuse() {
+        let dir = tempfile::tempdir().expect("dir");
+        let runner = HookRunner::new(HookConfig {
+            pre_compact: vec![hook(dir.path(), 2, "")],
+            ..HookConfig::default()
+        });
+        let ran = runner.pre_compact("manual", "keep the API notes", "s-1", Some(dir.path()));
+        assert!(!ran.is_denied(), "a pre_compact hook refused");
+        assert_eq!(ran.messages(), ["said"]);
+        let event: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("event.json")).expect("saved"),
+        )
+        .expect("json");
+        assert_eq!(event["hook_event_name"], "PreCompact");
+        assert_eq!(event["trigger"], "manual");
+        assert_eq!(event["custom_instructions"], "keep the API notes");
+
+        let stop_dir = tempfile::tempdir().expect("dir");
+        let runner = HookRunner::new(HookConfig {
+            stop: vec![hook(stop_dir.path(), 2, "")],
+            ..HookConfig::default()
+        });
+        let ran = runner.stop("all done", "s-1", Some(stop_dir.path()));
+        assert!(!ran.is_denied(), "a stop hook refused");
+        let event: Value = serde_json::from_str(
+            &std::fs::read_to_string(stop_dir.path().join("event.json")).expect("saved"),
+        )
+        .expect("json");
+        assert_eq!(event["hook_event_name"], "Stop");
+        assert_eq!(event["last_assistant_message"], "all done");
+        assert_eq!(event["session_id"], "s-1");
     }
 
     fn prompt_runner(commands: Vec<String>) -> HookRunner {

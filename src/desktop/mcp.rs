@@ -1754,6 +1754,8 @@ mod tests {
                     pre_tool_use: vec![deny.to_string()],
                     post_tool_use: Vec::new(),
                     user_prompt_submit: Vec::new(),
+                    pre_compact: Vec::new(),
+                    stop: Vec::new(),
                 },
             );
 
@@ -1791,6 +1793,8 @@ mod tests {
                     pre_tool_use: vec![allow.to_string()],
                     post_tool_use: Vec::new(),
                     user_prompt_submit: Vec::new(),
+                    pre_compact: Vec::new(),
+                    stop: Vec::new(),
                 },
             );
 

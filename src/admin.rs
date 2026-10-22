@@ -1606,6 +1606,8 @@ mod tests {
                 pre_tool_use: vec!["a-guard-command".to_string()],
                 post_tool_use: vec!["a-logging-command".to_string()],
                 user_prompt_submit: vec!["a-prompt-check".to_string()],
+                pre_compact: vec!["a-compact-note".to_string()],
+                stop: vec!["a-stop-note".to_string()],
             },
             desktop_display: Some("xvfb:1280x800".to_string()),
             desktop_limits: crate::desktop::limits::DesktopLimits {
