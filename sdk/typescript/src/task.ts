@@ -1,6 +1,10 @@
-/** One-shot runs: `incode -t "<task>" --output-format json`. */
+/**
+ * One-shot runs: `incode -t "<task>" --output-format json` (`runTask`), or
+ * `stream-json`, one event at a time (`streamTask`).
+ */
 
 import { spawn } from "node:child_process";
+import { createInterface } from "node:readline";
 
 import { IncodeError, IncodeTimeout, ProtocolError, TaskFailed } from "./errors.js";
 
@@ -95,10 +99,14 @@ export function parseTaskResult(data: Record<string, unknown>, exitCode: number 
   };
 }
 
-/** The command line `runTask` runs, as `[command, ...args]`. */
-export function buildTaskArgv(task: string, options: RunTaskOptions = {}): string[] {
+/** The command line `runTask` (`json`) or `streamTask` (`stream-json`) runs, as `[command, ...args]`. */
+export function buildTaskArgv(
+  task: string,
+  options: RunTaskOptions = {},
+  outputFormat: "json" | "stream-json" = "json",
+): string[] {
   const argv = commandOf(options.incodePath);
-  argv.push("-t", task, "--output-format", "json");
+  argv.push("-t", task, "--output-format", outputFormat);
   if (options.workspace !== undefined) argv.push("-w", options.workspace);
   if (options.model) argv.push("-m", options.model);
   if (options.permissionMode) argv.push("-p", options.permissionMode);
@@ -196,4 +204,136 @@ export function runTask(task: string, options: RunTaskOptions = {}): Promise<Tas
     });
     if (options.signal?.aborted) onAbort();
   });
+}
+
+/**
+ * One line of `incode -t ... --output-format stream-json` before the result:
+ * `type` is `init`, `text`, `thinking`, `notice`, `tool_use`, `tool_result` or
+ * `usage` (src/task_run.rs `Report::event`); `data` is the whole object.
+ */
+export interface TaskEvent {
+  type: string;
+  data: Record<string, unknown>;
+}
+
+/**
+ * A `stream-json` run. Iterate it (`for await`) for its events as they arrive;
+ * `result` resolves with the run's `TaskResult`, or rejects as `runTask` would
+ * (`TaskFailed`, `IncodeTimeout`, `IncodeError`, `ProtocolError`). Iterating to
+ * the end throws that same error.
+ */
+export interface TaskStream extends AsyncIterable<TaskEvent> {
+  readonly result: Promise<TaskResult>;
+}
+
+/** Run one instruction with `incode -t ... --output-format stream-json`. Takes `runTask`'s options. */
+export function streamTask(task: string, options: RunTaskOptions = {}): TaskStream {
+  const [command, ...args] = buildTaskArgv(task, options, "stream-json");
+  const queue: TaskEvent[] = [];
+  let wake: (() => void) | null = null;
+  let finished = false;
+  let stderr = "";
+  let timedOut = false;
+  let aborted = false;
+  let notJson: string | null = null;
+  let resultData: Record<string, unknown> | null = null;
+  let spawnError: NodeJS.ErrnoException | null = null;
+
+  const child = spawn(command as string, args, {
+    stdio: ["ignore", "pipe", "pipe"],
+    env: options.env ? { ...process.env, ...options.env } : process.env,
+  });
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (d: string) => (stderr += d));
+  const lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
+  lines.on("line", (raw: string) => {
+    const line = raw.trim();
+    if (line === "" || notJson !== null) return;
+    let value: unknown;
+    try {
+      value = JSON.parse(line);
+    } catch {
+      notJson = line;
+      child.kill("SIGKILL");
+      return;
+    }
+    if (!value || typeof value !== "object" || Array.isArray(value)) return;
+    const data = value as Record<string, unknown>;
+    if (data["type"] === "result") {
+      resultData = data;
+      return;
+    }
+    queue.push({ type: typeof data["type"] === "string" ? data["type"] : "", data });
+    wake?.();
+  });
+
+  const timer =
+    options.timeoutMs !== undefined
+      ? setTimeout(() => {
+          timedOut = true;
+          child.kill("SIGKILL");
+        }, options.timeoutMs)
+      : undefined;
+  const onAbort = (): void => {
+    aborted = true;
+    child.kill("SIGKILL");
+  };
+  options.signal?.addEventListener("abort", onAbort, { once: true });
+  if (options.signal?.aborted) onAbort();
+
+  const exited = new Promise<number | null>((resolve) => {
+    child.on("error", (err: NodeJS.ErrnoException) => {
+      spawnError = err;
+      resolve(null);
+    });
+    child.on("close", (code) => resolve(code));
+  });
+
+  const result = exited.then((code): TaskResult => {
+    finished = true;
+    if (timer) clearTimeout(timer);
+    options.signal?.removeEventListener("abort", onAbort);
+    wake?.();
+    if (spawnError) throw new IncodeError(`could not start incode: ${spawnError.message} (${command})`, { stderr });
+    if (timedOut) throw new IncodeTimeout(`incode -t did not finish within ${options.timeoutMs}ms`, { stderr });
+    if (aborted) throw new IncodeError("incode -t was aborted", { stderr });
+    if (notJson !== null) {
+      throw new ProtocolError(`incode -t printed a line that is not JSON: ${JSON.stringify((notJson as string).slice(0, 500))}`, {
+        stderr,
+        exitCode: code,
+      });
+    }
+    if (resultData === null) {
+      if (code !== 0) throw new IncodeError("incode -t failed before producing a result", { stderr, exitCode: code });
+      throw new ProtocolError("incode -t printed no JSON result object", { stderr, exitCode: code });
+    }
+    const parsed = parseTaskResult(resultData, code, stderr);
+    if (parsed.isError || code !== 0) {
+      throw new TaskFailed(`incode -t reported an error: ${parsed.error ?? "unknown error"}`, parsed, {
+        stderr,
+        exitCode: code,
+      });
+    }
+    return parsed;
+  });
+  // Handled here so a caller that only iterates is not warned of an
+  // unhandled rejection; `result` itself still rejects for whoever awaits it.
+  result.catch(() => undefined);
+
+  return {
+    result,
+    async *[Symbol.asyncIterator](): AsyncIterator<TaskEvent> {
+      for (;;) {
+        const next = queue.shift();
+        if (next !== undefined) {
+          yield next;
+          continue;
+        }
+        if (finished) break;
+        await new Promise<void>((resolve) => (wake = resolve));
+        wake = null;
+      }
+      await result;
+    },
+  };
 }

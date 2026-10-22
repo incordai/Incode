@@ -1,14 +1,16 @@
-"""One-shot runs: ``incode -t "<task>" --output-format json``."""
+"""One-shot runs: ``incode -t "<task>" --output-format json`` (:func:`run_task`)
+or ``stream-json``, one event at a time (:func:`stream_task`)."""
 
 import json
 import os
 import subprocess
+import threading
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Union
 
 from .errors import IncodeError, IncodeTimeout, ProtocolError, TaskFailed
 
-__all__ = ["TaskResult", "TaskUsage", "run_task", "build_task_argv"]
+__all__ = ["TaskEvent", "TaskResult", "TaskStream", "TaskUsage", "run_task", "stream_task", "build_task_argv"]
 
 PathLike = Union[str, "os.PathLike[str]"]
 
@@ -91,10 +93,12 @@ def build_task_argv(
     permission_mode: Optional[str] = None,
     incode_path: Union[PathLike, Sequence[str]] = "incode",
     extra_args: Sequence[str] = (),
+    output_format: str = "json",
 ) -> List[str]:
-    """The command line :func:`run_task` runs."""
+    """The command line :func:`run_task` (``json``) or :func:`stream_task`
+    (``stream-json``) runs."""
     argv = _command(incode_path)
-    argv += ["-t", task, "--output-format", "json"]
+    argv += ["-t", task, "--output-format", output_format]
     if workspace is not None:
         argv += ["-w", os.fspath(workspace)]
     if model:
@@ -196,6 +200,159 @@ def run_task(
             exit_code=proc.returncode,
         )
     return result
+
+
+@dataclass
+class TaskEvent:
+    """One line of ``incode -t ... --output-format stream-json`` before the
+    result: ``type`` is ``init``, ``text``, ``thinking``, ``notice``,
+    ``tool_use``, ``tool_result`` or ``usage`` (src/task_run.rs
+    ``Report::event``); ``data`` is the whole object."""
+
+    type: str
+    data: Dict[str, Any]
+
+
+class TaskStream:
+    """A ``stream-json`` run: iterate it for :class:`TaskEvent`\\ s as they
+    arrive. When iteration ends, :attr:`result` holds the run's
+    :class:`TaskResult`; a failed run raises at the end of iteration, as
+    :func:`run_task` would (:class:`TaskFailed`, :class:`IncodeTimeout`,
+    :class:`IncodeError`, :class:`ProtocolError`). :meth:`wait` drains what is
+    left and returns the result."""
+
+    def __init__(self, argv: List[str], timeout: Optional[float], env: Optional[Mapping[str, str]]):
+        self.result: Optional[TaskResult] = None
+        self._timeout = timeout
+        self._timed_out = False
+        self._stderr: List[str] = []
+        try:
+            self._proc = subprocess.Popen(
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env,
+            )
+        except FileNotFoundError as e:
+            raise IncodeError("could not start incode: %s (looked for %r)" % (e.strerror, argv[0])) from e
+        except PermissionError as e:
+            raise IncodeError("could not start incode: %s (%r)" % (e.strerror, argv[0])) from e
+        # stderr is read on its own thread, so a full pipe never stalls the run.
+        self._stderr_thread = threading.Thread(target=self._read_stderr, daemon=True)
+        self._stderr_thread.start()
+        self._timer: Optional[threading.Timer] = None
+        if timeout is not None:
+            self._timer = threading.Timer(timeout, self._kill_for_time)
+            self._timer.daemon = True
+            self._timer.start()
+        self._events = self._run()
+
+    def _read_stderr(self) -> None:
+        assert self._proc.stderr is not None
+        for chunk in iter(lambda: self._proc.stderr.read(4096), b""):  # type: ignore[union-attr]
+            self._stderr.append(_text(chunk))
+
+    def _kill_for_time(self) -> None:
+        self._timed_out = True
+        self._proc.kill()
+
+    @property
+    def stderr(self) -> str:
+        """What incode wrote on stderr so far."""
+        return "".join(self._stderr)
+
+    def __iter__(self) -> Iterator[TaskEvent]:
+        return self._events
+
+    def wait(self) -> TaskResult:
+        """Read the rest of the run and return its result (raising as
+        iteration would)."""
+        for _ in self._events:
+            pass
+        assert self.result is not None
+        return self.result
+
+    def _run(self) -> Iterator[TaskEvent]:
+        assert self._proc.stdout is not None
+        data: Optional[Dict[str, Any]] = None
+        try:
+            for raw in self._proc.stdout:
+                line = _text(raw).strip()
+                if not line:
+                    continue
+                try:
+                    value = json.loads(line)
+                except ValueError:
+                    self._proc.kill()
+                    self._finish()
+                    raise ProtocolError(
+                        "incode -t printed a line that is not JSON: %r" % line[:500], stderr=self.stderr
+                    ) from None
+                if not isinstance(value, dict):
+                    continue
+                if value.get("type") == "result":
+                    data = value
+                    continue
+                yield TaskEvent(type=str(value.get("type") or ""), data=value)
+        finally:
+            code = self._finish()
+        if self._timed_out:
+            raise IncodeTimeout("incode -t did not finish within %ss" % self._timeout, stderr=self.stderr)
+        if data is None:
+            if code != 0:
+                raise IncodeError("incode -t failed before producing a result", stderr=self.stderr, exit_code=code)
+            raise ProtocolError("incode -t printed no JSON result object", stderr=self.stderr, exit_code=code)
+        self.result = TaskResult.from_json(data, exit_code=code, stderr=self.stderr)
+        if self.result.is_error or code != 0:
+            raise TaskFailed(
+                "incode -t reported an error: %s" % (self.result.error or "unknown error"),
+                result=self.result,
+                stderr=self.stderr,
+                exit_code=code,
+            )
+
+    def _finish(self) -> int:
+        code = self._proc.wait()
+        if self._timer is not None:
+            self._timer.cancel()
+        self._stderr_thread.join(timeout=5)
+        # Both pipes are done with once the process has exited and stderr is
+        # read: closed, so a program streaming many runs does not leak them.
+        for pipe in (self._proc.stdout, self._proc.stderr):
+            if pipe is not None:
+                pipe.close()
+        return code
+
+
+def stream_task(
+    task: str,
+    *,
+    workspace: Optional[PathLike] = None,
+    model: Optional[str] = None,
+    permission_mode: Optional[str] = None,
+    timeout: Optional[float] = None,
+    incode_path: Union[PathLike, Sequence[str]] = "incode",
+    env: Optional[Mapping[str, str]] = None,
+    extra_args: Sequence[str] = (),
+) -> TaskStream:
+    """Run one instruction with ``incode -t ... --output-format stream-json``:
+    a :class:`TaskStream` yielding each event as it arrives, then holding the
+    result. Takes the arguments :func:`run_task` takes."""
+    argv = build_task_argv(
+        task,
+        workspace=workspace,
+        model=model,
+        permission_mode=permission_mode,
+        incode_path=incode_path,
+        extra_args=extra_args,
+        output_format="stream-json",
+    )
+    full_env = None
+    if env is not None:
+        full_env = dict(os.environ)
+        full_env.update(env)
+    return TaskStream(argv, timeout, full_env)
 
 
 def _text(data: Any) -> str:

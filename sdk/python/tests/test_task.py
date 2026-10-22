@@ -6,7 +6,7 @@ import unittest
 
 from _support import FAKE
 
-from incode_sdk import IncodeError, IncodeTimeout, ProtocolError, TaskFailed, TaskResult, run_task
+from incode_sdk import IncodeError, IncodeTimeout, ProtocolError, TaskFailed, TaskResult, run_task, stream_task
 from incode_sdk.aio import run_task_async
 from incode_sdk.task import build_task_argv
 
@@ -112,6 +112,60 @@ class RunTaskTest(unittest.TestCase):
     def test_async(self):
         result = asyncio.run(run_task_async("hello", workspace=self.ws, incode_path=FAKE))
         self.assertEqual(result.result, "done: hello")
+
+
+class StreamTaskTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = self.tmp.name
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_events_arrive_in_order_then_the_result(self):
+        argv_file = os.path.join(self.ws, "argv.json")
+        stream = stream_task("add a test", workspace=self.ws, incode_path=FAKE, env={"FAKE_INCODE_ARGV": argv_file})
+        events = list(stream)
+        self.assertEqual([e.type for e in events], ["init", "text", "tool_use", "tool_result", "usage"])
+        self.assertEqual(events[1].data["text"], "working on: add a test")
+        self.assertEqual(events[2].data["name"], "Read")
+        self.assertIsNotNone(stream.result)
+        self.assertEqual(stream.result.result, "done: add a test")
+        self.assertEqual(stream.result.usage.input_tokens, 120)
+        with open(argv_file, encoding="utf-8") as f:
+            argv = json.load(f)
+        self.assertIn("stream-json", argv)
+        self.assertNotIn("result", [e.type for e in events], "the result is not an event")
+
+    def test_wait_returns_the_result(self):
+        self.assertEqual(stream_task("hello", workspace=self.ws, incode_path=FAKE).wait().result, "done: hello")
+
+    def test_a_failed_run_raises_at_the_end_with_its_events_seen(self):
+        seen = []
+        with self.assertRaises(TaskFailed) as cm:
+            for event in stream_task("fail now", workspace=self.ws, incode_path=FAKE):
+                seen.append(event.type)
+        self.assertEqual(seen[0], "init")
+        self.assertTrue(cm.exception.result.is_error)
+
+    def test_a_line_that_is_not_json_is_a_protocol_error(self):
+        with self.assertRaises(ProtocolError):
+            list(stream_task("events-garbage", workspace=self.ws, incode_path=FAKE))
+
+    def test_a_crash_is_an_incode_error_with_stderr(self):
+        with self.assertRaises(IncodeError) as cm:
+            list(stream_task("crash", workspace=self.ws, incode_path=FAKE))
+        self.assertIn("could not start", cm.exception.stderr)
+
+    def test_a_timeout_kills_the_run(self):
+        with self.assertRaises(IncodeTimeout):
+            list(stream_task("sleep", workspace=self.ws, incode_path=FAKE, timeout=1))
+
+    def test_argv(self):
+        self.assertEqual(
+            build_task_argv("hi", output_format="stream-json"),
+            ["incode", "-t", "hi", "--output-format", "stream-json"],
+        )
 
 
 if __name__ == "__main__":

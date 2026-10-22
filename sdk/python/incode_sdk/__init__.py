@@ -1,6 +1,7 @@
 """Drive the incode coding agent from Python.
 
 * :func:`run_task` — one instruction, ``incode -t ... --output-format json``.
+* :func:`stream_task` — the same, ``stream-json``: each event as it arrives.
 * :class:`Session` — an interactive session over ACP, ``incode --acp``.
 * :mod:`incode_sdk.aio` — awaitable wrappers of both.
 """
@@ -30,11 +31,14 @@ from .events import (  # noqa: E402
 )
 from .fs import FsAccessDenied, FsError, WorkspaceFS  # noqa: E402
 from .session import PromptStream, Session, allow_all, reject_all  # noqa: E402
-from .task import TaskResult, TaskUsage, run_task  # noqa: E402
+from .task import TaskEvent, TaskResult, TaskStream, TaskUsage, run_task, stream_task  # noqa: E402
 
 __all__ = [
     "__version__",
     "run_task",
+    "stream_task",
+    "TaskEvent",
+    "TaskStream",
     "TaskResult",
     "TaskUsage",
     "Session",
