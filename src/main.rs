@@ -9,6 +9,7 @@
 use std::path::PathBuf;
 
 use anyhow::Context;
+use incord_code::completions;
 use incord_code::{IncordCodeConfig, PermissionMode};
 
 const USAGE: &str = "\
@@ -21,6 +22,8 @@ USAGE:
     incode review [--base <REF>] [-p]   Review the current change (see `incode review -h`)
     incode plugin list | add <git-url | path> | update [name] | remove <name>   [--project]
     incode mcp <list|get|add|remove|approve> ...   (see `incode mcp help`)
+    incode completions <bash|zsh|fish|powershell>   Print a completion script
+                              for that shell (the script says how to load it)
 
 OPTIONS:
     -m, --model <NAME>        Model to use (or set INCODE_MODEL)
@@ -80,6 +83,192 @@ OPTIONS:
     -h, --help                Print this help
     -V, --version             Print version
 ";
+
+/// The command line as `incode completions` completes it. Kept beside
+/// [`USAGE`]: the tests hold the two to the same flags, check that
+/// [`parse_args`] accepts each one and that every fixed value is one the
+/// parser takes, and drive the generated scripts in real shells.
+const COMPLETION: completions::Command = {
+    use completions::{Command, Flag, Value};
+    const fn flag(
+        long: &'static str,
+        short: Option<&'static str>,
+        value: Value,
+        help: &'static str,
+    ) -> Flag {
+        Flag {
+            long,
+            short,
+            value,
+            help,
+        }
+    }
+    const HELP: Flag = flag("--help", Some("-h"), Value::None, "Print help");
+    Command {
+        name: "incode",
+        flags: &[
+            flag("--model", Some("-m"), Value::Text, "Model to use"),
+            flag("--workspace", Some("-w"), Value::Path, "Workspace root"),
+            flag(
+                "--permission-mode",
+                Some("-p"),
+                Value::Choice(&[
+                    "read-only",
+                    "workspace-write",
+                    "danger-full-access",
+                    "prompt",
+                    "allow",
+                ]),
+                "What the agent may do",
+            ),
+            flag(
+                "--no-env-filter",
+                None,
+                Value::None,
+                "Pass the full environment",
+            ),
+            flag(
+                "--admin",
+                None,
+                Value::None,
+                "Print the operator's settings",
+            ),
+            flag(
+                "--serve",
+                None,
+                Value::None,
+                "Serve this workspace read-only",
+            ),
+            flag("--port", None, Value::Text, "Port for --serve"),
+            flag(
+                "--desktop-mcp",
+                None,
+                Value::None,
+                "Desktop MCP server on stdio",
+            ),
+            flag(
+                "--desktop-journal",
+                None,
+                Value::Path,
+                "File the desktop appends to",
+            ),
+            flag("--acp", None, Value::None, "Agent Client Protocol on stdio"),
+            flag("--team-mcp", None, Value::None, "Team MCP server on stdio"),
+            flag(
+                "--team-channel",
+                None,
+                Value::Path,
+                "Conversation --team-mcp joins",
+            ),
+            flag(
+                "--sandbox-exec",
+                None,
+                Value::None,
+                "Run under the OS sandbox",
+            ),
+            flag(
+                "--install-tools",
+                None,
+                Value::None,
+                "Install admin.json tools",
+            ),
+            flag(
+                "--tool-server",
+                None,
+                Value::None,
+                "Offer incode's tools over MCP",
+            ),
+            flag(
+                "--check-findings",
+                None,
+                Value::Path,
+                "Check a findings file",
+            ),
+            flag("--desktop-stop", None, Value::None, "Halt the desktop"),
+            flag("--task", Some("-t"), Value::Text, "Run one instruction"),
+            flag(
+                "--output-format",
+                None,
+                Value::Choice(&["text", "stream-json", "json"]),
+                "Output of a -t run",
+            ),
+            flag(
+                "--spec-gate",
+                None,
+                Value::Choice(&["on", "off"]),
+                "Spec gate for a -t run",
+            ),
+            flag("--resume", Some("-r"), Value::Text, "Continue a session"),
+            flag(
+                "--add-dir",
+                None,
+                Value::Path,
+                "Also work in this directory",
+            ),
+            HELP,
+            flag("--version", Some("-V"), Value::None, "Print version"),
+        ],
+        verbs: &[],
+        subcommands: &[
+            Command {
+                name: "update",
+                flags: &[
+                    flag("--check", None, Value::None, "Only report a newer release"),
+                    HELP,
+                ],
+                verbs: &[],
+                subcommands: &[],
+            },
+            Command {
+                name: "review",
+                flags: &[
+                    flag("--base", None, Value::Text, "Compare with this ref"),
+                    flag(
+                        "--print",
+                        Some("-p"),
+                        Value::None,
+                        "Print only the findings",
+                    ),
+                    flag("--model", Some("-m"), Value::Text, "Model to review with"),
+                    flag(
+                        "--workspace",
+                        Some("-w"),
+                        Value::Path,
+                        "Repository to review",
+                    ),
+                    HELP,
+                ],
+                verbs: &[],
+                subcommands: &[],
+            },
+            Command {
+                name: "plugin",
+                flags: &[flag(
+                    "--project",
+                    None,
+                    Value::None,
+                    "In this workspace's .incode/plugins",
+                )],
+                verbs: &["list", "add", "update", "remove", "help"],
+                subcommands: &[],
+            },
+            Command {
+                name: "mcp",
+                flags: &[HELP],
+                verbs: &[
+                    "list", "get", "add", "remove", "approve", "login", "logout", "help",
+                ],
+                subcommands: &[],
+            },
+            Command {
+                name: "completions",
+                flags: &[HELP],
+                verbs: &completions::Shell::NAMES,
+                subcommands: &[],
+            },
+        ],
+    }
+};
 
 fn main() -> anyhow::Result<()> {
     // The sbx engine's helper (`incode __sbx-enter ...`): confine this
@@ -662,6 +851,27 @@ fn parse_args(args: impl Iterator<Item = String>) -> anyhow::Result<Parsed> {
     if args.peek().map(String::as_str) == Some("mcp") {
         args.next();
         return Ok(Parsed::Mcp(args.collect()));
+    }
+    // A subcommand, in first place: one shell name, and the script for it is
+    // the whole answer.
+    if args.peek().map(String::as_str) == Some("completions") {
+        args.next();
+        let shells = completions::Shell::NAMES.join(", ");
+        let words: Vec<String> = args.collect();
+        let name = match words.as_slice() {
+            [flag] if flag == "-h" || flag == "--help" => {
+                return Ok(Parsed::Exit(format!(
+                    "usage: incode completions <shell>   ({shells})"
+                )))
+            }
+            [name] => name,
+            _ => anyhow::bail!("usage: incode completions <shell>   ({shells})"),
+        };
+        let shell = completions::Shell::parse(name)
+            .ok_or_else(|| anyhow::anyhow!("no completions for `{name}`. Shells: {shells}"))?;
+        return completions::script(shell, &COMPLETION)
+            .map(Parsed::Exit)
+            .map_err(|e| anyhow::anyhow!(e));
     }
 
     while let Some(arg) = args.next() {
@@ -1765,6 +1975,420 @@ mod tests {
         match parse(&["--version"]).unwrap() {
             Parsed::Exit(text) => assert!(text.contains("incode")),
             other => panic!("--version must not start a session, got {other:?}"),
+        }
+    }
+
+    // --- completions -------------------------------------------------------
+
+    use std::collections::BTreeSet;
+
+    /// The flags a help text names: words of `-` and a letter, or `--` and a
+    /// letter, with the punctuation around them cut off.
+    fn flags_named_in(text: &str) -> BTreeSet<String> {
+        text.split(|c: char| c.is_whitespace() || c == ',' || c == '`')
+            .map(|w| w.trim_matches(|c: char| !(c.is_ascii_alphanumeric() || c == '-')))
+            .filter(|w| {
+                let rest = w.trim_start_matches('-');
+                (1..=2).contains(&(w.len() - rest.len()))
+                    && rest.starts_with(|c: char| c.is_ascii_alphabetic())
+            })
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn table_flags(command: &completions::Command) -> BTreeSet<String> {
+        command
+            .flags
+            .iter()
+            .flat_map(|f| std::iter::once(f.long).chain(f.short))
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn sub(name: &str) -> &'static completions::Command {
+        COMPLETION
+            .subcommands
+            .iter()
+            .find(|c| c.name == name)
+            .unwrap_or_else(|| panic!("no `{name}` in the completion table"))
+    }
+
+    fn options_of(usage: &str) -> &str {
+        usage.split_once("OPTIONS:").expect("an OPTIONS section").1
+    }
+
+    /// **THE TABLE AND THE HELP NAME THE SAME FLAGS**, both ways: a flag added
+    /// to `USAGE` and not to the table fails here, and so does the reverse.
+    #[test]
+    fn the_completion_table_names_the_flags_the_help_does() {
+        assert_eq!(table_flags(&COMPLETION), flags_named_in(options_of(USAGE)));
+        assert_eq!(
+            table_flags(sub("review")),
+            flags_named_in(options_of(incord_code::review::USAGE))
+        );
+        let subcommands: BTreeSet<&str> = USAGE
+            .lines()
+            .filter_map(|l| l.trim_start().strip_prefix("incode "))
+            .filter_map(|rest| rest.split_whitespace().next())
+            .filter(|w| w.starts_with(|c: char| c.is_ascii_lowercase()))
+            .collect();
+        let table: BTreeSet<&str> = COMPLETION.subcommands.iter().map(|c| c.name).collect();
+        assert_eq!(table, subcommands);
+    }
+
+    /// The arguments that give `flag` a value the parser takes: one set per
+    /// fixed value, else one.
+    fn with_values(flag: &completions::Flag, spelling: &'static str) -> Vec<Vec<&'static str>> {
+        match flag.value {
+            completions::Value::None => vec![vec![spelling]],
+            completions::Value::Text => vec![vec![spelling, "1"]],
+            completions::Value::Path => vec![vec![spelling, "somewhere"]],
+            completions::Value::Choice(values) => {
+                values.iter().map(|v| vec![spelling, *v]).collect()
+            }
+        }
+    }
+
+    /// **EVERY FLAG AND VALUE OFFERED IS ONE THE PROGRAM TAKES.** A flag may
+    /// still be refused for what it is combined with (`--team-mcp` without
+    /// `--team-channel`); never as unknown.
+    #[test]
+    fn every_completed_flag_and_value_is_accepted_by_its_parser() {
+        for flag in COMPLETION.flags {
+            for spelling in std::iter::once(flag.long).chain(flag.short) {
+                // Taken by `main` before `parse_args`, ahead of every thread.
+                if spelling == "--sandbox-exec" {
+                    continue;
+                }
+                for args in with_values(flag, spelling) {
+                    if let Err(e) = parse(&args) {
+                        assert!(!e.to_string().contains("unknown"), "{args:?}: {e}");
+                    }
+                }
+            }
+        }
+        for flag in sub("update").flags {
+            for spelling in std::iter::once(flag.long).chain(flag.short) {
+                assert!(parse(&["update", spelling]).is_ok(), "update {spelling}");
+            }
+        }
+        for flag in sub("review").flags {
+            for spelling in std::iter::once(flag.long).chain(flag.short) {
+                for args in with_values(flag, spelling) {
+                    let args: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+                    incord_code::review::Args::parse(&args)
+                        .unwrap_or_else(|e| panic!("review {args:?}: {e}"));
+                }
+            }
+        }
+        let ws = tempfile::tempdir().expect("ws");
+        let data = tempfile::tempdir().expect("data");
+        for verb in sub("mcp").verbs {
+            if let Err(e) =
+                incord_code::mcp_config::command(&[(*verb).to_string()], ws.path(), data.path())
+            {
+                assert!(!e.starts_with("unknown"), "mcp {verb}: {e}");
+            }
+        }
+        // `plugin update` fetches every installed plugin, and `plugin` answers
+        // a wrong verb and a missing argument alike, so its verbs are checked
+        // against its help — `help` itself by running it.
+        for verb in sub("plugin").verbs {
+            if *verb == "help" {
+                assert_eq!(
+                    incord_code::plugins::cli(&["help".to_string()], ws.path()),
+                    Ok(incord_code::plugins::USAGE.to_string())
+                );
+            } else {
+                assert!(incord_code::plugins::USAGE.contains(verb), "plugin {verb}");
+            }
+        }
+    }
+
+    #[test]
+    fn completions_prints_a_script_for_each_shell_and_refuses_others() {
+        for shell in completions::Shell::NAMES {
+            match parse(&["completions", shell]).expect("a shell") {
+                Parsed::Exit(script) => {
+                    // fish spells it `-l permission-mode`.
+                    assert!(script.contains("permission-mode"), "{shell}");
+                    assert!(script.contains("completions"), "{shell}");
+                }
+                other => panic!("{shell}: {other:?}"),
+            }
+        }
+        assert!(matches!(
+            parse(&["completions", "--help"]),
+            Ok(Parsed::Exit(_))
+        ));
+        assert!(parse(&["completions"]).is_err());
+        assert!(parse(&["completions", "cmd"]).is_err());
+        assert!(parse(&["completions", "bash", "zsh"]).is_err());
+    }
+
+    /// One completion request and what must come back: `words` ends with the
+    /// word being completed (`""` after a space).
+    struct Case {
+        words: &'static [&'static str],
+        exactly: Option<&'static [&'static str]>,
+        includes: &'static [&'static str],
+        excludes: &'static [&'static str],
+    }
+
+    const fn case(
+        words: &'static [&'static str],
+        exactly: Option<&'static [&'static str]>,
+        includes: &'static [&'static str],
+        excludes: &'static [&'static str],
+    ) -> Case {
+        Case {
+            words,
+            exactly,
+            includes,
+            excludes,
+        }
+    }
+
+    /// The same requests for every shell, run in an empty folder so a file
+    /// name never stands in for a completion.
+    const CASES: &[Case] = &[
+        case(
+            &["incode", "--perm"],
+            Some(&["--permission-mode"]),
+            &[],
+            &[],
+        ),
+        case(
+            &["incode", "-p", ""],
+            Some(&[
+                "read-only",
+                "workspace-write",
+                "danger-full-access",
+                "prompt",
+                "allow",
+            ]),
+            &[],
+            &[],
+        ),
+        case(
+            &["incode", ""],
+            None,
+            &["update", "review", "plugin", "mcp", "completions"],
+            &[],
+        ),
+        case(&["incode", "--mo"], None, &["--model"], &[]),
+        case(
+            &["incode", "mcp", ""],
+            None,
+            &["login", "logout"],
+            &["--model"],
+        ),
+        case(&["incode", "mcp", "list", ""], None, &[], &["login"]),
+        // Prefixes, not a bare `--`: PowerShell reads `--` as its own
+        // end-of-parameters token and asks no completer for it.
+        case(&["incode", "review", "--b"], Some(&["--base"]), &[], &[]),
+        case(&["incode", "review", "--ad"], Some(&[]), &[], &[]),
+        case(&["incode", "-w", ""], Some(&[]), &[], &[]),
+        case(&["incode", "--admin", "up"], None, &[], &["update"]),
+        case(
+            &["incode", "completions", ""],
+            None,
+            &["bash", "zsh", "fish", "powershell"],
+            &[],
+        ),
+        case(
+            &["incode", "--output-format", "s"],
+            Some(&["stream-json"]),
+            &[],
+            &[],
+        ),
+    ];
+
+    fn check(shell: &str, case: &Case, got: &[String]) {
+        let got: BTreeSet<&str> = got.iter().map(String::as_str).collect();
+        if let Some(exactly) = case.exactly {
+            let want: BTreeSet<&str> = exactly.iter().copied().collect();
+            assert_eq!(got, want, "{shell} {:?}", case.words);
+        }
+        for word in case.includes {
+            assert!(
+                got.contains(word),
+                "{shell} {:?} lacks {word}: {got:?}",
+                case.words
+            );
+        }
+        for word in case.excludes {
+            assert!(
+                !got.contains(word),
+                "{shell} {:?} offers {word}: {got:?}",
+                case.words
+            );
+        }
+    }
+
+    /// Run `program args` in `dir` with `input` on stdin; its stdout lines.
+    fn run_lines(
+        program: &std::path::Path,
+        args: &[&str],
+        dir: &std::path::Path,
+        input: &str,
+    ) -> Vec<String> {
+        use std::io::Write as _;
+        let mut child = std::process::Command::new(program)
+            .args(args)
+            .current_dir(dir)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|e| panic!("start {}: {e}", program.display()));
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(input.as_bytes())
+            .expect("write stdin");
+        let out = child.wait_with_output().expect("wait");
+        assert!(
+            out.status.success(),
+            "{} {args:?}: {}",
+            program.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| l.trim_end().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    }
+
+    /// `name` where it can be run, or `None`. On Windows `bash` is Git for
+    /// Windows' (as `shell_choice` finds it): the `bash.exe` in the Windows
+    /// directory is the WSL launcher.
+    fn shell_program(name: &str) -> Option<std::path::PathBuf> {
+        let path = std::env::var_os("PATH")?;
+        let exe = if cfg!(windows) {
+            format!("{name}.exe")
+        } else {
+            name.to_string()
+        };
+        if cfg!(windows) && name == "bash" {
+            return std::env::split_paths(&path)
+                .filter(|dir| dir.join("git.exe").is_file())
+                .flat_map(|dir| [dir.join("../bin/bash.exe"), dir.join("../../bin/bash.exe")])
+                .find(|candidate| candidate.is_file());
+        }
+        std::env::split_paths(&path)
+            .map(|dir| dir.join(&exe))
+            .find(|candidate| candidate.is_file())
+    }
+
+    fn script_for(shell: completions::Shell) -> String {
+        completions::script(shell, &COMPLETION).expect("a script")
+    }
+
+    /// **BASH COMPLETES WHAT THE TABLE SAYS**, run by bash itself.
+    #[test]
+    fn bash_completes_from_the_table() {
+        let Some(bash) = shell_program("bash") else {
+            eprintln!("bash_completes_from_the_table: SKIPPED (no bash)");
+            return;
+        };
+        let dir = tempfile::tempdir().expect("empty dir");
+        let input = format!(
+            "{}\nCOMP_WORDS=(\"$@\"); COMP_CWORD=$(( ${{#COMP_WORDS[@]}} - 1 )); _incode\n\
+             printf '%s\\n' \"${{COMPREPLY[@]}}\"\n",
+            script_for(completions::Shell::Bash)
+        );
+        for case in CASES {
+            let mut args = vec!["-s", "--"];
+            args.extend(case.words);
+            check("bash", case, &run_lines(&bash, &args, dir.path(), &input));
+        }
+    }
+
+    /// PowerShell's own completion engine (`TabExpansion2`) asks the
+    /// registered completer, as at a prompt.
+    #[test]
+    fn powershell_completes_from_the_table() {
+        let Some(program) = shell_program("pwsh").or_else(|| shell_program("powershell")) else {
+            eprintln!("powershell_completes_from_the_table: SKIPPED (no PowerShell)");
+            return;
+        };
+        let dir = tempfile::tempdir().expect("empty dir");
+        let file = tempfile::tempdir().expect("script dir");
+        for case in CASES {
+            let line = case.words.join(" ");
+            let script = format!(
+                "{}\n$line = '{line}'\n\
+                 (TabExpansion2 -inputScript $line -cursorColumn $line.Length).CompletionMatches |\n\
+                 \x20   ForEach-Object {{ $_.CompletionText }}\n",
+                script_for(completions::Shell::PowerShell)
+            );
+            let path = file.path().join("case.ps1");
+            std::fs::write(&path, script).expect("write script");
+            let path = path.to_string_lossy().into_owned();
+            let got = run_lines(
+                &program,
+                &[
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    &path,
+                ],
+                dir.path(),
+                "",
+            );
+            check("powershell", case, &got);
+        }
+    }
+
+    /// fish's own engine (`complete -C`), where fish is installed.
+    #[test]
+    fn fish_completes_from_the_table() {
+        let Some(fish) = shell_program("fish") else {
+            eprintln!("fish_completes_from_the_table: SKIPPED (no fish)");
+            return;
+        };
+        let dir = tempfile::tempdir().expect("empty dir");
+        for case in CASES {
+            let line = case.words.join(" ");
+            let input = format!(
+                "{}\ncomplete -C '{line}'\n",
+                script_for(completions::Shell::Fish)
+            );
+            let got: Vec<String> = run_lines(&fish, &[], dir.path(), &input)
+                .into_iter()
+                .map(|l| l.split('\t').next().unwrap_or("").to_string())
+                .collect();
+            check("fish", case, &got);
+        }
+    }
+
+    /// The zsh function, where zsh is installed, with zsh's `compadd`,
+    /// `_files` and `compdef` stood in for: they belong to the completion
+    /// system, which needs a terminal. `compadd` keeps what matches the word,
+    /// as the real one does.
+    #[test]
+    fn zsh_completes_from_the_table() {
+        let Some(zsh) = shell_program("zsh") else {
+            eprintln!("zsh_completes_from_the_table: SKIPPED (no zsh)");
+            return;
+        };
+        let dir = tempfile::tempdir().expect("empty dir");
+        let input = format!(
+            "compdef() {{ : }}\n_files() {{ : }}\n\
+             compadd() {{ local w; for w in \"${{(@P)2}}\"; do\n\
+             \x20   [[ $w == \"${{words[CURRENT]}}\"* ]] && print -r -- \"$w\"; done }}\n\
+             {}\nwords=(\"$@\"); CURRENT=$#; _incode; true\n",
+            script_for(completions::Shell::Zsh)
+        );
+        for case in CASES {
+            let mut args = vec!["-s", "--"];
+            args.extend(case.words);
+            check("zsh", case, &run_lines(&zsh, &args, dir.path(), &input));
         }
     }
 }

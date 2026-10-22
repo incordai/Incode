@@ -307,6 +307,7 @@ agreeing what "done" means.
 | `incode --desktop-stop` | Halt the desktop driving this workspace. |
 | `incode --install-tools` | Download, check and unpack every [external tool](#external-tools) in `admin.json`, then exit (non-zero if any was not installed). |
 | `incode update [--check]` | Install the latest release over this program, checked against its `SHA256SUMS` (see [Install](#install)); `--check` only reports whether there is one. |
+| `incode completions <bash\|zsh\|fish\|powershell>` | Print a completion script for that shell: flags, the values of `-p`, `--output-format` and `--spec-gate`, the subcommands and their verbs (`mcp login`, `plugin add`, …), and file names after a path flag. Load it with `source <(incode completions bash)` (zsh: the same, after `compinit`), `incode completions fish \| source`, or in PowerShell `incode completions powershell \| Out-String \| Invoke-Expression` — in your shell's startup file to keep it. |
 | `incode --tool-server` | Internal. Started by the agent CLI that incode launched; offers incode's tools over MCP and runs nothing itself. |
 | `incode --desktop-mcp` | Internal. The desktop tools' executor, started by incode's toolbox. |
 | `incode --team-mcp --team-channel <p>` | Internal. The team channel as an MCP server, for `codex`. |

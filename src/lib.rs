@@ -10,6 +10,7 @@ pub mod auditor;
 pub mod brief;
 pub mod budget;
 pub mod cli;
+pub mod completions;
 pub mod config;
 pub mod contracts;
 pub mod custom_commands;
