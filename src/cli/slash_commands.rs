@@ -18,6 +18,8 @@ pub enum SlashCommand {
     Compact(Option<String>),
     /// Review the change against a base (default: where the branch forked).
     Review(Option<String>),
+    /// A prefilled GitHub issue link for what happened; sends nothing.
+    Bug(Option<String>),
     /// The tools incode runs, or with an argument the external tools:
     /// `add <name>…`, `update [name]`, `remove <name>`.
     Tools(Option<String>),
@@ -109,6 +111,7 @@ impl SlashCommand {
             "/status" | "/s" => Self::Status,
             "/compact" => Self::Compact(arg.filter(|a| !a.is_empty())),
             "/review" => Self::Review(arg.filter(|a| !a.is_empty())),
+            "/bug" | "/feedback" => Self::Bug(arg.filter(|a| !a.is_empty())),
             "/cost" => Self::Cost,
             "/vim" => Self::Vim,
             "/undo" | "/u" => Self::Undo,
@@ -206,6 +209,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/help", "Show this help message"),
     ("/status", "Session info, token usage, model"),
     ("/cost", "Tokens and estimated cost, per model"),
+    (
+        "/bug [what happened]",
+        "A prefilled GitHub issue link: version, OS, model, your words scrubbed. Sends nothing",
+    ),
     ("/vim", "Toggle vi editing for the input box"),
     (
         "/compact",
@@ -1526,6 +1533,39 @@ fn handle_pull_request_merge(words: &[&str], workspace: &std::path::Path) {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
+// Bug report handler
+// ---------------------------------------------------------------------------
+
+/// `/bug [what happened]`: print what a report would hold and the link that
+/// prefills it ([`crate::bug_report`]). Sends nothing and opens nothing.
+pub fn handle_bug(model: &str, permission_mode: &str, description: Option<&str>) {
+    let home = crate::admin::home_dir().map(|h| h.to_string_lossy().into_owned());
+    let report = crate::bug_report::report(&crate::bug_report::Facts {
+        model,
+        permission_mode,
+        description: description.unwrap_or(""),
+        home: home.as_deref(),
+    });
+    render::print_header("Bug report");
+    for line in report.text.lines() {
+        outln!("  {line}");
+    }
+    if report.cut {
+        render::print_info(
+            "The description in the link is cut to keep the link openable; paste the rest in \
+             the issue.",
+        );
+    }
+    outln!();
+    render::print_info(
+        "Nothing has been sent. Open this link to file it — check the fields first; tokens \
+         and your home folder are removed, but not everything private looks like a secret:",
+    );
+    outln!("  {}", report.url);
+    outln!();
+}
+
+// ---------------------------------------------------------------------------
 // Env filter handler
 // ---------------------------------------------------------------------------
 
@@ -1736,6 +1776,11 @@ mod tests {
         assert_eq!(
             SlashCommand::parse("/compact keep the API notes"),
             Some(SlashCommand::Compact(Some("keep the API notes".into())))
+        );
+        assert_eq!(SlashCommand::parse("/bug"), Some(SlashCommand::Bug(None)));
+        assert_eq!(
+            SlashCommand::parse("/feedback the footer flickers"),
+            Some(SlashCommand::Bug(Some("the footer flickers".into())))
         );
         assert_eq!(
             SlashCommand::parse("/review"),

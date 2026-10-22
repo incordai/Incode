@@ -933,6 +933,11 @@ impl CliApp {
                     }
                     SlashCommand::Help => slash_commands::handle_help(),
                     SlashCommand::Cost => ux::print_cost(&session),
+                    SlashCommand::Bug(description) => slash_commands::handle_bug(
+                        &display_model,
+                        permission_mode.as_str(),
+                        description.as_deref(),
+                    ),
                     SlashCommand::Vim => ux.toggle_vim(footer.as_mut(), &mut editor),
                     SlashCommand::Status => {
                         slash_commands::handle_agent_status(

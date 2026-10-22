@@ -9,6 +9,7 @@ pub mod ask;
 pub mod auditor;
 pub mod brief;
 pub mod budget;
+pub mod bug_report;
 pub mod cli;
 pub mod config;
 pub mod contracts;

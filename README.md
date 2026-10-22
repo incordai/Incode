@@ -562,6 +562,7 @@ machine rather than one run.
 | `/tools add <name>` · `/tools update [name]` · `/tools remove <name>` | Install, update or remove an [external tool](#external-tools) (also over `--acp`) |
 | `/tools` · `/mcp` · `/env` | Information screens (`/tools` also lists the external tools and what is installed) |
 | `/cost` | Input, output and cache tokens per model this session, with an estimated USD figure from list prices |
+| `/bug [what happened]` · `/feedback` | Print a bug report (version, OS, model, permission mode, your words) and a link to a prefilled GitHub issue. **Sends nothing and opens nothing**: tokens and your home folder are removed from what you typed, and you check the fields before filing |
 | `/vim` | Toggle vi editing in the input box for this session |
 | `/quit` | Exit |
 
