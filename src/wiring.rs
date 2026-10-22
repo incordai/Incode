@@ -119,9 +119,9 @@ pub const DELIBERATELY_UNWIRED: &[(&str, &str)] = &[
         "run_on_compact",
         "The operator's `on_compact` command, kept as configuration with nothing \
          to fire it truthfully on the CLI routes: the model CLI compacts its \
-         own, inside its own process. (The API route's compaction, \
-         `agent::compact`, runs inside the backend, which holds no lifecycle \
-         hooks.) The claude CLI's stream \
+         own, inside its own process. (The API route's own compaction fires \
+         the operator's `pre_compact` hooks instead, through \
+         `Toolbox::operator_pre_compact`; those supersede this.) The claude CLI's stream \
          does carry a `compact_boundary` system frame (found in the 2.1.283 \
          binary, NOT measured live: a compaction needs a full context window), \
          which is where this would be wired once it has been seen.",

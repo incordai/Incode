@@ -1086,6 +1086,16 @@ impl AgentSession {
                     AgentEvent::Quota {
                         status, resets_at, ..
                     } => *turn_quota = Some((status.clone(), *resets_at)),
+                    // incode speaking mid-turn: a line of its own, never part
+                    // of the reply. An observer presents it itself (`--acp`,
+                    // as a thought), so it is not drawn into the reply too.
+                    AgentEvent::Notice(note) if observer.is_none() => {
+                        if *mid_line {
+                            on_text("\n");
+                            *mid_line = false;
+                        }
+                        on_text(&format!("{note}\n"));
+                    }
                     AgentEvent::Usage {
                         input_tokens,
                         output_tokens,
@@ -1224,8 +1234,12 @@ impl AgentSession {
                             observe(event, &start);
                         }
                         replied.hear(event);
-                        if let AgentEvent::TextDelta(fragment) = event {
-                            on_text(fragment);
+                        match event {
+                            AgentEvent::TextDelta(fragment) => on_text(fragment),
+                            AgentEvent::Notice(note) if observer.is_none() => {
+                                on_text(&format!("\n{note}\n"));
+                            }
+                            _ => {}
                         }
                     });
                 if !replied.last().is_empty() {
@@ -1936,6 +1950,64 @@ mod tests {
                 .memory_sessions
                 .push(session.to_string());
         }
+    }
+
+    /// A backend that starts its reply, has incode say something mid-turn,
+    /// and finishes the reply.
+    struct Noticing;
+
+    impl AgentBackend for Noticing {
+        fn id(&self) -> &str {
+            "claude-code"
+        }
+        fn run_turn(
+            &mut self,
+            _prompt: &str,
+            on_event: &mut dyn FnMut(&AgentEvent),
+        ) -> Result<TurnOutcome, crate::agent::AgentError> {
+            on_event(&AgentEvent::TextDelta("half a ".to_string()));
+            on_event(&AgentEvent::Notice("[pre_compact hook] noted".to_string()));
+            on_event(&AgentEvent::TextDelta("reply".to_string()));
+            on_event(&AgentEvent::Text("half a reply".to_string()));
+            Ok(TurnOutcome {
+                session_id: String::new(),
+                stop_reason: "end_turn".to_string(),
+                is_error: false,
+                detail: None,
+                served_by: Vec::new(),
+            })
+        }
+        fn session_id(&self) -> Option<&str> {
+            None
+        }
+    }
+
+    /// **incode's NOTICE IS SHOWN ON A LINE OF ITS OWN**, even when it lands
+    /// mid-reply, and is not part of the reply.
+    #[test]
+    fn a_notice_mid_turn_is_shown_on_its_own_line() {
+        let ws = tempfile::tempdir().expect("ws");
+        let mut s = AgentSession::new(
+            ws.path().to_path_buf(),
+            "claude-code",
+            "claude".to_string(),
+            &crate::guards::Guards::default(),
+            Vec::new(),
+        )
+        .with_backend(Box::new(Noticing));
+        let mut shown = String::new();
+        let outcome = s.turn(
+            ws.path(),
+            "go",
+            &[],
+            &mut |t| shown.push_str(t),
+            &mut |_| {},
+        );
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert!(
+            shown.contains("half a \n[pre_compact hook] noted\nreply"),
+            "{shown:?}"
+        );
     }
 
     /// A session over `ws` whose backend records into `seen`, with the

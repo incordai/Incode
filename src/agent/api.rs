@@ -963,6 +963,11 @@ impl ApiBackend {
         if !super::compact::over_threshold(estimate, self.settings.context_window) {
             return;
         }
+        // The operator's `pre_compact` commands first, as before `/compact`:
+        // told, never asked. What they print is incode's to show.
+        for said in self.tools.operator_pre_compact("auto") {
+            on_event(&AgentEvent::Notice(format!("[pre_compact hook] {said}")));
+        }
         match self.compact_with(transport, "", super::compact::KEEP_TURNS) {
             Ok(Some(done)) => {
                 crate::trace!("compact", "{}", done.describe());
@@ -1944,6 +1949,44 @@ mod tests {
         assert!(!prompts.contains(&"first"), "summarised away: {prompts:?}");
         assert_eq!(prompts.last(), Some(&"second"));
         assert_eq!(notes.len(), 1, "the compaction is said once: {notes:?}");
+    }
+
+    /// **THE OPERATOR'S `pre_compact` RUNS BEFORE THE ROUTE COMPACTS ON ITS
+    /// OWN**, told `trigger: auto`, and what it prints is incode's notice —
+    /// before the compaction's own note, so before the summary was asked for.
+    #[test]
+    fn the_operators_pre_compact_hook_runs_before_an_automatic_compaction() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let transport = Canned::new(&[&said("one"), &said("THE SUMMARY"), &said("two")]);
+        // Prints the event it was given on stdin.
+        let echo_stdin = if cfg!(windows) { "more" } else { "cat" };
+        let mut agent = backend(dir.path()).with_operator_hooks(Some(
+            crate::hooks::HookRunner::new(crate::hooks::HookConfig {
+                pre_compact: vec![echo_stdin.to_string()],
+                ..crate::hooks::HookConfig::default()
+            }),
+        ));
+        agent.settings.context_window = 1;
+        agent
+            .run_turn_with(&transport, "first", &mut |_| {})
+            .expect("turn one");
+        let mut shown = Vec::new();
+        agent
+            .run_turn_with(&transport, "second", &mut |e| match e {
+                AgentEvent::Notice(note) => shown.push(format!("notice: {note}")),
+                AgentEvent::Thinking(note) => shown.push(format!("thinking: {note}")),
+                _ => {}
+            })
+            .expect("turn two");
+
+        assert_eq!(shown.len(), 2, "{shown:?}");
+        assert!(
+            shown[0].starts_with("notice: [pre_compact hook]")
+                && shown[0].contains("\"trigger\":\"auto\"")
+                && shown[0].contains("\"hook_event_name\":\"PreCompact\""),
+            "the hook did not run first, or was not told why: {shown:?}"
+        );
+        assert!(shown[1].starts_with("thinking: [context near"), "{shown:?}");
     }
 
     #[test]

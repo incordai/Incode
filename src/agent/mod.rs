@@ -104,6 +104,11 @@ pub enum AgentEvent {
     /// in a window from a table, because a guessed window is a wrong
     /// percentage on the owner's screen.
     Context { used: u64, size: u64 },
+    /// incode itself speaking during a turn, not the model — what the
+    /// operator's `pre_compact` commands printed before the API route
+    /// compacted on its own. Every front end shows it apart from the reply;
+    /// the transcript and the stop hook do not hear it.
+    Notice(String),
 }
 
 /// How a turn ended.

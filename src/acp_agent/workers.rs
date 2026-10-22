@@ -185,7 +185,7 @@ impl Presenter {
                 }
                 updates
             }
-            AgentEvent::Thinking(text) if !text.is_empty() => {
+            AgentEvent::Thinking(text) | AgentEvent::Notice(text) if !text.is_empty() => {
                 vec![acp::SessionUpdate::AgentThoughtChunk(
                     acp::ContentChunk::new(acp::ContentBlock::from(text.as_str())),
                 )]
@@ -388,5 +388,45 @@ impl Drop for Tap {
     /// its tab must not stay `running`.
     fn drop(&mut self) {
         self.ended(WorkerEnd::Failed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn presenter(voice: Voice, workspace: &Path) -> Presenter {
+        Presenter {
+            voice,
+            edits: present::Edits::new(workspace),
+            plans: present::Plans::new(),
+            notes: Arc::default(),
+            who: Arc::default(),
+            saw_deltas: false,
+        }
+    }
+
+    /// **incode's NOTICE IS A THOUGHT**, for the session's own turn and for
+    /// a worker's alike, and never reply text; an empty one is nothing.
+    #[test]
+    fn a_notice_becomes_a_thought_chunk_for_the_session_and_a_worker() {
+        let ws = tempfile::tempdir().expect("ws");
+        for voice in [Voice::Session, Voice::Worker] {
+            let mut shows = presenter(voice, ws.path());
+            let updates = shows.updates(
+                &AgentEvent::Notice("[pre_compact hook] noted".to_string()),
+                &|_| Before::Unknown,
+            );
+            let sent: Vec<Value> = updates
+                .iter()
+                .map(|u| serde_json::to_value(u).expect("json"))
+                .collect();
+            assert_eq!(sent.len(), 1, "{sent:#?}");
+            assert_eq!(sent[0]["sessionUpdate"], "agent_thought_chunk", "{sent:#?}");
+            assert_eq!(sent[0]["content"]["text"], "[pre_compact hook] noted");
+            assert!(shows
+                .updates(&AgentEvent::Notice(String::new()), &|_| Before::Unknown)
+                .is_empty());
+        }
     }
 }

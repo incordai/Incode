@@ -50,6 +50,7 @@ pub(super) fn act(
 ) {
     if let Behaviour::Thinks = behaviour {
         on_event(&AgentEvent::Thinking("weighing it".to_string()));
+        on_event(&AgentEvent::Notice("[pre_compact hook] noted".to_string()));
         on_event(&AgentEvent::TextDelta("decided".to_string()));
         return;
     }
@@ -342,6 +343,39 @@ fn reasoning_arrives_as_a_thought_chunk() {
         said.contains("decided") && !said.contains("weighing"),
         "{said}"
     );
+    client.close();
+}
+
+/// **incode's OWN NOTICE IS SHOWN, AND IS NOT THE REPLY** — what an
+/// operator's `pre_compact` hook printed mid-turn arrives as a thought.
+///
+/// Exercises the `AgentEvent::Notice` arm in `src/acp_agent/workers.rs`
+/// (`acp_agent::workers`), which turns it into an `agent_thought_chunk`, and
+/// the REPL arm in `cli::agent_turn` standing aside for the observer.
+#[test]
+fn a_notice_arrives_as_a_thought_chunk_not_as_the_reply() {
+    let mut client = started(Script::new(Behaviour::Thinks), false);
+    let ws = tempfile::tempdir().expect("ws");
+    let session = client.open_session(ws.path());
+    let (seen, _) = prompt(
+        &mut client,
+        &session,
+        json!([{"type": "text", "text": "think"}]),
+    );
+    let updates = updates_of(&seen);
+    assert!(
+        updates
+            .iter()
+            .any(|u| u["sessionUpdate"] == "agent_thought_chunk"
+                && u["content"]["text"] == "[pre_compact hook] noted"),
+        "{updates:#?}"
+    );
+    let said: String = updates
+        .iter()
+        .filter(|u| u["sessionUpdate"] == "agent_message_chunk")
+        .filter_map(|u| u["content"]["text"].as_str())
+        .collect();
+    assert!(!said.contains("pre_compact"), "{said}");
     client.close();
 }
 
