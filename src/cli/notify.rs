@@ -79,6 +79,9 @@ pub struct Settings {
     pub mode: Mode,
     pub command: Option<String>,
     pub after: Duration,
+    /// The operator's `notification` hook commands (`crate::hooks`), run
+    /// beside `command` for every notification.
+    pub hooks: Option<crate::hooks::HookRunner>,
 }
 
 impl Default for Settings {
@@ -87,6 +90,7 @@ impl Default for Settings {
             mode: Mode::Auto,
             command: None,
             after: DEFAULT_AFTER,
+            hooks: None,
         }
     }
 }
@@ -105,6 +109,7 @@ impl Settings {
             after: admin
                 .notify_after_secs
                 .map_or(DEFAULT_AFTER, Duration::from_secs),
+            hooks: crate::hooks::HookRunner::from_settings(),
         }
     }
 
@@ -158,6 +163,20 @@ fn human(took: Duration) -> String {
 fn deliver(settings: &Settings, event: Event, message: &str) {
     if let Some(command) = &settings.command {
         spawn_shell(command, &command_env(event, message));
+    }
+    // The operator's `notification` hooks (`crate::hooks`), beside the
+    // command and like it in the background: a slow one never holds up the
+    // prompt. What they print is not shown — a notification is the output.
+    if let Some(hooks) = settings.hooks.clone() {
+        let kind = match event {
+            Event::Done => "turn_done",
+            Event::Input => "input_needed",
+        };
+        let message = message.to_string();
+        std::thread::spawn(move || {
+            let cwd = std::env::current_dir().ok();
+            let _told = hooks.notification(kind, &message, cwd.as_deref());
+        });
     }
     match settings.mode {
         Mode::Off => {}
@@ -330,6 +349,44 @@ fn spawn_detached(program: &str, args: &[String], env: &[(String, String)]) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A NOTIFICATION RUNS THE OPERATOR'S `notification` HOOK**, in the
+    /// background, told what kind it is and what the person is told.
+    #[test]
+    fn a_notification_runs_the_notification_hook_with_its_kind_and_message() {
+        let dir = tempfile::tempdir().expect("dir");
+        let saved = dir.path().join("event.json");
+        let command = if cfg!(windows) {
+            format!("more > \"{}\"", saved.display())
+        } else {
+            format!("cat > '{}'", saved.display())
+        };
+        let settings = Settings {
+            mode: Mode::Off,
+            hooks: Some(crate::hooks::HookRunner::new(crate::hooks::HookConfig {
+                notification: vec![command],
+                ..crate::hooks::HookConfig::default()
+            })),
+            ..Settings::default()
+        };
+        deliver(&settings, Event::Input, "allow Write to a.rs?");
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let mut event = None;
+        while std::time::Instant::now() < deadline {
+            if let Some(json) = std::fs::read_to_string(&saved)
+                .ok()
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            {
+                event = Some(json);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let event = event.expect("the notification hook never ran");
+        assert_eq!(event["hook_event_name"], "Notification");
+        assert_eq!(event["notification_type"], "input_needed");
+        assert_eq!(event["message"], "allow Write to a.rs?");
+    }
 
     #[test]
     fn the_mode_reads_every_spelling_and_defaults_to_auto() {

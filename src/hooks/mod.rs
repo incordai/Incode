@@ -140,6 +140,11 @@ pub struct HookConfig {
     /// with the turn's notices.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stop: Vec<String>,
+    /// Commands run when incode would notify the person: a long turn
+    /// finished, or the agent is waiting on them. Run in the background,
+    /// beside `notify_command`; they cannot change anything.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notification: Vec<String>,
 }
 
 impl HookConfig {
@@ -154,6 +159,7 @@ impl HookConfig {
             && self.user_prompt_submit.is_empty()
             && self.pre_compact.is_empty()
             && self.stop.is_empty()
+            && self.notification.is_empty()
     }
 
     /// How many commands, over every event. Used where a plugin's hooks are
@@ -165,6 +171,7 @@ impl HookConfig {
             + self.user_prompt_submit.len()
             + self.pre_compact.len()
             + self.stop.len()
+            + self.notification.len()
     }
 
     /// `other`'s commands after these, event by event (a plugin's after the
@@ -175,6 +182,7 @@ impl HookConfig {
         self.user_prompt_submit.extend(other.user_prompt_submit);
         self.pre_compact.extend(other.pre_compact);
         self.stop.extend(other.stop);
+        self.notification.extend(other.notification);
     }
 }
 
@@ -434,6 +442,25 @@ impl HookRunner {
     }
 }
 
+impl HookRunner {
+    /// The `notification` commands: `kind` is `turn_done` or
+    /// `input_needed`, `message` what the person is told. They cannot change
+    /// anything; what they print is not shown.
+    ///
+    /// Called by `cli::notify::deliver`, on a thread of its own.
+    #[must_use]
+    pub fn notification(&self, kind: &str, message: &str, cwd: Option<&Path>) -> HookRunResult {
+        run_event(
+            &self.config.notification,
+            "Notification",
+            json!({ "notification_type": kind, "message": message }),
+            "",
+            cwd,
+            false,
+        )
+    }
+}
+
 /// Run `commands` for one event that is not a tool call: the event as JSON on
 /// stdin — `hook_event_name`, `session_id`, `cwd` and `fields` — bounded at
 /// [`HOOK_TIMEOUT`]. With `can_refuse`, exit 2 refuses (stderr, else stdout,
@@ -620,6 +647,7 @@ mod tests {
             user_prompt_submit: Vec::new(),
             pre_compact: Vec::new(),
             stop: Vec::new(),
+            notification: Vec::new(),
         });
         let input = json!({"path": "a.txt", "content": "hi"});
         let ran = runner.pre_tool(&call(&input, dir.path()));
@@ -646,6 +674,7 @@ mod tests {
             user_prompt_submit: Vec::new(),
             pre_compact: Vec::new(),
             stop: Vec::new(),
+            notification: Vec::new(),
         });
         let input = json!({"path": "a.txt"});
         let pre = runner.pre_tool(&call(&input, dir.path()));

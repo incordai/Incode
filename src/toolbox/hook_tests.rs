@@ -45,6 +45,7 @@ fn hooked(ws: &Path, pre: String, post: Vec<String>) -> Toolbox {
             user_prompt_submit: Vec::new(),
             pre_compact: Vec::new(),
             stop: Vec::new(),
+            notification: Vec::new(),
         },
     )))
 }
