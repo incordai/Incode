@@ -135,12 +135,33 @@ fn read(data_dir: &Path) -> Result<Store, String> {
 ///
 /// The folder or the store could not be read, or the store not written.
 pub fn approve(data_dir: &Path, plugin: &Plugin) -> Result<(), String> {
+    approve_key(data_dir, &key(plugin)?)
+}
+
+/// Record `key` as approved. The store holds every kind of project content
+/// the operator approved to run: a plugin ([`key`]), and a project's
+/// lifecycle commands (`runtime::lifecycle::approval_key`).
+///
+/// # Errors
+///
+/// The store could not be read, or not written.
+pub fn approve_key(data_dir: &Path, key: &str) -> Result<(), String> {
     let mut store = read(data_dir)?;
-    store.approved.insert(key(plugin)?);
+    store.approved.insert(key.to_string());
     std::fs::create_dir_all(data_dir).map_err(|e| format!("{}: {e}", data_dir.display()))?;
     let path = data_dir.join(FILE);
     let text = serde_json::to_string_pretty(&store).map_err(|e| e.to_string())?;
     std::fs::write(&path, text).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Whether `key` is approved. A store that cannot be read is an error, never
+/// quietly "not approved" or "approved".
+///
+/// # Errors
+///
+/// The store could not be read or parsed.
+pub fn is_approved(data_dir: &Path, key: &str) -> Result<bool, String> {
+    Ok(read(data_dir)?.approved.contains(key))
 }
 
 /// Where `plugin` stands.

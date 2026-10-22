@@ -22,6 +22,8 @@ USAGE:
     incode review [--base <REF>] [-p]   Review the current change (see `incode review -h`)
     incode plugin list | add <git-url | path> | update [name] | remove <name>   [--project]
     incode mcp <list|get|add|remove|approve> ...   (see `incode mcp help`)
+    incode lifecycle <show|approve>   This project's lifecycle commands, which run
+                              only once approved (see `incode lifecycle help`)
     incode completions <bash|zsh|fish|powershell>   Print a completion script
                               for that shell (the script says how to load it)
 
@@ -253,6 +255,12 @@ const COMPLETION: completions::Command = {
                 subcommands: &[],
             },
             Command {
+                name: "lifecycle",
+                flags: &[HELP],
+                verbs: &["show", "approve", "help"],
+                subcommands: &[],
+            },
+            Command {
                 name: "mcp",
                 flags: &[HELP],
                 verbs: &[
@@ -325,6 +333,19 @@ fn main() -> anyhow::Result<()> {
             let workspace = std::env::current_dir()?;
             let said =
                 incord_code::plugins::cli(&raw[1..], &workspace).map_err(|e| anyhow::anyhow!(e))?;
+            println!("{}", said.trim_end());
+            return Ok(());
+        }
+        // `incode lifecycle ...`: show or approve this project's lifecycle
+        // commands, which run nowhere until approved.
+        if raw.first().map(String::as_str) == Some("lifecycle") {
+            let workspace = std::env::current_dir()?;
+            let said = incord_code::runtime::lifecycle::cli(
+                &raw[1..],
+                &workspace,
+                &incord_code::admin::AdminConfig::default_dir(),
+            )
+            .map_err(|e| anyhow::anyhow!(e))?;
             println!("{}", said.trim_end());
             return Ok(());
         }
@@ -2083,6 +2104,13 @@ mod tests {
         }
         let ws = tempfile::tempdir().expect("ws");
         let data = tempfile::tempdir().expect("data");
+        for verb in sub("lifecycle").verbs {
+            if let Err(e) =
+                incord_code::runtime::lifecycle::cli(&[(*verb).to_string()], ws.path(), data.path())
+            {
+                assert!(!e.starts_with("unknown"), "lifecycle {verb}: {e}");
+            }
+        }
         for verb in sub("mcp").verbs {
             if let Err(e) =
                 incord_code::mcp_config::command(&[(*verb).to_string()], ws.path(), data.path())

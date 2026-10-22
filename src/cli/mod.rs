@@ -380,11 +380,20 @@ pub(crate) fn prepare_session(
     });
     tool_cache.detect_all();
 
-    // Lifecycle hooks (Feature 7: session start/end scripts)
+    // Lifecycle hooks (Feature 7: session start/end scripts). A project's
+    // run only once the operator approved them as they are
+    // (`runtime::lifecycle::usable`): they arrive with whatever was cloned.
     let lifecycle_hooks = if config.lifecycle_hooks.has_any() {
         config.lifecycle_hooks.clone()
     } else {
-        LifecycleHooks::discover(&workspace).unwrap_or_default()
+        let (hooks, note) = crate::runtime::lifecycle::usable(
+            &workspace,
+            &crate::admin::AdminConfig::default_dir(),
+        );
+        if let Some(note) = note {
+            render::print_info(&note);
+        }
+        hooks
     };
 
     // Load skills (72 bundled + user skills from workspace)
