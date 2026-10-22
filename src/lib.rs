@@ -43,6 +43,7 @@ pub mod plugin_approvals;
 pub mod plugins;
 pub mod recall;
 pub mod recorder;
+pub mod remote;
 pub mod research;
 pub mod review;
 pub mod reviews;
