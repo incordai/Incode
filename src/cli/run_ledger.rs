@@ -278,10 +278,14 @@ pub(crate) fn run(ctx: &RunContext<'_>, cancel: &CancelToken, watch: Watch<'_>) 
     let worker = worker.showing_edits(Box::new(move |line: &str| {
         edit_writer.write_text(line);
     }));
+    // The operator's hooks, read once for the run: each task's instruction
+    // goes through their `user_prompt_submit`, on this worker and every lane.
+    let operator_hooks = crate::hooks::HookRunner::from_settings();
     let mut worker = super::run_memory::Remembered::new(
         worker,
         crate::hooks::memory::MemoryHooks::new(engine.clone(), workspace, &worker_session),
-    );
+    )
+    .with_operator_hooks(operator_hooks.clone());
     let mut watcher = RunWatcher {
         status: &run_status,
         width: crate::cli::activity::terminal_width(),
@@ -341,6 +345,7 @@ pub(crate) fn run(ctx: &RunContext<'_>, cancel: &CancelToken, watch: Watch<'_>) 
         opened: std::sync::atomic::AtomicUsize::new(0),
         engine,
         review: crate::parallel::lanes_as_pull_requests(),
+        operator_hooks,
     };
     let outcome = work(
         &mut ledger,
@@ -579,6 +584,8 @@ pub(crate) struct CliLaneWorkers {
     /// Lanes are opened as pull requests on GitHub rather than merged here
     /// (`INCODE_LANES_AS=pr`), read once when the run starts.
     pub review: bool,
+    /// The operator's hooks, handed to every lane's worker.
+    pub operator_hooks: Option<crate::hooks::HookRunner>,
 }
 
 impl crate::runner::LaneWorkers for CliLaneWorkers {
@@ -611,6 +618,7 @@ impl crate::runner::LaneWorkers for CliLaneWorkers {
             cancel: self.cancel.clone(),
             lane,
             engine: self.engine.clone(),
+            operator_hooks: self.operator_hooks.clone(),
         }))
     }
 }
@@ -632,6 +640,8 @@ struct LaneAgent {
     lane: usize,
     /// The memory engine its session is filed with, when there is one.
     engine: Option<crate::hooks::engine::Engine>,
+    /// The operator's hooks, for each task's instruction.
+    operator_hooks: Option<crate::hooks::HookRunner>,
 }
 
 impl crate::runner::TaskWorker for LaneAgent {
@@ -692,7 +702,8 @@ impl LaneAgent {
         let mut worker = super::run_memory::Remembered::new(
             agent,
             crate::hooks::memory::MemoryHooks::new(self.engine.clone(), &self.workspace, &session),
-        );
+        )
+        .with_operator_hooks(self.operator_hooks.clone());
 
         let report = crate::runner::TaskWorker::work(&mut worker, task);
         // The conversation this lane opened is on the vendor's side and is
@@ -882,6 +893,7 @@ mod tests {
             opened: std::sync::atomic::AtomicUsize::new(0),
             engine: None,
             review: false,
+            operator_hooks: None,
         };
         let task = crate::ledger::Task::new("t-1", "r-1", "count the files").with_tier("implement");
         // The lane's own agent, as `spawn_for` makes it, on a stand-in
@@ -902,6 +914,7 @@ mod tests {
             cancel: lanes.cancel.clone(),
             lane: lanes.opened.load(std::sync::atomic::Ordering::Relaxed),
             engine: None,
+            operator_hooks: None,
         };
         let report = lane.work_on(Box::new(Says("three files")), &task);
         assert!(report.is_ok(), "{report:?}");

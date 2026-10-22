@@ -161,6 +161,9 @@ pub struct AgentBackendWorker<B: AgentBackend> {
     /// owns the list, and a worker that accumulated its own copy would keep
     /// handing on notes from a task the runner had since abandoned.
     handoffs: Vec<crate::runner::Handoff>,
+    /// What the operator's `user_prompt_submit` hooks added for the next
+    /// task (`TaskWorker::operator_context`), sent after its instruction.
+    operator_context: Vec<String>,
     /// Where this task's actions are being written down, once one is open.
     ///
     /// Opened per task rather than per worker: one file per task is what makes
@@ -272,6 +275,7 @@ impl<B: AgentBackend> AgentBackendWorker<B> {
             heard_up_to: None,
             conversation_for: None,
             handoffs: Vec::new(),
+            operator_context: Vec::new(),
             transcript: None,
             // OFF by default: a worker with no terminal behind it must not
             // start printing. Turned on with `showing_edits`.
@@ -693,6 +697,10 @@ impl<B: AgentBackend> TaskWorker for AgentBackendWorker<B> {
         self.handoffs = handoffs.to_vec();
     }
 
+    fn operator_context(&mut self, blocks: &[String]) {
+        self.operator_context = blocks.to_vec();
+    }
+
     fn release(&mut self) {
         self.heard_up_to = None;
         // The run is over: its claims and reads go now, not at their TTL.
@@ -833,6 +841,12 @@ impl<B: AgentBackend> TaskWorker for AgentBackendWorker<B> {
         };
 
         let mut instruction = crate::runner::task_instruction(task);
+        // The operator's hooks' context for this task, right after the task
+        // itself, as a person's turn carries it.
+        for block in &self.operator_context {
+            instruction.push_str("\n\n");
+            instruction.push_str(block);
+        }
         // Appended AFTER the task's own instruction, so the work being asked for
         // is read first and the briefing is plainly context rather than the
         // brief itself.
@@ -2617,6 +2631,36 @@ mod tests {
         assert!(
             body.contains("cargo test") && body.contains("3 passed"),
             "the record names neither the command nor its result: {body}"
+        );
+    }
+
+    /// The operator's prompt-hook context reaches the agent's prompt, after
+    /// the task itself.
+    #[test]
+    fn the_operators_hook_context_reaches_the_agents_prompt_after_the_task() {
+        let dir = workspace();
+        let backend = ScriptedBackend::saying(vec![AgentEvent::Text("done".to_string())]);
+        let mut worker = AgentBackendWorker::in_workspace(backend, dir.path().to_path_buf());
+
+        crate::runner::TaskWorker::operator_context(
+            &mut worker,
+            &[
+                "<operator-hook event=\"UserPromptSubmit\">\nticket ABC-1\n</operator-hook>"
+                    .to_string(),
+            ],
+        );
+        worker
+            .work(&Task::new("d1.2", "r-1", "fix the parser"))
+            .expect("the scripted turn succeeds");
+
+        let prompt = worker.backend.prompts.last().expect("a prompt was sent");
+        let task_at = prompt.find("fix the parser").expect("the task was sent");
+        let hook_at = prompt.find("ticket ABC-1").unwrap_or_else(|| {
+            panic!("the operator's hook context never reached the agent: {prompt}")
+        });
+        assert!(
+            task_at < hook_at,
+            "the context came before the task: {prompt}"
         );
     }
 

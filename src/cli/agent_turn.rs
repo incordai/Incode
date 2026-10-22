@@ -2064,6 +2064,64 @@ mod tests {
         }
     }
 
+    /// A repository with one commit and one untracked file: a change to
+    /// review.
+    fn repo_with_a_change() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("ws");
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .status()
+                .expect("git runs");
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(dir.path().join("a.txt"), "one\n").expect("write");
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "first"]);
+        std::fs::write(dir.path().join("new.rs"), "fn new() {}\n").expect("write");
+        dir
+    }
+
+    /// **`/review` GOES THROUGH THE OPERATOR'S PROMPT HOOK.** Exit 2 sends
+    /// nothing to the agent and says why; allowed, the hook's output rides
+    /// the review turn.
+    #[test]
+    fn a_review_refused_by_the_operators_hook_reaches_no_agent() {
+        for (code, refused) in [(2, true), (0, false)] {
+            let ws = repo_with_a_change();
+            let engine = tempfile::tempdir().expect("engine");
+            let seen = Arc::new(Mutex::new(Seen::default()));
+            let mut s = with_memory(ws.path(), engine.path(), &[], &seen, Box::new(|_| {}));
+            s.set_operator_hooks(Some(crate::hooks::HookRunner::new(
+                crate::hooks::HookConfig {
+                    user_prompt_submit: vec![operator_hook("checked", "no secrets", code)],
+                    ..crate::hooks::HookConfig::default()
+                },
+            )));
+            let ran = crate::cli::review_turn(&mut s, ws.path(), None);
+            let prompts = seen.lock().expect("seen").prompts.clone();
+            if refused {
+                let why = ran.expect_err("exit 2 did not refuse the review");
+                assert!(why.contains("no secrets"), "{why}");
+                assert!(prompts.is_empty(), "a refused review reached the agent");
+            } else {
+                assert!(ran.is_ok(), "{ran:?}");
+                assert_eq!(prompts.len(), 1, "{prompts:?}");
+                assert!(
+                    prompts[0].contains("new.rs") && prompts[0].contains("checked"),
+                    "{}",
+                    prompts[0]
+                );
+            }
+        }
+    }
+
     /// **A STOP HOOK RUNS WHEN THE TURN ENDS**, and what it prints is shown
     /// with the turn's notices; without one, no such notice appears.
     #[test]
