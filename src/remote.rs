@@ -1759,9 +1759,27 @@ mod tests {
         }
         // The agent owns the runner it works on, so the job that runs it
         // holds nothing that can push; a fresh job publishes its patch.
-        let (task_job, publish_job) = template
-            .split_once("\n  publish:\n")
+        // Split by lines, not on "\n": a Windows checkout (core.autocrlf)
+        // has the template with CRLF endings — checked here both ways.
+        for template in [
+            template.replace("\r\n", "\n"),
+            template.replace('\n', "\r\n"),
+        ] {
+            assert_task_and_publish_jobs_are_split(&template);
+        }
+    }
+
+    /// The `task` job of the workflow `template` runs incode and cannot push;
+    /// the `publish` job runs no incode and can. Called by
+    /// [`remote_workflow_template_matches_what_remote_relies_on`].
+    fn assert_task_and_publish_jobs_are_split(template: &str) {
+        let lines: Vec<&str> = template.lines().collect();
+        let publish_at = lines
+            .iter()
+            .position(|line| line.trim_end() == "  publish:")
             .expect("the template has a publish job");
+        let task_job = lines[..publish_at].join("\n");
+        let publish_job = lines[publish_at..].join("\n");
         assert!(
             task_job.contains("incode -t"),
             "incode runs in the task job"
