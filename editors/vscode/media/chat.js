@@ -21,6 +21,20 @@
   var modeSel = $("mode");
   var configEl = $("config");
   var completions = $("completions");
+  var composer = $("composer");
+  var attachBtn = $("attach");
+  var attachmentsEl = $("attachments");
+
+  // Pictures for the next prompt. The bounds are src/images.ts's, repeated
+  // here so a file is refused before it is read; the extension checks again.
+  var IMAGE_TYPES = ["image/png", "image/jpeg"];
+  var MAX_IMAGE_BYTES = 3750000;
+  var MAX_IMAGES = 4;
+  var MAX_TOTAL_IMAGE_BYTES = 5 * 1024 * 1024;
+  var imagesAllowed = false;
+  var attachments = []; // { name, mimeType, data (base64), size }
+  var draftSeq = 0;
+  var pending = null; // { draft, text, attachments }: sent, not yet answered
 
   var commands = [];
   var running = false;
@@ -323,11 +337,156 @@
 
   function send() {
     var text = input.value;
-    if (!text.trim() || running) return;
-    vscode.postMessage({ type: "send", text: text });
+    if (running) return;
+    if (!text.trim()) {
+      if (attachments.length > 0) localNotice("info", "Add a question to go with the picture.");
+      return;
+    }
+    // The draft is kept until the extension says it went: a refusal (a turn
+    // running, no session, a picture the agent cannot take) puts it back.
+    pending = { draft: ++draftSeq, text: text, attachments: attachments };
+    var message = { type: "send", text: text, draft: pending.draft };
+    if (attachments.length > 0) {
+      message.images = attachments.map(function (a) {
+        return { name: a.name, mimeType: a.mimeType, data: a.data };
+      });
+    }
+    vscode.postMessage(message);
     input.value = "";
+    attachments = [];
+    renderAttachments();
     updateCompletions();
   }
+
+  /** The extension refused draft `m.draft`: restore what has not been replaced since. */
+  function restoreDraft(m) {
+    if (!pending || pending.draft !== m.draft) return;
+    var draft = pending;
+    pending = null;
+    if (!input.value.trim()) input.value = draft.text;
+    if (attachments.length === 0 && draft.attachments.length > 0) {
+      attachments = draft.attachments;
+      renderAttachments();
+    }
+  }
+
+  // ----- pictures -----------------------------------------------------------
+
+  function localNotice(level, text) {
+    endStream();
+    append(el("div", "notice " + level, text));
+  }
+
+  function formatBytes(n) {
+    if (n >= 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + " MiB";
+    if (n >= 1024) return Math.round(n / 1024) + " KiB";
+    return n + " bytes";
+  }
+
+  /** Why a picture of this type and size cannot be added now, or null. */
+  function refusal(name, type, size) {
+    if (!imagesAllowed) return "this agent does not take pictures";
+    if (IMAGE_TYPES.indexOf(type) < 0) return name + " is " + (type || "not a picture") + "; only PNG and JPEG pictures are accepted";
+    if (size > MAX_IMAGE_BYTES) return name + " is " + formatBytes(size) + "; a picture may be at most " + formatBytes(MAX_IMAGE_BYTES);
+    if (attachments.length >= MAX_IMAGES) return "at most " + MAX_IMAGES + " pictures go with one prompt";
+    var total = size;
+    attachments.forEach(function (a) {
+      total += a.size;
+    });
+    if (total > MAX_TOTAL_IMAGE_BYTES) return "the pictures would come to more than " + formatBytes(MAX_TOTAL_IMAGE_BYTES) + " together";
+    return null;
+  }
+
+  function addAttachment(a) {
+    var why = refusal(a.name, a.mimeType, a.size);
+    if (why) {
+      localNotice("error", "Not attached: " + why + ".");
+      return;
+    }
+    attachments.push(a);
+    renderAttachments();
+  }
+
+  /** A File from paste, drop or the clipboard: checked, then read as base64. */
+  function addFile(file) {
+    var name = file.name || "pasted picture";
+    var why = refusal(name, file.type, file.size);
+    if (why) {
+      localNotice("error", "Not attached: " + why + ".");
+      return;
+    }
+    var reader = new FileReader();
+    reader.onload = function () {
+      var url = String(reader.result || "");
+      var comma = url.indexOf(",");
+      if (comma < 0) return;
+      addAttachment({ name: name, mimeType: file.type, data: url.slice(comma + 1), size: file.size });
+    };
+    reader.onerror = function () {
+      localNotice("error", "Not attached: " + name + " could not be read.");
+    };
+    reader.readAsDataURL(file);
+  }
+
+  function renderAttachments() {
+    while (attachmentsEl.firstChild) attachmentsEl.removeChild(attachmentsEl.firstChild);
+    attachmentsEl.hidden = attachments.length === 0;
+    attachments.forEach(function (a, i) {
+      var box = el("div", "thumb");
+      box.title = a.name + " (" + formatBytes(a.size) + ")";
+      var img = el("img");
+      img.alt = a.name;
+      // A data: URL of the picture's own bytes; the CSP allows data: for img-src only.
+      img.src = "data:" + a.mimeType + ";base64," + a.data;
+      box.appendChild(img);
+      var remove = el("button", "remove", "×");
+      remove.type = "button";
+      remove.title = "Remove " + a.name;
+      remove.setAttribute("aria-label", "Remove " + a.name);
+      remove.addEventListener("click", function () {
+        attachments.splice(i, 1);
+        renderAttachments();
+      });
+      box.appendChild(remove);
+      attachmentsEl.appendChild(box);
+    });
+  }
+
+  function listOf(files) {
+    var out = [];
+    for (var i = 0; files && i < files.length; i++) out.push(files[i]);
+    return out;
+  }
+
+  input.addEventListener("paste", function (e) {
+    var items = (e.clipboardData && e.clipboardData.items) || [];
+    var files = [];
+    for (var i = 0; i < items.length; i++) {
+      if (items[i].kind === "file") {
+        var f = items[i].getAsFile();
+        if (f) files.push(f);
+      }
+    }
+    // Text pastes as text; only a paste that carries files is taken over.
+    if (files.length === 0) return;
+    e.preventDefault();
+    files.forEach(addFile);
+  });
+  // Files dropped from the system's file manager. (VS Code's own explorer
+  // drags URIs, not files; those are left to the editor.)
+  composer.addEventListener("dragover", function (e) {
+    var types = (e.dataTransfer && e.dataTransfer.types) || [];
+    if (Array.prototype.indexOf.call(types, "Files") >= 0) e.preventDefault();
+  });
+  composer.addEventListener("drop", function (e) {
+    var files = listOf(e.dataTransfer && e.dataTransfer.files);
+    if (files.length === 0) return;
+    e.preventDefault();
+    files.forEach(addFile);
+  });
+  attachBtn.addEventListener("click", function () {
+    vscode.postMessage({ type: "attachImage" });
+  });
 
   sendBtn.addEventListener("click", send);
   stopBtn.addEventListener("click", function () {
@@ -350,9 +509,34 @@
         statusEl.textContent = m.text || "";
         statusEl.className = m.state;
         break;
-      case "user":
+      case "user": {
         endStream();
-        append(el("div", "msg user", m.text));
+        var box = el("div", "msg user", m.text);
+        if (Array.isArray(m.images) && m.images.length > 0) {
+          box.appendChild(el("div", "attached", "Attached: " + m.images.join(", ")));
+        }
+        append(box);
+        break;
+      }
+      case "capabilities":
+        imagesAllowed = !!m.images;
+        attachBtn.hidden = !imagesAllowed;
+        if (!imagesAllowed && attachments.length > 0) {
+          attachments = [];
+          renderAttachments();
+        }
+        break;
+      case "sent":
+        if (pending && pending.draft === m.draft) pending = null;
+        break;
+      case "notSent":
+        restoreDraft(m);
+        break;
+      case "attachment":
+        if (m.image) {
+          var bytes = Math.floor((String(m.image.data || "").length * 3) / 4);
+          addAttachment({ name: m.image.name, mimeType: m.image.mimeType, data: m.image.data, size: bytes });
+        }
         break;
       case "agentText":
         streamText("agentText", m.text);

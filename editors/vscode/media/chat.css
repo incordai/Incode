@@ -232,6 +232,42 @@ textarea {
 textarea:focus {
   outline: 1px solid var(--vscode-focusBorder);
 }
+#attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+#attachments[hidden] {
+  display: none;
+}
+.thumb {
+  position: relative;
+  width: 48px;
+  height: 48px;
+  border: 1px solid var(--vscode-input-border, var(--vscode-panel-border, transparent));
+  border-radius: 3px;
+  overflow: hidden;
+}
+.thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.thumb .remove {
+  position: absolute;
+  top: 0;
+  right: 0;
+  padding: 0 4px;
+  line-height: 1.2;
+  border-radius: 0 0 0 3px;
+}
+.msg.user .attached {
+  margin-top: 4px;
+  font-size: 0.9em;
+  color: var(--vscode-descriptionForeground);
+}
 .actions {
   display: flex;
   justify-content: flex-end;

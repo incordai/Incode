@@ -45,15 +45,32 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, View {
 
   private html(webview: vscode.Webview, media: vscode.Uri): string {
     const nonce = crypto.randomBytes(16).toString("base64");
-    const uri = (f: string): string => webview.asWebviewUri(vscode.Uri.joinPath(media, f)).toString();
-    const csp = [
-      "default-src 'none'",
-      `style-src ${webview.cspSource}`,
-      `font-src ${webview.cspSource}`,
-      `img-src ${webview.cspSource}`,
-      `script-src 'nonce-${nonce}'`,
-    ].join("; ");
-    return `<!DOCTYPE html>
+    return pageHtml(webview.cspSource, nonce, (f) => webview.asWebviewUri(vscode.Uri.joinPath(media, f)).toString());
+  }
+}
+
+/**
+ * The page's Content-Security-Policy. Everything is `'none'` but what the
+ * page loads from `media/` and its two nonce'd scripts. `img-src` also allows
+ * `data:`, and only that: the thumbnail of a picture attached to the input
+ * is its own bytes as a `data:` URL. An image cannot run script, and
+ * `connect-src`, `frame-src` and the rest stay `'none'`, so nothing the page
+ * shows can reach out.
+ */
+export function contentSecurityPolicy(cspSource: string, nonce: string): string {
+  return [
+    "default-src 'none'",
+    `style-src ${cspSource}`,
+    `font-src ${cspSource}`,
+    `img-src ${cspSource} data:`,
+    `script-src 'nonce-${nonce}'`,
+  ].join("; ");
+}
+
+/** The HTML shell; media/chat.js fills it. `uri` maps a file in `media/` to the webview's URI for it. */
+export function pageHtml(cspSource: string, nonce: string, uri: (file: string) => string): string {
+  const csp = contentSecurityPolicy(cspSource, nonce);
+  return `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -71,10 +88,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, View {
 <div id="status" role="status"></div>
 <main id="log" aria-live="polite"></main>
 <section id="plan" hidden></section>
-<footer>
+<footer id="composer">
   <ul id="completions" role="listbox" hidden></ul>
+  <div id="attachments" hidden></div>
   <textarea id="input" rows="3" placeholder="Ask incode… (/ for commands, Enter to send, Shift+Enter for a new line)"></textarea>
   <div class="actions">
+    <button id="attach" type="button" class="secondary" title="Attach a PNG or JPEG picture (you can also paste or drop one)" hidden>Image</button>
     <button id="send" type="button">Send</button>
     <button id="stop" type="button" class="secondary" hidden>Stop</button>
   </div>
@@ -83,5 +102,4 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, View {
 <script nonce="${nonce}" src="${uri("chat.js")}"></script>
 </body>
 </html>`;
-  }
 }
