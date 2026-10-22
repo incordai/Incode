@@ -1571,9 +1571,15 @@ pub fn handle_style(
             } else {
                 " "
             };
+            // Said beside each: a project's style came with the repository.
+            let from = match style.origin {
+                crate::styles::Origin::Operator => "yours",
+                crate::styles::Origin::Project => "this project",
+            };
             outln!(
-                "  {mark} {:<16} {}",
+                "  {mark} {:<16} {:<13} {}",
                 style.name,
+                from,
                 style.description.as_deref().unwrap_or("")
             );
         }

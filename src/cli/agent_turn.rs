@@ -1869,6 +1869,7 @@ mod tests {
                 description: None,
                 body: body.into(),
                 source: PathBuf::from(format!("{name}.md")),
+                origin: crate::styles::Origin::Operator,
             })
         };
         let mut s = AgentSession::new(

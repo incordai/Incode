@@ -1143,10 +1143,9 @@ impl AdminConfig {
                 "  output style   {}  <- {}{}\n",
                 style.value,
                 style.source.as_str(),
-                if crate::styles::load(workspace).find(&style.value).is_some() {
-                    ""
-                } else {
-                    "  (no such file: none is applied)"
+                match crate::styles::load(workspace).find(&style.value) {
+                    Some(found) => format!("  ({})", found.source.display()),
+                    None => "  (no such file: none is applied)".to_string(),
                 }
             ),
             None => "  output style   none\n".to_string(),

@@ -690,9 +690,12 @@ started in.
 ### Output styles
 
 An output style is a way of answering you choose: a Markdown file whose body
-the agent is told to follow in every reply, in `.incode/styles/<name>.md`
-(this project; it wins a clash) or `~/.incode/styles/<name>.md` (yours). An
-optional front matter gives `/style` a line to show:
+the agent is told to follow in every reply, in `~/.incode/styles/<name>.md`
+(yours) or `.incode/styles/<name>.md` (this project's). **Yours wins a
+clash**: a project's styles arrive with whatever you cloned, so a repository
+cannot replace the style you named, and the prompt, `/style` and `--admin` all
+say which folder the text came from. A symbolic link is refused in either
+folder. An optional front matter gives `/style` a line to show:
 
 ```markdown
 ---
