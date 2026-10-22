@@ -335,6 +335,32 @@ HTTP), which incode connects itself — in the background, so `session/new` does
 not wait for them — and runs through the same gate as its own tools.
 Details: `docs/ARCHITECTURE.md` §2.
 
+**Editors over ACP.** Any ACP client can run `incode --acp`. `incode` must
+be on the editor's `PATH`, or give its full path as `command` (on Windows,
+escape the backslashes in JSON: `"C:\\Users\\you\\.local\\bin\\incode.exe"`).
+
+- **VS Code:** the extension in [`editors/vscode`](editors/vscode/README.md).
+- **Zed:** Agent Settings → External Agents → Add Agent → Add Custom Agent,
+  then in `settings.json`:
+
+  ```json
+  "agent_servers": {
+    "incode": { "type": "custom", "command": "incode", "args": ["--acp"], "env": {} }
+  }
+  ```
+
+  Start a thread with it from the agent selector or the new-thread menu.
+- **JetBrains IDEs** (AI Assistant): AI Chat → the more-actions menu → Add
+  Custom Agent, which opens `~/.jetbrains/acp.json`:
+
+  ```json
+  { "agent_servers": { "incode": { "command": "incode", "args": ["--acp"], "env": {} } } }
+  ```
+
+Add `-p read-only` (or another mode) or `-m <model>` to `args` to fix them for
+the editor's sessions. These snippets follow each editor's documentation;
+report anything that differs in your editor on #26.
+
 ## Choosing agents and models
 
 incode builds one catalogue of agents at session start:
