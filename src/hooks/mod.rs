@@ -1,4 +1,6 @@
-//! Run an operator's own shell commands around a tool call.
+//! Run an operator's own shell commands around a tool call, and before a
+//! person's line is sent ([`HookRunner::user_prompt_submit`]: exit 2 refuses
+//! it, stdout is added to the turn, the line is never changed).
 //!
 //! # Where these run
 //!
@@ -124,6 +126,11 @@ pub struct HookConfig {
     /// deny here would report a refusal for something that was done.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub post_tool_use: Vec<String>,
+    /// Commands run when a person's line is about to go to the agent. Exit
+    /// code 2 refuses the line (the reason is shown, nothing is sent); stdout
+    /// is added to that turn's context. The line itself is never changed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub user_prompt_submit: Vec<String>,
 }
 
 impl HookConfig {
@@ -133,7 +140,17 @@ impl HookConfig {
     /// costs nothing beyond this.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.pre_tool_use.is_empty() && self.post_tool_use.is_empty()
+        self.pre_tool_use.is_empty()
+            && self.post_tool_use.is_empty()
+            && self.user_prompt_submit.is_empty()
+    }
+
+    /// `other`'s commands after these, event by event (a plugin's after the
+    /// operator's).
+    pub fn extend(&mut self, other: Self) {
+        self.pre_tool_use.extend(other.pre_tool_use);
+        self.post_tool_use.extend(other.post_tool_use);
+        self.user_prompt_submit.extend(other.user_prompt_submit);
     }
 }
 
@@ -206,9 +223,7 @@ impl HookRunner {
     #[must_use]
     pub fn from_settings() -> Option<Self> {
         let mut config = crate::admin::AdminConfig::load_default().desktop_hooks;
-        let plugins = crate::plugins::session_hooks();
-        config.pre_tool_use.extend(plugins.pre_tool_use);
-        config.post_tool_use.extend(plugins.post_tool_use);
+        config.extend(crate::plugins::session_hooks());
         (!config.is_empty()).then(|| Self::new(config))
     }
 
@@ -287,9 +302,20 @@ impl HookRunner {
         let mut payload = event.to_string().into_bytes();
         payload.push(b'\n');
 
+        let input = match call.tool_input {
+            Value::String(text) => text.clone(),
+            other => other.to_string(),
+        };
+        let env = [
+            ("HOOK_TOOL_NAME", call.tool_name.to_string()),
+            (
+                "HOOK_TOOL_INPUT",
+                crate::text::head_bytes(&input, MAX_ENV_INPUT_BYTES).to_string(),
+            ),
+        ];
         let mut messages = Vec::new();
         for command in commands {
-            match run_shell_command(command, call, &payload) {
+            match run_shell_command(command, &env, call.cwd, &payload) {
                 Ok((code, stdout, stderr)) => {
                     if code == 2 && matches!(side, Side::Pre) {
                         // Exit 2 denies; stderr is the reason, as the
@@ -317,6 +343,59 @@ impl HookRunner {
 
         HookRunResult::allow(messages)
     }
+
+    /// The `user_prompt_submit` commands for a person's `prompt`, before it
+    /// goes to the agent. Exit 2 from any of them refuses it — the rest are
+    /// not run — and the reason is stderr (stdout when stderr is empty).
+    /// Otherwise each one's stdout is a message for the turn's context. The
+    /// prompt is shown to them, never taken back from them.
+    ///
+    /// Called by `cli::agent_turn::AgentSession::prompt_hooks` (the REPL and
+    /// `--acp`, through `cli::plan_turn`) and by `task_run` (`-t`).
+    #[must_use]
+    pub fn user_prompt_submit(
+        &self,
+        prompt: &str,
+        session: &str,
+        cwd: Option<&Path>,
+    ) -> HookRunResult {
+        let commands = &self.config.user_prompt_submit;
+        if commands.is_empty() {
+            return HookRunResult::allow(Vec::new());
+        }
+        let mut payload = json!({
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": prompt,
+            "session_id": session,
+            "cwd": cwd.map(|p| p.to_string_lossy().into_owned()),
+        })
+        .to_string()
+        .into_bytes();
+        payload.push(b'\n');
+        let mut messages = Vec::new();
+        for command in commands {
+            match run_shell_command(command, &[], cwd, &payload) {
+                Ok((2, stdout, stderr)) => {
+                    let reason = if stderr.is_empty() { stdout } else { stderr };
+                    return HookRunResult {
+                        denied: true,
+                        messages: vec![if reason.is_empty() {
+                            format!("the operator's hook `{command}` refused this prompt")
+                        } else {
+                            reason
+                        }],
+                    };
+                }
+                Ok((_, stdout, _)) => {
+                    if !stdout.is_empty() {
+                        messages.push(stdout);
+                    }
+                }
+                Err(e) => messages.push(format!("Hook `{command}` failed: {e}")),
+            }
+        }
+        HookRunResult::allow(messages)
+    }
 }
 
 /// A call's input from its text: the JSON it holds, or the text itself.
@@ -324,11 +403,12 @@ fn parsed(tool_input: &str) -> Value {
     serde_json::from_str(tool_input).unwrap_or_else(|_| json!(tool_input))
 }
 
-/// One operator command, run through the shell with the event on its stdin:
-/// its exit code, stdout and stderr, each trimmed.
+/// One operator command, run through the shell in `cwd` with `env` set and the
+/// event on its stdin: its exit code, stdout and stderr, each trimmed.
 fn run_shell_command(
     command: &str,
-    call: &HookCall<'_>,
+    env: &[(&str, String)],
+    cwd: Option<&Path>,
     payload: &[u8],
 ) -> std::io::Result<(i32, String, String)> {
     // Verbatim on Windows, as the Bash tool passes its command: `Command::arg`
@@ -349,15 +429,10 @@ fn run_shell_command(
         c
     };
 
-    let input = match call.tool_input {
-        Value::String(text) => text.clone(),
-        other => other.to_string(),
-    };
-    child.env("HOOK_TOOL_NAME", call.tool_name).env(
-        "HOOK_TOOL_INPUT",
-        crate::text::head_bytes(&input, MAX_ENV_INPUT_BYTES),
-    );
-    if let Some(cwd) = call.cwd {
+    for (name, value) in env {
+        child.env(name, value);
+    }
+    if let Some(cwd) = cwd {
         child.current_dir(cwd);
     }
 
@@ -433,6 +508,7 @@ mod tests {
         let runner = HookRunner::new(HookConfig {
             pre_tool_use: vec![hook(dir.path(), 2, "no writes today")],
             post_tool_use: Vec::new(),
+            user_prompt_submit: Vec::new(),
         });
         let input = json!({"path": "a.txt", "content": "hi"});
         let ran = runner.pre_tool(&call(&input, dir.path()));
@@ -456,6 +532,7 @@ mod tests {
         let runner = HookRunner::new(HookConfig {
             pre_tool_use: vec![hook(dir.path(), 0, "fine")],
             post_tool_use: vec![hook(dir.path(), 2, "too late")],
+            user_prompt_submit: Vec::new(),
         });
         let input = json!({"path": "a.txt"});
         let pre = runner.pre_tool(&call(&input, dir.path()));
@@ -469,5 +546,71 @@ mod tests {
         .expect("json");
         assert_eq!(event["hook_event_name"], "PostToolUse");
         assert_eq!(event["tool_response"], "wrote it");
+    }
+
+    fn prompt_runner(commands: Vec<String>) -> HookRunner {
+        HookRunner::new(HookConfig {
+            user_prompt_submit: commands,
+            ..HookConfig::default()
+        })
+    }
+
+    /// **EXIT 2 REFUSES THE PROMPT, WITH STDERR AS THE REASON**, and the
+    /// commands after it are not run.
+    #[test]
+    fn a_prompt_hook_exiting_2_refuses_the_prompt_with_its_reason() {
+        let dir = tempfile::tempdir().expect("dir");
+        let later = tempfile::tempdir().expect("later");
+        let runner = prompt_runner(vec![
+            hook(dir.path(), 2, "no secrets in prompts"),
+            hook(later.path(), 0, "ran"),
+        ]);
+        let ran = runner.user_prompt_submit("paste my key here", "sess-1", Some(dir.path()));
+        assert!(ran.is_denied());
+        assert_eq!(ran.messages(), ["no secrets in prompts"]);
+        assert!(
+            !later.path().join("event.json").exists(),
+            "a command after the refusal ran"
+        );
+    }
+
+    /// Any other exit lets the prompt through; stdout is the turn's context,
+    /// and the event — the prompt, the session, the folder — is on stdin.
+    #[test]
+    fn a_prompt_hook_adds_context_and_is_told_the_prompt() {
+        let dir = tempfile::tempdir().expect("dir");
+        let runner = prompt_runner(vec![hook(dir.path(), 0, "")]);
+        let ran = runner.user_prompt_submit("fix the parser", "sess-1", Some(dir.path()));
+        assert!(!ran.is_denied());
+        assert_eq!(ran.messages(), ["said"]);
+        let event: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("event.json")).expect("saved"),
+        )
+        .expect("json");
+        assert_eq!(event["hook_event_name"], "UserPromptSubmit");
+        assert_eq!(event["prompt"], "fix the parser");
+        assert_eq!(event["session_id"], "sess-1");
+    }
+
+    /// The tool hooks do not run for a prompt, nor the prompt hooks for a
+    /// tool: each list is its own event's.
+    #[test]
+    fn prompt_hooks_and_tool_hooks_are_separate_events() {
+        let dir = tempfile::tempdir().expect("dir");
+        let tool_only = HookRunner::new(HookConfig {
+            pre_tool_use: vec![hook(dir.path(), 2, "tool hook")],
+            ..HookConfig::default()
+        });
+        assert!(!tool_only
+            .user_prompt_submit("hello", "", Some(dir.path()))
+            .is_denied());
+        let prompt_only = prompt_runner(vec![hook(dir.path(), 2, "prompt hook")]);
+        let input = json!({"path": "a"});
+        assert!(!prompt_only.pre_tool(&call(&input, dir.path())).is_denied());
+        assert!(!HookConfig {
+            user_prompt_submit: vec!["x".into()],
+            ..HookConfig::default()
+        }
+        .is_empty());
     }
 }

@@ -60,6 +60,10 @@ pub struct AgentSession {
     /// Set when the user asks to stop; cleared at the start of each turn so a
     /// press at the prompt cannot leak into the next one.
     cancel: Option<crate::runtime::cancel::CancelToken>,
+    /// The operator's own hook commands (`crate::hooks`), for the events this
+    /// session fires itself — a person's line, before it is sent. The tool
+    /// events are the toolbox's.
+    operator_hooks: Option<crate::hooks::HookRunner>,
     /// How many turns this session has run.
     turns: usize,
     /// Directories beyond the workspace this session may reach.
@@ -236,6 +240,7 @@ impl AgentSession {
             checkpoints: CheckpointStore::new(),
             snapshot_complete: None,
             cancel: None,
+            operator_hooks: None,
             turns: 0,
             quota: None,
             notices: Vec::new(),
@@ -564,6 +569,34 @@ impl AgentSession {
         if self.start_block.is_some() {
             self.carry_context();
         }
+    }
+
+    /// The operator's own hook commands for the events this session fires.
+    pub fn set_operator_hooks(&mut self, hooks: Option<crate::hooks::HookRunner>) {
+        self.operator_hooks = hooks;
+    }
+
+    /// The operator's `user_prompt_submit` commands for a person's `line`,
+    /// before anything is sent: the context their stdout adds to the turn, or
+    /// `Err` with the reason one refused it (exit 2). The line is not changed.
+    ///
+    /// Called by `cli::plan_turn`, so the REPL and `--acp` run it the same way.
+    pub fn prompt_hooks(&self, line: &str) -> Result<Vec<String>, String> {
+        let Some(hooks) = &self.operator_hooks else {
+            return Ok(Vec::new());
+        };
+        let ran =
+            hooks.user_prompt_submit(line, self.session_id().unwrap_or(""), Some(&self.workspace));
+        if ran.is_denied() {
+            return Err(ran.messages().join("\n"));
+        }
+        Ok(ran
+            .messages()
+            .iter()
+            .map(|said| {
+                format!("<operator-hook event=\"UserPromptSubmit\">\n{said}\n</operator-hook>")
+            })
+            .collect())
     }
 
     /// The person's line is about to go to the model: written to the session's
@@ -1902,6 +1935,54 @@ mod tests {
         s.set_output_style(None);
         assert!(styles_in(&seen).is_empty());
         assert_eq!(seen.lock().expect("seen").context, ["BASE"]);
+    }
+
+    /// An operator hook command that prints `out`, writes `why` to stderr and
+    /// exits with `code`, as the shell runs it.
+    fn operator_hook(out: &str, why: &str, code: i32) -> String {
+        if cfg!(windows) {
+            format!("echo {out}& echo {why} 1>&2& exit /b {code}")
+        } else {
+            format!("echo '{out}'; echo '{why}' >&2; exit {code}")
+        }
+    }
+
+    /// **A REFUSED LINE REACHES NOTHING.** The operator's `user_prompt_submit`
+    /// hook exits 2: the plan is a refusal with its reason, and the memory
+    /// engine never hears the line. Allowed, the hook's output rides the turn
+    /// and the engine does hear it.
+    #[test]
+    fn a_prompt_refused_by_the_operators_hook_reaches_neither_engine_nor_agent() {
+        for (code, refused) in [(2, true), (0, false)] {
+            let ws = tempfile::tempdir().expect("ws");
+            let engine = tempfile::tempdir().expect("engine");
+            let seen = Arc::new(Mutex::new(Seen::default()));
+            let mut s = with_memory(ws.path(), engine.path(), &[], &seen, Box::new(|_| {}));
+            s.set_operator_hooks(Some(crate::hooks::HookRunner::new(
+                crate::hooks::HookConfig {
+                    user_prompt_submit: vec![operator_hook("checked", "no secrets", code)],
+                    ..crate::hooks::HookConfig::default()
+                },
+            )));
+            let plan = crate::cli::plan_turn(&mut s, ws.path(), "fix it", "fix it");
+            let heard = fake::spawned(engine.path(), "user-prompt");
+            if refused {
+                match plan {
+                    crate::cli::TurnPlan::Refused(why) => assert_eq!(why, "no secrets"),
+                    _ => panic!("exit 2 did not refuse the line"),
+                }
+                assert_eq!(heard, 0, "the engine heard a refused line");
+            } else {
+                match plan {
+                    crate::cli::TurnPlan::Agent { context, .. } => {
+                        assert!(context.iter().any(|c| c.contains("checked")), "{context:?}")
+                    }
+                    _ => panic!("an allowing hook did not let the line through"),
+                }
+                assert_eq!(heard, 1, "the engine did not hear an allowed line");
+            }
+            assert!(seen.lock().expect("seen").prompts.is_empty());
+        }
     }
 
     fn start_context(text: &str) -> String {

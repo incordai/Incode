@@ -429,10 +429,9 @@ pub fn session_hooks() -> crate::hooks::HookConfig {
     let mut all = crate::hooks::HookConfig::default();
     for plugin in discover_here().plugins {
         match plugin.hooks() {
-            Ok(config) => {
-                all.pre_tool_use.extend(config.pre_tool_use);
-                all.post_tool_use.extend(config.post_tool_use);
-            }
+            // Every event, not a list of them: a field added to `HookConfig`
+            // reaches plugins without this needing to know.
+            Ok(config) => all.extend(config),
             Err(why) => crate::trace!("plugins", "{why}"),
         }
     }

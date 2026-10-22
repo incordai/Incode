@@ -644,6 +644,9 @@ pub(crate) fn prepare_session(
     .with_standby(standby)
     .with_cancel(cancel.clone())
     .with_extra_dirs(config.additional_dirs.clone());
+    // The operator's commands for the events the session fires itself (a
+    // person's line); the toolbox has its own for the tool events.
+    session.set_operator_hooks(crate::hooks::HookRunner::from_settings());
     if !config.additional_dirs.is_empty() {
         render::print_info(&format!(
             "Also working in {} additional director(ies) — guards and undo cover them.",
@@ -1743,6 +1746,12 @@ fn run_one_turn(
             render::print_assistant(&reply);
             Ok(())
         }
+        TurnPlan::Refused(why) => {
+            render::print_error(&format!(
+                "Not sent: the operator's user_prompt_submit hook refused it. {why}"
+            ));
+            Ok(())
+        }
         TurnPlan::Agent {
             instruction,
             context,
@@ -1760,6 +1769,9 @@ pub(crate) enum TurnPlan {
     NextQuestion(String),
     /// A bare greeting, answered here without starting an agent.
     Greeting(String),
+    /// The operator's `user_prompt_submit` hook refused the line: why. Nothing
+    /// is sent, and the memory engine does not hear it either.
+    Refused(String),
     /// A turn for the agent: what it is asked, and the context that goes
     /// before it.
     Agent {
@@ -1789,9 +1801,14 @@ pub(crate) fn plan_turn(
             return TurnPlan::NextQuestion(menu);
         }
         crate::cli::agent_turn::Answered::Ready(instruction) => {
-            // The answers are the person's line for this turn: the engine
-            // hears it, and its context for it rides the turn.
-            let context = session.memory_prompt(&instruction).into_iter().collect();
+            // The answers are the person's line for this turn: the operator's
+            // hooks see it first, then the engine hears it, and both their
+            // contexts ride the turn.
+            let mut context = match session.prompt_hooks(&instruction) {
+                Ok(added) => added,
+                Err(why) => return TurnPlan::Refused(why),
+            };
+            context.extend(session.memory_prompt(&instruction));
             return TurnPlan::Agent {
                 instruction,
                 context,
@@ -1828,7 +1845,13 @@ pub(crate) fn plan_turn(
     // itself: when it answers, incode's own per-turn rules are not fetched as
     // well, so the rules are never sent twice. When it does not — no engine,
     // or nothing to say — incode's own are.
-    let mut context = Vec::new();
+    //
+    // The operator's `user_prompt_submit` hooks first: one that refuses the
+    // line stops it here, before the engine or the agent hear it.
+    let mut context = match session.prompt_hooks(line) {
+        Ok(added) => added,
+        Err(why) => return TurnPlan::Refused(why),
+    };
     match session.memory_prompt(line) {
         Some(block) => context.push(block),
         None => {
