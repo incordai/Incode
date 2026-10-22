@@ -3,8 +3,9 @@
 //!
 //! Ported from incode's own Windows sandbox (`src/sandbox/windows.rs` and
 //! `windows/acl.rs`, Apache-2.0), whose authors measured it on Windows. What
-//! they measured is repeated here where it explains a choice; nothing in this
-//! crate's port has itself run on Windows yet (see the README).
+//! they measured is repeated here where it explains a choice. This crate's
+//! port is checked by `tests/escape_windows.rs` on the `windows-latest` CI
+//! runner, after `sbx setup-windows` (see the README).
 //!
 //! # Writes: a write-restricted token
 //!
