@@ -56,6 +56,7 @@ pub mod serve;
 pub mod session;
 pub mod skills;
 pub mod spec;
+pub mod styles;
 pub mod subagents;
 pub mod task_run;
 pub mod team;

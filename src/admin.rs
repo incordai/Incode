@@ -336,6 +336,11 @@ pub struct AdminConfig {
     /// toggles it for the session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub editing_mode: Option<String>,
+    /// The output style every session starts with: a file in
+    /// `.incode/styles/` or `~/.incode/styles/` ([`crate::styles`]).
+    /// `INCODE_OUTPUT_STYLE` overrides it; `/style` switches it per session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_style: Option<String>,
     /// Per-command permission rules — `allow`, `ask`, `deny` lists of `Tool`
     /// or `Tool(specifier)` — applied to every tool call the toolbox runs.
     /// Unioned with the managed and project rules; deny beats ask beats allow.
@@ -1129,6 +1134,24 @@ impl AdminConfig {
             codex_tools.source.as_str()
         ));
 
+        let env_style = std::env::var(crate::styles::ENV).ok();
+        out.push_str(&match crate::styles::chosen(
+            env_style.as_deref(),
+            self.output_style.as_deref(),
+        ) {
+            Some(style) => format!(
+                "  output style   {}  <- {}{}\n",
+                style.value,
+                style.source.as_str(),
+                if crate::styles::load(workspace).find(&style.value).is_some() {
+                    ""
+                } else {
+                    "  (no such file: none is applied)"
+                }
+            ),
+            None => "  output style   none\n".to_string(),
+        });
+
         // Every one of these is optional. Saying which are OFF is the point: a
         // harness quietly doing less looks exactly like one doing nothing.
         let off = self.plugins.disabled();
@@ -1595,6 +1618,7 @@ mod tests {
             notify_after_secs: Some(30),
             statusline_command: Some("~/.incode/statusline.sh".to_string()),
             editing_mode: Some("vi".to_string()),
+            output_style: Some("concise".to_string()),
             // The permission rules, or a `/roles` save would drop them.
             permissions: crate::permissions::rules::RuleLists {
                 allow: vec!["Bash(npm test:*)".to_string()],
