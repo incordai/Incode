@@ -1611,6 +1611,7 @@ mod tests {
                 notification: vec!["a-notify-hook".to_string()],
                 session_start: vec!["a-start-note".to_string()],
                 session_end: vec!["a-end-note".to_string()],
+                subagent_stop: vec!["a-subagent-note".to_string()],
             },
             desktop_display: Some("xvfb:1280x800".to_string()),
             desktop_limits: crate::desktop::limits::DesktopLimits {
