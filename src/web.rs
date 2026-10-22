@@ -569,7 +569,7 @@ fn encode(value: &str) -> String {
 /// Ask the search provider, bounded in time and size, following no redirect.
 fn search_get(url: String, key: Option<String>) -> Result<String, String> {
     crate::runtime::http::run_async(async move {
-        let client = reqwest::Client::builder()
+        let client = crate::runtime::http::builder(false)
             .timeout(SEARCH_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())
             .build()
@@ -623,7 +623,11 @@ fn fetch_page(url: &str) -> Result<(String, String), String> {
             .build()
             .map_err(|e| format!("no runtime for the request: {e}"))?;
         runtime.block_on(async move {
-            let client = reqwest::Client::builder()
+            // The system's proxy applies (`runtime::http`). Through one, the
+            // PROXY resolves the name, so the pin below cannot hold there: the
+            // checks above still refuse a name that resolves inward here, and
+            // what the proxy itself may reach is the proxy's to bound.
+            let client = crate::runtime::http::builder(false)
                 .timeout(TIMEOUT)
                 // The checked address, used instead of resolving again.
                 .resolve(&host, pinned)

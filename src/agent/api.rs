@@ -1205,10 +1205,14 @@ impl Transport for Http {
                 .build()
                 .map_err(|e| format!("no runtime for the request: {e}"))?;
             runtime.block_on(async move {
-                let client = reqwest::Client::builder()
-                    .timeout(http.timeout)
-                    .build()
-                    .map_err(|e| format!("client: {e}"))?;
+                // A model server on this machine is reached directly, never
+                // through a proxy (`runtime::http`).
+                let client = crate::runtime::http::builder(crate::runtime::http::names_loopback(
+                    &http.endpoint,
+                ))
+                .timeout(http.timeout)
+                .build()
+                .map_err(|e| format!("client: {e}"))?;
                 let (response, retried) = http.post(&client, &payload).await?;
                 let status = response.status();
                 let text = response
@@ -1252,10 +1256,12 @@ impl Transport for Http {
                 .build()
                 .map_err(|e| format!("no runtime for the request: {e}"))?;
             runtime.block_on(async move {
-                let client = reqwest::Client::builder()
-                    .timeout(http.timeout)
-                    .build()
-                    .map_err(|e| format!("client: {e}"))?;
+                let client = crate::runtime::http::builder(crate::runtime::http::names_loopback(
+                    &http.endpoint,
+                ))
+                .timeout(http.timeout)
+                .build()
+                .map_err(|e| format!("client: {e}"))?;
                 let (mut response, retried) = http.post(&client, &payload).await?;
                 let status = response.status();
                 if !status.is_success() {

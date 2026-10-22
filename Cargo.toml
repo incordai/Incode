@@ -317,3 +317,9 @@ tempfile = "3"
 # `From<http::Response<T>>` impl needs the type. Already resolved to 1.5.0 as a
 # transitive dependency of reqwest, so this pins nothing new and is test-only.
 http = "1"
+# The TLS server and the private certificate authority that prove a CA from
+# `INCODE_CA_CERTS` is trusted (`runtime::http`). Generated at test time: no key
+# is committed. Test-only; rustls and ring are already in Cargo.lock (as
+# optional parts of reqwest's tree), rcgen is from the same project.
+rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

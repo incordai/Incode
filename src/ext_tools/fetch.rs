@@ -172,12 +172,12 @@ pub(crate) fn get_bounded(
 
 /// The response at the end of `url`'s redirects, each address checked first.
 async fn follow(url: &str, accept: &str) -> Result<reqwest::Response, String> {
-    let client = crate::runtime::http::no_redirect_client()?;
     let mut at = url.to_string();
     for _ in 0..=MAX_REDIRECTS {
         crate::agent::catalogue::key_may_travel_to(&at)
             .map_err(|why| format!("refused to fetch it: {why}"))?;
-        let response = client
+        // Per hop: a redirect can lead off this machine, or onto it.
+        let response = crate::runtime::http::no_redirect_client(&at)?
             .get(&at)
             .header(reqwest::header::USER_AGENT, USER_AGENT)
             .header(reqwest::header::ACCEPT, accept)

@@ -1419,6 +1419,27 @@ there gives way), and the memory
 engine's files stay where they are. `INCODE_TRACE` (area `migrate`) says what
 moved. The old `INCORD_*` variables are not read any more: rename them.
 
+### Proxies and certificates
+
+Behind a corporate proxy, every outbound request — the model API, web fetch and
+search, MCP servers over HTTP and their OAuth, external tools and
+`incode update`, the memory engine — follows `HTTPS_PROXY`, `HTTP_PROXY`,
+`ALL_PROXY` and `NO_PROXY` (either case), and then the proxy set in Windows'
+Internet Options or macOS' network settings. A request to **this machine** —
+`localhost`, a `.localhost` name, `127.0.0.0/8` or `::1` — never goes through a
+proxy, whatever `NO_PROXY` says, so a local memory engine, model server or MCP
+server keeps working. Through a proxy, web fetch's check of where a name points
+is made here, and the proxy resolves the name again itself: what the proxy can
+reach is the proxy's to limit.
+
+When the proxy re-signs TLS with the company's own certificate authority, point
+`INCODE_CA_CERTS` (or `SSL_CERT_FILE`) at its PEM file — one or more
+certificates. They are trusted beside the system's own. A file that cannot be
+read, or holds no certificate, is said on stderr at the first request and
+nothing extra is trusted, so a connection that needed it fails with a
+certificate error rather than going elsewhere. A coding agent CLI incode drives
+(claude, codex, agy) makes its own requests and reads its own settings.
+
 ## Security notes
 
 - **No subscription login is read or held.** The agent CLIs authenticate

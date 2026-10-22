@@ -495,7 +495,7 @@ async fn read_bounded(mut response: reqwest::Response) -> Result<String, String>
 /// Find the authorization server for the MCP server at `server`.
 async fn discover(server: String) -> Result<Discovered, String> {
     checked(&server, "the server's address")?;
-    let client = crate::runtime::http::no_redirect_client()?;
+    let client = crate::runtime::http::no_redirect_client(&server)?;
     let hello = json!({"jsonrpc": "2.0", "id": 0, "method": "initialize",
                        "params": {"protocolVersion": crate::mcp_stdio::PROTOCOL_VERSION,
                                   "capabilities": {},
@@ -884,7 +884,7 @@ struct Client {
 /// Register incode as a public client (RFC 7591) for `redirect_uri`.
 async fn register(endpoint: String, redirect_uri: String) -> Result<Client, String> {
     checked(&endpoint, "its registration endpoint")?;
-    let client = crate::runtime::http::no_redirect_client()?;
+    let client = crate::runtime::http::no_redirect_client(&endpoint)?;
     let request = json!({
         "client_name": "incode",
         "redirect_uris": [redirect_uri],
@@ -988,7 +988,7 @@ async fn token_request(
     if let Some(resource) = &base.resource {
         form.push(("resource", resource.clone()));
     }
-    let client = crate::runtime::http::no_redirect_client()?;
+    let client = crate::runtime::http::no_redirect_client(&base.token_endpoint)?;
     let response = client
         .post(&base.token_endpoint)
         .header(ACCEPT, "application/json")
