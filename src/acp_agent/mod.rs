@@ -1184,6 +1184,11 @@ fn drive<F: SessionFactory>(
     // the session is over, and the memory engine is told — on this thread,
     // which owns the session, bounded by the engine runner.
     held.session.end_memory("other");
+    // The operator's `session_end` commands. Nowhere to show their output
+    // once the client has closed the session: it is traced.
+    for said in held.session.operator_session_end("other") {
+        crate::trace!("hooks", "session_end hook: {said}");
+    }
 }
 
 /// One open session, as its thread holds it.

@@ -647,6 +647,11 @@ pub(crate) fn prepare_session(
     // The operator's commands for the events the session fires itself (a
     // person's line); the toolbox has its own for the tool events.
     session.set_operator_hooks(crate::hooks::HookRunner::from_settings());
+    // The operator's `session_start` commands, now the session exists — the
+    // REPL and `--acp` both come through here. Shown, never asked.
+    for said in session.operator_session_start("startup") {
+        render::print_info(&format!("[session_start hook] {said}"));
+    }
     if !config.additional_dirs.is_empty() {
         render::print_info(&format!(
             "Also working in {} additional director(ies) — guards and undo cover them.",
@@ -1367,6 +1372,9 @@ impl CliApp {
         // The memory engine's end of the session, bounded by the engine
         // runner, before the operator's own end-of-session command.
         session.end_memory("prompt_input_exit");
+        for said in session.operator_session_end("prompt_input_exit") {
+            render::print_info(&format!("[session_end hook] {said}"));
+        }
 
         // Run session end lifecycle hook (Feature 7)
         if let Some(result) = lifecycle_hooks.run_session_end(&workspace) {

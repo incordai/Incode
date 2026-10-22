@@ -467,7 +467,9 @@ impl CodexBackend {
     }
 
     /// Have codex start `exe` as the tool server instead of this binary.
-    #[cfg(test)]
+    /// Unix only, as its one caller is (the bridged-turn test's fakes are
+    /// shell scripts).
+    #[cfg(all(test, unix))]
     fn with_tool_server(mut self, exe: PathBuf) -> Self {
         self.tool_server = Some(exe);
         self

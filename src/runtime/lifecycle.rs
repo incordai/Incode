@@ -4,6 +4,10 @@
 //! - `on_session_start`: Run when a new session begins (e.g. "npm install")
 //! - `on_session_end`: Run when session ends (e.g. "cargo fmt")
 //! - `on_compact`: Run after compaction (e.g. custom cleanup)
+//!
+//! Superseded by the operator's `session_start` / `session_end` hooks
+//! (`crate::hooks::HookConfig`); kept so an existing `lifecycle.json` still
+//! runs.
 
 use std::path::Path;
 use std::process::Command;

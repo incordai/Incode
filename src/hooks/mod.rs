@@ -145,6 +145,14 @@ pub struct HookConfig {
     /// beside `notify_command`; they cannot change anything.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notification: Vec<String>,
+    /// Commands run when a session starts (REPL, `--acp`, `-t`). They cannot
+    /// stop it; stdout is shown.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub session_start: Vec<String>,
+    /// Commands run when a session ends. They cannot keep it open; stdout is
+    /// shown where there is still somewhere to show it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub session_end: Vec<String>,
 }
 
 impl HookConfig {
@@ -160,6 +168,8 @@ impl HookConfig {
             && self.pre_compact.is_empty()
             && self.stop.is_empty()
             && self.notification.is_empty()
+            && self.session_start.is_empty()
+            && self.session_end.is_empty()
     }
 
     /// How many commands, over every event. Used where a plugin's hooks are
@@ -172,6 +182,8 @@ impl HookConfig {
             + self.pre_compact.len()
             + self.stop.len()
             + self.notification.len()
+            + self.session_start.len()
+            + self.session_end.len()
     }
 
     /// `other`'s commands after these, event by event (a plugin's after the
@@ -183,6 +195,8 @@ impl HookConfig {
         self.pre_compact.extend(other.pre_compact);
         self.stop.extend(other.stop);
         self.notification.extend(other.notification);
+        self.session_start.extend(other.session_start);
+        self.session_end.extend(other.session_end);
     }
 }
 
@@ -461,6 +475,42 @@ impl HookRunner {
     }
 }
 
+impl HookRunner {
+    /// The `session_start` commands; `source` is `startup`. They cannot stop
+    /// it; stdout is a message.
+    ///
+    /// Called by `cli::agent_turn::AgentSession::operator_session_start`
+    /// (REPL and `--acp`) and `task_run` (`-t`).
+    #[must_use]
+    pub fn session_start(&self, source: &str, session: &str, cwd: Option<&Path>) -> HookRunResult {
+        run_event(
+            &self.config.session_start,
+            "SessionStart",
+            json!({ "source": source }),
+            session,
+            cwd,
+            false,
+        )
+    }
+
+    /// The `session_end` commands; `reason` says why it ended. They cannot
+    /// keep it open; stdout is a message.
+    ///
+    /// Called by `cli::agent_turn::AgentSession::operator_session_end` (REPL
+    /// and `--acp`, beside each `end_memory`) and `task_run` (`-t`).
+    #[must_use]
+    pub fn session_end(&self, reason: &str, session: &str, cwd: Option<&Path>) -> HookRunResult {
+        run_event(
+            &self.config.session_end,
+            "SessionEnd",
+            json!({ "reason": reason }),
+            session,
+            cwd,
+            false,
+        )
+    }
+}
+
 /// Run `commands` for one event that is not a tool call: the event as JSON on
 /// stdin — `hook_event_name`, `session_id`, `cwd` and `fields` — bounded at
 /// [`HOOK_TIMEOUT`]. With `can_refuse`, exit 2 refuses (stderr, else stdout,
@@ -648,6 +698,8 @@ mod tests {
             pre_compact: Vec::new(),
             stop: Vec::new(),
             notification: Vec::new(),
+            session_start: Vec::new(),
+            session_end: Vec::new(),
         });
         let input = json!({"path": "a.txt", "content": "hi"});
         let ran = runner.pre_tool(&call(&input, dir.path()));
@@ -675,6 +727,8 @@ mod tests {
             pre_compact: Vec::new(),
             stop: Vec::new(),
             notification: Vec::new(),
+            session_start: Vec::new(),
+            session_end: Vec::new(),
         });
         let input = json!({"path": "a.txt"});
         let pre = runner.pre_tool(&call(&input, dir.path()));
@@ -740,6 +794,43 @@ mod tests {
         assert_eq!(event["hook_event_name"], "Stop");
         assert_eq!(event["last_assistant_message"], "all done");
         assert_eq!(event["session_id"], "s-1");
+    }
+
+    /// `session_start` and `session_end` are told, never asked: exit 2 keeps
+    /// nothing from starting or ending, stdout is a message, and the event
+    /// says why.
+    #[test]
+    fn session_start_and_end_are_told_and_cannot_refuse() {
+        let start_dir = tempfile::tempdir().expect("dir");
+        let runner = HookRunner::new(HookConfig {
+            session_start: vec![hook(start_dir.path(), 2, "")],
+            ..HookConfig::default()
+        });
+        let ran = runner.session_start("startup", "s-2", Some(start_dir.path()));
+        assert!(!ran.is_denied(), "a session_start hook refused");
+        assert_eq!(ran.messages(), ["said"]);
+        let event: Value = serde_json::from_str(
+            &std::fs::read_to_string(start_dir.path().join("event.json")).expect("saved"),
+        )
+        .expect("json");
+        assert_eq!(event["hook_event_name"], "SessionStart");
+        assert_eq!(event["source"], "startup");
+        assert_eq!(event["session_id"], "s-2");
+
+        let end_dir = tempfile::tempdir().expect("dir");
+        let runner = HookRunner::new(HookConfig {
+            session_end: vec![hook(end_dir.path(), 2, "")],
+            ..HookConfig::default()
+        });
+        let ran = runner.session_end("prompt_input_exit", "s-2", Some(end_dir.path()));
+        assert!(!ran.is_denied(), "a session_end hook refused");
+        assert_eq!(ran.messages(), ["said"]);
+        let event: Value = serde_json::from_str(
+            &std::fs::read_to_string(end_dir.path().join("event.json")).expect("saved"),
+        )
+        .expect("json");
+        assert_eq!(event["hook_event_name"], "SessionEnd");
+        assert_eq!(event["reason"], "prompt_input_exit");
     }
 
     fn prompt_runner(commands: Vec<String>) -> HookRunner {
