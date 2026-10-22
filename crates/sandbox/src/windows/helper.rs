@@ -270,32 +270,46 @@ fn launch_offline(
     let (user, domain) = (wide(&account), wide("."));
 
     // SAFETY: Win32 process creation; every pointer passed outlives the
-    // call, the password is zeroed when `password` drops just after it, and
-    // every handle returned is owned and closed.
+    // call, the password is zeroed when `password` drops just after the last
+    // attempt, and every handle returned is owned and closed.
     unsafe {
         // The handle values are copied as they are: they are valid in the
         // second helper because seclogon creates it as this process's child
         // with inheritance, so they must be inheritable here.
         let si = startup_info();
-        let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
-        let ok = CreateProcessWithLogonW(
-            user.as_ptr(),
-            domain.as_ptr(),
-            password.as_ptr(),
-            LOGON_FLAGS,
-            application.as_ptr(),
-            line.as_mut_ptr(),
-            CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
-            environment.as_ptr().cast(),
-            cwd.as_ptr(),
-            &si,
-            &mut pi,
+        // Made again only when refused because another run's call was still
+        // starting seclogon ([`super::SECLOGON_STARTING`]). A fresh copy of
+        // the command line each time: the call may write to it.
+        let started = super::start_once_seclogon_is_up(
+            || {
+                let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
+                let mut attempt_line = line.clone();
+                let ok = CreateProcessWithLogonW(
+                    user.as_ptr(),
+                    domain.as_ptr(),
+                    password.as_ptr(),
+                    LOGON_FLAGS,
+                    application.as_ptr(),
+                    attempt_line.as_mut_ptr(),
+                    CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+                    environment.as_ptr().cast(),
+                    cwd.as_ptr(),
+                    &si,
+                    &mut pi,
+                );
+                if ok == 0 {
+                    Err(GetLastError())
+                } else {
+                    Ok(pi)
+                }
+            },
+            |_| std::thread::sleep(super::SECLOGON_START_WAIT),
         );
-        let err = GetLastError();
         drop(password);
-        if ok == 0 {
-            return Err(sandbox(logon_failure(err, &account, &exe)));
-        }
+        let pi = match started {
+            Ok(pi) => pi,
+            Err(err) => return Err(sandbox(logon_failure(err, &account, &exe))),
+        };
         let thread = OwnedHandle(pi.hThread);
         let process = OwnedHandle(pi.hProcess);
         if AssignProcessToJobObject(job.0, process.0) == 0 {
