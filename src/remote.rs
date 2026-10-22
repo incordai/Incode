@@ -98,6 +98,11 @@ const MAX_API_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
 /// The most of `result.json` read.
 const MAX_RESULT_BYTES: u64 = 16 * 1024 * 1024;
+/// Reads of a run in a row that may fail while [`run`] waits for it. A wait
+/// lasts up to an hour or more, and GitHub answers the odd poll with a 502
+/// or a rate limit, or the network drops when a laptop sleeps; one such
+/// answer is no reason to abandon a run that is still going.
+const POLL_MISSES_TOLERATED: u32 = 5;
 
 /// What `incode remote …` prints on stdout, and whether it exits 0.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -745,22 +750,34 @@ fn run(
         wait.as_secs().div_ceil(60)
     ));
     let deadline = Instant::now().checked_add(wait);
+    let mut status = found.status.clone();
+    let mut misses = 0;
     let finished = loop {
-        let now = get_run(gh, found.id)?;
-        if now.status == "completed" {
-            break now;
+        match get_run(gh, found.id) {
+            Ok(now) if now.status == "completed" => break now,
+            Ok(now) => {
+                misses = 0;
+                status = now.status;
+            }
+            Err(said) if misses < POLL_MISSES_TOLERATED => {
+                misses += 1;
+                progress(&format!(
+                    "run {}: {said}; asking again ({misses} of {POLL_MISSES_TOLERATED} misses in a row allowed)",
+                    found.id
+                ));
+            }
+            Err(said) => return Err(said),
         }
         let left = deadline.map(|d| d.saturating_duration_since(Instant::now()));
         if left.is_some_and(|left| left.is_zero()) {
             return Ok(Outcome {
                 text: format!(
-                    "Run {} is still running ({}) after {} min; it was not cancelled: {}\n\
+                    "Run {} is still running ({status}) after {} min; it was not cancelled: {}\n\
                      `incode remote logs {} -R {}` shows its result once it ends.",
-                    now.id,
-                    now.status,
+                    found.id,
                     wait.as_secs().div_ceil(60),
-                    now.url,
-                    now.id,
+                    found.url,
+                    found.id,
                     gh.repo
                 ),
                 ok: false,
@@ -925,7 +942,10 @@ fn list(gh: &GitHub<'_>) -> Result<Outcome, String> {
 }
 
 /// `incode remote logs <run-id>`: the run's state and address, and its
-/// result once it has completed.
+/// result once it has completed. `ok` unless the run completed without
+/// succeeding or its task reported an error — as [`finish`] decides for
+/// `run`, so a script that dispatched with `--no-wait` can tell the two
+/// apart; a run still going is not a failure.
 fn logs(gh: &GitHub<'_>, run_id: u64) -> Result<Outcome, String> {
     let found = get_run(gh, run_id)?;
     let mut text = format!(
@@ -937,13 +957,17 @@ fn logs(gh: &GitHub<'_>, run_id: u64) -> Result<Outcome, String> {
     );
     if found.status != "completed" {
         text.push_str("Still running; its result can be read once it ends.");
-    } else {
-        match fetch_result(gh, run_id)? {
-            Some(result) => text.push_str(&result.to_string()),
-            None => text.push_str(&format!("It left no {ARTIFACT} artifact.")),
-        }
+        return Ok(Outcome { text, ok: true });
     }
-    Ok(Outcome { text, ok: true })
+    let mut ok = found.conclusion.as_deref() == Some("success");
+    match fetch_result(gh, run_id)? {
+        Some(result) => {
+            ok &= result.get("is_error").and_then(Value::as_bool) != Some(true);
+            text.push_str(&result.to_string());
+        }
+        None => text.push_str(&format!("It left no {ARTIFACT} artifact.")),
+    }
+    Ok(Outcome { text, ok })
 }
 
 #[cfg(test)]
@@ -1097,6 +1121,13 @@ mod tests {
     /// The dispatched run appears on the second listing and completes on
     /// the third poll. Returns the API base, its log, and the blob's log.
     fn fake_github(script: Script) -> (String, Log, Log) {
+        fake_github_failing(script, 0)
+    }
+
+    /// [`fake_github`] whose first `failing_polls` reads of the run answer
+    /// 502, as GitHub now and then does; the run then completes on the
+    /// third poll that succeeds.
+    fn fake_github_failing(script: Script, failing_polls: usize) -> (String, Log, Log) {
         let zip = script.result.as_ref().map(result_zip);
         let (blob, blob_log) = serve("localhost", move |seen, _| match &zip {
             Some(zip) if seen.path() == "/blob/result.zip" => Reply {
@@ -1148,8 +1179,11 @@ mod tests {
                 }
                 ("GET", "/repos/o/r/actions/runs/77") => {
                     let n = polls.fetch_add(1, Ordering::SeqCst);
+                    if n < failing_polls {
+                        return reply(502, json!({"message": "Server Error"}));
+                    }
                     match script.conclusion {
-                        Some(conclusion) if n >= 2 => {
+                        Some(conclusion) if n >= failing_polls + 2 => {
                             reply(200, run("completed", Some(conclusion)))
                         }
                         _ => reply(200, run("in_progress", None)),
@@ -1365,6 +1399,36 @@ mod tests {
         assert!(!api_seen.iter().any(|s| s.target.contains("cancel")));
     }
 
+    /// **remote::run KEEPS WAITING THROUGH A FEW FAILED POLLS**: GitHub's
+    /// odd 502 mid-wait is reported and asked again, up to
+    /// [`POLL_MISSES_TOLERATED`] in a row; one more than that ends the wait
+    /// with GitHub's answer.
+    #[test]
+    fn remote_run_keeps_waiting_through_a_few_failed_polls() {
+        let (api, _, _) = fake_github_failing(
+            Script {
+                conclusion: Some("success"),
+                result: Some(json!({"type": "result", "is_error": false})),
+            },
+            POLL_MISSES_TOLERATED as usize,
+        );
+        let (outcome, said) = run_against(&api, &run_args(Some(Duration::from_secs(30))));
+        let outcome = outcome.expect("the wait survives the failed polls");
+        assert!(outcome.ok, "{outcome:?}");
+        assert!(said.iter().any(|l| l.contains("asking again")), "{said:?}");
+
+        let (api, _, _) = fake_github_failing(
+            Script {
+                conclusion: Some("success"),
+                result: None,
+            },
+            POLL_MISSES_TOLERATED as usize + 1,
+        );
+        let (outcome, _) = run_against(&api, &run_args(Some(Duration::from_secs(30))));
+        let said = outcome.expect_err("too many failed polls in a row");
+        assert!(said.contains("502"), "{said}");
+    }
+
     /// **remote::run --no-wait RETURNS ONCE THE RUN IS FOUND**, with its
     /// address, without polling it.
     #[test]
@@ -1567,8 +1631,32 @@ mod tests {
         assert!(running.text.contains("Still running"), "{}", running.text);
         let _ = logs(&gh, 77).expect("logs");
         let done = logs(&gh, 77).expect("logs");
+        assert!(done.ok && running.ok, "{done:?}");
         assert!(done.text.contains("success"), "{}", done.text);
         assert!(done.text.contains(r#""result":"ok""#), "{}", done.text);
+
+        // A run that failed, or whose task reported an error, exits non-zero.
+        for (conclusion, is_error) in [("failure", false), ("success", true)] {
+            let (api, _, _) = fake_github(Script {
+                conclusion: Some(conclusion),
+                result: Some(json!({"type": "result", "is_error": is_error})),
+            });
+            let gh = GitHub {
+                api: &api,
+                repo: &repo,
+                token: TOKEN,
+            };
+            for _ in 0..2 {
+                assert!(
+                    logs(&gh, 77).expect("logs").ok,
+                    "still running is not failure"
+                );
+            }
+            assert!(
+                !logs(&gh, 77).expect("logs").ok,
+                "logs of a run ended {conclusion} (is_error {is_error}) exited 0"
+            );
+        }
     }
 
     /// **remote::parse READS EACH VERB'S ARGUMENTS** and refuses what it
@@ -1669,6 +1757,29 @@ mod tests {
                 "an input is used outside run-name and env: {line}"
             );
         }
+        // The agent owns the runner it works on, so the job that runs it
+        // holds nothing that can push; a fresh job publishes its patch.
+        let (task_job, publish_job) = template
+            .split_once("\n  publish:\n")
+            .expect("the template has a publish job");
+        assert!(
+            task_job.contains("incode -t"),
+            "incode runs in the task job"
+        );
+        assert!(
+            !publish_job.contains("incode -t"),
+            "incode runs in the publish job"
+        );
+        assert!(
+            !task_job.contains("contents: write"),
+            "the task job can push"
+        );
+        assert!(
+            task_job.contains("persist-credentials: false"),
+            "the task job's checkout keeps a token"
+        );
+        assert!(publish_job.contains("contents: write"));
+        assert!(publish_job.contains("git apply --index --binary"));
     }
 
     /// **remote::read_result READS result.json FROM THE ARTIFACT'S ZIP**,

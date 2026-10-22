@@ -61,25 +61,43 @@ supported.
 
 ## What the workflow does
 
-`run-name: incode remote <id>`; then, on `ubuntu-latest`:
+`run-name: incode remote <id>`; then two jobs on `ubuntu-latest`.
+
+**`task`** — with `contents: read` only:
 
 - checks the id is letters, digits and dashes (it names the branch);
-- checks out the repository and installs the latest incode release with
+- checks out the repository without keeping a token in it
+  (`persist-credentials: false`) and installs the latest incode release with
   `scripts/install.sh`, as the GitHub Action does;
 - writes a one-route `admin.json` (the key's variable name only) into a
   private `INCODE_DIR`;
 - runs `incode -t "$TASK" --spec-gate off --output-format json`, writing
   `result.json` outside the checkout;
-- if the working tree changed, commits it to `incode/remote-<id>` and pushes
-  that branch;
+- records everything the agent changed as a patch against the starting
+  commit and uploads it with `result.json` as the artifact `incode-work`.
+
+**`publish`** — with `contents: write`, on a fresh runner:
+
+- applies the patch, commits it to `incode/remote-<id>` and pushes that
+  branch, when there is one;
 - adds `branch` to `result.json` and uploads it as the artifact
   `incode-result`;
-- fails the job when the task failed.
+- fails the run when the task failed.
+
+The split is deliberate: the agent runs commands, and a hosted runner gives
+them sudo, so nothing later in its own job can be trusted to be as the
+workflow wrote it. The job that can push never runs anything the agent left
+behind; it only applies a patch.
 
 ## Safety
 
 - **Who can run it.** Dispatching a workflow takes write access to the
-  repository, and the run holds your model key and a token that can push.
+  repository. The agent's job holds your model key but no token that can
+  push; only the `publish` job can, and it runs none of the agent's code.
+- **The model key stays off the branch.** `publish` refuses to push changes
+  that hold the key as written. That catches an agent that writes its
+  environment into a file; it cannot catch one that encodes the key first,
+  so the key should be one you can revoke, scoped to this use.
 - **The task is untrusted text.** The workflow passes it, and every other
   input, through environment variables; none is spliced into a script.
 - **No pull request, no existing branch.** The run pushes only a new
