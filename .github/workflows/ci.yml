@@ -30,8 +30,9 @@ jobs:
   # The SDKs and the VS Code extension, against their fake incode/agent. The
   # SDKs on the oldest runtimes they promise (Node 18, Python 3.9) as well as
   # current ones; the extension on the Node VS Code ships. Python 3.9 is past
-  # its end of life and setup-python offers no build of it for Ubuntu 24.04
-  # (`ubuntu-latest`), so that leg runs on 22.04.
+  # its end of life and setup-python has no build of it for the Ubuntu
+  # `ubuntu-latest` now is (26.04: "The version '3.9' ... was not found"), so
+  # that leg runs on 22.04.
   sdk-and-editor:
     name: sdk-and-editor (node ${{ matrix.node }}, python ${{ matrix.python }})
     runs-on: ${{ matrix.os }}
