@@ -457,19 +457,46 @@ mod tests {
     /// thing under test is the thread actually beating — a fake clock would
     /// test the arithmetic that `silence_past_the_deadline_refuses` already
     /// covers.
+    ///
+    /// The switch is read as open at some moment past its first deadline,
+    /// which only a beat after the start can explain. It is not read at one
+    /// fixed moment: on a loaded CI runner the beating thread can go
+    /// unscheduled for longer than a short deadline, and a single read then
+    /// fails a supervisor that is working (#50).
     #[test]
     fn a_live_supervisor_keeps_the_switch_open_past_its_deadline() {
-        let safety = Safety::new(Duration::from_millis(150));
+        let deadline = Duration::from_millis(150);
+        let safety = Safety::new(deadline);
+        let started = Instant::now();
         let supervisor = Supervisor::start(safety.clone(), Duration::from_millis(20), || true);
 
-        std::thread::sleep(Duration::from_millis(400));
-
-        assert_eq!(
-            safety.check(Instant::now()),
-            Ok(()),
+        assert!(
+            eventually(|| {
+                let now = Instant::now();
+                now > started + 2 * deadline && safety.check(now).is_ok()
+            }),
             "a beating supervisor must keep the desktop authorised"
         );
         supervisor.shutdown();
+    }
+
+    /// How long a test waits for a supervisor thread to do what it must.
+    /// Far past any scheduler stall, so only a supervisor that never acts
+    /// fails it; a working one ends the wait at once.
+    const WAIT_FOR_THREAD: Duration = Duration::from_secs(10);
+
+    /// Whether `holds` becomes true within [`WAIT_FOR_THREAD`], asked every
+    /// few milliseconds. Called by the tests that wait on a real supervisor
+    /// thread rather than sleeping a fixed time and reading once.
+    fn eventually(holds: impl Fn() -> bool) -> bool {
+        let give_up = Instant::now() + WAIT_FOR_THREAD;
+        while Instant::now() < give_up {
+            if holds() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        holds()
     }
 
     /// A supervisor that reports its subject is GONE stops permanently.
@@ -488,11 +515,9 @@ mod tests {
 
         // The supervised thing dies.
         alive.store(false, Ordering::SeqCst);
-        std::thread::sleep(Duration::from_millis(120));
 
-        assert_eq!(
-            safety.check(Instant::now()),
-            Err(Refusal::Stopped),
+        assert!(
+            eventually(|| safety.check(Instant::now()) == Err(Refusal::Stopped)),
             "a supervisor that lost its subject must STOP, not merely go quiet"
         );
         supervisor.shutdown();
@@ -503,22 +528,35 @@ mod tests {
     /// Forgetting to shut down cleanly is the likeliest mistake, so the safe
     /// outcome has to be the automatic one: beating stops, the deadline does
     /// the rest.
+    ///
+    /// Both halves wait for what they prove instead of reading once after a
+    /// fixed sleep: that read, 60 ms into a 120 ms deadline, failed on macOS
+    /// CI when the beating thread went 136 ms unscheduled (#50).
     #[test]
     fn dropping_the_supervisor_lets_the_switch_trip_on_its_own() {
-        let safety = Safety::new(Duration::from_millis(120));
+        let deadline = Duration::from_millis(120);
+        let safety = Safety::new(deadline);
+        let started = Instant::now();
 
         {
             let _supervisor = Supervisor::start(safety.clone(), Duration::from_millis(20), || true);
-            std::thread::sleep(Duration::from_millis(60));
-            assert_eq!(safety.check(Instant::now()), Ok(()));
+            assert!(
+                eventually(|| {
+                    let now = Instant::now();
+                    now > started + deadline && safety.check(now).is_ok()
+                }),
+                "the supervisor never kept the switch open past its deadline"
+            );
         } // dropped here
 
-        std::thread::sleep(Duration::from_millis(250));
-
-        match safety.check(Instant::now()) {
-            Err(Refusal::Unsupervised { .. }) => {}
-            other => panic!("an unsupervised desktop must refuse, got {other:?}"),
-        }
+        assert!(
+            eventually(|| matches!(
+                safety.check(Instant::now()),
+                Err(Refusal::Unsupervised { .. })
+            )),
+            "an unsupervised desktop must refuse, got {:?}",
+            safety.check(Instant::now())
+        );
     }
 
     #[test]
