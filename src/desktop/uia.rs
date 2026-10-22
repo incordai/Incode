@@ -1171,16 +1171,17 @@ mod tests {
                     e.rect.width > 0 && e.rect.height > 0,
                     "kept an empty: {e:?}"
                 );
-                // Within a desktop's size of the desktop: screen pixels, not
-                // garbage. Not every element is ON it — a window wider than a
-                // small screen (a CI runner's 1024 pixels) has controls past
-                // the edge, which UI Automation still reports.
+                // Screen pixels, not garbage. Not every element is near the
+                // desktop: a window wider than a small screen (a CI runner's
+                // 1024 pixels) has controls past the edge, and a web page
+                // reports where its off-screen content really is — text kept
+                // for screen readers is drawn 1×1 far outside the view
+                // (y = -16079 on one page, #52), and a long page's content lies
+                // far below the fold. So this bounds the numbers, not the
+                // distance; the next assertion checks the coordinate space.
                 assert!(
-                    e.rect.x >= bounds.x - bounds.width
-                        && e.rect.x <= bounds.x + 2 * bounds.width
-                        && e.rect.y >= bounds.y - bounds.height
-                        && e.rect.y <= bounds.y + 2 * bounds.height,
-                    "element {e:?} is nowhere near the desktop {bounds:?}"
+                    plausible(e.rect.x, e.rect.width) && plausible(e.rect.y, e.rect.height),
+                    "element {e:?} has coordinates no screen could have"
                 );
             }
             // And the window is on the desktop: the same space the mouse uses.
@@ -1190,6 +1191,35 @@ mod tests {
                     "no element of the focused window is on the desktop {bounds:?}"
                 );
             }
+        }
+
+        /// The furthest from the desktop's origin a reported coordinate may
+        /// be, in pixels: a web document's furthest content is well inside
+        /// it, and garbage — an unset or overflowed value near `i32::MIN` or
+        /// `i32::MAX` — is far outside.
+        const MAX_PLAUSIBLE_PIXELS: i64 = 1 << 24;
+
+        /// Whether an edge at `start` with `length` lies within
+        /// [`MAX_PLAUSIBLE_PIXELS`] on both ends. Called by
+        /// [`the_focused_window_can_be_walked`].
+        fn plausible(start: i32, length: i32) -> bool {
+            let (start, end) = (i64::from(start), i64::from(start) + i64::from(length));
+            start.abs() <= MAX_PLAUSIBLE_PIXELS && end.abs() <= MAX_PLAUSIBLE_PIXELS
+        }
+
+        /// What [`plausible`] lets through: pixels anywhere a window or a
+        /// document can put them, the visually-hidden element #52 found
+        /// among them; and what it refuses: values no screen could have.
+        #[test]
+        fn plausible_coordinates_are_screen_pixels_not_garbage() {
+            assert!(plausible(0, 1920));
+            assert!(plausible(-16079, 1), "a visually-hidden element (#52)");
+            assert!(
+                plausible(48_000, 900),
+                "a long page's content below the fold"
+            );
+            assert!(!plausible(i32::MIN, 10), "an unset coordinate");
+            assert!(!plausible(i32::MAX - 5, 100), "an overflowed edge");
         }
 
         /// Not an assertion — the readout.
