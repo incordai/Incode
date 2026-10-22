@@ -33,4 +33,11 @@ export type {
 } from "./events.js";
 export { FsAccessDenied, FsError, INTERNAL_ERROR, INVALID_PARAMS, RESOURCE_NOT_FOUND, WorkspaceFs, realPath } from "./fs.js";
 export { allowAll, PROTOCOL_VERSION, PromptStream, rejectAll, Session } from "./session.js";
-export type { PermissionHandler, PromptOptions, ReadFileHandler, SessionOptions, WriteFileHandler } from "./session.js";
+export type {
+  PermissionHandler,
+  PromptOptions,
+  ReadFileHandler,
+  SessionInfo,
+  SessionOptions,
+  WriteFileHandler,
+} from "./session.js";

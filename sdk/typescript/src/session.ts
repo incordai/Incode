@@ -32,6 +32,32 @@ export type PermissionHandler = (request: PermissionRequest) => MaybePromise<Per
 export type ReadFileHandler = (request: ReadFileRequest) => MaybePromise<string>;
 export type WriteFileHandler = (request: WriteFileRequest) => MaybePromise<void>;
 
+/**
+ * One session incode kept, as `session/list` names it (src/acp_agent
+ * `history::list_in`): `sessionId` to pass as `loadSessionId`, the workspace it
+ * ran in (`cwd`), its `title` (its first line) and when it was last updated
+ * (`updatedAt`, RFC 3339), either `null` when incode did not say.
+ */
+export interface SessionInfo {
+  sessionId: string;
+  cwd: string;
+  title: string | null;
+  updatedAt: string | null;
+  /** The object as sent. */
+  raw: Json;
+}
+
+function sessionInfoOf(data: Json): SessionInfo {
+  const text = (v: unknown): string | null => (typeof v === "string" ? v : null);
+  return {
+    sessionId: text(data["sessionId"]) ?? "",
+    cwd: text(data["cwd"]) ?? "",
+    title: text(data["title"]),
+    updatedAt: text(data["updatedAt"]),
+    raw: data,
+  };
+}
+
 /** The default permission handler: pick the reject option (`cancelled` if there is none). */
 export const rejectAll: PermissionHandler = (request) => request.reject();
 /** Allow every call once. Only for trusted, sandboxed work. */
@@ -497,9 +523,21 @@ export class Session {
     return this.configOptions;
   }
 
-  /** `session/list` for this workspace. */
+  /** `session/list` for this workspace, as incode answered it. */
   async listSessions(): Promise<Json[]> {
     return asArray((await this.request("session/list", { cwd: this.workspace }))["sessions"]).map(asObject);
+  }
+
+  /**
+   * The sessions incode has kept, as `SessionInfo`: this workspace's, or with
+   * `allWorkspaces` every workspace an ACP session was recorded in. Most
+   * recently updated first. A session listed here can be reopened with
+   * `loadSessionId`.
+   */
+  async sessions(options: { allWorkspaces?: boolean } = {}): Promise<SessionInfo[]> {
+    const params = options.allWorkspaces ? {} : { cwd: this.workspace };
+    const listed = asArray((await this.request("session/list", params))["sessions"]).map(asObject);
+    return listed.map(sessionInfoOf).sort((a, b) => (b.updatedAt ?? "").localeCompare(a.updatedAt ?? ""));
   }
 
   // ------------------------------------------------------------ reader side

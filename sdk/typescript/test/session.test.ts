@@ -114,6 +114,24 @@ describe("start", () => {
     );
     await assert.rejects(session({ loadSessionId: "no-such" }).start(), AcpError);
   });
+
+  it("lists this workspace's sessions newest first, or every workspace's", async () => {
+    const s = await started();
+    const mine = await s.sessions();
+    assert.deepEqual(
+      mine.map((i) => i.sessionId),
+      ["fake-session-1", "kept-session"],
+    );
+    assert.ok(mine.every((i) => i.cwd === s.workspace));
+    assert.equal(mine[1]?.title, "an earlier session");
+    assert.equal(mine[0]?.updatedAt, "2026-10-22T12:00:00Z");
+    const everywhere = await s.sessions({ allWorkspaces: true });
+    assert.deepEqual(
+      everywhere.map((i) => i.sessionId),
+      ["fake-session-1"],
+    );
+    assert.equal((await s.listSessions()).length, 2, "the raw form stays as it was");
+  });
 });
 
 describe("prompt", () => {

@@ -18,6 +18,7 @@ from incode_sdk import (
     Plan,
     PromptResult,
     Session,
+    SessionInfo,
     ThoughtChunk,
     ToolCall,
     ToolCallUpdate,
@@ -115,6 +116,17 @@ class StartTest(SessionTestBase):
             self.assertEqual(s.idle_events[0].text, "remember the parser")
         with self.assertRaises(AcpError):
             self.session(load_session_id="no-such").start()
+
+    def test_sessions_lists_this_workspace_newest_first_or_every_workspace(self):
+        with self.session() as s:
+            mine = s.sessions()
+            self.assertEqual([i.session_id for i in mine], ["fake-session-1", "kept-session"])
+            self.assertTrue(all(isinstance(i, SessionInfo) and i.cwd == self.ws for i in mine))
+            self.assertEqual(mine[1].title, "an earlier session")
+            self.assertEqual(mine[0].updated_at, "2026-10-22T12:00:00Z")
+            everywhere = s.sessions(all_workspaces=True)
+            self.assertEqual([i.session_id for i in everywhere], ["fake-session-1"])
+            self.assertEqual(len(s.list_sessions()), 2, "the raw form stays as it was")
 
 
 class PromptTest(SessionTestBase):
