@@ -629,6 +629,44 @@ impl AgentSession {
         self.memory.prompt(line)
     }
 
+    /// The operator's `session_start` commands (`crate::hooks`): what they
+    /// printed, for the caller to show. `source` is `startup`.
+    ///
+    /// Called by `cli::prepare_session` (REPL and `--acp`); `task_run` fires
+    /// its own, as it has no `AgentSession`.
+    #[must_use]
+    pub fn operator_session_start(&self, source: &str) -> Vec<String> {
+        self.operator_hooks.as_ref().map_or_else(Vec::new, |hooks| {
+            hooks
+                .session_start(
+                    source,
+                    self.session_id().unwrap_or(""),
+                    Some(&self.workspace),
+                )
+                .messages()
+                .to_vec()
+        })
+    }
+
+    /// The operator's `session_end` commands (`crate::hooks`): what they
+    /// printed, for the caller to show if it still can.
+    ///
+    /// Called beside `end_memory` by the REPL (`cli::mod`) and `--acp`
+    /// (`acp_agent`); `task_run` fires its own.
+    #[must_use]
+    pub fn operator_session_end(&self, reason: &str) -> Vec<String> {
+        self.operator_hooks.as_ref().map_or_else(Vec::new, |hooks| {
+            hooks
+                .session_end(
+                    reason,
+                    self.session_id().unwrap_or(""),
+                    Some(&self.workspace),
+                )
+                .messages()
+                .to_vec()
+        })
+    }
+
     /// The session is over; `reason` says why. A session-start still being
     /// answered is collected first, so the engine hears the start before the
     /// end.
@@ -2053,6 +2091,39 @@ mod tests {
             .take_notices()
             .iter()
             .any(|n| n.starts_with("[stop hook]")));
+    }
+
+    /// **THE SESSION'S START AND END HOOKS RUN IN ITS WORKSPACE**, and what
+    /// they print comes back for the caller to show; without hooks, nothing.
+    #[test]
+    fn session_start_and_end_hooks_run_in_the_workspace_and_are_shown() {
+        let ws = tempfile::tempdir().expect("ws");
+        let engine = tempfile::tempdir().expect("engine");
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let mut s = with_memory(ws.path(), engine.path(), &[], &seen, Box::new(|_| {}));
+        // Prints the directory it ran in: the workspace, or the hook was
+        // given the wrong `cwd`.
+        let here = if cfg!(windows) { "cd" } else { "pwd" };
+        s.set_operator_hooks(Some(crate::hooks::HookRunner::new(
+            crate::hooks::HookConfig {
+                session_start: vec![here.to_string()],
+                session_end: vec![operator_hook("bye", "", 2)],
+                ..crate::hooks::HookConfig::default()
+            },
+        )));
+        let started = s.operator_session_start("startup");
+        let ran_in = std::fs::canonicalize(started.first().expect("start printed nothing"))
+            .expect("the hook printed a directory");
+        assert_eq!(
+            ran_in,
+            std::fs::canonicalize(ws.path()).expect("ws"),
+            "{started:?}"
+        );
+        assert_eq!(s.operator_session_end("prompt_input_exit"), ["bye"]);
+
+        s.set_operator_hooks(None);
+        assert!(s.operator_session_start("startup").is_empty());
+        assert!(s.operator_session_end("other").is_empty());
     }
 
     fn start_context(text: &str) -> String {

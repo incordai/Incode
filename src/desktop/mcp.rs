@@ -1757,6 +1757,8 @@ mod tests {
                     pre_compact: Vec::new(),
                     stop: Vec::new(),
                     notification: Vec::new(),
+                    session_start: Vec::new(),
+                    session_end: Vec::new(),
                 },
             );
 
@@ -1797,6 +1799,8 @@ mod tests {
                     pre_compact: Vec::new(),
                     stop: Vec::new(),
                     notification: Vec::new(),
+                    session_start: Vec::new(),
+                    session_end: Vec::new(),
                 },
             );
 

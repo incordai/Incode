@@ -366,7 +366,8 @@ pub fn run_task_with_model(
     )
 }
 
-/// The run itself, telling `report` what happens.
+/// The run itself, telling `report` what happens, with the operator's hooks
+/// from `admin.json` and their own plugins.
 fn run_task_reporting(
     workspace: &Path,
     instruction: &str,
@@ -374,6 +375,28 @@ fn run_task_reporting(
     command_tools: &[String],
     permission_mode: Option<crate::permissions::PermissionMode>,
     report: &mut Report,
+) -> Result<String, String> {
+    run_task_hooked(
+        workspace,
+        instruction,
+        model,
+        command_tools,
+        permission_mode,
+        report,
+        crate::hooks::HookRunner::from_settings(),
+    )
+}
+
+/// [`run_task_reporting`] with the operator's hooks given, so a test can
+/// give its own.
+fn run_task_hooked(
+    workspace: &Path,
+    instruction: &str,
+    model: Option<&str>,
+    command_tools: &[String],
+    permission_mode: Option<crate::permissions::PermissionMode>,
+    report: &mut Report,
+    operator_hooks: Option<crate::hooks::HookRunner>,
 ) -> Result<String, String> {
     if instruction.trim().is_empty() {
         return Err("nothing to do: the instruction is empty".to_string());
@@ -402,10 +425,34 @@ fn run_task_reporting(
     // as in a session (`cli::plan_turn`): one that refuses it stops the run
     // before the memory engine or an agent hears it. What they print rides
     // the turn as context.
-    let hooked: Vec<String> = match crate::hooks::HookRunner::from_settings() {
+    //
+    // `session_start` first, as a session's start comes before its first
+    // line; what it prints goes to stderr, which a JSON run keeps apart.
+    if let Some(hooks) = &operator_hooks {
+        for said in hooks
+            .session_start("startup", &session_id, Some(workspace))
+            .messages()
+        {
+            eprintln!("incode: [session_start hook] {said}");
+        }
+    }
+    // Every way out after the start runs this, a refused line included, so
+    // no `session_start` is left without its `session_end`.
+    let operator_end = || {
+        if let Some(hooks) = &operator_hooks {
+            for said in hooks
+                .session_end("other", &session_id, Some(workspace))
+                .messages()
+            {
+                eprintln!("incode: [session_end hook] {said}");
+            }
+        }
+    };
+    let hooked: Vec<String> = match &operator_hooks {
         Some(hooks) => {
             let ran = hooks.user_prompt_submit(instruction, &session_id, Some(workspace));
             if ran.is_denied() {
+                operator_end();
                 return Err(format!(
                     "not run: the operator's user_prompt_submit hook refused it. {}",
                     ran.messages().join("\n")
@@ -499,6 +546,7 @@ fn run_task_reporting(
     };
     let ran = drive(&task, &mut memory, report);
     memory.end("other");
+    operator_end();
     ran
 }
 
@@ -1057,6 +1105,51 @@ pub fn build_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A REFUSED LINE STILL ENDS THE SESSION IT STARTED.** The operator's
+    /// `user_prompt_submit` hook refuses the instruction: the run stops with
+    /// the reason, and `session_end` runs after `session_start`, in the
+    /// workspace, so no start is left without its end.
+    #[test]
+    fn a_refused_instruction_still_runs_the_session_end_hook() {
+        let ws = tempfile::tempdir().expect("ws");
+        let (refuse, mark) = if cfg!(windows) {
+            (
+                "echo no secrets 1>&2& exit /b 2",
+                ["echo started> started.txt", "echo ended> ended.txt"],
+            )
+        } else {
+            (
+                "echo 'no secrets' >&2; exit 2",
+                ["echo started > started.txt", "echo ended > ended.txt"],
+            )
+        };
+        let hooks = crate::hooks::HookRunner::new(crate::hooks::HookConfig {
+            session_start: vec![mark[0].to_string()],
+            user_prompt_submit: vec![refuse.to_string()],
+            session_end: vec![mark[1].to_string()],
+            ..crate::hooks::HookConfig::default()
+        });
+        let ran = run_task_hooked(
+            ws.path(),
+            "fix it",
+            None,
+            &[],
+            None,
+            &mut Report::text(),
+            Some(hooks),
+        );
+        let why = ran.expect_err("exit 2 did not refuse the instruction");
+        assert!(why.contains("no secrets"), "{why}");
+        assert!(
+            ws.path().join("started.txt").exists(),
+            "session_start did not run"
+        );
+        assert!(
+            ws.path().join("ended.txt").exists(),
+            "a refused run left its session_start without a session_end"
+        );
+    }
 
     #[test]
     fn the_allowed_tools_are_a_comma_separated_list_or_all() {
