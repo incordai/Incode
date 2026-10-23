@@ -143,3 +143,11 @@ jobs:
           # A tag with a hyphen (`v1.2.0-rc.1`) is a pre-release, which
           # GitHub's `releases/latest` — and so every installer — skips.
           prerelease: ${{ contains(github.ref_name, '-') }}
+
+  # What was just published, installed the way a user installs it on each
+  # platform, and checked to report this tag's version.
+  install-check:
+    needs: release
+    uses: ./.github/workflows/install-check.yml
+    with:
+      tag: ${{ github.ref_name }}

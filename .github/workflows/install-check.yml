@@ -1,0 +1,80 @@
+# Install a published release the way a user does, on every platform it
+# ships for, and check that the installed programs report the release's
+# version.
+#
+# release.yml calls this after it publishes (a release published with the
+# workflow's own token starts no other workflow, so `on: release` would never
+# fire). Run it by hand for an existing tag with:
+#   gh workflow run install-check.yml -f tag=v0.1.0-rc.2
+#
+# The installers are taken from the tag itself, so what is checked is what
+# that release's users were told to run.
+name: install check
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The release tag to install, such as v0.1.0-rc.2.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  install:
+    name: install (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-22.04-arm, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      TAG: ${{ inputs.tag }}
+    steps:
+      - name: Check the tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$TAG" in
+            v[0-9]*) ;;
+            *) echo "::error::install check: '$TAG' is not a version tag"; exit 1 ;;
+          esac
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+
+      - name: Install with install.sh
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          INCODE_VERSION="$TAG" INCODE_INSTALL_DIR="$RUNNER_TEMP/incode-bin" sh scripts/install.sh
+      - name: Install with install.ps1
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:INCODE_VERSION = $env:TAG
+          $env:INCODE_INSTALL_DIR = Join-Path $env:RUNNER_TEMP 'incode-bin'
+          ./scripts/install.ps1
+
+      - name: The installed programs report the tag's version
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="$RUNNER_TEMP/incode-bin"
+          want="${TAG#v}"
+          for program in incode sbx; do
+            got="$("$bin/$program" --version)"
+            echo "$program --version: $got"
+            if [ "$got" != "$program $want" ]; then
+              echo "::error::$program reports '$got', expected '$program $want'"
+              exit 1
+            fi
+          done
