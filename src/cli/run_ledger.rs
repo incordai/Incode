@@ -13,12 +13,15 @@
 
 use std::path::{Path, PathBuf};
 
+mod lanes;
+
 use crate::cli::render;
 use crate::ledger::Ledger;
 use crate::outln;
 use crate::permissions::PermissionMode;
 use crate::runner::Progress;
 use crate::runtime::cancel::{CancelToken, StopWatch};
+use lanes::CliLaneWorkers;
 
 /// What a run needs from the session that starts it.
 pub(crate) struct RunContext<'a> {
@@ -49,38 +52,9 @@ pub(crate) enum Watch<'w> {
 /// say how it ended.
 pub(crate) fn run(ctx: &RunContext<'_>, cancel: &CancelToken, watch: Watch<'_>) {
     let workspace = ctx.workspace;
-    if ctx.permission_mode == PermissionMode::ReadOnly {
-        render::print_error(
-            "The ledger run changes files, and this session is read-only. Switch to \
-             workspace-write first.",
-        );
-        return;
-    }
-    // The loop is where an unspecified project costs the most: it runs
-    // unattended, so nobody is present to notice it building the wrong thing.
-    // Refused outright rather than started and stopped at the first write.
-    if let Some(note) = crate::spec::intake_note(workspace) {
-        render::print_error(
-            "The autonomous loop will not start on a project that is not specified yet.",
-        );
-        render::print_info(&note);
-        return;
-    }
-    // Built from the roadmap the owner approved, so the harness can only work
-    // on what was actually planned. Planning is for a ledger that has just
-    // been derived; one resumed from disk was planned on the run that made it.
-    let Some((mut ledger, freshly_derived)) = ledger_to_work(workspace) else {
+    let Some((mut ledger, freshly_derived, _stop_watch)) = ledger_for_run(ctx, cancel) else {
         return;
     };
-    if ledger.tasks.is_empty() {
-        render::print_info("Nothing to run: the roadmap has no open items.");
-        return;
-    }
-    render::print_info(&format!(
-        "Running {} task(s). A stop lands at the next task.",
-        ledger.tasks.len()
-    ));
-    let _stop_watch = watch_for_stop(cancel, workspace);
 
     // The ceiling the operator set, from wherever they set it — not the
     // environment alone, which would ignore the admin file.
@@ -97,134 +71,12 @@ pub(crate) fn run(ctx: &RunContext<'_>, cancel: &CancelToken, watch: Watch<'_>) 
     };
     // Finished work is written to the shared store under the AGENT's id.
     let mut journal = crate::runner::MemoryJournal;
-    // The lead by the choice as it stands NOW, so a `/agent` made in this
-    // session applies from the next `/run`.
-    let agent = match ctx
-        .catalogue
-        .lead(crate::agent::registry::preferred_agent().as_deref())
-    {
-        Ok(found) => found,
-        Err(why) => {
-            render::print_error(&why);
-            return;
-        }
+    let Some(agents) = RunAgents::resolve(ctx) else {
+        return;
     };
-    // THE AGENT THAT WORKS THE TASKS: the lead's sub-agent, read fresh for the
-    // same reason.
-    let sub = ctx.catalogue.sub_agent(
-        &agent,
-        crate::admin::AdminConfig::load_default()
-            .sub_agent
-            .as_deref(),
-    );
-    if let Some(note) = &sub.note {
-        render::print_info(note);
-    }
-    let worker_agent = sub.agent;
-    // THE ROLES AS THEY STAND NOW: a `/roles` saved in this session must
-    // reach the run. A file broken since startup is said out loud, and the
-    // settings the session started with are used.
-    let run_roles = match crate::admin::AdminConfig::load(ctx.data_dir) {
-        Ok(fresh) => fresh.resolve_roles().value,
-        Err(e) => {
-            render::print_error(&e);
-            ctx.admin.resolve_roles().value
-        }
-    };
-    render::print_info(&format!(
-        "Working the ledger with {} — its own loop, on your subscription. The check is \
-         still run by this harness, in its own process.",
-        worker_agent.display_name
-    ));
-    // Defaulted rather than fatal HERE only because the worker loads the same
-    // policy and refuses to delegate at all if it cannot be parsed.
-    let run_guards = crate::guards::Guards::load(workspace).unwrap_or_default();
-    // EVERYTHING THE SESSION KNOWS, ON THE RUN PATH TOO: the run backend was
-    // once built without the system context, twice. See `run_backend`.
-    let mut backend: Box<dyn crate::agent::AgentBackend> = super::route_backend(
-        workspace,
-        &worker_agent.id,
-        &worker_agent.command,
-        &run_guards,
-        ctx.system_prompt,
-        ctx.env_filter,
-    );
-    // Planning is the lead's job; only a sub-agent other than the lead needs
-    // a second backend for it.
-    let mut lead_planner: Option<Box<dyn crate::agent::AgentBackend>> =
-        (worker_agent.id != agent.id).then(|| {
-            super::route_backend(
-                workspace,
-                &agent.id,
-                &agent.command,
-                &run_guards,
-                ctx.system_prompt,
-                ctx.env_filter,
-            )
-        });
-    // Every OTHER installed agent is somewhere the work can move when this
-    // one runs out of room: two subscriptions are two separate allowances.
-    let mut standby: Vec<Box<dyn crate::agent::AgentBackend>> = ctx
-        .fleet
-        .agents()
-        .iter()
-        .filter(|a| a.id != worker_agent.id)
-        .map(|other| {
-            super::run_backend(
-                workspace,
-                &other.id,
-                &other.command,
-                &run_guards,
-                ctx.system_prompt,
-            )
-        })
-        .collect();
-    if !standby.is_empty() {
-        render::print_info(&format!(
-            "{} standby agent(s) available if this one cannot do the work.",
-            standby.len()
-        ));
-    }
-    // THE PLANNING PASS: a roadmap item is a thing to achieve, not a kind of
-    // work, so it carries no role. One planning turn per open item, in `plan`
-    // mode. An item the planner returns nothing for is KEPT AS IT WAS.
+    let mut backends = RunBackends::build(ctx, &agents);
     if freshly_derived {
-        // The operator's check, never named by the model.
-        let verify = ctx
-            .admin
-            .resolve_verify(workspace)
-            .map(|resolved| resolved.value)
-            .unwrap_or_default();
-        if verify.is_empty() {
-            render::print_error(
-                "No check is configured for this project, so no planned step can be proved \
-                 finished. Set one with INCODE_VERIFY_CMD or `verify_command` in admin.json.",
-            );
-        }
-        let mut planned: Vec<crate::ledger::Task> = Vec::new();
-        for task in &ledger.tasks {
-            let planner = match lead_planner.as_mut() {
-                Some(lead) => lead.as_mut(),
-                None => backend.as_mut(),
-            };
-            let steps = crate::plan::split(planner, &run_roles, &task.title);
-            if steps.is_empty() {
-                planned.push(task.clone());
-                continue;
-            }
-            render::print_info(&format!(
-                "{} -> {} step(s): {}",
-                task.roadmap_id,
-                steps.len(),
-                steps
-                    .iter()
-                    .map(|s| s.role.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-            planned.extend(Ledger::from_plan(&task.roadmap_id, &steps, &verify, workspace).tasks);
-        }
-        ledger.tasks = planned;
+        plan_ledger(ctx, &mut ledger, backends.planner(), &agents.roles);
     }
 
     // THE WORKER IS A MEMORY SESSION OF ITS OWN, as a person's session is:
@@ -233,37 +85,7 @@ pub(crate) fn run(ctx: &RunContext<'_>, cancel: &CancelToken, watch: Watch<'_>) 
     // planning pass, which is the lead's work, not the worker's.
     let engine = crate::hooks::engine::Engine::locate();
     let worker_session = uuid::Uuid::new_v4().to_string();
-    backend.set_memory_session(&worker_session);
-    for other in &mut standby {
-        other.set_memory_session(&worker_session);
-    }
-    // A protected write — the test a step writes first — is put to the owner
-    // rather than refused, on the same switch as the worker's own channel.
-    // Nobody is at a terminal during a run, so this is the only one to ask.
-    if ctx.admin.plugins.owner {
-        let owner: std::sync::Arc<dyn crate::hooks::engine::Prompter> =
-            std::sync::Arc::new(crate::owner::OwnerPrompter::new(
-                Box::new(crate::runner::MemoryOwner::default()),
-                workspace,
-            ));
-        backend.set_owner(std::sync::Arc::clone(&owner));
-        for other in &mut standby {
-            other.set_owner(std::sync::Arc::clone(&owner));
-        }
-    }
-    // The role table applies here too: the CLI takes `--model` per
-    // invocation, so cheap work runs cheap.
-    let worker =
-        crate::agent::worker::AgentBackendWorker::in_workspace(backend, workspace.to_path_buf())
-            .with_roles(run_roles.clone())
-            .with_standby(standby)
-            .with_extra_dirs(ctx.extra_dirs.to_vec())
-            // Its OWN channel rather than the runner's, on the same switch.
-            .with_owner(if ctx.admin.plugins.owner {
-                Box::new(crate::runner::MemoryOwner::default())
-            } else {
-                Box::new(crate::runner::NoOwner) as Box<dyn crate::runner::OwnerChannel>
-            });
+    let (worker, _lead_planner) = backends.into_worker(ctx, &agents.roles, &worker_session);
     // A bar the whole time the loop runs, on a terminal; and what the run is
     // changing, as it changes it, written through the bar's OWN lock.
     let draw =
@@ -286,67 +108,15 @@ pub(crate) fn run(ctx: &RunContext<'_>, cancel: &CancelToken, watch: Watch<'_>) 
         crate::hooks::memory::MemoryHooks::new(engine.clone(), workspace, &worker_session),
     )
     .with_operator_hooks(operator_hooks.clone());
-    let mut watcher = RunWatcher {
-        status: &run_status,
-        width: crate::cli::activity::terminal_width(),
-        also: match watch {
-            Watch::By(progress) => Some(progress),
-            Watch::Terminal => None,
-        },
-    };
-    // A SECOND OPINION WHEN A GOAL DEFEATS ITS FIRST PLAN, bounded at
-    // `runner::MAX_REPLANS`. Its own backend: the worker holds the run's.
-    let titles: std::collections::HashMap<String, String> = match crate::brief::check(workspace) {
-        crate::brief::Gate::Ready(brief) => brief
-            .roadmap
-            .iter()
-            .map(|item| (item.id.clone(), item.title.clone()))
-            .collect(),
-        // No roadmap to plan against means no second opinion worth having.
-        _ => std::collections::HashMap::new(),
-    };
+    let mut watcher = RunWatcher::new(&run_status, watch);
     let mut no_replan = crate::runner::NoReplan;
-    let mut live_replan = LiveReplanner {
-        workspace: workspace.to_path_buf(),
-        // THE SAME CONSTRUCTOR THE RUN ITSELF USES: routing by id is
-        // `run_backend`'s whole job.
-        backend: super::run_backend(
-            workspace,
-            &agent.id,
-            &agent.command,
-            &run_guards,
-            ctx.system_prompt,
-        ),
-        roles: run_roles.clone(),
-        verify: ctx
-            .admin
-            .resolve_verify(workspace)
-            .map(|resolved| resolved.value)
-            .unwrap_or_default(),
-        titles,
-    };
+    let mut live_replan = LiveReplanner::for_run(ctx, &agents);
     let replanner: &mut dyn crate::runner::Replanner = if live_replan.titles.is_empty() {
         &mut no_replan
     } else {
         &mut live_replan
     };
-    let lanes = CliLaneWorkers {
-        // Lanes work tasks, so they run the sub-agent.
-        agent_id: worker_agent.id.clone(),
-        command: worker_agent.command.clone(),
-        guards: run_guards.clone(),
-        system_prompt: ctx.system_prompt.to_vec(),
-        roles: run_roles,
-        extra_dirs: ctx.extra_dirs.to_vec(),
-        desktop: super::desktop_enabled_from_env(),
-        permission_mode: ctx.permission_mode,
-        watch: followed,
-        cancel: cancel.clone(),
-        opened: std::sync::atomic::AtomicUsize::new(0),
-        engine,
-        review: crate::parallel::lanes_as_pull_requests(),
-        operator_hooks,
-    };
+    let lanes = CliLaneWorkers::for_run(ctx, &agents, followed, cancel, engine, operator_hooks);
     let outcome = work(
         &mut ledger,
         Crew {
@@ -370,6 +140,313 @@ pub(crate) fn run(ctx: &RunContext<'_>, cancel: &CancelToken, watch: Watch<'_>) 
     // WHAT THE RUN ACTUALLY ACHIEVED, not what it attempted: the same call
     // `/roadmap` makes, so the board and the belief are told either way.
     super::slash_commands::handle_roadmap(workspace);
+}
+
+/// Whether this session may start a run at all. Why not is said.
+///
+/// Called by [`ledger_for_run`], before anything is read or built.
+fn may_start(ctx: &RunContext<'_>) -> bool {
+    if ctx.permission_mode == PermissionMode::ReadOnly {
+        render::print_error(
+            "The ledger run changes files, and this session is read-only. Switch to \
+             workspace-write first.",
+        );
+        return false;
+    }
+    // The loop is where an unspecified project costs the most: it runs
+    // unattended, so nobody is present to notice it building the wrong thing.
+    // Refused outright rather than started and stopped at the first write.
+    if let Some(note) = crate::spec::intake_note(ctx.workspace) {
+        render::print_error(
+            "The autonomous loop will not start on a project that is not specified yet.",
+        );
+        render::print_info(&note);
+        return false;
+    }
+    true
+}
+
+/// The ledger a run works, whether it was derived just now, and the watch on
+/// the interface's stop file — held for as long as the run lasts. `None` when
+/// the run must not start or has nothing to do; why is said.
+///
+/// Called by [`run`], first.
+fn ledger_for_run(ctx: &RunContext<'_>, cancel: &CancelToken) -> Option<(Ledger, bool, StopWatch)> {
+    if !may_start(ctx) {
+        return None;
+    }
+    // Built from the roadmap the owner approved, so the harness can only work
+    // on what was actually planned. Planning is for a ledger that has just
+    // been derived; one resumed from disk was planned on the run that made it.
+    let (ledger, freshly_derived) = ledger_to_work(ctx.workspace)?;
+    if ledger.tasks.is_empty() {
+        render::print_info("Nothing to run: the roadmap has no open items.");
+        return None;
+    }
+    render::print_info(&format!(
+        "Running {} task(s). A stop lands at the next task.",
+        ledger.tasks.len()
+    ));
+    let stop_watch = watch_for_stop(cancel, ctx.workspace);
+    Some((ledger, freshly_derived, stop_watch))
+}
+
+/// The agents a run works with, and the settings they work under — every one
+/// read as it stands NOW, so a change made in this session reaches the next
+/// `/run`.
+///
+/// # Wired to
+///
+/// - **Resolved by** [`run`], once the ledger has work in it.
+/// - **Read by** [`RunBackends::build`], [`LiveReplanner::for_run`] and
+///   [`CliLaneWorkers::for_run`].
+struct RunAgents {
+    /// The lead: plans the ledger, and plans it again when a plan fails.
+    lead: crate::agent::registry::DetectedAgent,
+    /// The lead's sub-agent: works the tasks, here and in every lane.
+    worker: crate::agent::registry::DetectedAgent,
+    roles: crate::roles::RoleTable,
+    guards: crate::guards::Guards,
+}
+
+impl RunAgents {
+    /// Who leads and who works, the roles and the guards. `None` when no
+    /// agent can lead; why is said.
+    ///
+    /// Called by [`run`].
+    fn resolve(ctx: &RunContext<'_>) -> Option<Self> {
+        // The lead by the choice as it stands NOW, so a `/agent` made in this
+        // session applies from the next `/run`.
+        let lead = match ctx
+            .catalogue
+            .lead(crate::agent::registry::preferred_agent().as_deref())
+        {
+            Ok(found) => found,
+            Err(why) => {
+                render::print_error(&why);
+                return None;
+            }
+        };
+        // THE AGENT THAT WORKS THE TASKS: the lead's sub-agent, read fresh for the
+        // same reason.
+        let sub = ctx.catalogue.sub_agent(
+            &lead,
+            crate::admin::AdminConfig::load_default()
+                .sub_agent
+                .as_deref(),
+        );
+        if let Some(note) = &sub.note {
+            render::print_info(note);
+        }
+        let worker = sub.agent;
+        // THE ROLES AS THEY STAND NOW: a `/roles` saved in this session must
+        // reach the run. A file broken since startup is said out loud, and the
+        // settings the session started with are used.
+        let roles = match crate::admin::AdminConfig::load(ctx.data_dir) {
+            Ok(fresh) => fresh.resolve_roles().value,
+            Err(e) => {
+                render::print_error(&e);
+                ctx.admin.resolve_roles().value
+            }
+        };
+        render::print_info(&format!(
+            "Working the ledger with {} — its own loop, on your subscription. The check is \
+             still run by this harness, in its own process.",
+            worker.display_name
+        ));
+        // Defaulted rather than fatal HERE only because the worker loads the same
+        // policy and refuses to delegate at all if it cannot be parsed.
+        let guards = crate::guards::Guards::load(ctx.workspace).unwrap_or_default();
+        Some(Self {
+            lead,
+            worker,
+            roles,
+            guards,
+        })
+    }
+}
+
+/// The backends the run's own thread drives: the worker's, the lead's when
+/// it is a different agent, and a standby for every other installed agent.
+///
+/// # Wired to
+///
+/// - **Built by** [`run`], from [`RunAgents`].
+/// - **Plans through** [`Self::planner`], in [`plan_ledger`].
+/// - **Becomes the run's worker** in [`Self::into_worker`].
+struct RunBackends {
+    worker: Backend,
+    lead_planner: Option<Backend>,
+    standby: Vec<Backend>,
+}
+
+/// One agent backend, as the run holds it.
+type Backend = Box<dyn crate::agent::AgentBackend>;
+
+impl RunBackends {
+    /// Every backend the run needs, built as the agents stand now.
+    ///
+    /// Called by [`run`], once the agents are resolved.
+    fn build(ctx: &RunContext<'_>, agents: &RunAgents) -> Self {
+        let workspace = ctx.workspace;
+        // EVERYTHING THE SESSION KNOWS, ON THE RUN PATH TOO: the run backend was
+        // once built without the system context, twice. See `run_backend`.
+        let worker: Box<dyn crate::agent::AgentBackend> = super::route_backend(
+            workspace,
+            &agents.worker.id,
+            &agents.worker.command,
+            &agents.guards,
+            ctx.system_prompt,
+            ctx.env_filter,
+        );
+        // Planning is the lead's job; only a sub-agent other than the lead needs
+        // a second backend for it.
+        let lead_planner: Option<Box<dyn crate::agent::AgentBackend>> =
+            (agents.worker.id != agents.lead.id).then(|| {
+                super::route_backend(
+                    workspace,
+                    &agents.lead.id,
+                    &agents.lead.command,
+                    &agents.guards,
+                    ctx.system_prompt,
+                    ctx.env_filter,
+                )
+            });
+        // Every OTHER installed agent is somewhere the work can move when this
+        // one runs out of room: two subscriptions are two separate allowances.
+        let standby: Vec<Box<dyn crate::agent::AgentBackend>> = ctx
+            .fleet
+            .agents()
+            .iter()
+            .filter(|a| a.id != agents.worker.id)
+            .map(|other| {
+                super::run_backend(
+                    workspace,
+                    &other.id,
+                    &other.command,
+                    &agents.guards,
+                    ctx.system_prompt,
+                )
+            })
+            .collect();
+        if !standby.is_empty() {
+            render::print_info(&format!(
+                "{} standby agent(s) available if this one cannot do the work.",
+                standby.len()
+            ));
+        }
+        Self {
+            worker,
+            lead_planner,
+            standby,
+        }
+    }
+
+    /// The backend that plans: the lead's when it has its own, else the worker's.
+    ///
+    /// Called by [`run`] for [`plan_ledger`].
+    fn planner(&mut self) -> &mut dyn crate::agent::AgentBackend {
+        match self.lead_planner.as_mut() {
+            Some(lead) => lead.as_mut(),
+            None => self.worker.as_mut(),
+        }
+    }
+
+    /// The run's own worker, its backends filed under the run's memory session,
+    /// and the lead's planner — handed back so it is kept, unused, until the run
+    /// ends, as it always was.
+    ///
+    /// Called by [`run`], after the planning pass.
+    fn into_worker(
+        mut self,
+        ctx: &RunContext<'_>,
+        roles: &crate::roles::RoleTable,
+        session: &str,
+    ) -> (
+        crate::agent::worker::AgentBackendWorker<Backend>,
+        Option<Backend>,
+    ) {
+        self.worker.set_memory_session(session);
+        for other in &mut self.standby {
+            other.set_memory_session(session);
+        }
+        // A protected write — the test a step writes first — is put to the owner
+        // rather than refused, on the same switch as the worker's own channel.
+        // Nobody is at a terminal during a run, so this is the only one to ask.
+        if ctx.admin.plugins.owner {
+            let owner: std::sync::Arc<dyn crate::hooks::engine::Prompter> =
+                std::sync::Arc::new(crate::owner::OwnerPrompter::new(
+                    Box::new(crate::runner::MemoryOwner::default()),
+                    ctx.workspace,
+                ));
+            self.worker.set_owner(std::sync::Arc::clone(&owner));
+            for other in &mut self.standby {
+                other.set_owner(std::sync::Arc::clone(&owner));
+            }
+        }
+        // The role table applies here too: the CLI takes `--model` per
+        // invocation, so cheap work runs cheap.
+        let worker = crate::agent::worker::AgentBackendWorker::in_workspace(
+            self.worker,
+            ctx.workspace.to_path_buf(),
+        )
+        .with_roles(roles.clone())
+        .with_standby(self.standby)
+        .with_extra_dirs(ctx.extra_dirs.to_vec())
+        // Its OWN channel rather than the runner's, on the same switch.
+        .with_owner(if ctx.admin.plugins.owner {
+            Box::new(crate::runner::MemoryOwner::default())
+        } else {
+            Box::new(crate::runner::NoOwner) as Box<dyn crate::runner::OwnerChannel>
+        });
+        (worker, self.lead_planner)
+    }
+}
+
+/// THE PLANNING PASS: a roadmap item is a thing to achieve, not a kind of
+/// work, so it carries no role. One planning turn per open item, in `plan`
+/// mode. An item the planner returns nothing for is KEPT AS IT WAS.
+///
+/// Called by [`run`], only for a ledger derived just now.
+fn plan_ledger(
+    ctx: &RunContext<'_>,
+    ledger: &mut Ledger,
+    planner: &mut dyn crate::agent::AgentBackend,
+    roles: &crate::roles::RoleTable,
+) {
+    let workspace = ctx.workspace;
+    // The operator's check, never named by the model.
+    let verify = ctx
+        .admin
+        .resolve_verify(workspace)
+        .map(|resolved| resolved.value)
+        .unwrap_or_default();
+    if verify.is_empty() {
+        render::print_error(
+            "No check is configured for this project, so no planned step can be proved \
+             finished. Set one with INCODE_VERIFY_CMD or `verify_command` in admin.json.",
+        );
+    }
+    let mut planned: Vec<crate::ledger::Task> = Vec::new();
+    for task in &ledger.tasks {
+        let steps = crate::plan::split(planner, roles, &task.title);
+        if steps.is_empty() {
+            planned.push(task.clone());
+            continue;
+        }
+        render::print_info(&format!(
+            "{} -> {} step(s): {}",
+            task.roadmap_id,
+            steps.len(),
+            steps
+                .iter()
+                .map(|s| s.role.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        planned.extend(Ledger::from_plan(&task.roadmap_id, &steps, &verify, workspace).tasks);
+    }
+    ledger.tasks = planned;
 }
 
 /// The ledger to work, and whether it was derived just now (and so still
@@ -518,6 +595,22 @@ struct RunWatcher<'a, 'w> {
     also: Option<&'w mut dyn Progress>,
 }
 
+impl<'a, 'w> RunWatcher<'a, 'w> {
+    /// The bar on `status`, handing on to whoever `watch` names.
+    ///
+    /// Called by [`run`], once the status line is up.
+    fn new(status: &'a render::LiveStatus, watch: Watch<'w>) -> Self {
+        Self {
+            status,
+            width: crate::cli::activity::terminal_width(),
+            also: match watch {
+                Watch::By(progress) => Some(progress),
+                Watch::Terminal => None,
+            },
+        }
+    }
+}
+
 impl Progress for RunWatcher<'_, '_> {
     fn advanced(&mut self, done: usize, total: usize) {
         let snapshot = crate::cli::activity::Status {
@@ -541,185 +634,6 @@ impl Progress for RunWatcher<'_, '_> {
 
     fn watch(&self) -> Option<std::sync::Arc<dyn crate::watch::Watch>> {
         self.also.as_ref().and_then(|also| also.watch())
-    }
-}
-
-/// Builds one agent worker per lane, each in its own checkout.
-///
-/// # Why it holds settings and not a backend
-///
-/// [`crate::agent::AgentBackend`] is not `Send` — it owns callbacks into the
-/// terminal — so a backend cannot be handed to a lane's thread. What CAN
-/// cross is the settings it is built from: strings, paths and tables. So the
-/// backend is constructed inside the lane, from the same
-/// `run_backend_with_desktop` the sequential path uses, and no second place
-/// decides which agent serves the work.
-///
-/// A process per lane is not waste: the worker already drops the agent's
-/// conversation between tasks, so a reused one would start from nothing
-/// anyway.
-pub(crate) struct CliLaneWorkers {
-    pub agent_id: String,
-    pub command: String,
-    pub guards: crate::guards::Guards,
-    pub system_prompt: Vec<String>,
-    pub roles: crate::roles::RoleTable,
-    pub extra_dirs: Vec<PathBuf>,
-    pub desktop: bool,
-    /// Carried rather than read from the environment, because a lane runs on
-    /// its own thread and a capability decision should not depend on what a
-    /// process-wide variable happens to hold when that thread gets there.
-    pub permission_mode: PermissionMode,
-    /// Who follows each lane as it works, when anyone does: `incode --acp`
-    /// shows every lane as a sub-agent with its own conversation.
-    pub watch: Option<std::sync::Arc<dyn crate::watch::Watch>>,
-    /// The run's stop. A lane's agent stops with it at once; what it had done
-    /// is sealed onto its branch when the lane is closed, and not merged.
-    pub cancel: CancelToken,
-    /// How many lanes this run has opened, so each is named apart.
-    pub opened: std::sync::atomic::AtomicUsize,
-    /// The memory engine each lane's session is filed with, when there is
-    /// one: every lane is a session of its own.
-    pub engine: Option<crate::hooks::engine::Engine>,
-    /// Lanes are opened as pull requests on GitHub rather than merged here
-    /// (`INCODE_LANES_AS=pr`), read once when the run starts.
-    pub review: bool,
-    /// The operator's hooks, handed to every lane's worker.
-    pub operator_hooks: Option<crate::hooks::HookRunner>,
-}
-
-impl crate::runner::LaneWorkers for CliLaneWorkers {
-    /// GitHub through `gh`, always: a task waiting on a pull request is
-    /// settled whether or not this run opens new ones.
-    fn forge(&self) -> Option<&dyn crate::tools::pull_request::Forge> {
-        Some(&crate::tools::pull_request::GitHubCli)
-    }
-
-    fn open_for_review(&self) -> bool {
-        self.review
-    }
-
-    fn spawn_for(&self, workspace: &Path) -> Option<Box<dyn crate::runner::TaskWorker + Send>> {
-        let lane = self
-            .opened
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            + 1;
-        Some(Box::new(LaneAgent {
-            workspace: workspace.to_path_buf(),
-            agent_id: self.agent_id.clone(),
-            command: self.command.clone(),
-            guards: self.guards.clone(),
-            system_prompt: self.system_prompt.clone(),
-            roles: self.roles.clone(),
-            extra_dirs: self.extra_dirs.clone(),
-            desktop: self.desktop,
-            permission_mode: self.permission_mode,
-            watch: self.watch.clone(),
-            cancel: self.cancel.clone(),
-            lane,
-            engine: self.engine.clone(),
-            operator_hooks: self.operator_hooks.clone(),
-        }))
-    }
-}
-
-/// One lane's agent, built where it runs.
-struct LaneAgent {
-    workspace: PathBuf,
-    agent_id: String,
-    command: String,
-    guards: crate::guards::Guards,
-    system_prompt: Vec<String>,
-    roles: crate::roles::RoleTable,
-    extra_dirs: Vec<PathBuf>,
-    desktop: bool,
-    permission_mode: PermissionMode,
-    watch: Option<std::sync::Arc<dyn crate::watch::Watch>>,
-    cancel: CancelToken,
-    /// This lane's number in the run, from 1.
-    lane: usize,
-    /// The memory engine its session is filed with, when there is one.
-    engine: Option<crate::hooks::engine::Engine>,
-    /// The operator's hooks, for each task's instruction.
-    operator_hooks: Option<crate::hooks::HookRunner>,
-}
-
-impl crate::runner::TaskWorker for LaneAgent {
-    fn work(&mut self, task: &crate::ledger::Task) -> Result<String, String> {
-        // Built HERE, on the lane's own thread, because the backend cannot
-        // cross a thread boundary. Every argument is the one the sequential
-        // path passes, except the workspace — which is the whole point.
-        let backend = super::run_backend_with_desktop(
-            &self.workspace,
-            &self.agent_id,
-            &self.command,
-            &self.guards,
-            &self.system_prompt,
-            self.desktop,
-            self.permission_mode,
-        );
-        self.work_on(backend, task)
-    }
-}
-
-impl LaneAgent {
-    /// Work `task` on `backend`, followed by the watch when there is one, and
-    /// stopped with the run.
-    fn work_on(
-        &self,
-        mut backend: Box<dyn crate::agent::AgentBackend>,
-        task: &crate::ledger::Task,
-    ) -> Result<String, String> {
-        backend.set_cancel(self.cancel.clone());
-        // Announced before it starts; its tools report under it.
-        let lane = format!("lane {}", self.lane);
-        let tap = self.watch.as_ref().and_then(|watch| {
-            watch.worker(&crate::watch::WorkerSpec {
-                kind: "lane",
-                name: format!("{} · {lane}", task.role().unwrap_or("task")),
-                task: task.title.clone(),
-                role: task.role().map(str::to_string),
-                agent: Some(self.agent_id.clone()),
-                // Routed by the worker as the task starts, so not known here.
-                model: None,
-                lane: Some(lane.clone()),
-                workspace: self.workspace.clone(),
-            })
-        });
-        if let Some(tap) = &tap {
-            backend.set_watch(tap.watch());
-        }
-        // A session of its own with the memory engine, like every worker.
-        let session = uuid::Uuid::new_v4().to_string();
-        backend.set_memory_session(&session);
-        let mut agent =
-            crate::agent::worker::AgentBackendWorker::in_workspace(backend, self.workspace.clone())
-                .with_roles(self.roles.clone())
-                .with_extra_dirs(self.extra_dirs.clone());
-        if let Some(tap) = tap {
-            agent = agent.with_tap(tap);
-        }
-        let mut worker = super::run_memory::Remembered::new(
-            agent,
-            crate::hooks::memory::MemoryHooks::new(self.engine.clone(), &self.workspace, &session),
-        )
-        .with_operator_hooks(self.operator_hooks.clone());
-
-        let report = crate::runner::TaskWorker::work(&mut worker, task);
-        // The conversation this lane opened is on the vendor's side and is
-        // billed on every later turn. Nothing else will clear it: the worker
-        // is dropped here.
-        crate::runner::TaskWorker::release(&mut worker);
-        if let Some(mut tap) = worker.inner_mut().take_tap() {
-            tap.ended(if self.cancel.is_cancelled() {
-                crate::watch::WorkerEnd::Cancelled
-            } else if report.is_ok() {
-                crate::watch::WorkerEnd::Completed
-            } else {
-                crate::watch::WorkerEnd::Failed
-            });
-        }
-        report
     }
 }
 
@@ -751,6 +665,46 @@ struct LiveReplanner {
     /// the failed task's wording: planning against the task that just failed
     /// would inherit the framing that failed with it.
     titles: std::collections::HashMap<String, String>,
+}
+
+impl LiveReplanner {
+    /// A SECOND OPINION WHEN A GOAL DEFEATS ITS FIRST PLAN, bounded at
+    /// `runner::MAX_REPLANS`. Its own backend: the worker holds the run's.
+    ///
+    /// Called by [`run`]; used only when the brief has roadmap titles to plan
+    /// against.
+    fn for_run(ctx: &RunContext<'_>, agents: &RunAgents) -> Self {
+        let workspace = ctx.workspace;
+        let titles: std::collections::HashMap<String, String> = match crate::brief::check(workspace)
+        {
+            crate::brief::Gate::Ready(brief) => brief
+                .roadmap
+                .iter()
+                .map(|item| (item.id.clone(), item.title.clone()))
+                .collect(),
+            // No roadmap to plan against means no second opinion worth having.
+            _ => std::collections::HashMap::new(),
+        };
+        Self {
+            workspace: workspace.to_path_buf(),
+            // THE SAME CONSTRUCTOR THE RUN ITSELF USES: routing by id is
+            // `run_backend`'s whole job.
+            backend: super::run_backend(
+                workspace,
+                &agents.lead.id,
+                &agents.lead.command,
+                &agents.guards,
+                ctx.system_prompt,
+            ),
+            roles: agents.roles.clone(),
+            verify: ctx
+                .admin
+                .resolve_verify(workspace)
+                .map(|resolved| resolved.value)
+                .unwrap_or_default(),
+            titles,
+        }
+    }
 }
 
 impl crate::runner::Replanner for LiveReplanner {
@@ -796,139 +750,5 @@ impl crate::runner::Replanner for LiveReplanner {
             return Vec::new();
         }
         Ledger::from_plan(roadmap_id, &steps, &self.verify, &self.workspace).tasks
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::watch::{Decision, Watch, WorkerEnd, WorkerSpec, WorkerTap};
-    use std::sync::{Arc, Mutex};
-
-    /// A watch that keeps what the lanes told it.
-    #[derive(Default)]
-    struct Kept {
-        spawned: Mutex<Vec<WorkerSpec>>,
-        said: Arc<Mutex<Vec<String>>>,
-        ended: Arc<Mutex<Vec<WorkerEnd>>>,
-    }
-
-    struct KeptTap {
-        said: Arc<Mutex<Vec<String>>>,
-        ended: Arc<Mutex<Vec<WorkerEnd>>>,
-    }
-
-    impl Watch for Kept {
-        fn output(&self, _: &str, _: &str) {}
-        fn decided(&self, _: &str, _: &Decision) {}
-        fn recorded(&self, _: &str, _: bool, _: Option<u64>) {}
-        fn worker(&self, spec: &WorkerSpec) -> Option<Box<dyn WorkerTap>> {
-            self.spawned.lock().expect("spawned").push(spec.clone());
-            Some(Box::new(KeptTap {
-                said: Arc::clone(&self.said),
-                ended: Arc::clone(&self.ended),
-            }))
-        }
-    }
-
-    impl WorkerTap for KeptTap {
-        fn event(&mut self, event: &crate::agent::AgentEvent) {
-            if let crate::agent::AgentEvent::TextDelta(text) = event {
-                self.said.lock().expect("said").push(text.clone());
-            }
-        }
-        fn ended(&mut self, end: WorkerEnd) {
-            self.ended.lock().expect("ended").push(end);
-        }
-        fn watch(&self) -> Arc<dyn Watch> {
-            Arc::new(Kept::default())
-        }
-    }
-
-    /// An agent that says one thing and finishes.
-    struct Says(&'static str);
-
-    impl crate::agent::AgentBackend for Says {
-        fn id(&self) -> &str {
-            "claude-code"
-        }
-        fn run_turn(
-            &mut self,
-            _prompt: &str,
-            on_event: &mut dyn FnMut(&crate::agent::AgentEvent),
-        ) -> Result<crate::agent::TurnOutcome, crate::agent::AgentError> {
-            on_event(&crate::agent::AgentEvent::TextDelta(self.0.to_string()));
-            on_event(&crate::agent::AgentEvent::Text(self.0.to_string()));
-            Ok(crate::agent::TurnOutcome {
-                session_id: "lane-conv".to_string(),
-                stop_reason: "end_turn".to_string(),
-                is_error: false,
-                detail: None,
-                served_by: Vec::new(),
-            })
-        }
-        fn session_id(&self) -> Option<&str> {
-            None
-        }
-    }
-
-    /// **EACH LANE IS A WORKER OF ITS OWN.** Its agent is announced as
-    /// `<role> · lane <n>` with its task, every event of its turn reaches the
-    /// tap it was given, and it is said to have ended once it has.
-    #[test]
-    fn a_lane_is_announced_followed_and_ended() {
-        let ws = tempfile::tempdir().expect("ws");
-        let kept = Arc::new(Kept::default());
-        let lanes = CliLaneWorkers {
-            agent_id: "claude-code".to_string(),
-            command: "claude".to_string(),
-            guards: crate::guards::Guards::default(),
-            system_prompt: Vec::new(),
-            roles: crate::roles::RoleTable::default(),
-            extra_dirs: Vec::new(),
-            desktop: false,
-            permission_mode: PermissionMode::WorkspaceWrite,
-            watch: Some(Arc::clone(&kept) as Arc<dyn Watch>),
-            cancel: CancelToken::new(),
-            opened: std::sync::atomic::AtomicUsize::new(0),
-            engine: None,
-            review: false,
-            operator_hooks: None,
-        };
-        let task = crate::ledger::Task::new("t-1", "r-1", "count the files").with_tier("implement");
-        // The lane's own agent, as `spawn_for` makes it, on a stand-in
-        // backend: a batch-file stand-in CLI cannot take the worker's
-        // multi-line prompt on Windows.
-        let _ = crate::runner::LaneWorkers::spawn_for(&lanes, ws.path()).expect("a lane");
-        let lane = LaneAgent {
-            workspace: ws.path().to_path_buf(),
-            agent_id: lanes.agent_id.clone(),
-            command: lanes.command.clone(),
-            guards: lanes.guards.clone(),
-            system_prompt: Vec::new(),
-            roles: lanes.roles.clone(),
-            extra_dirs: Vec::new(),
-            desktop: false,
-            permission_mode: lanes.permission_mode,
-            watch: lanes.watch.clone(),
-            cancel: lanes.cancel.clone(),
-            lane: lanes.opened.load(std::sync::atomic::Ordering::Relaxed),
-            engine: None,
-            operator_hooks: None,
-        };
-        let report = lane.work_on(Box::new(Says("three files")), &task);
-        assert!(report.is_ok(), "{report:?}");
-
-        let spawned = kept.spawned.lock().expect("spawned").clone();
-        assert_eq!(spawned.len(), 1);
-        assert_eq!(spawned[0].name, "implement · lane 1");
-        assert_eq!(spawned[0].task, "count the files");
-        assert_eq!(spawned[0].lane.as_deref(), Some("lane 1"));
-        assert_eq!(spawned[0].agent.as_deref(), Some("claude-code"));
-        assert_eq!(kept.said.lock().expect("said").concat(), "three files");
-        assert_eq!(
-            kept.ended.lock().expect("ended").clone(),
-            [WorkerEnd::Completed]
-        );
     }
 }

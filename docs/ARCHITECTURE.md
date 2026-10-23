@@ -192,7 +192,7 @@ session's events and every worker's into updates.
   workers are: the `Agent` tool's sub-agent (`toolbox::subagent`, named
   `<role> · sub-agent`; its events reach the tap from the child backend's own
   `run_turn` callback, and its own toolbox reports to the tap's watch), and each
-  parallel lane of `/run` (`cli::run_ledger::LaneAgent`, named
+  parallel lane of `/run` (`cli::run_ledger::lanes::LaneAgent`, named
   `<role> · lane <n>`, `n` counted per run; the tap is handed to its
   `AgentBackendWorker`, whose event callback feeds it, and the run's
   `runner::Progress::watch` is where the lanes get the watch). The team channel is
@@ -671,7 +671,7 @@ That is why the fallback is traced rather than silent.
 | `guards.rs` | **You do not get to edit your own exam.** Tests, CI, migrations, `.env` and the ledger are read-only to the agent (one list, `DEFAULT_PROTECTED`, read through `Guards::effective` by the toolbox, the sentinel and a delegated agent's deny rules alike; `guards/shell.rs` reads which paths a shell command writes) — checked before dispatch for the harness's own tools, and by `Sentinel` (fingerprint before, compare after) for a delegated agent that brings its own. The second is detection rather than prevention, and does not revert. |
 | `contracts.rs` | **A frozen interface is checked, not merely written down.** Runs inside `verify`, so a breach fails the same exit code as a broken test. |
 | `ledger.rs` | **One edge into `Done`, and it demands proof.** Seven states, no `Failed` — a failure is a counter and a note. |
-| `runner.rs` | **The runner decides what to do next; it never decides that something is done.** Nine stop conditions, each with a message — and a drained queue is not one of them until every roadmap goal's check has also passed (`RUNNER.md` §6a) and no task is left marked in progress. |
+| `runner/` | **The runner decides what to do next; it never decides that something is done.** Nine stop conditions, each with a message — and a drained queue is not one of them until every roadmap goal's check has also passed (`RUNNER.md` §6a) and no task is left marked in progress. |
 | `parallel.rs` | **An agent that cannot be isolated does not get a lane.** Every task a plan produces writes code, so two in one directory means `verify` proving a tree neither agent intended. A lane is a git worktree; no git, one lane. A merge conflict is never resolved — the branch is kept and the task goes back. |
 | `team.rs` | **A question asked is not a question seen.** An ask never blocks, so the channel keeps an unanswered one in front of whoever could answer it, and the run reports the ones nobody did. Each is a guess somebody made. |
 | `budget.rs` | **Bound the action, never the measurement.** `spent()` keeps counting past the ceiling. |
