@@ -235,7 +235,7 @@
       }
     },
     "RateLimitInfo": {
-      "_owner": "src/agent/claude_code.rs — subscription quota, reported instead of a dollar figure. Wire names are camelCase; the Rust names are snake_case via serde rename.",
+      "_owner": "src/agent/claude_code/wire.rs — subscription quota, reported instead of a dollar figure. Wire names are camelCase; the Rust names are snake_case via serde rename.",
       "fields": {
         "status": "string — `allowed` is the only value that means work can proceed",
         "resets_at": "i64 (wire: resetsAt)",
