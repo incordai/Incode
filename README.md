@@ -139,16 +139,12 @@ The design is in `docs/ARCHITECTURE.md`; the tool layer is its §5a and §5b.
   on a clean Debian 13 image; the same names install on Ubuntu 24.04:
 
   ```sh
-  sudo apt install pkg-config libssl-dev \
-    libclang-dev libwayland-dev libegl-dev libgbm-dev libpipewire-0.3-dev libxcb1-dev
+  sudo apt install pkg-config libssl-dev
   ```
 
-  The first line is for HTTPS. The second is the screen-capture library's,
-  for computer use: it builds a Wayland and PipeWire backend even though
-  incode drives X11 only. A server that never runs computer use can skip it
-  by building without the `desktop-capture` feature (see [Install](#install));
-  the binary then also runs without `libgbm`, `libwayland-client` and
-  `libxcb` installed.
+  Both are for HTTPS. Computer use needs no build package: screen capture,
+  input and the accessibility tree talk to the X server and D-Bus in pure
+  Rust.
 - **At least one coding agent CLI**, installed and logged in: `claude`, `codex`
   or `agy`. `/doctor` names what it found and what is missing. `gemini`,
   `opencode` and `cursor` are detected but not driven.
@@ -184,10 +180,9 @@ irm https://raw.githubusercontent.com/incordai/incode/main/scripts/install.ps1 |
 Set `INCODE_VERSION=v0.2.0` to pin a release instead of the latest. Once
 installed, `incode update --check` says whether a newer release exists, and
 `incode update` installs it in place (sha256-checked; `sbx` is updated too when
-it sits beside `incode`). The Linux binary is built with the default
-`desktop-capture` feature, so it needs the shared libraries of the capture
-stack (`libgbm`, `libwayland-client`, `libxcb`) present at run time; on a
-server without them, build from source without that feature.
+it sits beside `incode`). The Linux binary links no desktop library: screen
+capture reads the X server over its socket, so it runs on a server with no
+X11, Wayland or GPU libraries installed.
 
 ### From source
 
@@ -223,8 +218,8 @@ Each Outline language is a default cargo feature (`lang-rust`, `lang-ts`,
 `lang-python`, `lang-go`, `lang-js`); build with `--no-default-features` and a
 subset to drop grammars. Screen capture for computer use is the default
 feature `desktop-capture`; leaving it out (on a server that never drives a
-desktop) drops the Linux Wayland/PipeWire build dependencies, and every
-screenshot is then refused by name:
+desktop) drops the xcap library on Windows and macOS, and every screenshot is
+then refused by name:
 
 ```sh
 cargo build --release --no-default-features \

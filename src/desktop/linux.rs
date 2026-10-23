@@ -16,7 +16,8 @@
 //!
 //! The chosen display is put in this process's `DISPLAY` before the input
 //! thread opens its connection, and the Wayland variables are cleared, so
-//! capture (xcap) and input (enigo) both take the X11 path to that display.
+//! capture (`capture/x11.rs`, which connects to `$DISPLAY`) and input (enigo)
+//! both take the X11 path to that display.
 //!
 //! # The accessibility tree
 //!

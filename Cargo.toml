@@ -184,15 +184,26 @@ tar = { version = "=0.4.46", default-features = false }
 # `screenshots` is NOT used: it is deprecated in favour of xcap by the same
 # author, and the 0.8.x version in the original sketch is two minor lines stale.
 #
-# xcap is OPTIONAL, behind the `desktop-capture` feature (on by default). On
-# Linux 0.9.8 has no feature to leave out its Wayland backend: it always
-# builds libwayshot-xcap (wayland-client, GBM, EGL) and PipeWire (bindgen, so
-# libclang too), which this crate never uses — Linux computer use is X11 only
-# (docs/COMPUTER_USE.md decision 5). Building without the feature drops them,
-# for a server that never runs computer use.
-xcap = { version = "0.9.8", default-features = false, optional = true }
+# xcap is the capture library on Windows and macOS ONLY — see the target table
+# below — and optional there, behind the `desktop-capture` feature.
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 enigo = { version = "0.6.1", default-features = false }
+
+# Screen capture on Windows and macOS (`src/desktop/capture.rs`), optional
+# behind the `desktop-capture` feature (on by default).
+#
+# NOT on Linux, where the screen is read from the X server with x11rb instead
+# (`src/desktop/capture/x11.rs`). xcap 0.9.8 has no feature to leave out its
+# Linux Wayland backend: it always builds libwayshot-xcap (wayland-client, GBM,
+# EGL) and PipeWire (pipewire 0.10.1 -> libspa 0.10.1, through bindgen, so
+# libclang too), none of which this crate uses — Linux computer use is X11 only
+# (docs/COMPUTER_USE.md decision 5). That backend is what broke the release
+# build: libspa 0.10 expects newer PipeWire headers than Ubuntu 22.04 (the
+# release runner, chosen for its older glibc) ships, and fails to compile
+# there (`spa_meta_first` missing, `spa_video_info_raw` has no `flags`). No
+# 0.9.x release offers a way out, so on Linux the dependency is gone.
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+xcap = { version = "0.9.8", default-features = false, optional = true }
 
 # ---------------------------------------------------------------------------
 # Computer use — see docs/COMPUTER_USE.md.
@@ -278,14 +289,18 @@ landlock = "=0.4.7"
 #     gethostname 1.1.0 (MIT OR Apache-2.0, pure Rust, no C library) — and
 #     nothing on Windows or macOS, since this table is Linux-only. enigo
 #     0.6.1 (the latest) pins x11rb 0.13, so 0.14 is not a choice here.
-#   - zbus for the AT-SPI2 accessibility tree: NO NEW PACKAGE. xcap already
-#     resolves zbus 5.19.0 (the latest) on Linux with its default features,
+#   - zbus for the AT-SPI2 accessibility tree: NO NEW PACKAGE. zbus 5.19.0
+#     (the latest) was resolved by xcap when it was vetted; since xcap left
+#     Linux this line is what resolves it, with the same default features,
 #     which include the blocking API used here.
 #   - x11rb, named directly to ask the X server which window keystrokes
-#     reach (`linux::keyboard_pid`): NO NEW PACKAGE — the same 0.13.2 the
-#     enigo backend above already resolves, core protocol only, no features.
+#     reach (`linux::keyboard_pid`) and to capture the screen
+#     (`desktop::capture::x11`): NO NEW PACKAGE — the same 0.13.2 the enigo
+#     backend above already resolves. `randr` is for the display list
+#     (RandR 1.5 GetMonitors); enigo already turns it on for the same crate,
+#     so naming it here builds nothing new.
 enigo = { version = "0.6.1", default-features = false, features = ["x11rb"] }
-x11rb = { version = "0.13.2", default-features = false }
+x11rb = { version = "0.13.2", default-features = false, features = ["randr"] }
 zbus = "5.19"
 
 # ---------------------------------------------------------------------------
@@ -300,9 +315,10 @@ zbus = "5.19"
 # Every Outline grammar is on by default; each can be dropped to shrink the
 # binary, and Outline then says that language was not built in.
 default = ["desktop-capture", "lang-rust", "lang-ts", "lang-python", "lang-go", "lang-js"]
-# Screenshots and the display list for computer use (`src/desktop/capture.rs`).
-# Without it every capture is refused by name; on Linux it is what needs the
-# Wayland, GBM, EGL, PipeWire and libclang development packages to build.
+# Screenshots and the display list for computer use (`src/desktop/capture.rs`),
+# on every OS. Without it every capture is refused by name. On Windows and
+# macOS it builds xcap; on Linux it needs no extra crate (the X server is read
+# with x11rb, which input already links), so `dep:xcap` names nothing there.
 desktop-capture = ["dep:xcap"]
 lang-rust = ["dep:tree-sitter-rust"]
 lang-ts = ["dep:tree-sitter-typescript"]

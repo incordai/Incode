@@ -14,12 +14,18 @@ A part whose toolchain (cargo, python3, npm) or folder is missing is skipped
 and named in the summary; the exit code is non-zero when any part that ran
 failed.
 
-On Linux, building incode needs the desktop backends' libraries:
+On Linux, building incode needs pkg-config and the OpenSSL headers; the
+desktop backends (x11rb, zbus) are pure Rust and need no system library:
 
 ```sh
-sudo apt-get install -y --no-install-recommends pkg-config clang libclang-dev \
-  libwayland-dev libpipewire-0.3-dev libxcb1-dev libxcb-randr0-dev \
-  libxcb-shm0-dev libdbus-1-dev libegl-dev libgbm-dev
+sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
+```
+
+The X11 screen capture has a live test that needs an X server; with Xvfb:
+
+```sh
+Xvfb :99 -screen 0 1280x800x24 &
+DISPLAY=:99 cargo test --lib desktop::capture::x11 -- --ignored
 ```
 
 The tests create git repositories and commit in them, so git needs a name and

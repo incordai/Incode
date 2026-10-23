@@ -25,8 +25,8 @@ jobs:
           # glibc it was built against, and an older one runs on more systems.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
-          # A native ARM runner, so the desktop stack's C libraries need no
-          # cross toolchain.
+          # A native ARM runner, so OpenSSL and the C the grammars compile
+          # need no cross toolchain.
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-22.04-arm
           # One macOS runner builds both: Xcode's SDK targets either arch.
@@ -39,16 +39,16 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      # The same set ci.yml installs: the Linux desktop backends (xcap,
-      # enigo's x11rb, AT-SPI over zbus) link against these at build time.
+      # The same set ci.yml installs, and ci.yml's `release-build-linux` job
+      # builds the Linux legs below exactly as this does on every pull
+      # request — change the two together. The desktop backends (x11rb for
+      # capture and input, AT-SPI over zbus) are pure Rust and link no system
+      # library; pkg-config is how openssl-sys finds the runner's OpenSSL.
       - name: Linux build dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            pkg-config clang libclang-dev libwayland-dev libpipewire-0.3-dev \
-            libxcb1-dev libxcb-randr0-dev libxcb-shm0-dev libdbus-1-dev \
-            libegl-dev libgbm-dev
+          sudo apt-get install -y --no-install-recommends pkg-config
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}

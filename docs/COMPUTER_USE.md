@@ -12,7 +12,11 @@
 > admin.json `desktop_display` names the display (`":N"`, or `"xvfb"` for a private one the
 > server starts and stops; unset refuses rather than using `$DISPLAY`), enigo's x11rb
 > backend for input, `xclip`/`xsel` for the clipboard, and the AT-SPI2 tree over zbus,
-> kept to the applications whose own `DISPLAY` is the server's. Driven live in Docker
+> kept to the applications whose own `DISPLAY` is the server's. Since 2026-10-23 the
+> Linux screen is captured with x11rb (RandR 1.5 monitors, `GetImage` of the root;
+> `src/desktop/capture/x11.rs`), not xcap: xcap always builds a Wayland and PipeWire
+> backend on Linux, which this decision makes dead weight and which failed to compile
+> on the Ubuntu 22.04 release runner. Driven live in Docker
 > (Debian 13): a GTK3 window walked at true screen positions, clicked by element, typed
 > and pasted into; a GTK4 window's tree comes with a NOTE instead of positions, because
 > GTK 4.18.6 reports every control at (0,0) — `set_value`/`element_action` work on it by

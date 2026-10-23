@@ -18,13 +18,12 @@ is called done, and contributions are held to the same rule.
 
 ## Building and checking
 
-You need a stable Rust toolchain (1.88 or newer) and git. On Linux, the
-desktop backends (screen capture, input, accessibility) also need these
-development packages:
+You need a stable Rust toolchain (1.88 or newer) and git. On Linux, also
+pkg-config and the OpenSSL headers (for HTTPS); the desktop backends (screen
+capture, input, accessibility) are pure Rust and need nothing more:
 
 ```sh
-sudo apt-get install pkg-config clang libclang-dev libwayland-dev libpipewire-0.3-dev \
-  libxcb1-dev libxcb-randr0-dev libxcb-shm0-dev libdbus-1-dev libegl-dev libgbm-dev
+sudo apt-get install pkg-config libssl-dev
 ```
 
 Before opening a pull request, run these checks; a pull request is merged only
