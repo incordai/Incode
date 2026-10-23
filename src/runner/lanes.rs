@@ -19,8 +19,8 @@ use crate::ledger::{Ledger, Task, TaskState};
 /// `&mut dyn TaskWorker`, which is exactly one thing and cannot be in two
 /// places.
 ///
-/// It is a trait for the same reason [`OwnerChannel`] and [`RoadmapGoals`]
-/// are: the real one builds an agent CLI backend, and a loop whose parallel
+/// It is a trait for the same reason [`super::OwnerChannel`] and
+/// [`super::RoadmapGoals`] are: the real one builds an agent CLI backend, and a loop whose parallel
 /// path can only be exercised by spawning real agents is a path nobody tests.
 /// `Sync` because the factory is called from every lane's thread at once. It
 /// is the one thing all the lanes share, so it is the one thing that has to be
@@ -81,7 +81,7 @@ impl LaneWorkers for NoLanes {
 ///
 /// The runner's law — attempts, escalation, the owner channel, and the single
 /// edge into `Done` through [`crate::verify`] — is written once, in the
-/// sequential loop below. Re-implementing it for the parallel path would mean
+/// sequential loop (`ledger_loop.rs`, with each attempt in `attempt.rs`). Re-implementing it for the parallel path would mean
 /// two copies of the rule that decides whether work is finished, and the one
 /// that gets fixed would not always be the one that ran.
 ///

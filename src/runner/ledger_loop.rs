@@ -74,7 +74,7 @@ pub(super) struct LedgerLoop<'r> {
     /// Every task this run finished, in the order it finished.
     pub(super) completed: Vec<String>,
     /// What finished tasks have reported, in the order they finished. Grows only
-    /// on a PASS — see the push site.
+    /// on a PASS — see where `attempt.rs` pushes it after `ledger.complete`.
     pub(super) handoffs: Vec<Handoff>,
     pub(super) attempted: usize,
     /// Per task, per run. Bounds the ask-answer-ask cycle described on

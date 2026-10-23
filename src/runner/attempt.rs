@@ -203,11 +203,12 @@ fn annotate(ledger: &mut Ledger, task_id: &str, handovers: &[String], gaps: &[St
 ///
 /// # Wired to
 ///
-/// **Both** failure exits of the loop in [`run_watched`] — the one where the
-/// ATTEMPT failed and the one where the CHECK failed. They are separate arms
-/// several hundred lines apart, and the first cut of this feature wired only
-/// the second: the task abandoned, the run stopped, and nothing was ever
-/// learned or re-planned. A test caught it; a reader would not have.
+/// **Both** failure exits of a round — the one where the ATTEMPT failed and
+/// the one where the CHECK failed — through `failed` above. They used to be
+/// separate arms several hundred lines apart, and the first cut of this
+/// feature wired only the second: the task abandoned, the run stopped, and
+/// nothing was ever learned or re-planned. A test caught it; a reader would
+/// not have. Sharing `failed` keeps the two from drifting apart again.
 ///
 /// Returns `true` when a fresh plan is now in the ledger and the loop should
 /// carry on, `false` when the run should stop.

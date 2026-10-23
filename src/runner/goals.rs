@@ -31,7 +31,8 @@ pub enum GoalVerdict {
 
 /// The final testing: whether the roadmap items this run was for are reached.
 ///
-/// A trait for the same reason [`OwnerChannel`] and [`WorkJournal`] are: the
+/// A trait for the same reason [`super::OwnerChannel`] and
+/// [`super::WorkJournal`] are: the
 /// real implementation fetches the brief over HTTP, and a runner whose loop can
 /// only be exercised with a service running is a loop nobody tests. It also
 /// keeps the network out of the scheduling tests, which would otherwise pass or
@@ -99,7 +100,7 @@ fn goal_verdict(workspace: &Path, ledger: &Ledger) -> GoalVerdict {
     }
 }
 
-/// [`unreached_goals`] with the roadmap passed in rather than fetched.
+/// [`goal_verdict`]'s check with the roadmap passed in rather than fetched.
 ///
 /// Split out because the fetch is an HTTP call to the memory service, and a
 /// test that needs one cannot run. Everything interesting — running each

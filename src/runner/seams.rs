@@ -8,6 +8,11 @@
 use super::Handoff;
 use crate::ledger::{Ledger, Task};
 
+/// What actually did the work for one task.
+///
+/// A trait rather than a hardwired call to the agent loop, so the runner's
+/// scheduling and its proof discipline can be exercised without a model — and
+/// so the thing that does the work stays swappable.
 pub trait TaskWorker {
     /// Attempt one task. The returned text is the worker's REPORT, which is a
     /// claim: it is recorded, and it never decides whether the task is done.
@@ -155,11 +160,6 @@ impl OwnerChannel for MemoryOwner {
     }
 }
 
-/// Nobody to ask.
-///
-/// Not a stub for tests — a real mode. A runner started where no owner can be
-/// reached should stop at the first question rather than guess, and saying so in
-/// the type is better than passing a null channel that silently approves.
 /// How many times one roadmap item may be planned again after failing.
 ///
 /// Two, and then the run stops for a person — the same bound and the same reason
@@ -173,7 +173,8 @@ pub const MAX_REPLANS: u8 = 2;
 /// # Wired to
 ///
 /// - **Implemented by** `crate::cli`, which calls [`crate::plan::split`].
-/// - **Called by** [`run_with_replans`] when a task exhausts its attempts.
+/// - **Called by** `learn_and_replan` (`attempt.rs`) when a task exhausts its
+///   attempts.
 /// - **Sibling to** [`OwnerChannel`]: both are seams that let this module stay
 ///   testable without a model or a network, and both must fail CLOSED.
 ///
@@ -213,6 +214,10 @@ impl Replanner for NoReplan {
 }
 
 /// Nobody to ask.
+///
+/// Not a stub for tests — a real mode. A runner started where no owner can be
+/// reached should stop at the first question rather than guess, and saying so in
+/// the type is better than passing a null channel that silently approves.
 pub struct NoOwner;
 
 impl OwnerChannel for NoOwner {

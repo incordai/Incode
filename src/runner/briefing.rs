@@ -6,11 +6,6 @@
 
 use crate::ledger::Task;
 
-/// What actually did the work for one task.
-///
-/// A trait rather than a hardwired call to the agent loop, so the runner's
-/// scheduling and its proof discipline can be exercised without a model — and
-/// so the thing that does the work stays swappable.
 /// What one finished task tells the tasks that come after it.
 ///
 /// Carries the worker's own REPORT, which is a claim and not evidence — the
