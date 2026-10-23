@@ -765,13 +765,12 @@ mod tests {
 
         let (conn, screen) = x11rb::connect(None).expect("an X server on $DISPLAY");
         let screen = conn.setup().roots[screen].clone();
-        let visual = screen
+        let visual = *screen
             .allowed_depths
             .iter()
             .flat_map(|d| &d.visuals)
             .find(|v| v.visual_id == screen.root_visual)
-            .expect("the root visual")
-            .clone();
+            .expect("the root visual");
         // A window filled with the pixel value the visual calls pure red,
         // on top (override-redirect: no window manager places it).
         let window = conn.generate_id().expect("id");

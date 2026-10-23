@@ -199,7 +199,7 @@ pub fn capture_region(region: Rect, options: CaptureOptions) -> Result<Screensho
         ))
     })?;
     // The id screen_info gives this display: its place in the list. The
-    // library's own id (an X11 RandR output, a Windows handle) is a number
+    // backend's own id (a Windows handle, a macOS display id) is a number
     // nothing else in the tool surface uses.
     let id = index as u32;
 
