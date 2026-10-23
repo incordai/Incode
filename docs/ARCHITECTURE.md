@@ -691,7 +691,7 @@ That is why the fallback is traced rather than silent.
 
 ### The mechanical half
 
-`agent/` discovers an installed agent and drives it as a model — `claude_code.rs`
+`agent/` discovers an installed agent and drives it as a model — `claude_code/`
 speaks its stream protocol and opens the tool bridge per turn, `api.rs` is the API
 route's own tool loop, `catalogue.rs` is the one list of agents, `worker.rs` hands one
 ledger task at a time. `cli/` is the terminal, and `cli/agent_turn.rs` is one
@@ -936,7 +936,7 @@ incode (parent) ──spawns──▶ agent CLI (the model; its own tools off)
 - `incode --tool-server` (`src/tool_bridge.rs`) speaks MCP on stdio to the CLI, through
   the framing shared with the team server (`src/mcp_stdio.rs`). It runs nothing: each
   `tools/list` and `tools/call` is forwarded to the parent over a loopback socket.
-- The parent (`Bridge`, opened per turn by `src/agent/claude_code.rs` `run_turn`) binds
+- The parent (`Bridge`, opened per turn by `src/agent/claude_code/turn.rs` `run_once`) binds
   `127.0.0.1:0`, makes a 256-bit token, and passes both to the CLI through its
   ENVIRONMENT (`INCODE_TOOL_BRIDGE`, `INCODE_TOOL_TOKEN`), never its argv. The CLI's
   stdio servers inherit that environment (measured live).
