@@ -2996,4 +2996,562 @@ pub(crate) mod tests {
             path
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Pinned behaviour: every wire shape `map_line` reads, the exact argv and
+    // environment a turn is started with, and what a whole turn reports.
+    // -----------------------------------------------------------------------
+
+    /// A turn outcome, spelled out.
+    fn outcome_of(
+        session: &str,
+        stop: &str,
+        is_error: bool,
+        detail: Option<&str>,
+        served_by: &[&str],
+    ) -> TurnOutcome {
+        TurnOutcome {
+            session_id: session.to_string(),
+            stop_reason: stop.to_string(),
+            is_error,
+            detail: detail.map(str::to_string),
+            served_by: served_by.iter().map(|m| (*m).to_string()).collect(),
+        }
+    }
+
+    fn usage_of(input: u32, output: u32, creation: u32, read: u32) -> AgentEvent {
+        AgentEvent::Usage {
+            input_tokens: input,
+            output_tokens: output,
+            cache_creation_tokens: creation,
+            cache_read_tokens: read,
+        }
+    }
+
+    /// **EVERY WIRE SHAPE, AND WHAT IT BECOMES.** One line per branch of the
+    /// mapping — each event type, the subagent and empty cases, every way a
+    /// failed result can describe itself, and lines that do not parse.
+    #[test]
+    fn the_map_line_corpus_is_pinned() {
+        let text = |t: &str| AgentEvent::Text(t.to_string());
+        let started = |s: &str, m: &str| AgentEvent::SessionStarted {
+            session_id: s.to_string(),
+            model: m.to_string(),
+        };
+        let none: Vec<AgentEvent> = Vec::new();
+        let cases: Vec<(&str, Vec<AgentEvent>, Option<TurnOutcome>)> = vec![
+            // system
+            (
+                r#"{"type":"system","subtype":"init","session_id":"s1","model":"m1"}"#,
+                vec![started("s1", "m1")],
+                None,
+            ),
+            (
+                r#"{"type":"system","subtype":"init"}"#,
+                vec![started("", "unknown")],
+                None,
+            ),
+            (
+                r#"  {"type":"system","subtype":"init","session_id":"s2"}  "#,
+                vec![started("s2", "unknown")],
+                None,
+            ),
+            (
+                r#"{"type":"system","subtype":"hook_started","hook_id":"h"}"#,
+                none.clone(),
+                None,
+            ),
+            (r#"{"type":"system"}"#, none.clone(), None),
+            // stream_event
+            (
+                r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}},"parent_tool_use_id":null}"#,
+                vec![AgentEvent::TextDelta("hi".to_string())],
+                None,
+            ),
+            (
+                r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":""}}}"#,
+                none.clone(),
+                None,
+            ),
+            (
+                r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta"}}}"#,
+                none.clone(),
+                None,
+            ),
+            (
+                r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"why"}}}"#,
+                vec![AgentEvent::Thinking("why".to_string())],
+                None,
+            ),
+            (
+                r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":""}}}"#,
+                none.clone(),
+                None,
+            ),
+            (
+                r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"x"}},"parent_tool_use_id":"toolu_9"}"#,
+                none.clone(),
+                None,
+            ),
+            (
+                r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"x"}},"parent_tool_use_id":"toolu_9"}"#,
+                none.clone(),
+                None,
+            ),
+            (
+                r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0},"parent_tool_use_id":null}"#,
+                none.clone(),
+                None,
+            ),
+            (
+                r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{}"}}}"#,
+                none.clone(),
+                None,
+            ),
+            (
+                r#"{"type":"stream_event","event":{"type":"content_block_start","delta":{"type":"text_delta","text":"x"}}}"#,
+                none.clone(),
+                None,
+            ),
+            (r#"{"type":"stream_event"}"#, none.clone(), None),
+            // assistant
+            (
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"a"},{"type":"tool_use","id":"t1","name":"Write","input":{}},{"type":"thinking","thinking":"hm"},{"type":"text","text":"b"}]},"parent_tool_use_id":null}"#,
+                vec![text("a"), text("b")],
+                None,
+            ),
+            (
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":""}]}}"#,
+                vec![text("")],
+                None,
+            ),
+            (r#"{"type":"assistant","message":{}}"#, none.clone(), None),
+            (
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"sub"}]},"parent_tool_use_id":"toolu_2"}"#,
+                none.clone(),
+                None,
+            ),
+            (r#"{"type":"assistant"}"#, none.clone(), None),
+            // user lines carry tool results incode already showed
+            (
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#,
+                none.clone(),
+                None,
+            ),
+            // rate_limit_event
+            (
+                r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected"}}"#,
+                vec![AgentEvent::Quota {
+                    status: "rejected".to_string(),
+                    kind: String::new(),
+                    resets_at: 0,
+                    using_overage: false,
+                }],
+                None,
+            ),
+            (
+                r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":17,"rateLimitType":"seven_day","isUsingOverage":true}}"#,
+                vec![AgentEvent::Quota {
+                    status: "allowed_warning".to_string(),
+                    kind: "seven_day".to_string(),
+                    resets_at: 17,
+                    using_overage: true,
+                }],
+                None,
+            ),
+            (r#"{"type":"rate_limit_event"}"#, none.clone(), None),
+            // result
+            (
+                r#"{"type":"result","is_error":false,"session_id":"r1"}"#,
+                vec![usage_of(0, 0, 0, 0)],
+                Some(outcome_of("r1", "unknown", false, None, &[])),
+            ),
+            (
+                r#"{"type":"result","is_error":false,"session_id":"r1","stop_reason":"max_tokens","result":"the reply","subtype":"success","usage":{"input_tokens":3,"output_tokens":4,"cache_creation_input_tokens":5,"cache_read_input_tokens":6}}"#,
+                vec![usage_of(3, 4, 5, 6)],
+                Some(outcome_of("r1", "max_tokens", false, None, &[])),
+            ),
+            (
+                r#"{"type":"result","is_error":true,"session_id":"r2","stop_reason":"stop_sequence","subtype":"error_x","result":"said"}"#,
+                vec![usage_of(0, 0, 0, 0)],
+                Some(outcome_of(
+                    "r2",
+                    "stop_sequence",
+                    true,
+                    Some("error_x: said"),
+                    &[],
+                )),
+            ),
+            (
+                r#"{"type":"result","is_error":true,"session_id":"r2","subtype":"error_max_turns"}"#,
+                vec![usage_of(0, 0, 0, 0)],
+                Some(outcome_of(
+                    "r2",
+                    "unknown",
+                    true,
+                    Some("error_max_turns"),
+                    &[],
+                )),
+            ),
+            (
+                r#"{"type":"result","is_error":true,"session_id":"r2","result":"boom"}"#,
+                vec![usage_of(0, 0, 0, 0)],
+                Some(outcome_of("r2", "unknown", true, Some("boom"), &[])),
+            ),
+            (
+                r#"{"type":"result","is_error":true,"session_id":"r2"}"#,
+                vec![usage_of(0, 0, 0, 0)],
+                Some(outcome_of("r2", "unknown", true, None, &[])),
+            ),
+            (
+                r#"{"type":"result","is_error":true,"session_id":"r2","subtype":"  ","result":" "}"#,
+                vec![usage_of(0, 0, 0, 0)],
+                Some(outcome_of("r2", "unknown", true, None, &[])),
+            ),
+            (
+                r#"{"type":"result","is_error":true,"session_id":"r2","subtype":" k ","result":" t "}"#,
+                vec![usage_of(0, 0, 0, 0)],
+                Some(outcome_of("r2", "unknown", true, Some("k: t"), &[])),
+            ),
+            (
+                r#"{"type":"result","is_error":false,"session_id":"r3","usage":{"input_tokens":1,"iterations":[{"input_tokens":9},{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":100,"cache_creation_input_tokens":20}]},"modelUsage":{"b-model":{"inputTokens":50,"contextWindow":200000},"a-model":{"inputTokens":1,"contextWindow":1000}}}"#,
+                vec![
+                    usage_of(1, 0, 0, 0),
+                    AgentEvent::Context {
+                        used: 135,
+                        size: 200_000,
+                    },
+                ],
+                Some(outcome_of(
+                    "r3",
+                    "unknown",
+                    false,
+                    None,
+                    &["a-model", "b-model"],
+                )),
+            ),
+            (
+                r#"{"type":"result","is_error":false,"session_id":"r4","usage":{"iterations":[]},"modelUsage":{"m":{"contextWindow":200000}}}"#,
+                vec![usage_of(0, 0, 0, 0)],
+                Some(outcome_of("r4", "unknown", false, None, &["m"])),
+            ),
+            (
+                r#"{"type":"result","is_error":false,"session_id":"r5","usage":{"iterations":[{"input_tokens":1}]},"modelUsage":{"m":{"contextWindow":0}}}"#,
+                vec![usage_of(0, 0, 0, 0)],
+                Some(outcome_of("r5", "unknown", false, None, &["m"])),
+            ),
+            (
+                r#"{"type":"result","is_error":false,"session_id":"r6","usage":{"iterations":[{"input_tokens":1}]},"modelUsage":{"m":{"inputTokens":1}}}"#,
+                vec![usage_of(0, 0, 0, 0)],
+                Some(outcome_of("r6", "unknown", false, None, &["m"])),
+            ),
+            (r#"{"type":"result","is_error":false}"#, none.clone(), None),
+            (r#"{"type":"result","session_id":"r7"}"#, none.clone(), None),
+            // unknown and malformed
+            (
+                r#"{"type":"some_future_event","payload":{}}"#,
+                none.clone(),
+                None,
+            ),
+            ("not json", none.clone(), None),
+            ("", none.clone(), None),
+            ("[]", none.clone(), None),
+            ("null", none.clone(), None),
+            ("{}", none.clone(), None),
+            (r#"{"type":42}"#, none.clone(), None),
+            (
+                r#"{"type":"assistant","message":{"content":[{"type":"text"}]}}"#,
+                none,
+                None,
+            ),
+        ];
+        for (line, events, outcome) in cases {
+            let mut got = None;
+            assert_eq!(map_line(line, &mut got), events, "events of {line}");
+            assert_eq!(got, outcome, "outcome of {line}");
+        }
+    }
+
+    /// Only a result line touches the outcome; every other line leaves an
+    /// earlier one in place.
+    #[test]
+    fn only_a_result_line_writes_the_outcome() {
+        let earlier = outcome_of("before", "end_turn", false, None, &[]);
+        for line in [
+            r#"{"type":"system","subtype":"init","session_id":"s"}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"a"}]}}"#,
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed"}}"#,
+            "not json",
+        ] {
+            let mut outcome = Some(earlier.clone());
+            map_line(line, &mut outcome);
+            assert_eq!(outcome.as_ref(), Some(&earlier), "{line}");
+        }
+    }
+
+    /// The environment a command sets or removes, minus the entries that
+    /// depend on the machine: the profile choice, and the session variables
+    /// removed only when this process inherited them.
+    fn pinned_envs(cmd: &Command) -> Vec<(String, Option<String>)> {
+        let mut envs: Vec<(String, Option<String>)> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .filter(|(k, _)| {
+                let upper = k.to_ascii_uppercase();
+                upper != PROFILE_ENV
+                    && upper != "SESSION_INGRESS_URL"
+                    && !upper.starts_with("CLAUDE_CODE_SESSION")
+                    && !upper.starts_with("CLAUDE_CODE_REMOTE")
+            })
+            .collect();
+        envs.sort();
+        envs
+    }
+
+    /// The environment every turn's command carries, sorted.
+    fn turn_envs() -> Vec<(String, Option<String>)> {
+        let mut envs: Vec<(String, Option<String>)> = [
+            "CLAUDECODE",
+            "CLAUDE_CODE_ENTRYPOINT",
+            "CLAUDE_CODE_CHILD_SESSION",
+            "CLAUDE_CODE_MESSAGING_SOCKET",
+            "CLAUDE_CODE_MESSAGING_TOKEN",
+            "CLAUDE_SESSION_INGRESS_TOKEN_FILE",
+        ]
+        .into_iter()
+        .map(|k| (k.to_string(), None))
+        .chain([
+            (
+                "CLAUDE_CODE_DISABLE_CLAUDE_MDS".to_string(),
+                Some("1".to_string()),
+            ),
+            (
+                "CLAUDE_CODE_DISABLE_AUTO_MEMORY".to_string(),
+                Some("1".to_string()),
+            ),
+        ])
+        .collect();
+        envs.sort();
+        envs
+    }
+
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// **THE EXACT ARGV AND ENVIRONMENT, FOR A PLAIN TURN.** Guards, a
+    /// permission mode and extra roots change nothing on the command line:
+    /// the toolbox enforces them.
+    #[test]
+    fn a_plain_turn_is_started_with_exactly_this_command() {
+        let mut backend = ClaudeCodeBackend::new(PathBuf::from("."))
+            .with_guards(&crate::guards::Guards::default())
+            .with_extra_dirs(vec![PathBuf::from("other-root")]);
+        backend.set_permission_mode("acceptEdits");
+        let allowed = strings(&["mcp__incode"]);
+        let cmd = backend.command(Some("hi"), "", "SERVERS", &allowed);
+        assert_eq!(cmd.get_program(), "claude");
+        assert_eq!(
+            args_of(&cmd),
+            strings(&[
+                "-p",
+                "hi",
+                "--output-format",
+                "stream-json",
+                "--tools",
+                "",
+                "--strict-mcp-config",
+                "--setting-sources",
+                "",
+                "--disable-slash-commands",
+                "--verbose",
+                "--mcp-config",
+                "SERVERS",
+                "--allowedTools",
+                "mcp__incode",
+            ])
+        );
+        assert_eq!(pinned_envs(&cmd), turn_envs());
+        assert_eq!(cmd.get_current_dir(), None);
+    }
+
+    /// **THE EXACT ARGV FOR A TURN WITH EVERYTHING SET**: pictures (prompt on
+    /// stdin), a model chain, streaming, context and a session to resume.
+    #[test]
+    fn a_fully_configured_turn_is_started_with_exactly_this_command() {
+        let backend = ClaudeCodeBackend::new(PathBuf::from("."))
+            .with_binary("/opt/agent/claude")
+            .with_models(&strings(&["opus", "sonnet", "haiku"]))
+            .with_session("s-9")
+            .streaming(true);
+        let allowed = strings(&["a", "b"]);
+        let cmd = backend.command(None, "CTX", "SERVERS", &allowed);
+        assert_eq!(cmd.get_program(), "/opt/agent/claude");
+        assert_eq!(
+            args_of(&cmd),
+            strings(&[
+                "-p",
+                "--input-format",
+                "stream-json",
+                "--output-format",
+                "stream-json",
+                "--tools",
+                "",
+                "--strict-mcp-config",
+                "--setting-sources",
+                "",
+                "--disable-slash-commands",
+                "--verbose",
+                "--mcp-config",
+                "SERVERS",
+                "--allowedTools",
+                "a",
+                "b",
+                "--model",
+                "opus",
+                "--include-partial-messages",
+                "--thinking-display",
+                "summarized",
+                "--append-system-prompt",
+                "CTX",
+                "--fallback-model",
+                "sonnet,haiku",
+                "--resume",
+                "s-9",
+            ])
+        );
+        assert_eq!(pinned_envs(&cmd), turn_envs());
+    }
+
+    /// Once the CLI has refused the thinking flag, a streaming turn is
+    /// started without it — and nothing else changes.
+    #[test]
+    fn a_turn_after_the_thinking_flag_was_refused_omits_only_that_flag() {
+        let mut backend = ClaudeCodeBackend::new(PathBuf::from(".")).streaming(true);
+        backend.thinking_display = false;
+        let cmd = backend.command(Some("q"), "", "S", &[]);
+        assert_eq!(
+            args_of(&cmd),
+            strings(&[
+                "-p",
+                "q",
+                "--output-format",
+                "stream-json",
+                "--tools",
+                "",
+                "--strict-mcp-config",
+                "--setting-sources",
+                "",
+                "--disable-slash-commands",
+                "--verbose",
+                "--mcp-config",
+                "S",
+                "--allowedTools",
+                "--include-partial-messages",
+            ])
+        );
+    }
+
+    /// The stdin message for a turn with no pictures, byte for byte.
+    #[test]
+    fn the_stdin_message_is_pinned() {
+        assert_eq!(
+            user_message("hi", &[]),
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}}\n"
+        );
+    }
+
+    /// **A WHOLE TURN THROUGH `run_turn`**: the events in order, the outcome,
+    /// and the session kept for the next turn.
+    #[test]
+    fn a_whole_turn_reports_these_events_and_this_outcome() {
+        let dir = tempfile::tempdir().expect("scratch");
+        let fake = stand_in_cli(dir.path(), false);
+        let mut backend =
+            ClaudeCodeBackend::new(dir.path().to_path_buf()).with_binary(fake.to_string_lossy());
+        let mut seen = Vec::new();
+        let outcome = backend
+            .run_turn("hi", &mut |e| seen.push(e.clone()))
+            .expect("the stand-in finishes its turn");
+        assert_eq!(
+            seen,
+            vec![
+                AgentEvent::SessionStarted {
+                    session_id: "sub-conv-1".to_string(),
+                    model: "fake-sub-model".to_string(),
+                },
+                AgentEvent::Thinking("looking around".to_string()),
+                AgentEvent::TextDelta("three files".to_string()),
+                AgentEvent::Text("three files".to_string()),
+                usage_of(1, 1, 0, 0),
+            ]
+        );
+        assert_eq!(
+            outcome,
+            outcome_of("sub-conv-1", "end_turn", false, None, &[])
+        );
+        assert_eq!(backend.session_id(), Some("sub-conv-1"));
+    }
+
+    /// A CLI that cannot be started names itself in the error.
+    #[test]
+    fn a_cli_that_cannot_start_is_named_in_the_error() {
+        let dir = tempfile::tempdir().expect("scratch");
+        let missing = dir.path().join("no-such-agent-binary");
+        let mut backend =
+            ClaudeCodeBackend::new(dir.path().to_path_buf()).with_binary(missing.to_string_lossy());
+        let err = backend
+            .run_turn("hi", &mut |_| {})
+            .expect_err("nothing to start");
+        assert!(
+            err.to_string()
+                .starts_with(&format!("failed to spawn `{}`: ", missing.display())),
+            "{err}"
+        );
+    }
+
+    /// A stand-in that starts a session and exits cleanly, saying nothing
+    /// else and writing nothing to stderr.
+    fn a_cli_that_ends_without_a_result(dir: &std::path::Path) -> PathBuf {
+        const INIT: &str = r#"{"type":"system","subtype":"init","session_id":"cut-1","model":"m"}"#;
+        #[cfg(windows)]
+        {
+            let path = dir.join("cut-agent.cmd");
+            std::fs::write(&path, format!("@echo off\r\necho {INIT}\r\nexit /b 0\r\n"))
+                .expect("write the stand-in agent");
+            path
+        }
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = dir.join("cut-agent.sh");
+            std::fs::write(&path, format!("#!/bin/sh\necho '{INIT}'\nexit 0\n"))
+                .expect("write the stand-in agent");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("make it runnable");
+            path
+        }
+    }
+
+    /// No result line: the exact error, and the session still kept.
+    #[test]
+    fn a_turn_without_a_result_fails_with_this_error_and_keeps_its_session() {
+        let dir = tempfile::tempdir().expect("scratch");
+        let fake = a_cli_that_ends_without_a_result(dir.path());
+        let mut backend =
+            ClaudeCodeBackend::new(dir.path().to_path_buf()).with_binary(fake.to_string_lossy());
+        let err = backend
+            .run_turn("hi", &mut |_| {})
+            .expect_err("no result line");
+        assert_eq!(
+            err.to_string(),
+            "agent exited with 0 before producing a result: "
+        );
+        assert_eq!(backend.session_id(), Some("cut-1"));
+    }
 }

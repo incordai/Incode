@@ -924,4 +924,302 @@ mod tests {
         backend.set_permission_mode("plan");
         assert_eq!(backend.mode.as_deref(), Some("plan"));
     }
+
+    // -----------------------------------------------------------------------
+    // Pinned behaviour: the exact command a turn is started with, and what a
+    // whole turn through `run_turn` reports.
+    // -----------------------------------------------------------------------
+
+    fn args_of(cmd: &Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// What the command SETS in the environment. Removals are the parent
+    /// session's variables, guarded by the test above.
+    fn set_envs(cmd: &Command) -> Vec<(String, String)> {
+        cmd.get_envs()
+            .filter_map(|(k, v)| {
+                Some((
+                    k.to_string_lossy().into_owned(),
+                    v?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect()
+    }
+
+    /// **THE EXACT COMMAND FOR A DEFAULT TURN**: accept-edits, the long print
+    /// timeout, the workspace as the working directory.
+    #[test]
+    fn a_default_turn_is_started_with_exactly_this_command() {
+        let cmd = AgyBackend::new(PathBuf::from("ws")).command("p");
+        assert_eq!(cmd.get_program(), "agy");
+        assert_eq!(
+            args_of(&cmd),
+            strings(&[
+                "--print",
+                "p",
+                "--output-format",
+                "stream-json",
+                "--print-timeout",
+                "30m",
+                "--mode",
+                "accept-edits",
+            ])
+        );
+        assert_eq!(cmd.get_current_dir(), Some(std::path::Path::new("ws")));
+        assert!(set_envs(&cmd).is_empty(), "{:?}", set_envs(&cmd));
+    }
+
+    /// **THE EXACT COMMAND WITH EVERYTHING SET**: a model, plan mode, two
+    /// extra roots and a conversation to resume.
+    #[test]
+    fn a_configured_turn_is_started_with_exactly_this_command() {
+        let mut backend = AgyBackend::new(PathBuf::from(".")).with_binary("/opt/agy");
+        backend.set_models(&strings(&["sonnet", "gemini-3.1-pro-high"]));
+        backend.set_permission_mode("read-only");
+        backend.set_extra_dirs(vec![PathBuf::from("a"), PathBuf::from("b")]);
+        backend.set_session_id("c-1");
+        let cmd = backend.command("p");
+        assert_eq!(cmd.get_program(), "/opt/agy");
+        assert_eq!(
+            args_of(&cmd),
+            strings(&[
+                "--print",
+                "p",
+                "--output-format",
+                "stream-json",
+                "--print-timeout",
+                "30m",
+                "--model",
+                "gemini-3.1-pro-high",
+                "--mode",
+                "plan",
+                "--add-dir",
+                "a",
+                "--add-dir",
+                "b",
+                "--conversation",
+                "c-1",
+            ])
+        );
+
+        backend.set_permission_mode("danger-full-access");
+        backend.clear_session();
+        assert!(
+            !args_of(&backend.command("p"))
+                .iter()
+                .any(|a| a == "--mode" || a == "--conversation"),
+            "an unknown mode and a cleared session leave no flag"
+        );
+    }
+
+    /// A stand-in agy: prints `lines` on stdout, `stderr` on stderr, and
+    /// exits with `code`.
+    fn stand_in_agy(dir: &std::path::Path, lines: &[&str], stderr: &str, code: i32) -> PathBuf {
+        #[cfg(windows)]
+        {
+            let mut body = String::from("@echo off\r\n");
+            for line in lines {
+                body.push_str(&format!("echo {line}\r\n"));
+            }
+            if !stderr.is_empty() {
+                body.push_str(&format!("echo {stderr} 1>&2\r\n"));
+            }
+            body.push_str(&format!("exit /b {code}\r\n"));
+            let path = dir.join("agy.cmd");
+            std::fs::write(&path, body).expect("write the stand-in agy");
+            path
+        }
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut body = String::from("#!/bin/sh\n");
+            for line in lines {
+                body.push_str(&format!("echo '{line}'\n"));
+            }
+            if !stderr.is_empty() {
+                body.push_str(&format!("echo '{stderr}' >&2\n"));
+            }
+            body.push_str(&format!("exit {code}\n"));
+            let path = dir.join("agy.sh");
+            std::fs::write(&path, body).expect("write the stand-in agy");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("make it runnable");
+            path
+        }
+    }
+
+    /// One turn through `run_turn` on a stand-in, with its events.
+    fn turn_on(
+        lines: &[&str],
+        stderr: &str,
+        code: i32,
+        set_up: impl FnOnce(&mut AgyBackend),
+    ) -> (Result<TurnOutcome, String>, Vec<AgentEvent>, AgyBackend) {
+        let dir = tempfile::tempdir().expect("scratch");
+        let fake = stand_in_agy(dir.path(), lines, stderr, code);
+        let mut backend =
+            AgyBackend::new(dir.path().to_path_buf()).with_binary(fake.to_string_lossy());
+        set_up(&mut backend);
+        let mut seen = Vec::new();
+        let result = backend
+            .run_turn("hi", &mut |e| seen.push(e.clone()))
+            .map_err(|e| e.to_string());
+        (result, seen, backend)
+    }
+
+    const INIT: &str = r#"{"event":"init","conversation_id":"conv-1","init":{"tools":["view_file","invoke_subagent"]}}"#;
+
+    /// **A WHOLE TURN**: the session, each fragment live, the step's text
+    /// once, the last usage reported, a garbage line skipped, and the
+    /// conversation the result names kept for the next turn.
+    #[test]
+    fn a_whole_turn_reports_these_events_and_this_outcome() {
+        let (result, seen, backend) = turn_on(
+            &[
+                INIT,
+                r#"{"event":"step_update","step_update":{"step_index":1,"step_type":"agent_response","text_delta":"PO"}}"#,
+                "not json",
+                r#"{"event":"step_update","step_update":{"step_index":1,"step_type":"agent_response","text_delta":"NG","usage":{"input_tokens":7,"output_tokens":3,"cache_read_tokens":2}}}"#,
+                r#"{"event":"step_update","step_update":{"step_index":2,"step_type":"tool_call","text_delta":"ignored"}}"#,
+                r#"{"event":"something_new"}"#,
+                r#"{"event":"result","result":{"conversation_id":"conv-2","status":"SUCCESS","usage":{"input_tokens":9,"output_tokens":4,"cache_read_tokens":5}}}"#,
+            ],
+            "",
+            0,
+            |b| b.set_models(&strings(&["gemini-3.8-flash-high"])),
+        );
+        assert_eq!(
+            seen,
+            vec![
+                AgentEvent::SessionStarted {
+                    session_id: "conv-1".to_string(),
+                    model: "gemini-3.8-flash-high".to_string(),
+                },
+                AgentEvent::TextDelta("PO".to_string()),
+                AgentEvent::TextDelta("NG".to_string()),
+                AgentEvent::Text("PONG".to_string()),
+                AgentEvent::Usage {
+                    input_tokens: 9,
+                    output_tokens: 4,
+                    cache_creation_tokens: 0,
+                    cache_read_tokens: 5,
+                },
+            ]
+        );
+        assert_eq!(
+            result.expect("a result line"),
+            TurnOutcome {
+                session_id: "conv-2".to_string(),
+                stop_reason: "SUCCESS".to_string(),
+                is_error: false,
+                detail: None,
+                served_by: strings(&["gemini-3.8-flash-high"]),
+            }
+        );
+        assert_eq!(backend.session_id(), Some("conv-2"));
+    }
+
+    /// A step's usage stands when the result carries none; an `ERROR` status
+    /// is a failed outcome carrying the agent's reason.
+    #[test]
+    fn an_error_result_is_an_outcome_with_the_agents_reason() {
+        let (result, seen, _) = turn_on(
+            &[
+                INIT,
+                r#"{"event":"step_update","step_update":{"step_index":0,"step_type":"agent_response","text_delta":"","usage":{"input_tokens":2,"output_tokens":1,"cache_read_tokens":0}}}"#,
+                r#"{"event":"result","result":{"conversation_id":"conv-1","status":"ERROR","error":"model x is not recognized"}}"#,
+            ],
+            "",
+            1,
+            |_| {},
+        );
+        assert_eq!(
+            seen,
+            vec![
+                AgentEvent::SessionStarted {
+                    session_id: "conv-1".to_string(),
+                    model: String::new(),
+                },
+                AgentEvent::Usage {
+                    input_tokens: 2,
+                    output_tokens: 1,
+                    cache_creation_tokens: 0,
+                    cache_read_tokens: 0,
+                },
+            ]
+        );
+        assert_eq!(
+            result.expect("a result line"),
+            TurnOutcome {
+                session_id: "conv-1".to_string(),
+                stop_reason: "ERROR".to_string(),
+                is_error: true,
+                detail: Some("model x is not recognized".to_string()),
+                served_by: Vec::new(),
+            }
+        );
+    }
+
+    /// No result line: the exact error, with and without stderr, after the
+    /// usage is still reported.
+    #[test]
+    fn a_turn_without_a_result_fails_with_this_error() {
+        let (result, seen, backend) = turn_on(&[INIT], "boom", 3, |_| {});
+        assert_eq!(
+            result.expect_err("no result line"),
+            "the agent produced no result line (exit 3): boom"
+        );
+        assert_eq!(
+            seen.last(),
+            Some(&AgentEvent::Usage {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+            })
+        );
+        assert_eq!(backend.session_id(), Some("conv-1"));
+
+        let (quiet, _, _) = turn_on(&[INIT], "", 0, |_| {});
+        assert_eq!(
+            quiet.expect_err("no result line"),
+            "the agent produced no result line (exit 0)"
+        );
+    }
+
+    /// A stopped turn says so, before handling any output.
+    #[test]
+    fn a_cancelled_turn_stops_with_this_error() {
+        let (result, seen, _) = turn_on(&[INIT], "", 0, |b| {
+            let token = crate::runtime::cancel::CancelToken::new();
+            token.cancel();
+            b.set_cancel(token);
+        });
+        assert_eq!(result.expect_err("cancelled"), "the turn was cancelled");
+        assert!(seen.is_empty(), "{seen:?}");
+    }
+
+    /// A CLI that cannot be started names itself in the error.
+    #[test]
+    fn a_cli_that_cannot_start_is_named_in_the_error() {
+        let dir = tempfile::tempdir().expect("scratch");
+        let missing = dir.path().join("no-such-agy-binary");
+        let mut backend =
+            AgyBackend::new(dir.path().to_path_buf()).with_binary(missing.to_string_lossy());
+        let err = backend
+            .run_turn("hi", &mut |_| {})
+            .expect_err("nothing to start");
+        assert!(
+            err.to_string()
+                .starts_with(&format!("could not start `{}`: ", missing.display())),
+            "{err}"
+        );
+    }
 }
