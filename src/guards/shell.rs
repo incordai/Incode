@@ -966,3 +966,7 @@ mod tests {
         assert!(targets("ls # rm tests/a.rs").is_empty());
     }
 }
+
+#[cfg(test)]
+#[path = "shell_pinned_tests.rs"]
+mod pinned_tests;

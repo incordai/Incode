@@ -37,6 +37,8 @@ pub mod mcp_stdio;
 pub mod migrate;
 pub mod owner;
 pub mod parallel;
+#[cfg(test)]
+mod parser_pins;
 pub mod permissions;
 pub mod plan;
 pub mod plugin_approvals;

@@ -1327,3 +1327,7 @@ fn read_project(workspace: &Path) -> Result<Option<RuleLists>, String> {
 #[cfg(test)]
 #[path = "rules_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "rules_pinned_tests.rs"]
+mod pinned_tests;

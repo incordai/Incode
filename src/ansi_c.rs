@@ -202,3 +202,7 @@ mod tests {
         assert_eq!(decode("abc"), ("abc".to_string(), 3));
     }
 }
+
+#[cfg(test)]
+#[path = "ansi_c_pinned_tests.rs"]
+mod pinned_tests;
