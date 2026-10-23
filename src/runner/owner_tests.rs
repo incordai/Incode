@@ -459,6 +459,43 @@ fn an_owner_who_only_ever_redirects_cannot_loop_the_runner() {
     assert_eq!(ledger.get("t-1").expect("task").state, TaskState::Blocked);
 }
 
+/// **THE LAST ANSWER RIDES THE NEXT QUESTION.** A task redirected by the
+/// owner and blocked again carries the answer it was redirected with into the
+/// next card — and the first card, asked before any answer, carries none.
+#[test]
+fn a_redirected_task_carries_the_last_answer_into_the_next_card() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mut ledger = unverifiable_ledger();
+    let answer = crate::owner::Verdict::Change {
+        note: "try again".to_string(),
+        by: "owner".to_string(),
+        reason: String::new(),
+    };
+    let recorded = answer.summary();
+    let mut owner = ScriptedOwner::saying(answer);
+
+    let _ = run_with_owner(
+        &mut ledger,
+        &mut LyingWorker { calls: 0 },
+        dir.path(),
+        &mut Budget::default(),
+        &never_cancelled(),
+        &mut owner,
+    );
+
+    assert_eq!(owner.asked.len(), 2, "{:?}", owner.asked);
+    assert!(
+        !owner.asked[0].contains("Last answer:"),
+        "{}",
+        owner.asked[0]
+    );
+    assert!(
+        owner.asked[1].contains(&format!("Last answer: {}", recorded.trim())),
+        "{}",
+        owner.asked[1]
+    );
+}
+
 /// **The owner's instruction has to reach the agent.** `change` exists so the
 /// person can tell the coding agent what to do differently; an instruction
 /// that lands only in the ledger makes the whole exchange theatre — the owner

@@ -320,3 +320,73 @@ fn a_store_that_is_down_does_not_undo_finished_work() {
     assert_eq!(outcome.completed, vec!["t-1".to_string()]);
     assert_eq!(ledger.get("t-1").expect("task").state, TaskState::Done);
 }
+
+/// Works each task as the agent its id names, spending what that agent spends.
+#[derive(Default)]
+struct AgentPerTask {
+    last: String,
+}
+
+impl AgentPerTask {
+    /// `(agent, tokens)` for a task id.
+    fn agent_for(id: &str) -> (&'static str, u32) {
+        match id {
+            "t-1" => ("beta", 1_000),
+            "t-2" => ("alpha", 1_000),
+            _ => ("idle", 0),
+        }
+    }
+}
+
+impl TaskWorker for AgentPerTask {
+    fn work(&mut self, task: &Task) -> Result<String, String> {
+        self.last = task.id.clone();
+        Ok("did it".to_string())
+    }
+    fn spent_since_last_call(&mut self) -> crate::runtime::usage::TokenUsage {
+        crate::runtime::usage::TokenUsage {
+            input_tokens: Self::agent_for(&self.last).1,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        }
+    }
+    fn attribution(&self, task: &Task) -> crate::identity::Attribution {
+        crate::identity::Attribution::new(crate::identity::AgentId::new(
+            Self::agent_for(&task.id).0,
+            "grunt",
+        ))
+    }
+}
+
+/// **HEAVIEST FIRST, A TIE BY NAME, AND NOBODY WHO SPENT NOTHING.** The spend
+/// table answers "which one is burning the budget": an agent that spent
+/// nothing is not an answer, and an order that changed between runs would make
+/// two reports of the same run disagree.
+#[test]
+fn spend_is_ranked_heaviest_first_ties_by_name_and_idle_agents_left_out() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mut ledger = Ledger {
+        version: 1,
+        tasks: vec![
+            passing_task("t-1"),
+            passing_task("t-2"),
+            passing_task("t-3"),
+        ],
+    };
+
+    let outcome = run(
+        &mut ledger,
+        &mut AgentPerTask::default(),
+        dir.path(),
+        &mut Budget::default(),
+        &never_cancelled(),
+    );
+
+    let label = |name: &str| crate::identity::AgentId::new(name, "grunt").label();
+    assert_eq!(outcome.completed.len(), 3, "{:?}", outcome.stop);
+    assert_eq!(
+        outcome.spend_by_agent,
+        vec![(label("alpha"), 1_000), (label("beta"), 1_000)]
+    );
+}

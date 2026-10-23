@@ -745,3 +745,237 @@ fn a_single_lane_never_creates_a_worktree() {
         "a lane was opened for a run that asked for one"
     );
 }
+
+/// A pool that says up front it cannot supply workers — and records it if it
+/// is asked for one anyway.
+struct DecliningLanes {
+    seen: std::sync::Arc<std::sync::Mutex<Vec<std::path::PathBuf>>>,
+}
+
+impl LaneWorkers for DecliningLanes {
+    fn spawn_for(&self, workspace: &Path) -> Option<Box<dyn TaskWorker + Send>> {
+        self.seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(workspace.to_path_buf());
+        None
+    }
+
+    fn available(&self) -> bool {
+        false
+    }
+}
+
+/// **A POOL THAT CANNOT SERVE LEAVES THE RUN AS IT WAS.** Two lanes asked
+/// for, two tasks ready, a repository — and a pool that says no. The run
+/// works both tasks sequentially, and no lane is ever opened for a batch that
+/// would never run.
+#[test]
+fn a_pool_that_cannot_supply_workers_leaves_the_run_sequential() {
+    let _env = crate::brief::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Some((_guard, root)) = a_repo() else {
+        return;
+    };
+    std::env::set_var(crate::parallel::LANES_ENV, "2");
+
+    let mut ledger = Ledger {
+        version: 1,
+        tasks: vec![passing_task("t-1"), passing_task("t-2")],
+    };
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let lanes = DecliningLanes {
+        seen: std::sync::Arc::clone(&seen),
+    };
+    let mut worker = LyingWorker { calls: 0 };
+
+    let outcome = run_watched(
+        &mut ledger,
+        &mut worker,
+        &root,
+        &mut Budget::default(),
+        &never_cancelled(),
+        &mut NoOwner,
+        &mut NoJournal,
+        &mut Unwatched,
+        &mut NoReplan,
+        &mut AllGoalsReached,
+        &lanes,
+    );
+
+    std::env::remove_var(crate::parallel::LANES_ENV);
+
+    assert_eq!(outcome.stop, StopReason::LedgerEmpty, "{:?}", outcome.stop);
+    assert_eq!(worker.calls, 2, "both tasks were worked here, in turn");
+    assert!(
+        seen.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty(),
+        "a pool that declined was asked for a worker anyway"
+    );
+}
+
+/// A forge that knows the default branch and refuses everything else,
+/// keeping a note of whatever it was asked to do.
+#[derive(Default)]
+struct DeskForge {
+    asked: std::sync::Mutex<Vec<&'static str>>,
+}
+
+impl DeskForge {
+    fn refuse<T>(&self, what: &'static str) -> Result<T, String> {
+        self.asked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(what);
+        Err(format!("{what} is not part of this test"))
+    }
+}
+
+impl crate::tools::pull_request::Forge for DeskForge {
+    fn default_branch(&self, _repo: &Path) -> Result<String, String> {
+        Ok("main".to_string())
+    }
+    fn open_pr(&self, _repo: &Path, _branch: &str) -> Result<Option<String>, String> {
+        self.refuse("open_pr")
+    }
+    fn create(
+        &self,
+        _repo: &Path,
+        _new: &crate::tools::pull_request::NewPr,
+    ) -> Result<String, String> {
+        self.refuse("create")
+    }
+    fn pr_status(
+        &self,
+        _repo: &Path,
+        _branch: &str,
+    ) -> Result<Option<crate::tools::pull_request::PrStatus>, String> {
+        self.refuse("pr_status")
+    }
+    fn merge(
+        &self,
+        _repo: &Path,
+        _number: u64,
+        _method: crate::tools::pull_request::MergeMethod,
+        _head: &str,
+    ) -> Result<String, String> {
+        self.refuse("merge")
+    }
+    fn review(
+        &self,
+        _repo: &Path,
+        _pr: &str,
+    ) -> Result<crate::tools::pull_request::Review, String> {
+        self.refuse("review")
+    }
+}
+
+/// Lanes asked to be opened as pull requests on [`DeskForge`].
+struct ReviewedLanes {
+    forge: DeskForge,
+}
+
+impl LaneWorkers for ReviewedLanes {
+    fn spawn_for(&self, workspace: &Path) -> Option<Box<dyn TaskWorker + Send>> {
+        Some(Box::new(LaneScribe {
+            workspace: workspace.to_path_buf(),
+        }))
+    }
+
+    fn forge(&self) -> Option<&dyn crate::tools::pull_request::Forge> {
+        Some(&self.forge)
+    }
+
+    fn open_for_review(&self) -> bool {
+        true
+    }
+}
+
+/// **A BRANCH AHEAD OF ITS REMOTE IS MERGED HERE, NOT OPENED FOR REVIEW.**
+/// Pull requests were asked for and the branch is on origin — but HEAD has a
+/// commit origin lacks, which every pull request would carry. So the batch is
+/// merged here: both tasks land and are proved, and the forge is never asked
+/// to open anything.
+#[test]
+fn lanes_asked_for_review_on_a_branch_ahead_of_origin_are_merged_here() {
+    let _env = crate::brief::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Some((_guard, root)) = a_repo() else {
+        return;
+    };
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(args)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    };
+    // On origin as it was, then one commit ahead of it.
+    let branch = git(&["rev-parse", "--abbrev-ref", "HEAD"]).expect("branch");
+    git(&[
+        "remote",
+        "add",
+        "origin",
+        "https://example.invalid/repo.git",
+    ])
+    .expect("remote");
+    git(&[
+        "update-ref",
+        &format!("refs/remotes/origin/{branch}"),
+        "HEAD",
+    ])
+    .expect("origin ref");
+    std::fs::write(root.join("ahead.txt"), "not pushed\n").expect("write");
+    git(&["add", "-A"]).expect("add");
+    git(&["commit", "-m", "ahead of origin"]).expect("commit");
+    std::env::set_var(crate::parallel::LANES_ENV, "2");
+
+    let mut ledger = Ledger {
+        version: 1,
+        tasks: vec![passing_task("t-1"), passing_task("t-2")],
+    };
+    let lanes = ReviewedLanes {
+        forge: DeskForge::default(),
+    };
+
+    let outcome = run_watched(
+        &mut ledger,
+        &mut NeverWorker,
+        &root,
+        &mut Budget::default(),
+        &never_cancelled(),
+        &mut NoOwner,
+        &mut NoJournal,
+        &mut Unwatched,
+        &mut NoReplan,
+        &mut AllGoalsReached,
+        &lanes,
+    );
+
+    std::env::remove_var(crate::parallel::LANES_ENV);
+
+    assert_eq!(outcome.stop, StopReason::LedgerEmpty, "{:?}", outcome.stop);
+    assert!(
+        root.join("t-1.txt").exists(),
+        "lane one was not merged here"
+    );
+    assert!(
+        root.join("t-2.txt").exists(),
+        "lane two was not merged here"
+    );
+    assert!(
+        lanes
+            .forge
+            .asked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty(),
+        "the forge was asked to open a pull request for unpushed work"
+    );
+}
