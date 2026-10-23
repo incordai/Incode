@@ -31,7 +31,7 @@ they disagree with this table, this table is right.
 | — | Session id | incode's own (the ACP `sessionId`, or a v4 UUID), given to every backend, the toolbox and the model. | `AgentBackend::set_memory_session` |
 | — | Transcript | `.incode/transcripts/<session>.jsonl` in the engine's shape, when an engine is present or the session is an ACP one; newest 200 kept. | `src/hooks/memory.rs` |
 | — | `/run` workers | Each worker (sequential, and each lane) is a memory session of its own. | `cli::run_memory` |
-| — | Recording a session twice | claude: its settings and hooks are off. codex: `--disable hooks` (`b39a99e`). **agy** has no switch to skip its settings, so if its hooks file is installed the engine may still hear an agy session twice. | `src/agent/codex.rs` |
+| — | Recording a session twice | claude: its settings and hooks are off. codex: `--disable hooks` (`b39a99e`). **agy** has no switch to skip its settings, so if its hooks file is installed the engine may still hear an agy session twice. | `src/agent/codex/argv.rs` |
 | — | Operator hooks | The operator's `hooks` (alias `desktop_hooks`) run around every Toolbox tool, before the engine. | `hooks::HookRunner` |
 
 ### Phase 8 (2026-09-26) — CLI parity and the OS sandbox
@@ -44,7 +44,7 @@ they disagree with this table, this table is right.
 | OS sandbox for shell commands | **DONE (Windows + Linux live; macOS validated on a Mac)** — `src/sandbox`. `admin.json` `sandbox: off\|workspace-write\|read-only` (env `INCODE_SANDBOX`), tied to the permission mode by default. Linux: Landlock (`--sandbox-exec` helper). macOS: `sandbox-exec` Seatbelt profile. Windows: a write-restricted token for **read-only** (measured: writes denied inside and outside the workspace, reads and `NUL` work); **workspace-write left OFF** on Windows with the reason stated — see `docs/ARCHITECTURE.md`. Network not restricted on any OS; reported, not pretended. |
 | Operator hooks on every tool | **DONE** — `hooks::HookRunner` now runs the operator's `admin.json` `desktop_hooks` (alias `hooks`) pre- and post-tool for EVERY Toolbox tool, in `Toolbox::run_call` (exit 2 denies; stdin piped with the event JSON, bounded 10 s). The desktop's own executor still runs them for the desktop tools, so they are not doubled. |
 | `/run` workers as memory sessions | **DONE** — `cli::run_memory::Remembered` makes each ledger worker (sequential and each lane) a memory session of its own: `session-start`, a `capture` per task, `session-end`, under its own id, with its agents' calls filed under it. A carry-on answer is recorded, not followed (the task's check decides). |
-| codex hooks off | **DONE** — `codex exec`/`exec resume` now carry `--disable hooks` (`src/agent/codex.rs`), so codex does not fire its own `~/.codex/hooks.json` and record a session incode already records. Proven live on codex 0.145.0 and 0.153.4 (probe hooks file, trust bypassed): hooks on recorded `session-start`/`user-prompt`, `--disable hooks` recorded nothing. |
+| codex hooks off | **DONE** — `codex exec`/`exec resume` now carry `--disable hooks` (`src/agent/codex/argv.rs`), so codex does not fire its own `~/.codex/hooks.json` and record a session incode already records. Proven live on codex 0.145.0 and 0.153.4 (probe hooks file, trust bypassed): hooks on recorded `session-start`/`user-prompt`, `--disable hooks` recorded nothing. |
 | `--thinking-display` fallback | **DONE** — the claude backend drops `--thinking-display summarized` and retries the turn once if the CLI rejects it with "unknown option" naming the flag, and remembers that for the session (`agent::claude_code`). Tested with a fake CLI that rejects the flag. |
 | `run_on_compact` | Allowlisted honestly in `wiring.rs` `DELIBERATELY_UNWIRED` with the reason: incode never compacts (the model CLI compacts inside its own process); the claude stream's `compact_boundary` frame is where it would wire once measured. |
 
@@ -123,8 +123,8 @@ inherits whichever route that session uses.
 the CLI route, whether each feature works depends on the child CLI. Three facts
 about how incord-code starts the child limit that:
 
-- **Nobody can type into the child.** Claude is started with `-p` (`src/agent/claude_code.rs:931`) and `stdin(Stdio::null())` (`:1060`). Codex also gets `stdin(Stdio::null())` (`src/agent/codex.rs:270`).
-- **Codex never asks for approval** when resuming, because it is started with `--dangerously-bypass-approvals-and-sandbox` (`src/agent/codex.rs:234`).
+- **Nobody can type into the child.** Claude is started with `-p` (`src/agent/claude_code.rs:931`) and `stdin(Stdio::null())` (`:1060`). Codex also gets `stdin(Stdio::null())` (`src/agent/codex/argv.rs`, `command`).
+- **Codex never asks for approval** when resuming, because it is started with `--dangerously-bypass-approvals-and-sandbox` (`src/agent/codex/argv.rs`, `command`).
 - **Nothing in incord-code cuts a 600 s hook short on this route.**
   - The Claude/Codex stream readers have no turn timeout. The only `recv_timeout` in `claude_code.rs` is test code (`:1872`).
   - Antigravity gets `--print-timeout 30m` (`src/agent/agy.rs:36`, `:241`).

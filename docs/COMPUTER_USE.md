@@ -93,7 +93,7 @@ screenshot-reason-click loop.
 
 ## 2. Where it plugs in
 
-The seam already exists and is already used. `src/agent/codex.rs:207` injects MCP server
+The seam already exists and is already used. `src/agent/codex/argv.rs` (`command`) injects MCP server
 configuration into the delegated agent's process:
 
 ```rust
@@ -124,7 +124,7 @@ spawn-flag call site:
 
 | Backend | MCP registration in the harness | Spawn flags it does pass |
 |---|---|---|
-| `src/agent/codex.rs` | **Yes** — `:207` and `:218` inject `mcp_servers.memory.…` | |
+| `src/agent/codex/argv.rs` | **Yes** — both spawn paths of `command` inject `mcp_servers.memory.…` | |
 | `src/agent/claude_code.rs` | **NONE** | `:894-935` — `--output-format`, `--verbose`, `--model`, `--include-partial-messages`, `--add-dir`, `--permission-mode`, `--append-system-prompt`, `--disallowedTools`, `--fallback-model`, `--resume`. No `--mcp-config`, no `--strict-mcp-config`. |
 | `src/agent/agy.rs` | **NONE** | `:232-254` — `--print`, `--output-format`, `--print-timeout`, `--model`, `--mode`, `--add-dir`, `--conversation`. |
 
@@ -151,7 +151,7 @@ until the adapters are measured. Section 12 orders it that way.
 
 ### Approval mode is NOT copied from memory
 
-`codex.rs:207` sets `default_tools_approval_mode="auto"` for the memory server. That is
+`codex/argv.rs` (`command`) sets `default_tools_approval_mode="auto"` for the memory server. That is
 correct for memory — reads and writes to a local store are recoverable. It is **wrong**
 for desktop control and must not be copy-pasted. See section 7.
 
@@ -514,7 +514,7 @@ that does. Computer use therefore has exactly two real gates:
    dead-man's switch (7b) live here, in `src/desktop/`, because here they cannot be
    configured away.
 2. **The agent's MCP approval mode**, set when the harness registers the server
-   (section 2). This is where `codex.rs:207`'s `default_tools_approval_mode` sits, and it
+   (section 2). This is where `codex/argv.rs`'s `default_tools_approval_mode` sits, and it
    is why that line must NOT be copied verbatim:
 
 ```rust
@@ -658,7 +658,7 @@ before it is pinned.
 **Platform crates go behind `[target.'cfg(windows)'.dependencies]` and friends**, so a
 Linux build never compiles the Windows accessibility stack. This is consistent with the
 crate as it already stands: 9 files already use `cfg(windows)` / `cfg(not(windows))`
-(`src/tools/bash.rs`, `src/verify.rs`, `src/agent/mod.rs`, `src/agent/registry.rs`,
+(`src/tools/bash.rs`, `src/verify.rs`, `src/agent/spawn_budget.rs`, `src/agent/registry.rs`,
 `src/hooks/mod.rs`, `src/runtime/lifecycle.rs`, `src/tools/bash_jobs.rs`,
 `src/tools/tool_status.rs`, `src/cli/render.rs`), so decision 3 is continuing existing
 practice rather than introducing it.
@@ -787,7 +787,7 @@ from one working implementation is honest, one generalised from zero is a guess.
    turns "computer use exists" into "every agent has computer use".
 
    **Done, 2026-09-16, for the two backends that have a per-spawn flag.** The seam is
-   `AgentBackend::mcp_config()` (`src/agent/mod.rs`), defaulting to `None`:
+   `AgentBackend::mcp_config()` (`src/agent/backend.rs`), defaulting to `None`:
 
    | backend | spelling | measured from |
    | --- | --- | --- |

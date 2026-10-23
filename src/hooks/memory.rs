@@ -64,7 +64,7 @@ pub(crate) const TRANSCRIPTS: &str = ".incode/transcripts";
 
 /// Where an oversized block is written whole, under the workspace. Also where
 /// `crate::agent::budget_for_spawn` writes a task too long for a command
-/// line (src/agent/mod.rs `spill`), so `prune` keeps both bounded.
+/// line (src/agent/spawn_budget.rs `spill`), so `prune` keeps both bounded.
 pub(crate) const CONTEXT: &str = ".incode/context";
 
 /// How many files each of those two directories keeps. The newest survive.
