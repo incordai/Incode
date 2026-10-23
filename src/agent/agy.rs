@@ -419,7 +419,68 @@ impl AgentBackend for AgyBackend {
         on_event: &mut dyn FnMut(&AgentEvent),
     ) -> Result<TurnOutcome, AgentError> {
         let sent = self.full_prompt(prompt)?;
-        let mut command = self.command(&sent);
+        let Running {
+            mut child,
+            tree,
+            stdout,
+            stderr,
+        } = self.spawn(&sent)?;
+        let mut turn = TurnSoFar::default();
+
+        for line in BufReader::new(stdout).lines() {
+            if self.cancel.as_ref().is_some_and(|t| t.is_cancelled()) {
+                tree.kill(&mut child);
+                return Err(AgentError::new("the turn was cancelled"));
+            }
+            let Ok(line) = line else { break };
+            // A line this module does not understand is SKIPPED, never fatal:
+            // the CLI is free to add events, and a turn that died because of an
+            // unrecognised one would be a self-inflicted outage on upgrade.
+            let Ok(wire) = serde_json::from_str::<Wire>(&line) else {
+                continue;
+            };
+            self.read(wire, &mut turn, on_event);
+        }
+        turn.reply.finish(on_event);
+
+        on_event(&AgentEvent::Usage {
+            input_tokens: turn.usage.input_tokens,
+            output_tokens: turn.usage.output_tokens,
+            cache_creation_tokens: turn.usage.cache_creation_input_tokens,
+            cache_read_tokens: turn.usage.cache_read_input_tokens,
+        });
+
+        let status = child
+            .wait()
+            .map_err(|e| AgentError::new(format!("the agent did not exit cleanly: {e}")))?;
+
+        turn.outcome.ok_or_else(|| no_result_line(status, stderr))
+    }
+}
+
+/// A started agy, with what `run_turn` reads from it.
+struct Running {
+    child: std::process::Child,
+    tree: crate::agent::process_tree::Tree,
+    stdout: std::process::ChildStdout,
+    stderr: crate::agent::stderr_tail::StderrTail,
+}
+
+/// What a turn has gathered from the stream so far.
+#[derive(Default)]
+struct TurnSoFar {
+    outcome: Option<TurnOutcome>,
+    usage: crate::runtime::usage::TokenUsage,
+    reply: StepText,
+}
+
+impl AgyBackend {
+    /// The CLI started on `prompt` with its output piped, everything it starts
+    /// taken in, and its stderr drained from the start.
+    ///
+    /// Called by `run_turn`, once per turn.
+    fn spawn(&self, prompt: &str) -> Result<Running, AgentError> {
+        let mut command = self.command(prompt);
         crate::agent::process_tree::prepare(&mut command);
         let mut child = command
             .stdout(Stdio::piped())
@@ -434,102 +495,103 @@ impl AgentBackend for AgyBackend {
             .ok_or_else(|| AgentError::new("the agent produced no output stream"))?;
 
         let stderr = crate::agent::stderr_tail::StderrTail::capture(child.stderr.take());
-
-        let mut outcome: Option<TurnOutcome> = None;
-        let mut usage = crate::runtime::usage::TokenUsage::default();
-        let mut reply = StepText::default();
-
-        for line in BufReader::new(stdout).lines() {
-            if let Some(token) = &self.cancel {
-                if token.is_cancelled() {
-                    tree.kill(&mut child);
-                    return Err(AgentError::new("the turn was cancelled"));
-                }
-            }
-            let Ok(line) = line else { break };
-            // A line this module does not understand is SKIPPED, never fatal:
-            // the CLI is free to add events, and a turn that died because of an
-            // unrecognised one would be a self-inflicted outage on upgrade.
-            let Ok(wire) = serde_json::from_str::<Wire>(&line) else {
-                continue;
-            };
-            match wire {
-                Wire::Init(init) => {
-                    self.conversation_id = Some(init.conversation_id.clone());
-                    on_event(&AgentEvent::SessionStarted {
-                        session_id: init.conversation_id,
-                        model: self.model.clone().unwrap_or_default(),
-                    });
-                    // Reported rather than acted on: the harness cannot remove
-                    // a tool from this agent, so the honest thing is to record
-                    // that the sub-agent tools were on offer.
-                    if init.init.tools.iter().any(|t| t.contains("subagent")) {
-                        crate::trace!(
-                            "guards",
-                            "agy offers sub-agent tools and cannot be told not to: {}",
-                            init.init
-                                .tools
-                                .iter()
-                                .filter(|t| t.contains("subagent"))
-                                .cloned()
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        );
-                    }
-                }
-                Wire::StepUpdate { step_update } => {
-                    reply.feed(&step_update, on_event);
-                    if let Some(u) = step_update.usage {
-                        usage = to_usage(&u);
-                    }
-                }
-                Wire::Result { result } => {
-                    if let Some(u) = &result.usage {
-                        usage = to_usage(u);
-                    }
-                    let is_error = !result.status.eq_ignore_ascii_case("SUCCESS");
-                    self.conversation_id = Some(result.conversation_id.clone());
-                    outcome = Some(TurnOutcome {
-                        session_id: result.conversation_id.clone(),
-                        stop_reason: result.status.clone(),
-                        is_error,
-                        // This CLI reports no per-model billing record, so the
-                        // model that was ASKED for is the only answer available
-                        // — and it is labelled as such by being the requested
-                        // one, never presented as a billing fact.
-                        detail: result.error.clone().filter(|e| !e.trim().is_empty()),
-                        served_by: self.model.clone().into_iter().collect(),
-                    });
-                }
-                Wire::Other => {}
-            }
-        }
-        reply.finish(on_event);
-
-        on_event(&AgentEvent::Usage {
-            input_tokens: usage.input_tokens,
-            output_tokens: usage.output_tokens,
-            cache_creation_tokens: usage.cache_creation_input_tokens,
-            cache_read_tokens: usage.cache_read_input_tokens,
-        });
-
-        let status = child
-            .wait()
-            .map_err(|e| AgentError::new(format!("the agent did not exit cleanly: {e}")))?;
-
-        outcome.ok_or_else(|| {
-            let stderr_output = stderr.finish();
-            let detail = if stderr_output.is_empty() {
-                String::new()
-            } else {
-                format!(": {stderr_output}")
-            };
-            AgentError::new(format!(
-                "the agent produced no result line (exit {}){detail}",
-                status.code().unwrap_or(-1)
-            ))
+        Ok(Running {
+            child,
+            tree,
+            stdout,
+            stderr,
         })
     }
+
+    /// One understood line of the stream, folded into `turn`.
+    ///
+    /// Called by `run_turn` for every line that parses.
+    fn read(&mut self, wire: Wire, turn: &mut TurnSoFar, on_event: &mut dyn FnMut(&AgentEvent)) {
+        match wire {
+            Wire::Init(init) => self.started(init, on_event),
+            Wire::StepUpdate { step_update } => {
+                turn.reply.feed(&step_update, on_event);
+                if let Some(u) = step_update.usage {
+                    turn.usage = to_usage(&u);
+                }
+            }
+            Wire::Result { result } => {
+                if let Some(u) = &result.usage {
+                    turn.usage = to_usage(u);
+                }
+                turn.outcome = Some(self.finished(&result));
+            }
+            Wire::Other => {}
+        }
+    }
+
+    /// The conversation this turn runs in, kept for the next one and
+    /// announced.
+    ///
+    /// Called by [`Self::read`] on the `init` line.
+    fn started(&mut self, init: InitEvent, on_event: &mut dyn FnMut(&AgentEvent)) {
+        self.conversation_id = Some(init.conversation_id.clone());
+        on_event(&AgentEvent::SessionStarted {
+            session_id: init.conversation_id,
+            model: self.model.clone().unwrap_or_default(),
+        });
+        // Reported rather than acted on: the harness cannot remove
+        // a tool from this agent, so the honest thing is to record
+        // that the sub-agent tools were on offer.
+        if init.init.tools.iter().any(|t| t.contains("subagent")) {
+            crate::trace!(
+                "guards",
+                "agy offers sub-agent tools and cannot be told not to: {}",
+                init.init
+                    .tools
+                    .iter()
+                    .filter(|t| t.contains("subagent"))
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
+
+    /// The turn's outcome, from the `result` line; the conversation it names
+    /// is kept for the next turn.
+    ///
+    /// Called by [`Self::read`] on the `result` line.
+    fn finished(&mut self, result: &ResultEvent) -> TurnOutcome {
+        let is_error = !result.status.eq_ignore_ascii_case("SUCCESS");
+        self.conversation_id = Some(result.conversation_id.clone());
+        TurnOutcome {
+            session_id: result.conversation_id.clone(),
+            stop_reason: result.status.clone(),
+            is_error,
+            // This CLI reports no per-model billing record, so the
+            // model that was ASKED for is the only answer available
+            // — and it is labelled as such by being the requested
+            // one, never presented as a billing fact.
+            detail: result.error.clone().filter(|e| !e.trim().is_empty()),
+            served_by: self.model.clone().into_iter().collect(),
+        }
+    }
+}
+
+/// The error for a turn that ended without a result line: its exit code,
+/// and what it wrote on stderr when it wrote anything.
+///
+/// Called by `run_turn` once the agent has exited.
+fn no_result_line(
+    status: std::process::ExitStatus,
+    stderr: crate::agent::stderr_tail::StderrTail,
+) -> AgentError {
+    let stderr_output = stderr.finish();
+    let detail = if stderr_output.is_empty() {
+        String::new()
+    } else {
+        format!(": {stderr_output}")
+    };
+    AgentError::new(format!(
+        "the agent produced no result line (exit {}){detail}",
+        status.code().unwrap_or(-1)
+    ))
 }
 
 /// The assistant's words for a turn, rebuilt from step updates: each
@@ -583,345 +645,5 @@ fn to_usage(wire: &WireUsage) -> crate::runtime::usage::TokenUsage {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Issue #3: launched from inside another agent session, a child that
-    /// inherits its variables reports that session as its own.
-    #[test]
-    fn the_cli_never_joins_the_session_that_launched_incode() {
-        let cmd = AgyBackend::new(PathBuf::from(".")).command("p");
-        assert!(
-            cmd.get_envs()
-                .any(|(k, v)| k == "CLAUDECODE" && v.is_none()),
-            "CLAUDECODE is inherited, so the child joins the parent's session"
-        );
-    }
-
-    /// **AN AGENT THAT CANNOT TAKE A PICTURE HEADLESS SAYS SO, BY NAME.**
-    /// `agy --help` (1.2.11) has no image flag, and its stream-json input
-    /// shape is not measured, so pictures are refused rather than dropped.
-    #[test]
-    fn pictures_are_refused_by_name() {
-        let picture = crate::toolbox::Image::from_base64(
-            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC",
-        )
-        .expect("a 1x1 png");
-        let mut backend = AgyBackend::new(PathBuf::from("."));
-        let why = backend
-            .attach_images(vec![picture])
-            .expect_err("agy takes no pictures");
-        assert!(why.starts_with("agy cannot take pictures"), "{why}");
-    }
-
-    fn parse(line: &str) -> Wire {
-        serde_json::from_str(line).expect("a wire line")
-    }
-
-    /// **A REPLY STREAMED IN FRAGMENTS IS SAID ONCE, WHOLE.** Lines shaped as
-    /// a real long reply (measured on agy, Insi's lesson writer): fragments of
-    /// one step, `ACTIVE` then `DONE`, each a few words and split inside words
-    /// and inside a JSON key. The step is one `Text`, the fragments joined byte
-    /// for byte, so its JSON parses; every fragment is still shown live as a
-    /// `TextDelta`; a later step is a `Text` of its own.
-    #[test]
-    fn a_reply_streamed_in_fragments_is_said_once_whole() {
-        let line = |index: u64, state: &str, kind: &str, text: &str| {
-            format!(
-                r#"{{"event":"step_update","step_update":{{"step_index":{index},"state":"{state}","step_type":"{kind}","text_delta":{}}}}}"#,
-                serde_json::to_string(text).expect("json")
-            )
-        };
-        let stream = [
-            line(0, "DONE", "user_input", ""),
-            line(2, "ACTIVE", "agent_response", "{\n  \"issue"),
-            line(2, "ACTIVE", "agent_response", "\": \"The agent added anim"),
-            line(
-                2,
-                "ACTIVE",
-                "agent_response",
-                "ation math\",\n  \"use\": \"Wire it",
-            ),
-            line(2, "DONE", "agent_response", " end to end.\"\n}"),
-            line(4, "DONE", "agent_response", "Done."),
-        ];
-        let mut said = Vec::new();
-        let mut deltas = 0;
-        {
-            let mut on_event = |event: &AgentEvent| match event {
-                AgentEvent::Text(text) => said.push(text.clone()),
-                AgentEvent::TextDelta(_) => deltas += 1,
-                _ => {}
-            };
-            let mut reply = StepText::default();
-            for wire in stream.iter().map(|l| parse(l)) {
-                if let Wire::StepUpdate { step_update } = wire {
-                    reply.feed(&step_update, &mut on_event);
-                }
-            }
-            reply.finish(&mut on_event);
-        }
-        assert_eq!(said.len(), 2, "{said:?}");
-        let answer: serde_json::Value =
-            serde_json::from_str(&said[0]).expect("the whole reply parses");
-        assert_eq!(answer["issue"], "The agent added animation math");
-        assert_eq!(answer["use"], "Wire it end to end.");
-        assert_eq!(said[1], "Done.");
-        assert_eq!(deltas, 5, "every fragment shown as it came");
-    }
-
-    /// The envelope is keyed on `event`, not `type`.
-    ///
-    /// Copied from a real v1.1.23 run. If this ever parses as `Other` the CLI
-    /// changed its envelope, and every other test here would still pass while
-    /// the backend silently read nothing.
-    #[test]
-    fn the_init_line_from_a_real_run_is_understood() {
-        let wire = parse(
-            r#"{"event":"init","conversation_id":"1b343cea","init":{"cwd":"C:\\tmp","tools":["view_file","invoke_subagent"],"permission_mode":"request-review"}}"#,
-        );
-        match wire {
-            Wire::Init(init) => {
-                assert_eq!(init.conversation_id, "1b343cea");
-                assert!(init.init.tools.iter().any(|t| t == "invoke_subagent"));
-            }
-            other => panic!("the init envelope was not recognised: {other:?}"),
-        }
-    }
-
-    /// Assistant text arrives on a step update, not a content block.
-    #[test]
-    fn the_agents_reply_is_read_from_a_step_update() {
-        let wire = parse(
-            r#"{"event":"step_update","step_update":{"step_index":1,"state":"DONE","step_type":"agent_response","text_delta":"PONG\n","usage":{"input_tokens":16317,"output_tokens":183,"cache_read_tokens":0}}}"#,
-        );
-        match wire {
-            Wire::StepUpdate { step_update } => {
-                assert_eq!(step_update.step_type, "agent_response");
-                assert_eq!(step_update.text_delta, "PONG\n");
-                let u = to_usage(&step_update.usage.expect("usage"));
-                assert_eq!(u.input_tokens, 16317);
-                assert_eq!(u.output_tokens, 183);
-            }
-            other => panic!("a step update was not recognised: {other:?}"),
-        }
-    }
-
-    /// **Every `status: ERROR` moves the work, whatever the wording.**
-    ///
-    /// The three the owner named — a lapsed subscription, a model the account
-    /// cannot reach, a model that is busy — arrive with three unrelated
-    /// messages and one identical status. Only the middle one is in the phrase
-    /// list; the first and third are asserted below to MISS it, which is what
-    /// makes reading the status the fix rather than a longer list.
-    #[test]
-    fn any_error_status_moves_the_work_however_it_is_worded() {
-        let backend = AgyBackend::new(std::path::PathBuf::from("."));
-        let failed = |detail: &str| crate::agent::TurnOutcome {
-            session_id: "c1".to_string(),
-            stop_reason: "ERROR".to_string(),
-            is_error: true,
-            detail: Some(detail.to_string()),
-            served_by: Vec::new(),
-        };
-
-        // VERBATIM from the live run.
-        let busy =
-            "Our servers are experiencing high traffic right now, please try again in a minute.";
-        let lapsed = "Your plan does not include this model.";
-        let missing = "model sonnet is not recognized";
-
-        assert!(
-            !crate::agent::moves_the_work(busy) && !crate::agent::moves_the_work(lapsed),
-            "the control holds only while the phrase list really does miss these"
-        );
-        for detail in [busy, lapsed, missing] {
-            assert!(
-                backend.agent_failed(&failed(detail)),
-                "an ERROR status is the agent's own failure: {detail}"
-            );
-        }
-
-        // A turn the agent COMPLETED is never moved, however it reads — that is
-        // the harness's own check to judge, and walking a wrong task through
-        // every subscription spends them all to learn one thing.
-        let finished = crate::agent::TurnOutcome {
-            session_id: "c1".to_string(),
-            stop_reason: "SUCCESS".to_string(),
-            is_error: false,
-            detail: None,
-            served_by: Vec::new(),
-        };
-        assert!(!backend.agent_failed(&finished));
-    }
-
-    /// A non-SUCCESS status is a failed turn, and says which status it was.
-    #[test]
-    fn a_failed_turn_is_reported_with_the_status_that_caused_it() {
-        let ok =
-            parse(r#"{"event":"result","result":{"conversation_id":"c1","status":"SUCCESS"}}"#);
-        let bad =
-            parse(r#"{"event":"result","result":{"conversation_id":"c1","status":"CANCELLED"}}"#);
-        let status_of = |w: Wire| match w {
-            Wire::Result { result } => (
-                result.status.clone(),
-                !result.status.eq_ignore_ascii_case("SUCCESS"),
-            ),
-            other => panic!("a result line was not recognised: {other:?}"),
-        };
-        assert_eq!(status_of(ok), ("SUCCESS".to_string(), false));
-        assert_eq!(status_of(bad), ("CANCELLED".to_string(), true));
-    }
-
-    /// An unknown event is ignored, never fatal — the CLI may add events.
-    #[test]
-    fn an_unrecognised_event_does_not_break_the_turn() {
-        assert!(matches!(
-            parse(r#"{"event":"something_new_in_a_later_release"}"#),
-            Wire::Other
-        ));
-    }
-
-    /// **This backend enforces nothing, and says so.**
-    ///
-    /// The measured reason: no per-tool deny flag exists on this CLI, and its
-    /// own init line advertises four sub-agent tools. Claiming enforcement it
-    /// does not have would be the exact failure the guard docs warn about.
-    #[test]
-    fn this_backend_claims_no_enforcement_it_does_not_have() {
-        let backend = AgyBackend::new(PathBuf::from("."));
-        assert_eq!(
-            backend.enforces(),
-            crate::guards::Enforcement::NOTHING,
-            "claiming enforcement this CLI has no flag for would report a guard \
-             that is not there"
-        );
-    }
-
-    /// The harness's policy becomes a REPORTED GAP here, not a silent drop.
-    #[test]
-    fn the_whole_policy_is_reported_as_unenforced_on_this_agent() {
-        let policy = crate::guards::restrictions(&crate::guards::Guards::default());
-        let gaps = policy.unenforced_by(&AgyBackend::new(PathBuf::from(".")).enforces());
-        assert_eq!(gaps.len(), 2, "both halves must be reported: {gaps:?}");
-        assert!(gaps.iter().any(|g| g.contains("protected path")));
-        assert!(gaps.iter().any(|g| g.contains("sub-agents")));
-    }
-
-    /// Only the first SERVEABLE candidate survives: no fallback chain here.
-    #[test]
-    fn a_fallback_chain_collapses_to_the_first_choice() {
-        let mut backend = AgyBackend::new(PathBuf::from("."));
-        backend.set_models(&[
-            "gemini-3.8-flash-high".to_string(),
-            "gemini-3.1-pro-high".to_string(),
-        ]);
-        assert_eq!(backend.model(), Some("gemini-3.8-flash-high"));
-    }
-
-    /// **Another vendor's model id is NOT forwarded.**
-    ///
-    /// The live failure: the role ladder holds `sonnet`/`opus`, this agent
-    /// answered `status: ERROR, error: model sonnet is not recognized`, and
-    /// every task in the run died before any work began. Leaving the agent's
-    /// own default standing loses routing; forwarding the name loses the run.
-    #[test]
-    fn a_foreign_model_id_is_dropped_rather_than_sent() {
-        let mut backend = AgyBackend::new(PathBuf::from("."));
-        backend.set_models(&["sonnet".to_string(), "opus".to_string()]);
-        assert_eq!(
-            backend.model(),
-            None,
-            "a model this agent cannot serve must not reach its command line"
-        );
-
-        // Control: a ladder it CAN serve is still honoured, so the assertion
-        // above is not passing because nothing is ever accepted.
-        backend.set_models(&["sonnet".to_string(), "gemini-3.1-pro-high".to_string()]);
-        assert_eq!(backend.model(), Some("gemini-3.1-pro-high"));
-    }
-
-    /// **This agent routes on its OWN ladder, not the operator's foreign one.**
-    ///
-    /// Before this, a ladder of `sonnet, opus` left the agent un-routed and
-    /// every role ran on its default — the expensive one. The ids below come
-    /// from `agy models`, and a cheap role must not draw the strong model.
-    #[test]
-    fn each_role_draws_a_model_this_agent_actually_has() {
-        let backend = AgyBackend::new(PathBuf::from("."));
-        for role in crate::roles::KNOWN_ROLES {
-            for id in backend.ladder_for(role) {
-                assert!(
-                    backend.serves(&id),
-                    "role {role} was given `{id}`, which this agent cannot serve"
-                );
-            }
-        }
-        assert_ne!(
-            backend.ladder_for("explore"),
-            backend.ladder_for("implement"),
-            "reading and writing must not draw the same tier, or routing saves nothing"
-        );
-        assert!(
-            backend.ladder_for("no-such-role").is_empty(),
-            "an unknown role gets the agent's default, never a guess"
-        );
-    }
-
-    /// A failed turn carries the agent's OWN reason, not a shrug.
-    #[test]
-    fn a_failure_reports_the_reason_the_agent_gave() {
-        let line = r#"{"event":"result","result":{"conversation_id":"c1","status":"ERROR","error":"model sonnet is not recognized"}}"#;
-        match parse(line) {
-            Wire::Result { result } => {
-                let detail = result.error.clone().filter(|e| !e.trim().is_empty());
-                assert_eq!(
-                    detail.as_deref(),
-                    Some("model sonnet is not recognized"),
-                    "the reason the agent gave was discarded"
-                );
-            }
-            other => panic!("not a result: {other:?}"),
-        }
-    }
-
-    /// **The harness's context reaches this agent even with no flag for it.**
-    ///
-    /// The pinned failure on the other backend was a run where every task was
-    /// worked by an agent told none of the guards, findings or roles. This CLI
-    /// has no `--append-system-prompt`, so the same loss would happen silently
-    /// unless the context is carried in the prompt instead.
-    #[test]
-    fn the_harness_context_is_carried_in_the_prompt_when_no_flag_exists() {
-        let bare = AgyBackend::new(PathBuf::from("."));
-        assert_eq!(
-            bare.full_prompt("do the work").expect("sent"),
-            "do the work"
-        );
-
-        let briefed = AgyBackend::new(PathBuf::from("."))
-            .with_system_context(vec!["the guards in force: tests/ is protected".to_string()]);
-        let sent = briefed.full_prompt("do the work").expect("sent");
-        assert!(
-            sent.contains("tests/ is protected"),
-            "the harness context never reached the agent: {sent}"
-        );
-        assert!(
-            sent.ends_with("do the work"),
-            "the task must come last, after its context: {sent}"
-        );
-    }
-
-    /// An unknown permission mode leaves the agent's default standing.
-    #[test]
-    fn an_unknown_permission_mode_is_not_passed_through() {
-        let mut backend = AgyBackend::new(PathBuf::from("."));
-        backend.set_permission_mode("danger-full-access");
-        assert!(
-            backend.mode.is_none(),
-            "passing a word this CLI rejects would fail the turn over a setting"
-        );
-        backend.set_permission_mode("plan");
-        assert_eq!(backend.mode.as_deref(), Some("plan"));
-    }
-}
+#[path = "agy_tests.rs"]
+mod tests;

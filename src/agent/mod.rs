@@ -366,7 +366,8 @@ pub const MIN_CONTEXT_BUDGET: usize = 4_000;
 /// the turn is not started on a prompt the agent would never see whole.
 ///
 /// Called by the CLI backends that pass the prompt on a command line:
-/// `agy.rs` and `codex.rs` (`full_prompt`) and `claude_code.rs` (`run_once`).
+/// `agy.rs` and `codex.rs` (`full_prompt`) and `claude_code/turn.rs`
+/// (`run_once`).
 pub fn budget_for_spawn(
     prompt: &str,
     system_context: &[String],
