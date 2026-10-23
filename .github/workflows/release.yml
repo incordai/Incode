@@ -15,8 +15,35 @@ permissions:
   contents: read
 
 jobs:
+  # The tag must name the version the programs report. `incode update` compares
+  # its own version against the latest release's tag, so a binary that reports
+  # less than its tag (an rc built as plain `0.1.0`) would never see the final
+  # release as newer, and one that reports more would skip a real update.
+  version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag matches both crates' versions
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          want="${TAG#v}"
+          cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "incord-code" or .name == "incord-sandbox") | "\(.name) \(.version)"' \
+            > versions.txt
+          cat versions.txt
+          test "$(wc -l < versions.txt)" -eq 2
+          while read -r name version; do
+            if [ "$version" != "$want" ]; then
+              echo "::error::tag $TAG names version $want, but $name is $version in its Cargo.toml"
+              exit 1
+            fi
+          done < versions.txt
+
   build:
     name: build (${{ matrix.target }})
+    needs: version
     strategy:
       fail-fast: false
       matrix:
