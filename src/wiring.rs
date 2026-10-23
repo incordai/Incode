@@ -24,7 +24,9 @@
 //! A `pub` item is UNWIRED when its name appears nowhere in the crate's
 //! production code except the file that defines it. Tests are excluded on
 //! purpose — a capability whose only callers are its own tests is the precise
-//! shape this is looking for.
+//! shape this is looking for. "Tests" means each item a `#[cfg(test)]` guards
+//! (and nothing past it), plus every file a parent declares as
+//! `#[cfg(test)] mod name;` and the module tree beneath it.
 //!
 //! # Comments are stripped first, and that is the load-bearing part
 //!
@@ -43,7 +45,7 @@
 //! with the reason written down.
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// How many unwired capabilities this crate is known to carry.
 ///
@@ -54,7 +56,13 @@ use std::path::{Path, PathBuf};
 /// actually happened, six times.
 ///
 /// Lower it whenever the number falls. The test fails and tells you to.
-pub const MAX_UNWIRED: usize = 38;
+///
+/// It rose once, from 38 to 41, and not because anything new was added: the
+/// scanner had been blind. It stopped reading a file at a `#[cfg(test)]` that
+/// guarded one `use`, and it read split-out test files as production callers.
+/// Seeing again found `toolbox::Toolbox::set_permission_rules` and
+/// `ClaudeCodeBackend::{with_session, with_models}`, each reached only by tests.
+pub const MAX_UNWIRED: usize = 41;
 
 /// A `pub` item nothing outside its own file calls.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -144,21 +152,35 @@ pub const DELIBERATELY_UNWIRED: &[(&str, &str)] = &[
 /// be worse than no check.
 pub fn unwired_in(src: &Path) -> std::io::Result<Vec<Unwired>> {
     let files = rust_files(src)?;
+    let known: BTreeSet<PathBuf> = files.iter().cloned().collect();
 
-    // Every file's production half, keyed by path. Read once: this is quadratic
+    let mut sources: Vec<Source> = Vec::new();
+    for path in files {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let scan = scan_source(&text);
+        sources.push(Source { path, text, scan });
+    }
+
+    // A file a parent declares as `#[cfg(test)] mod name;` carries no marker
+    // of its own — every line of it is a test, and nothing inside says so.
+    let tests = test_module_files(&sources, &known);
+
+    // Every file's production code, keyed by path. Read once: this is quadratic
     // in the number of items otherwise, and the tree has thousands.
     let mut production: Vec<(PathBuf, String)> = Vec::new();
     let mut declared: Vec<(String, PathBuf, usize)> = Vec::new();
 
-    for path in &files {
-        let Ok(text) = std::fs::read_to_string(path) else {
+    for source in &sources {
+        if tests.contains(&source.path) {
             continue;
-        };
-        let code = strip_comments(production_half(&text));
-        for (name, line) in declarations(&code) {
-            declared.push((name, path.clone(), line));
         }
-        production.push((path.clone(), code));
+        let code = strip_comments(&without_regions(&source.text, &source.scan.test_regions));
+        for (name, line) in declarations(&code) {
+            declared.push((name, source.path.clone(), line));
+        }
+        production.push((source.path.clone(), code));
     }
 
     let allowed: BTreeSet<&str> = DELIBERATELY_UNWIRED.iter().map(|(name, _)| *name).collect();
@@ -220,38 +242,548 @@ fn rust_files(src: &Path) -> std::io::Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-/// A file up to its first `#[cfg(test)]`.
+/// One source file, read once, with what [`scan_source`] found in it.
+struct Source {
+    path: PathBuf,
+    text: String,
+    scan: Scan,
+}
+
+/// What one pass over a file finds.
+#[derive(Debug, Default)]
+struct Scan {
+    /// Byte ranges compiled only for tests, each from its `#[cfg(test)]` to
+    /// the end of the ONE item that attribute guards.
+    test_regions: Vec<(usize, usize)>,
+    /// Every out-of-line `mod name;` the file declares.
+    modules: Vec<ModDecl>,
+}
+
+/// A `mod name;` declaration: a module whose body is another file.
+#[derive(Debug)]
+struct ModDecl {
+    name: String,
+    /// The `#[path = "…"]` it carries, if any.
+    path: Option<String>,
+    /// Whether it exists only under `cfg(test)`.
+    test: bool,
+}
+
+/// Find what in `text` is test-only, and which module files it declares.
 ///
-/// Everything after it is the tests, and a capability whose only callers are
-/// its own tests is exactly what this looks for — so counting them would make
-/// the check report nothing, forever.
-fn production_half(text: &str) -> &str {
-    // THE MARKER MUST BE AT COLUMN ZERO.
-    //
-    // `text.find("#[cfg(test)]")` was wrong in a way that made the check lie
-    // rather than merely miss things. `cli/agent_turn.rs` has a single
-    // test-only method at line 177 — `#[cfg(test)] pub fn with_backend` —
-    // and matching that threw away the remaining 1,028 lines of the file.
-    // Every call site in it became invisible, so `checkpoint::begin`,
-    // `has_undo`, `pending_label` and `undo_last` were all reported as having
-    // no caller while `/undo` was working perfectly.
-    //
-    // That is a FALSE POSITIVE, which this module's own header calls the
-    // thing that kills a check: four items were on the list for months
-    // pointing at code that was fine, and the next reader has to verify by
-    // hand before believing any entry.
-    //
-    // A test MODULE is written at column zero (`#[cfg(test)]\nmod tests`);
-    // an attribute on an item inside an `impl` is indented. Anchoring to the
-    // line start keeps the trailing test block out and keeps the file in.
-    let mut offset = 0usize;
-    for line in text.split_inclusive('\n') {
-        if line.starts_with("#[cfg(test)]") {
-            return &text[..offset];
+/// # A `#[cfg(test)]` guards ONE item, and that is all it may hide
+///
+/// This used to cut each file at its first column-zero `#[cfg(test)]`, on the
+/// theory that such a marker opens the trailing `mod tests`. It does not have
+/// to. `agent/claude_code.rs` opened with `#[cfg(test)]\nuse std::io::BufRead;`
+/// on line 8, so ~1,600 production lines went unread: none of its callers were
+/// seen and none of its functions were declared — `run_once`, `spawn`,
+/// `finish`, `consume` and `debug_stream_path` were invisible to the check in
+/// both directions. Before that it was any `#[cfg(test)]` at all, and one
+/// test-only method in `cli/agent_turn.rs` hid 1,028 lines and put four
+/// working `/undo` capabilities on the dead list for months.
+///
+/// Both were the same mistake: treating an attribute as a line in a file
+/// rather than as what it is, a guard on the next item. So the item is found —
+/// brace-matched, with strings, chars and comments skipped so a `'{'` cannot
+/// unbalance it — and exactly that span is test code. An inline `mod tests
+/// { … }` is one item like any other; the code after its closing brace is
+/// production again.
+///
+/// `#[cfg(all(test, …))]` is test-only too. `#[cfg(any(test, …))]` and
+/// `#[cfg(not(test))]` are not: both compile into a shipped binary.
+fn scan_source(text: &str) -> Scan {
+    let b = text.as_bytes();
+    let mut scan = Scan::default();
+    let mut i = 0;
+    while i < b.len() {
+        if let Some(next) = skip_literal(b, i) {
+            i = next;
+            continue;
         }
-        offset += line.len();
+        if b[i] == b'#' && b.get(i + 1) == Some(&b'[') {
+            let attrs = attributes(text, i);
+            let item = skip_visibility(b, skip_trivia(b, attrs.end));
+            if let Some((name, end)) = module_declaration(text, item) {
+                if attrs.test {
+                    scan.test_regions.push((i, end));
+                }
+                scan.modules.push(ModDecl {
+                    name,
+                    path: attrs.path,
+                    test: attrs.test,
+                });
+                i = end;
+                continue;
+            }
+            if attrs.test {
+                let end = item_end(text, item);
+                scan.test_regions.push((i, end));
+                i = end;
+                continue;
+            }
+            i = attrs.end;
+            continue;
+        }
+        if is_ident(b[i]) && (i == 0 || !is_ident(b[i - 1])) {
+            let end = ident_end(b, i);
+            if &text[i..end] == "mod" {
+                if let Some((name, after)) = module_declaration(text, i) {
+                    scan.modules.push(ModDecl {
+                        name,
+                        path: None,
+                        test: false,
+                    });
+                    i = after;
+                    continue;
+                }
+            }
+            i = end;
+            continue;
+        }
+        i += 1;
     }
-    text
+    scan
+}
+
+/// A run of `#[…]` attributes starting at `i`.
+struct Attributes {
+    /// Just past the last `]`.
+    end: usize,
+    /// Whether any of them confines the item to test builds.
+    test: bool,
+    /// The value of a `#[path = "…"]` among them.
+    path: Option<String>,
+}
+
+fn attributes(text: &str, mut i: usize) -> Attributes {
+    let b = text.as_bytes();
+    let mut out = Attributes {
+        end: i,
+        test: false,
+        path: None,
+    };
+    while b.get(i) == Some(&b'#') && b.get(i + 1) == Some(&b'[') {
+        let close = closing(b, i + 1);
+        let body = text[i + 2..close].trim();
+        if let Some(cfg) = parenthesised(body, "cfg") {
+            out.test |= cfg_is_test_only(cfg);
+        } else if let Some(value) = body
+            .strip_prefix("path")
+            .map(str::trim_start)
+            .and_then(|rest| rest.strip_prefix('='))
+        {
+            out.path = Some(value.trim().trim_matches('"').to_string());
+        }
+        out.end = (close + 1).min(b.len());
+        i = skip_trivia(b, out.end);
+    }
+    out
+}
+
+/// `inner` when `text` is `head(inner)`.
+fn parenthesised<'a>(text: &'a str, head: &str) -> Option<&'a str> {
+    text.strip_prefix(head)?
+        .trim_start()
+        .strip_prefix('(')?
+        .strip_suffix(')')
+}
+
+/// Whether a `cfg(…)` predicate can only be true in a test build.
+fn cfg_is_test_only(predicate: &str) -> bool {
+    let predicate = predicate.trim();
+    if predicate == "test" {
+        return true;
+    }
+    let Some(inner) = parenthesised(predicate, "all") else {
+        return false;
+    };
+    let mut depth = 0usize;
+    let mut from = 0;
+    let mut args = Vec::new();
+    for (at, c) in inner.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                args.push(&inner[from..at]);
+                from = at + 1;
+            }
+            _ => {}
+        }
+    }
+    args.push(&inner[from..]);
+    args.into_iter().any(cfg_is_test_only)
+}
+
+/// `mod name;` at `i`, as the name and the offset just past the `;`.
+///
+/// `mod name { … }` is not a declaration of another file, so it is `None`.
+fn module_declaration(text: &str, i: usize) -> Option<(String, usize)> {
+    let b = text.as_bytes();
+    if !b.get(i..)?.starts_with(b"mod") || !b.get(i + 3)?.is_ascii_whitespace() {
+        return None;
+    }
+    let start = skip_trivia(b, i + 3);
+    if !b.get(start).is_some_and(|&c| is_ident(c)) {
+        return None;
+    }
+    let end = ident_end(b, start);
+    let semi = skip_trivia(b, end);
+    (b.get(semi) == Some(&b';')).then(|| (text[start..end].to_string(), semi + 1))
+}
+
+/// The first offset past `pub`, `pub(crate)`, `pub(in path)` at `i`.
+fn skip_visibility(b: &[u8], i: usize) -> usize {
+    let is_pub = b.get(i..).is_some_and(|rest| rest.starts_with(b"pub"))
+        && !b.get(i + 3).is_some_and(|&c| is_ident(c));
+    if !is_pub {
+        return i;
+    }
+    let after = skip_trivia(b, i + 3);
+    if b.get(after) == Some(&b'(') {
+        return skip_trivia(b, (closing(b, after) + 1).min(b.len()));
+    }
+    after
+}
+
+/// Where the item starting at `start` ends.
+///
+/// At a `;`, or at the `}` that closes its body (a `fn`, an `impl`, a `mod
+/// tests { … }`, a macro invocation). Something that is not a keyword-led item
+/// — a struct field, an enum variant, a match arm — also ends at a `,`; a
+/// keyword-led one does not, because `fn f<A, B>()` has commas outside any
+/// bracket this counts. Either way it ends BEFORE a closer it did not open,
+/// because that belongs to the enclosing scope.
+fn item_end(text: &str, start: usize) -> usize {
+    const KEYWORDS: [&str; 16] = [
+        "fn",
+        "impl",
+        "mod",
+        "trait",
+        "struct",
+        "enum",
+        "union",
+        "macro_rules",
+        "use",
+        "const",
+        "static",
+        "type",
+        "extern",
+        "let",
+        "async",
+        "unsafe",
+    ];
+    let b = text.as_bytes();
+    let first = &text[start..ident_end(b, start)];
+    let keyword_led = KEYWORDS.contains(&first);
+
+    let mut depth = 0usize;
+    let mut j = start;
+    while j < b.len() {
+        if let Some(next) = skip_literal(b, j) {
+            j = next;
+            continue;
+        }
+        match b[j] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                if depth == 0 {
+                    return j;
+                }
+                depth -= 1;
+                if depth == 0 && b[j] == b'}' {
+                    return j + 1;
+                }
+            }
+            b';' if depth == 0 => return j + 1,
+            b',' if depth == 0 && !keyword_led => return j + 1,
+            _ => {}
+        }
+        j += 1;
+    }
+    b.len()
+}
+
+/// The offset of the bracket that closes the one at `open`, or the end.
+fn closing(b: &[u8], open: usize) -> usize {
+    let mut depth = 0usize;
+    let mut j = open;
+    while j < b.len() {
+        if let Some(next) = skip_literal(b, j) {
+            j = next;
+            continue;
+        }
+        match b[j] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return j;
+                }
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    b.len()
+}
+
+/// Past any whitespace and comments at `i`.
+fn skip_trivia(b: &[u8], mut i: usize) -> usize {
+    while i < b.len() {
+        if b[i].is_ascii_whitespace() {
+            i += 1;
+        } else if b[i] == b'/' && matches!(b.get(i + 1), Some(b'/' | b'*')) {
+            i = skip_literal(b, i).unwrap_or(i + 1);
+        } else {
+            break;
+        }
+    }
+    i
+}
+
+/// Past the comment, string or char literal at `i`, if one starts there.
+///
+/// Brace matching is only as good as this: one `'{'` or `"}"` miscounted and a
+/// test module's end lands in the wrong place.
+fn skip_literal(b: &[u8], i: usize) -> Option<usize> {
+    match b[i] {
+        // Stops AT the newline, so line counting never loses one.
+        b'/' if b.get(i + 1) == Some(&b'/') => Some(find_byte(b, i, b'\n')),
+        b'/' if b.get(i + 1) == Some(&b'*') => Some(block_comment_end(b, i)),
+        b'"' => Some(string_end(b, i + 1)),
+        b'\'' => char_literal_end(b, i),
+        b'b' | b'c' | b'r' if i == 0 || !is_ident(b[i - 1]) => prefixed_literal_end(b, i),
+        _ => None,
+    }
+}
+
+fn find_byte(b: &[u8], from: usize, byte: u8) -> usize {
+    b.get(from..)
+        .and_then(|rest| rest.iter().position(|&c| c == byte))
+        .map_or(b.len(), |at| from + at)
+}
+
+/// Past a `/* … */`, which nests.
+fn block_comment_end(b: &[u8], i: usize) -> usize {
+    let mut depth = 0usize;
+    let mut j = i;
+    while j + 1 < b.len() {
+        if b[j] == b'/' && b[j + 1] == b'*' {
+            depth += 1;
+            j += 2;
+        } else if b[j] == b'*' && b[j + 1] == b'/' {
+            depth -= 1;
+            j += 2;
+            if depth == 0 {
+                return j;
+            }
+        } else {
+            j += 1;
+        }
+    }
+    b.len()
+}
+
+/// Past the closing `"` of a string whose body starts at `j`.
+fn string_end(b: &[u8], mut j: usize) -> usize {
+    while j < b.len() {
+        match b[j] {
+            b'\\' => j += 2,
+            b'"' => return j + 1,
+            _ => j += 1,
+        }
+    }
+    b.len()
+}
+
+/// Past a char literal at `i`, or `None` when the `'` opens a lifetime.
+fn char_literal_end(b: &[u8], i: usize) -> Option<usize> {
+    if b.get(i + 1) == Some(&b'\\') {
+        // An escape: `'\n'`, `'\''`, `'\u{1F600}'`. The escaped character is
+        // skipped first, so `'\''` does not end at its own second quote.
+        return Some((find_byte(b, i + 3, b'\'') + 1).min(b.len()));
+    }
+    let width = match *b.get(i + 1)? {
+        0x00..=0x7F => 1,
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        _ => 4,
+    };
+    // One character and a quote is a char; anything else is `'a` or `'static`.
+    (b.get(i + 1 + width) == Some(&b'\'')).then_some(i + 2 + width)
+}
+
+/// Past `r"…"`, `r#"…"#`, `b"…"`, `br"…"`, `b'x'` or `c"…"` at `i`.
+fn prefixed_literal_end(b: &[u8], i: usize) -> Option<usize> {
+    let mut j = i;
+    if b[j] != b'r' {
+        j += 1;
+        match b.get(j) {
+            Some(b'"') => return Some(string_end(b, j + 1)),
+            Some(b'\'') => return char_literal_end(b, j),
+            Some(b'r') => {}
+            _ => return None,
+        }
+    }
+    j += 1;
+    let hashes_from = j;
+    while b.get(j) == Some(&b'#') {
+        j += 1;
+    }
+    // `r#name` is a raw identifier, not a string.
+    if b.get(j) != Some(&b'"') {
+        return None;
+    }
+    let hashes = j - hashes_from;
+    j += 1;
+    while j < b.len() {
+        if b[j] == b'"'
+            && b.get(j + 1..j + 1 + hashes)
+                .is_some_and(|tail| tail.iter().all(|&c| c == b'#'))
+        {
+            return Some(j + 1 + hashes);
+        }
+        j += 1;
+    }
+    Some(b.len())
+}
+
+fn is_ident(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'_'
+}
+
+fn ident_end(b: &[u8], mut i: usize) -> usize {
+    while i < b.len() && is_ident(b[i]) {
+        i += 1;
+    }
+    i
+}
+
+/// `text` with every test region reduced to its newlines.
+///
+/// Newlines are kept so every declaration still reports the line it is on.
+fn without_regions(text: &str, regions: &[(usize, usize)]) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut from = 0;
+    for &(start, end) in regions {
+        out.push_str(&text[from..start]);
+        out.extend(text[start..end].chars().filter(|&c| c == '\n'));
+        from = end;
+    }
+    out.push_str(&text[from..]);
+    out
+}
+
+/// Every file compiled only for tests because a parent declares it
+/// `#[cfg(test)] mod name;` — and every module file declared beneath one.
+///
+/// # Why a file has to be told it is a test
+///
+/// A test module split into its own file (`runner/lane_tests.rs`,
+/// `agent/claude_code/wire_tests.rs`, `permissions/rules/tests/*.rs`) has no
+/// marker inside it: the `#[cfg(test)]` is on the declaration in the parent.
+/// Read on its own, every call in it looked like a production caller and
+/// every helper in it like a capability — the exact disguise the check exists
+/// to see through. So the declaration is resolved to its file the way rustc
+/// resolves it, and the file and its subtree are tests.
+fn test_module_files(sources: &[Source], known: &BTreeSet<PathBuf>) -> BTreeSet<PathBuf> {
+    // A file loaded through `#[path]` keeps its children beside it, as a
+    // `mod.rs` does.
+    let path_loaded: BTreeSet<PathBuf> = sources
+        .iter()
+        .flat_map(|source| {
+            source
+                .scan
+                .modules
+                .iter()
+                .filter(|m| m.path.is_some())
+                .filter_map(|m| module_file(&source.path, false, m, known))
+        })
+        .map(|(file, _)| file)
+        .collect();
+
+    let mut pending: Vec<(PathBuf, bool)> = sources
+        .iter()
+        .flat_map(|source| {
+            let owns_dir = owns_directory(&source.path) || path_loaded.contains(&source.path);
+            source
+                .scan
+                .modules
+                .iter()
+                .filter(|m| m.test)
+                .filter_map(move |m| module_file(&source.path, owns_dir, m, known))
+        })
+        .collect();
+
+    let mut tests = BTreeSet::new();
+    while let Some((file, owns_dir)) = pending.pop() {
+        if !tests.insert(file.clone()) {
+            continue;
+        }
+        // Everything a test file declares is test code too, `cfg` or not.
+        if let Some(source) = sources.iter().find(|s| s.path == file) {
+            pending.extend(
+                source
+                    .scan
+                    .modules
+                    .iter()
+                    .filter_map(|m| module_file(&file, owns_dir, m, known)),
+            );
+        }
+    }
+    tests
+}
+
+/// Whether `file`'s child modules live beside it rather than in a folder
+/// named after it.
+fn owns_directory(file: &Path) -> bool {
+    file.file_name()
+        .is_some_and(|name| name == "mod.rs" || name == "lib.rs" || name == "main.rs")
+}
+
+/// The file `decl` names when `declaring` declares it, and whether that file
+/// in turn owns its directory. `None` when it is not in the tree.
+fn module_file(
+    declaring: &Path,
+    owns_dir: bool,
+    decl: &ModDecl,
+    known: &BTreeSet<PathBuf>,
+) -> Option<(PathBuf, bool)> {
+    let parent = declaring.parent()?;
+    // `#[path]` outside an inline module is relative to the declaring
+    // file's own directory, whatever kind of file that is.
+    if let Some(path) = &decl.path {
+        let file = normalize(&parent.join(path));
+        return known.contains(&file).then_some((file, true));
+    }
+    let dir = if owns_dir {
+        parent.to_path_buf()
+    } else {
+        parent.join(declaring.file_stem()?)
+    };
+    let flat = dir.join(format!("{}.rs", decl.name));
+    if known.contains(&flat) {
+        return Some((flat, false));
+    }
+    let nested = dir.join(&decl.name).join("mod.rs");
+    known.contains(&nested).then_some((nested, true))
+}
+
+/// `path` with `.` and `..` folded away, without touching the filesystem.
+fn normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// The same code with comment lines BLANKED, not removed.
@@ -292,37 +824,17 @@ fn declarations(code: &str) -> Vec<(String, usize)> {
     const KINDS: [&str; 1] = ["fn "];
     let mut out = Vec::new();
 
-    // Whether the previous non-blank line marked the next item as test-only.
-    // Now that `production_half` keeps the rest of a file after an item-level
-    // `#[cfg(test)]`, those items are in range — and a helper that exists only
-    // for tests is not a production capability, so declaring it would put a
+    // Test-only items are not here to be declared: `scan_source` already
+    // blanked every one, so a helper that exists for tests never becomes a
     // permanent false entry on the list.
-    let mut test_only = false;
-
     for (index, line) in code.lines().enumerate() {
         let trimmed = line.trim_start();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if trimmed.starts_with("#[cfg(test)]") {
-            test_only = true;
-            continue;
-        }
 
         // `pub(crate)` and `pub(super)` count: a crate-visible item nothing in
         // the crate calls is the same defect, and more clearly so.
         let Some(rest) = trimmed.strip_prefix("pub") else {
-            // Attributes and doc lines sit between the marker and the item, so
-            // the flag survives them and clears on the first real statement.
-            if !trimmed.starts_with('#') {
-                test_only = false;
-            }
             continue;
         };
-        if test_only {
-            test_only = false;
-            continue;
-        }
         let rest = match rest.find(char::is_whitespace) {
             Some(cut) => rest[cut..].trim_start(),
             None => continue,
@@ -370,210 +882,5 @@ fn display_path(root: &Path, path: &Path) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_pub_item_nobody_calls_is_found() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        std::fs::write(
-            dir.path().join("lonely.rs"),
-            "pub fn never_called_anywhere() {}\npub fn called_from_elsewhere() {}\n",
-        )
-        .expect("write");
-        std::fs::write(
-            dir.path().join("caller.rs"),
-            "fn go() { called_from_elsewhere(); }\n",
-        )
-        .expect("write");
-
-        let found = unwired_in(dir.path()).expect("scan");
-        let names: Vec<&str> = found.iter().map(|u| u.name.as_str()).collect();
-
-        assert!(names.contains(&"never_called_anywhere"), "got: {names:?}");
-        assert!(
-            !names.contains(&"called_from_elsewhere"),
-            "a called item was reported: {names:?}"
-        );
-    }
-
-    /// **THE TESTS ARE NOT CALLERS.**
-    ///
-    /// The whole point. Every one of the six capabilities this was written
-    /// for had passing tests — that is what made them look used, and what
-    /// kept them unwired for months.
-    #[test]
-    fn a_test_calling_it_does_not_count_as_wired() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        std::fs::write(dir.path().join("thing.rs"), "pub fn heartbeat() {}\n").expect("write");
-        std::fs::write(
-            dir.path().join("other.rs"),
-            "fn unrelated() {}\n#[cfg(test)]\nmod tests {\n  #[test]\n  fn t() { heartbeat(); }\n}\n",
-        )
-        .expect("write");
-
-        let names: Vec<String> = unwired_in(dir.path())
-            .expect("scan")
-            .into_iter()
-            .map(|u| u.name)
-            .collect();
-        assert!(
-            names.contains(&"heartbeat".to_string()),
-            "a test was counted as a caller: {names:?}"
-        );
-    }
-
-    /// **A MENTION IN A DOC COMMENT IS NOT A CALL.**
-    ///
-    /// This codebase refers to items by name constantly. Counting those would
-    /// mean the better-documented an unwired item is, the more wired it looks
-    /// — and nothing would ever be reported.
-    #[test]
-    fn being_written_about_is_not_being_called() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        std::fs::write(dir.path().join("a.rs"), "pub fn orphan() {}\n").expect("write");
-        std::fs::write(
-            dir.path().join("b.rs"),
-            "/// Calls [`orphan`] one day.\n// orphan();\nfn real() {}\n",
-        )
-        .expect("write");
-
-        let names: Vec<String> = unwired_in(dir.path())
-            .expect("scan")
-            .into_iter()
-            .map(|u| u.name)
-            .collect();
-        assert!(
-            names.contains(&"orphan".to_string()),
-            "prose was counted as a caller: {names:?}"
-        );
-    }
-
-    /// **A MODULE CALLING ITS OWN HELPER IS NOT A FINDING.**
-    ///
-    /// The rule this replaced was "no caller outside the defining file", and
-    /// against the real tree it reported 225 items — almost all of them
-    /// ordinary helpers used exactly where they were meant to be. A number
-    /// that size is a check nobody reads.
-    ///
-    /// What the six real capabilities had in common is narrower: the
-    /// declaration was the ONLY appearance of the name in production code
-    /// anywhere.
-    #[test]
-    fn a_helper_its_own_module_calls_is_wired() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        std::fs::write(
-            dir.path().join("only.rs"),
-            "pub fn helper() {}\nfn local() { helper(); }\n",
-        )
-        .expect("write");
-
-        let names: Vec<String> = unwired_in(dir.path())
-            .expect("scan")
-            .into_iter()
-            .map(|u| u.name)
-            .collect();
-        assert!(
-            !names.contains(&"helper".to_string()),
-            "an ordinary helper was reported as dead: {names:?}"
-        );
-    }
-
-    /// **ONE TEST-ONLY METHOD MUST NOT BLIND THE REST OF ITS FILE.**
-    ///
-    /// The check used to cut a file at the first `#[cfg(test)]` anywhere in
-    /// it. `cli/agent_turn.rs` has one test-only method 177 lines in, so the
-    /// remaining 1,028 lines — every caller in the file — were invisible, and
-    /// four working capabilities sat on the dead list for months:
-    /// `checkpoint::begin`, `has_undo`, `pending_label` and `undo_last`, all
-    /// of them reached every time anyone typed `/undo`.
-    ///
-    /// A false positive is worse than a miss here. It makes the list
-    /// something a reader has to verify by hand before believing any of it,
-    /// which is how a check stops being used.
-    #[test]
-    fn a_test_only_method_does_not_hide_the_callers_below_it() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        std::fs::write(
-            dir.path().join("lib.rs"),
-            "pub fn used_later() {}\n\
-             impl Thing {\n\
-             \x20   #[cfg(test)]\n\
-             \x20   pub fn only_for_tests(&self) {}\n\
-             }\n\
-             fn real_caller() { used_later(); }\n\
-             #[cfg(test)]\n\
-             mod tests {\n\
-             \x20   fn t() { whatever(); }\n\
-             }\n",
-        )
-        .expect("write");
-
-        let names: Vec<String> = unwired_in(dir.path())
-            .expect("scan")
-            .into_iter()
-            .map(|u| u.name)
-            .collect();
-
-        assert!(
-            !names.contains(&"used_later".to_string()),
-            "a caller below an item-level `#[cfg(test)]` was not seen: {names:?}"
-        );
-        // AND THE TEST-ONLY ITEM IS NOT A CAPABILITY. Keeping the rest of the
-        // file in scope must not put every test helper onto the list instead.
-        assert!(
-            !names.contains(&"only_for_tests".to_string()),
-            "a test-only method was reported as a dead capability: {names:?}"
-        );
-    }
-
-    /// Every allowlist entry carries a reason somebody had to write.
-    #[test]
-    fn nothing_is_excused_without_saying_why() {
-        for (name, why) in DELIBERATELY_UNWIRED {
-            assert!(!name.trim().is_empty(), "an entry with no name");
-            assert!(
-                why.trim().len() > 30,
-                "`{name}` is excused without a real reason: {why:?}"
-            );
-        }
-    }
-
-    /// **THIS CRATE, CHECKED AGAINST ITSELF — AS A RATCHET.**
-    ///
-    /// The first run over the real tree found 68. Demanding zero would mean
-    /// wiring or excusing all of them in one unfocused change, and a gate that
-    /// cannot be made green on the day it lands is a gate somebody deletes.
-    ///
-    /// So the number may go DOWN and never up. That is the property worth
-    /// enforcing: it does not clear the debt, it stops a seventh
-    /// `PermissionPolicy` being added without anyone noticing — which is the
-    /// failure that actually happened, six times.
-    ///
-    /// When it goes down, lower [`MAX_UNWIRED`]. The test says so on failure.
-    #[test]
-    fn no_new_dead_capability_is_added() {
-        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let found = unwired_in(&src).expect("the source tree must be readable");
-
-        assert!(
-            found.len() <= MAX_UNWIRED,
-            "{} capabilities have no caller, up from {MAX_UNWIRED}. Wire the new one \
-             up, or add it to DELIBERATELY_UNWIRED with the reason:\n{}",
-            found.len(),
-            found
-                .iter()
-                .map(Unwired::line_report)
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
-
-        assert!(
-            found.len() >= MAX_UNWIRED,
-            "good news: {} capabilities are unwired, down from {MAX_UNWIRED}. \
-             Lower MAX_UNWIRED to {} so the ratchet holds the ground you just took.",
-            found.len(),
-            found.len()
-        );
-    }
-}
+#[path = "wiring_tests.rs"]
+mod tests;
