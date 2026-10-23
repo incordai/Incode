@@ -12,10 +12,11 @@
 //! either reading finds counts.
 //!
 //! Used by the two such readers:
-//! - `permissions::rules` — `split_into`, `substitution`, `words` and
-//!   `unquote`: which commands a line holds, for the allow / ask / deny rules.
-//! - `guards::shell` — `lex` and `Lexer::substitution`: which files a command
-//!   writes, for the protected-path guard.
+//! - `permissions::rules` — `split::Splitter::dollar`,
+//!   `split::ParenScan::unquoted`, `peel::words` and `peel::unquote`: which
+//!   commands a line holds, for the allow / ask / deny rules.
+//! - `guards::shell` — `lex::Lexer::dollar` and `lex::Lexer::skipped`: which
+//!   files a command writes, for the protected-path guard.
 //!
 //! `$"…"` (a double-quoted string translated by the locale) needs nothing
 //! here: past its `$` it is read exactly as `"…"`.
@@ -55,63 +56,89 @@ fn decode(body: &[char]) -> String {
             break;
         };
         i += 1;
-        let code = match escaped {
-            'a' => 0x07,
-            'b' => 0x08,
-            'e' | 'E' => 0x1b,
-            'f' => 0x0c,
-            'n' => u32::from('\n'),
-            'r' => u32::from('\r'),
-            't' => u32::from('\t'),
-            'v' => 0x0b,
-            '\\' | '\'' | '"' | '?' => u32::from(escaped),
-            // `\nnn`: one to three octal digits, the first already read.
-            '0'..='7' => {
-                let (rest, used) = digits(body, i, 8, 2);
-                i += used;
-                let first = escaped.to_digit(8).unwrap_or(0);
-                (first * 8u32.pow(used as u32) + rest) & 0xff
-            }
-            'x' | 'u' | 'U' => {
-                let most = match escaped {
-                    'x' => 2,
-                    'u' => 4,
-                    _ => 8,
-                };
-                let (value, used) = digits(body, i, 16, most);
-                if used == 0 {
-                    // No digits: bash keeps the escape as written.
-                    out.push('\\');
-                    out.push(escaped);
-                    continue;
-                }
-                i += used;
-                value
-            }
-            // `\cx`: the control character of the next character, whatever
-            // it is (`\c\` is 0x1c).
-            'c' => match body.get(i) {
-                Some(&x) => {
-                    i += 1;
-                    u32::from(x) & 0x1f
-                }
-                None => {
-                    out.push_str("\\c");
-                    continue;
-                }
-            },
-            other => {
+        let (decoded, used) = escape(escaped, body, i);
+        i += used;
+        match decoded {
+            Escape::Kept => {
                 out.push('\\');
-                out.push(other);
-                continue;
+                out.push(escaped);
             }
-        };
-        if code == 0 {
-            break;
+            Escape::Code(0) => break,
+            Escape::Code(code) => {
+                out.push(char::from_u32(code).unwrap_or(char::REPLACEMENT_CHARACTER));
+            }
         }
-        out.push(char::from_u32(code).unwrap_or(char::REPLACEMENT_CHARACTER));
     }
     out
+}
+
+/// What one escape decodes to.
+enum Escape {
+    /// A character code; 0 ends the text.
+    Code(u32),
+    /// Not an escape bash decodes: the backslash and the character stay.
+    Kept,
+}
+
+/// The escape `\<escaped>` whose operand, if it takes one, starts at
+/// `at`: what it decodes to and how many characters of operand it used.
+///
+/// Called by [`decode`] for every backslash with a character after it.
+fn escape(escaped: char, body: &[char], at: usize) -> (Escape, usize) {
+    match escaped {
+        // `\nnn`: one to three octal digits, the first already read.
+        '0'..='7' => {
+            let (rest, used) = digits(body, at, 8, 2);
+            let first = escaped.to_digit(8).unwrap_or(0);
+            (
+                Escape::Code((first * 8u32.pow(used as u32) + rest) & 0xff),
+                used,
+            )
+        }
+        'x' | 'u' | 'U' => hex(escaped, body, at),
+        // `\cx`: the control character of the next character, whatever
+        // it is (`\c\` is 0x1c).
+        'c' => match body.get(at) {
+            Some(&x) => (Escape::Code(u32::from(x) & 0x1f), 1),
+            None => (Escape::Kept, 0),
+        },
+        _ => (named(escaped).map_or(Escape::Kept, Escape::Code), 0),
+    }
+}
+
+/// `\xHH`, `\uHHHH` or `\UHHHHHHHH`: up to that many hex digits. With none,
+/// bash keeps the escape as written.
+///
+/// Called by [`escape`].
+fn hex(escaped: char, body: &[char], at: usize) -> (Escape, usize) {
+    let most = match escaped {
+        'x' => 2,
+        'u' => 4,
+        _ => 8,
+    };
+    match digits(body, at, 16, most) {
+        (_, 0) => (Escape::Kept, 0),
+        (value, used) => (Escape::Code(value), used),
+    }
+}
+
+/// The code of a one-letter escape (`\n`, `\t`, `\\`, …), if it is one.
+///
+/// Called by [`escape`].
+fn named(escaped: char) -> Option<u32> {
+    let code = match escaped {
+        'a' => 0x07,
+        'b' => 0x08,
+        'e' | 'E' => 0x1b,
+        'f' => 0x0c,
+        'n' => u32::from('\n'),
+        'r' => u32::from('\r'),
+        't' => u32::from('\t'),
+        'v' => 0x0b,
+        '\\' | '\'' | '"' | '?' => u32::from(escaped),
+        _ => return None,
+    };
+    Some(code)
 }
 
 /// Up to `most` digits in `radix` from `start`: their value and how many.
