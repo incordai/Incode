@@ -1,6 +1,7 @@
 [package]
 name = "incord-sandbox"
-version = "0.1.0"
+# Released beside incode, under the same tag: kept equal to its version.
+version = "0.1.0-rc.2"
 edition = "2021"
 rust-version = "1.88"
 license = "Apache-2.0"

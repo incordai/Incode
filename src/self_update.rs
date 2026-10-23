@@ -410,6 +410,21 @@ mod tests {
         assert!(Version::parse(env!("CARGO_PKG_VERSION")).is_some());
     }
 
+    /// **sbx SHIPS UNDER incode's VERSION.** One release tag carries both
+    /// programs, and release.yml refuses a tag that either crate's version
+    /// disagrees with; this catches the drift on a pull request instead of at
+    /// release time.
+    #[test]
+    fn sbx_is_versioned_with_incode() {
+        let sandbox = include_str!("../crates/sandbox/Cargo.toml");
+        let version = sandbox
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("version = \""))
+            .and_then(|rest| rest.strip_suffix('"'))
+            .expect("crates/sandbox/Cargo.toml names a version");
+        assert_eq!(version, env!("CARGO_PKG_VERSION"));
+    }
+
     #[test]
     fn asset_names_match_the_release_workflow() {
         assert_eq!(

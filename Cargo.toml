@@ -7,7 +7,9 @@ members = [".", "crates/sandbox"]
 [package]
 name = "incord-code"
 description = "Autonomous coding harness: plans work, delegates it to an installed agent on your own subscription, and proves it was done"
-version = "0.1.0"
+# The release tag without its `v`: release.yml refuses a tag that disagrees,
+# because `incode update` compares this against the latest release's tag.
+version = "0.1.0-rc.2"
 edition = "2021"
 license = "Apache-2.0"
 # The oldest toolchain this actually builds on, MEASURED rather than guessed:
