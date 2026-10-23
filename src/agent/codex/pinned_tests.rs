@@ -469,6 +469,103 @@ fn every_corpus_line_reads_as_it_did_on_both_routes() {
     assert_eq!(OWN.len(), CORPUS.len(), "one reading per line");
 }
 
+/// Whole turns, by name: the [`CORPUS`] lines read in order, the model the
+/// reading was started with, and whether it is bridged.
+const TURNS: [(&str, &[&str], Option<&str>, bool); 7] = [
+    (
+        "own_turn",
+        &[
+            "thread",
+            "turn_started",
+            "not_json",
+            "start_cmd",
+            "done_cmd_ok",
+            "start_mcp_elsewhere",
+            "done_mcp_texts",
+            "done_message",
+            "turn_done_usage",
+        ],
+        Some("gpt-5.5"),
+        false,
+    ),
+    (
+        "bridged_turn",
+        &[
+            "thread",
+            "turn_started",
+            "start_mcp_incode",
+            "done_mcp_incode",
+            "done_mcp_incode_failed",
+            "done_message",
+            "turn_done_partial_usage",
+        ],
+        Some("gpt-5.5"),
+        true,
+    ),
+    (
+        "failed_after_thread",
+        &["thread", "turn_failed_nested"],
+        Some("gpt-5.5"),
+        false,
+    ),
+    (
+        "error_overwrites_success",
+        &["thread", "turn_done_usage", "error_plain"],
+        Some("gpt-5.5"),
+        false,
+    ),
+    (
+        "success_overwrites_error",
+        &["error_no_message", "thread", "turn_done_no_usage"],
+        Some("gpt-5.5"),
+        false,
+    ),
+    (
+        "no_model",
+        &["thread", "done_message", "turn_done_partial_usage"],
+        None,
+        false,
+    ),
+    (
+        "usage_kept_when_a_later_turn_has_none",
+        &["turn_done_usage", "turn_done_no_usage"],
+        None,
+        false,
+    ),
+];
+
+/// What each of [`TURNS`] leaves behind.
+const TURN_READINGS: &[(&str, &str)] = &[
+    (
+        "own_turn",
+        "[session(\"th-1\",\"gpt-5.5\") use(\"item_1\",\"Bash\",\"bash -lc ls\") use(\"item_5\",\"Bash\",\"powershell.exe -Command Get-Location\") result(\"item_5\",false,\"C:\\\\Projects\\\\incord-code\\n\") use(\"item_2\",\"recall\",\"{\\\"q\\\":\\\"x\\\"}\") use(\"item_1\",\"watchman_lookup\",\"{\\\"task\\\":\\\"C:\\\\\\\\Projects\\\\\\\\incord-code\\\"}\") result(\"item_1\",false,\"one\\ntwo\") delta(\"The package name is incord-code.\") text(\"The package name is incord-code.\")] thread=Some(\"th-1\") outcome(\"th-1\",\"SUCCESS\",false,None,[\"gpt-5.5\"]) usage(122070,438,100,112128)",
+    ),
+    (
+        "bridged_turn",
+        "[session(\"th-1\",\"gpt-5.5\") delta(\"The package name is incord-code.\") text(\"The package name is incord-code.\")] thread=Some(\"th-1\") outcome(\"th-1\",\"SUCCESS\",false,None,[\"gpt-5.5\"]) usage(3,2,0,0)",
+    ),
+    (
+        "failed_after_thread",
+        "[session(\"th-1\",\"gpt-5.5\")] thread=Some(\"th-1\") outcome(\"th-1\",\"ERROR\",true,Some(\"The 'bad-model' model is not supported.\"),[\"gpt-5.5\"]) usage(0,0,0,0)",
+    ),
+    (
+        "error_overwrites_success",
+        "[session(\"th-1\",\"gpt-5.5\")] thread=Some(\"th-1\") outcome(\"th-1\",\"ERROR\",true,Some(\"Reconnecting... 1/5\"),[\"gpt-5.5\"]) usage(122070,438,100,112128)",
+    ),
+    (
+        "success_overwrites_error",
+        "[session(\"th-1\",\"gpt-5.5\")] thread=Some(\"th-1\") outcome(\"th-1\",\"SUCCESS\",false,None,[\"gpt-5.5\"]) usage(0,0,0,0)",
+    ),
+    (
+        "no_model",
+        "[session(\"th-1\",\"\") delta(\"The package name is incord-code.\") text(\"The package name is incord-code.\")] thread=Some(\"th-1\") outcome(\"th-1\",\"SUCCESS\",false,None,[]) usage(3,2,0,0)",
+    ),
+    (
+        "usage_kept_when_a_later_turn_has_none",
+        "[] thread=None outcome(\"\",\"SUCCESS\",false,None,[]) usage(122070,438,100,112128)",
+    ),
+];
+
 /// Whole turns: the state a line leaves is what the next one reads.
 #[test]
 fn whole_turns_read_as_they_did() {
@@ -479,103 +576,12 @@ fn whole_turns_read_as_they_did() {
             .map(|(_, l)| *l)
             .expect("a corpus line")
     };
-    let turns: [(&str, &[&str], Option<&str>, bool); 7] = [
-        (
-            "own_turn",
-            &[
-                "thread",
-                "turn_started",
-                "not_json",
-                "start_cmd",
-                "done_cmd_ok",
-                "start_mcp_elsewhere",
-                "done_mcp_texts",
-                "done_message",
-                "turn_done_usage",
-            ],
-            Some("gpt-5.5"),
-            false,
-        ),
-        (
-            "bridged_turn",
-            &[
-                "thread",
-                "turn_started",
-                "start_mcp_incode",
-                "done_mcp_incode",
-                "done_mcp_incode_failed",
-                "done_message",
-                "turn_done_partial_usage",
-            ],
-            Some("gpt-5.5"),
-            true,
-        ),
-        (
-            "failed_after_thread",
-            &["thread", "turn_failed_nested"],
-            Some("gpt-5.5"),
-            false,
-        ),
-        (
-            "error_overwrites_success",
-            &["thread", "turn_done_usage", "error_plain"],
-            Some("gpt-5.5"),
-            false,
-        ),
-        (
-            "success_overwrites_error",
-            &["error_no_message", "thread", "turn_done_no_usage"],
-            Some("gpt-5.5"),
-            false,
-        ),
-        (
-            "no_model",
-            &["thread", "done_message", "turn_done_partial_usage"],
-            None,
-            false,
-        ),
-        (
-            "usage_kept_when_a_later_turn_has_none",
-            &["turn_done_usage", "turn_done_no_usage"],
-            None,
-            false,
-        ),
-    ];
-    let want: &[(&str, &str)] = &[
-        (
-            "own_turn",
-            "[session(\"th-1\",\"gpt-5.5\") use(\"item_1\",\"Bash\",\"bash -lc ls\") use(\"item_5\",\"Bash\",\"powershell.exe -Command Get-Location\") result(\"item_5\",false,\"C:\\\\Projects\\\\incord-code\\n\") use(\"item_2\",\"recall\",\"{\\\"q\\\":\\\"x\\\"}\") use(\"item_1\",\"watchman_lookup\",\"{\\\"task\\\":\\\"C:\\\\\\\\Projects\\\\\\\\incord-code\\\"}\") result(\"item_1\",false,\"one\\ntwo\") delta(\"The package name is incord-code.\") text(\"The package name is incord-code.\")] thread=Some(\"th-1\") outcome(\"th-1\",\"SUCCESS\",false,None,[\"gpt-5.5\"]) usage(122070,438,100,112128)",
-        ),
-        (
-            "bridged_turn",
-            "[session(\"th-1\",\"gpt-5.5\") delta(\"The package name is incord-code.\") text(\"The package name is incord-code.\")] thread=Some(\"th-1\") outcome(\"th-1\",\"SUCCESS\",false,None,[\"gpt-5.5\"]) usage(3,2,0,0)",
-        ),
-        (
-            "failed_after_thread",
-            "[session(\"th-1\",\"gpt-5.5\")] thread=Some(\"th-1\") outcome(\"th-1\",\"ERROR\",true,Some(\"The 'bad-model' model is not supported.\"),[\"gpt-5.5\"]) usage(0,0,0,0)",
-        ),
-        (
-            "error_overwrites_success",
-            "[session(\"th-1\",\"gpt-5.5\")] thread=Some(\"th-1\") outcome(\"th-1\",\"ERROR\",true,Some(\"Reconnecting... 1/5\"),[\"gpt-5.5\"]) usage(122070,438,100,112128)",
-        ),
-        (
-            "success_overwrites_error",
-            "[session(\"th-1\",\"gpt-5.5\")] thread=Some(\"th-1\") outcome(\"th-1\",\"SUCCESS\",false,None,[\"gpt-5.5\"]) usage(0,0,0,0)",
-        ),
-        (
-            "no_model",
-            "[session(\"th-1\",\"\") delta(\"The package name is incord-code.\") text(\"The package name is incord-code.\")] thread=Some(\"th-1\") outcome(\"th-1\",\"SUCCESS\",false,None,[]) usage(3,2,0,0)",
-        ),
-        (
-            "usage_kept_when_a_later_turn_has_none",
-            "[] thread=None outcome(\"\",\"SUCCESS\",false,None,[]) usage(122070,438,100,112128)",
-        ),
-    ];
     let mut wrong = Vec::new();
-    for (name, names, model, bridged) in turns {
+    for (name, names, model, bridged) in TURNS {
         let lines: Vec<&str> = names.iter().map(|n| line(n)).collect();
         let got = read_all(&lines, model, bridged);
-        if want.iter().find(|(n, _)| *n == name).map(|(_, w)| *w) != Some(got.as_str()) {
+        let want = TURN_READINGS.iter().find(|(n, _)| *n == name);
+        if want.map(|(_, w)| *w) != Some(got.as_str()) {
             wrong.push(format!("({name:?}, {got:?}),"));
         }
     }
@@ -641,8 +647,27 @@ fn configured(tools: CodexTools) -> CodexBackend {
     backend
 }
 
+const AUTO: &str = "mcp_servers.memory.default_tools_approval_mode=\"auto\"";
+const TEAM: &str = "mcp_servers.team.command=\"incode\"";
+const DESKTOP: &str = "mcp_servers.desktop.args=[\"--desktop\"]";
+const LEAD: [&str; 4] = ["--skip-git-repo-check", "--json", "--disable", "hooks"];
+const IMAGES: [&str; 4] = ["--image", "one.png", "--image", "two.jpg"];
+const BYPASS: &str = "--dangerously-bypass-approvals-and-sandbox";
+
 #[test]
 fn every_spawn_is_built_as_it_was() {
+    let cases = built_spawns();
+    let mut want = own_route_spawns();
+    want.extend(bridged_route_spawns());
+    assert_eq!(cases.len(), want.len());
+    for ((name, got), (want_name, want)) in cases.iter().zip(&want) {
+        assert_eq!(name, want_name);
+        assert_eq!(got, want, "{name}");
+    }
+}
+
+/// What [`spawn`] reports for each configuration, by name, in order.
+fn built_spawns() -> Vec<(String, String)> {
     let mut cases: Vec<(String, String)> = Vec::new();
     let mut add = |name: &str, backend: &CodexBackend| {
         let cmd = backend.command("the task");
@@ -674,29 +699,29 @@ fn every_spawn_is_built_as_it_was() {
     add("bridged", &bridged);
     bridged.thread_id = Some("t-2".to_string());
     add("bridged_resumed", &bridged);
+    cases
+}
 
-    const AUTO: &str = "mcp_servers.memory.default_tools_approval_mode=\"auto\"";
-    const TEAM: &str = "mcp_servers.team.command=\"incode\"";
-    const DESKTOP: &str = "mcp_servers.desktop.args=[\"--desktop\"]";
-    const LEAD: [&str; 4] = ["--skip-git-repo-check", "--json", "--disable", "hooks"];
-    const IMAGES: [&str; 4] = ["--image", "one.png", "--image", "two.jpg"];
-    const BYPASS: &str = "--dangerously-bypass-approvals-and-sandbox";
-    let opt = bridged_overrides("/opt/incode/bin/incode");
-    let plain = |tail: &[&str]| -> Vec<String> {
-        let mut args = vec!["exec"];
-        args.extend(LEAD);
-        args.extend(["-c", AUTO]);
-        args.extend(tail);
-        args.iter().map(|a| (*a).to_string()).collect()
-    };
+/// A fresh own-route argv with no settings, ending in `tail`.
+fn plain(tail: &[&str]) -> Vec<String> {
+    let mut args = vec!["exec"];
+    args.extend(LEAD);
+    args.extend(["-c", AUTO]);
+    args.extend(tail);
+    args.iter().map(|a| (*a).to_string()).collect()
+}
+
+/// What the original built on codex's own tools, for the configurations of
+/// [`built_spawns`] before the bridged two.
+fn own_route_spawns() -> Vec<(&'static str, String)> {
     let mut want: Vec<(&str, String)> = vec![
         (
             "bare",
-            expect("codex", ".", &plain(&[BYPASS, "-C", ".", "the task"]), &[]),
+            reported("codex", ".", &plain(&[BYPASS, "-C", ".", "the task"]), &[]),
         ),
         (
             "bare_resumed",
-            expect(
+            reported(
                 "codex",
                 ".",
                 &strings(
@@ -712,7 +737,7 @@ fn every_spawn_is_built_as_it_was() {
         ),
         (
             "own",
-            expect(
+            reported(
                 "codex-x",
                 "ws",
                 &strings(
@@ -731,7 +756,7 @@ fn every_spawn_is_built_as_it_was() {
         ),
         (
             "own_resumed",
-            expect(
+            reported(
                 "codex-x",
                 "ws",
                 &strings(
@@ -760,8 +785,15 @@ fn every_spawn_is_built_as_it_was() {
             .copied()
             .chain(["-C", ".", "the task"])
             .collect();
-        want.push((mode, expect("codex", ".", &plain(&tail), &[])));
+        want.push((mode, reported("codex", ".", &plain(&tail), &[])));
     }
+    want
+}
+
+/// What the original built on the bridged route, fresh and resumed.
+fn bridged_route_spawns() -> Vec<(&'static str, String)> {
+    let opt = bridged_overrides("/opt/incode/bin/incode");
+    let mut want = Vec::new();
     for (name, lead, tail) in [
         ("bridged", &["exec"][..], &["-C", "ws"][..]),
         ("bridged_resumed", &["exec", "resume"][..], &["t-2"][..]),
@@ -771,13 +803,9 @@ fn every_spawn_is_built_as_it_was() {
         args.extend(strings(
             &[&["-m", "gpt-5.5"][..], tail, &["the task"]].concat(),
         ));
-        want.push((name, expect("codex-x", "ws", &args, &[])));
+        want.push((name, reported("codex-x", "ws", &args, &[])));
     }
-    assert_eq!(cases.len(), want.len());
-    for ((name, got), (want_name, want)) in cases.iter().zip(&want) {
-        assert_eq!(name, want_name);
-        assert_eq!(got, want, "{name}");
-    }
+    want
 }
 
 /// `strs` as owned strings.
@@ -786,7 +814,7 @@ fn strings(strs: &[&str]) -> Vec<String> {
 }
 
 /// What [`spawn`] reports for a command built this way.
-fn expect(program: &str, dir: &str, args: &[String], env: &[(&str, &str)]) -> String {
+fn reported(program: &str, dir: &str, args: &[String], env: &[(&str, &str)]) -> String {
     let env: Vec<(String, String)> = env
         .iter()
         .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
@@ -855,7 +883,7 @@ fn the_bridged_command_escapes_a_windows_server_path() {
         );
         args.extend(overrides.iter().cloned());
         args.extend(strings(tail));
-        assert_eq!(got, expect("codex", ".", &args, &[]));
+        assert_eq!(got, reported("codex", ".", &args, &[]));
     }
 }
 
