@@ -54,7 +54,7 @@ pub(super) enum Program {
 /// stands in front of it.
 ///
 /// Called by [`super::arguments_written`], and by
-/// [`super::collect_reading`]'s pipelines to find the one that reads a
+/// [`super::pipeline_targets`] to find the pipeline's program that reads a
 /// heredoc.
 pub(super) fn program_of(words: &[&str]) -> (Program, usize, bool) {
     let (index, xargs) = program_index(words);
