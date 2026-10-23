@@ -504,6 +504,9 @@ fn spill(prompt: &str, workspace: &std::path::Path) -> Result<String, AgentError
 }
 
 #[cfg(test)]
+mod budget_pinned_tests;
+
+#[cfg(test)]
 mod route_parity_tests {
     use super::*;
     use crate::guards::Enforcement;

@@ -1280,6 +1280,9 @@ fn to_usage(wire: &WireUsage) -> crate::runtime::usage::TokenUsage {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+mod pinned_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
