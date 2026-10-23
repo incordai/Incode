@@ -746,12 +746,16 @@ mod tests {
         }
     }
 
-    /// The live check, against a real X server: what is captured is the size
-    /// of the display it was reported as, and in the colours the server drew.
+    /// The live check, against a real X server: the display list is the
+    /// server's, what is captured is the size of the display it was reported
+    /// as, and in the colours the server drew — whole screen and one window's
+    /// region alike.
     ///
-    /// `DISPLAY=:99 cargo test --lib desktop::capture::x11 -- --ignored`
-    /// with an Xvfb (or any X server) on `:99`. It maps a small window of a
-    /// known colour, captures, and reads that colour back.
+    /// `DISPLAY=:99 cargo test --lib desktop::capture::x11 -- --ignored --nocapture`
+    /// with an Xvfb (or any X server) on `:99`; CI's `live-x11-capture` job
+    /// runs it at depth 24 and depth 16. It maps three windows filled with
+    /// the pixel values the root visual calls pure red, green and blue,
+    /// captures, and reads those colours back.
     #[cfg(all(target_os = "linux", feature = "desktop-capture"))]
     #[test]
     #[ignore = "needs an X server on $DISPLAY"]
@@ -760,54 +764,120 @@ mod tests {
         use x11rb::protocol::xproto::{ConnectionExt as _, CreateWindowAux, WindowClass};
         use x11rb::wrapper::ConnectionExt as _;
 
-        use crate::desktop::capture::{capture_primary, CaptureOptions};
+        use crate::desktop::capture::{capture_primary, capture_region, CaptureOptions};
         use crate::desktop::screen_info;
 
         let (conn, screen) = x11rb::connect(None).expect("an X server on $DISPLAY");
-        let screen = conn.setup().roots[screen].clone();
+        let setup = conn.setup();
+        let screen = setup.roots[screen].clone();
         let visual = *screen
             .allowed_depths
             .iter()
             .flat_map(|d| &d.visuals)
             .find(|v| v.visual_id == screen.root_visual)
             .expect("the root visual");
-        // A window filled with the pixel value the visual calls pure red,
-        // on top (override-redirect: no window manager places it).
-        let window = conn.generate_id().expect("id");
-        conn.create_window(
+        let bits = setup
+            .pixmap_formats
+            .iter()
+            .find(|f| f.depth == screen.root_depth)
+            .map(|f| f.bits_per_pixel);
+        println!(
+            "X server: {}x{} depth {} ({bits:?} bits per pixel), image byte order {:?}, \
+             masks r={:#x} g={:#x} b={:#x}",
+            screen.width_in_pixels,
+            screen.height_in_pixels,
             screen.root_depth,
-            window,
-            screen.root,
-            40,
-            30,
-            64,
-            48,
-            0,
-            WindowClass::INPUT_OUTPUT,
-            screen.root_visual,
-            &CreateWindowAux::new()
-                .background_pixel(visual.red_mask)
-                .override_redirect(1),
-        )
-        .expect("create");
-        conn.map_window(window).expect("map");
-        conn.sync().expect("the window is drawn");
+            setup.image_byte_order,
+            visual.red_mask,
+            visual.green_mask,
+            visual.blue_mask
+        );
+
+        // Windows on top (override-redirect: no window manager places them),
+        // 64x48 each, side by side from (40, 30).
+        let colours = [
+            (visual.red_mask, [255, 0, 0, 255]),
+            (visual.green_mask, [0, 255, 0, 255]),
+            (visual.blue_mask, [0, 0, 255, 255]),
+        ];
+        let mut windows = Vec::new();
+        for (i, (pixel, _)) in colours.iter().enumerate() {
+            let window = conn.generate_id().expect("id");
+            conn.create_window(
+                screen.root_depth,
+                window,
+                screen.root,
+                40 + 80 * i as i16,
+                30,
+                64,
+                48,
+                0,
+                WindowClass::INPUT_OUTPUT,
+                screen.root_visual,
+                &CreateWindowAux::new()
+                    .background_pixel(*pixel)
+                    .override_redirect(1),
+            )
+            .expect("create");
+            conn.map_window(window).expect("map");
+            windows.push(window);
+        }
+        conn.sync().expect("the windows are drawn");
 
         let screen_info = screen_info().expect("the display list");
+        println!(
+            "screen_info: {}",
+            serde_json::to_string(&screen_info.monitors).expect("json")
+        );
         let primary = screen_info.primary().expect("a primary display").clone();
         let native = CaptureOptions {
             max_edge: u32::MAX,
             ..CaptureOptions::default()
         };
+        let decode = |bytes: &[u8]| {
+            image::load_from_memory_with_format(bytes, image::ImageFormat::Png)
+                .expect("the bytes decode")
+                .to_rgba8()
+        };
         let shot = capture_primary(native).expect("capture the X screen");
-        let decoded = image::load_from_memory_with_format(&shot.bytes, image::ImageFormat::Png)
-            .expect("the bytes decode")
-            .to_rgba8();
-        conn.destroy_window(window).expect("destroy");
+        let whole = decode(&shot.bytes);
+        let red_region = Rect {
+            x: 40,
+            y: 30,
+            width: 64,
+            height: 48,
+        };
+        let region = decode(
+            &capture_region(red_region, native)
+                .expect("capture a region")
+                .bytes,
+        );
+        for window in windows {
+            conn.destroy_window(window).expect("destroy");
+        }
         conn.sync().expect("gone");
 
+        let read: Vec<[u8; 4]> = (0..3)
+            .map(|i| {
+                let x = (40 + 80 * i + 32 - primary.rect.x) as u32;
+                let y = (30 + 24 - primary.rect.y) as u32;
+                whole.get_pixel(x, y).0
+            })
+            .collect();
+        println!(
+            "captured: {}x{} image of display {} ({:?}); window centres read {read:?}; \
+             region {}x{} reads {:?}",
+            whole.width(),
+            whole.height(),
+            shot.monitor_id,
+            shot.monitor_name,
+            region.width(),
+            region.height(),
+            region.get_pixel(32, 24).0
+        );
+
         assert_eq!(
-            (decoded.width(), decoded.height()),
+            (whole.width(), whole.height()),
             (primary.rect.width as u32, primary.rect.height as u32),
             "the image is not the size of the display it came from"
         );
@@ -815,14 +885,20 @@ mod tests {
             (shot.transform.source_width, shot.transform.source_height),
             (primary.rect.width as u32, primary.rect.height as u32)
         );
-        let (px, py) = (
-            (40 + 32 - primary.rect.x) as u32,
-            (30 + 24 - primary.rect.y) as u32,
-        );
         assert_eq!(
-            decoded.get_pixel(px, py).0,
-            [255, 0, 0, 255],
-            "the red window was captured in another colour"
+            (primary.rect.width, primary.rect.height),
+            (
+                i32::from(screen.width_in_pixels),
+                i32::from(screen.height_in_pixels)
+            ),
+            "a lone Xvfb screen is one display the size of the root"
+        );
+        let expected: Vec<[u8; 4]> = colours.iter().map(|(_, rgba)| *rgba).collect();
+        assert_eq!(read, expected, "the windows were captured in other colours");
+        assert_eq!((region.width(), region.height()), (64, 48), "region size");
+        assert!(
+            region.pixels().all(|p| p.0 == [255, 0, 0, 255]),
+            "the red window's region is not all red"
         );
     }
 }

@@ -104,6 +104,39 @@ jobs:
             exit 1
           fi
 
+  # Linux screen capture (src/desktop/capture/x11.rs) against a real X
+  # server: the display list from RandR, GetImage of the root, the pixel
+  # conversion, at depth 24 (32 bits per pixel) and depth 16 (5-6-5). The
+  # live test is #[ignore]d everywhere else because it needs a display;
+  # this job is what keeps that path proven.
+  live-x11-capture:
+    name: live X11 capture (Xvfb)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Linux build dependencies, and Xvfb
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config xvfb xauth
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Each run must have RUN the test: a filter that matches nothing
+      # passes with "0 passed", so the count is checked, not just the exit.
+      - name: capture at depth 24, then depth 16
+        shell: bash
+        run: |
+          set -euo pipefail
+          live=desktop::capture::x11::tests::a_real_x_screen_is_captured_at_its_size_and_in_its_colours
+          for screen in 1280x800x24 1024x768x16; do
+            echo "::group::Xvfb -screen 0 $screen"
+            xvfb-run -a -s "-screen 0 $screen" \
+              cargo test --lib "$live" -- --ignored --exact --nocapture --test-threads=1 \
+              | tee "$RUNNER_TEMP/live.txt"
+            grep -q "test result: ok. 1 passed" "$RUNNER_TEMP/live.txt"
+            echo "::endgroup::"
+          done
+
   test:
     name: test (${{ matrix.os }})
     strategy:
