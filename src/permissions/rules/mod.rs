@@ -192,3 +192,6 @@ mod tests;
 
 #[cfg(test)]
 mod pinned_tests;
+
+#[cfg(test)]
+mod pinned_set_tests;

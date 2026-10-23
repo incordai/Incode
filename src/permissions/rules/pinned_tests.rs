@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use super::{
     split_command, unquote, words, Layer, PathContext, PermissionRules, RuleLists, Subject,
 };
-use crate::parser_pins::{assert_pinned, esc, list, record};
+use crate::parser_pins::{assert_pinned, digest, esc, list, nesting, record};
 
 const RECORDING: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -59,11 +59,9 @@ fn reading(narrow: &PermissionRules, broad: &PermissionRules, command: &str) -> 
     )
 }
 
-/// **NO RESTRUCTURING CHANGES A VERDICT.** Every command of the corpus is
-/// split, peeled and decided exactly as it was when the recording was made.
-#[test]
-fn every_pinned_command_is_split_and_decided_as_recorded() {
-    let narrow = rules(
+/// Allow rules for a few commands, an ask, and denies for `rm` and `curl`.
+fn narrow() -> PermissionRules {
+    rules(
         &[
             "Bash(echo:*)",
             "Bash(ls:*)",
@@ -74,10 +72,53 @@ fn every_pinned_command_is_split_and_decided_as_recorded() {
         ],
         &["Bash(git push:*)"],
         &["Bash(rm:*)", "Bash(curl:*)"],
-    );
-    let broad = rules(&["Bash"], &[], &["Bash(rm -rf:*)", "Bash(bash:*)"]);
+    )
+}
+
+/// Every command allowed but `rm -rf` and `bash`.
+fn broad() -> PermissionRules {
+    rules(&["Bash"], &[], &["Bash(rm -rf:*)", "Bash(bash:*)"])
+}
+
+/// **NO RESTRUCTURING CHANGES A VERDICT.** Every command of the corpus is
+/// split, peeled and decided exactly as it was when the recording was made.
+#[test]
+fn every_pinned_command_is_split_and_decided_as_recorded() {
+    let (narrow, broad) = (narrow(), broad());
     assert_pinned(
         RECORDING,
         &record(|command| reading(&narrow, &broad, command)),
     );
+}
+
+const NESTING: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/pinned/permissions_rules_nesting.txt"
+));
+
+/// **THE DEPTH LIMIT IS WHERE IT WAS.** Commands that really recurse —
+/// quoted `bash -c`, `sh -c`, `eval`, `$(…)`, heredocs fed to `sh` — at depths
+/// around the limit and well past it are split and decided as recorded: the
+/// count of parts and of opaque ones, a digest of the whole reading, and both
+/// verdicts in full.
+#[test]
+fn every_pinned_nesting_is_split_and_decided_as_recorded() {
+    let (narrow, broad) = (narrow(), broad());
+    let lines: Vec<String> = nesting()
+        .iter()
+        .map(|(name, command)| {
+            let parts = split_command(command);
+            format!(
+                "{name} input {} chars {} => parts {} opaque {} reading {} | {} | {}",
+                command.chars().count(),
+                digest(command),
+                parts.len(),
+                parts.iter().filter(|s| s.opaque).count(),
+                digest(&reading(&narrow, &broad, command)),
+                verdict(&narrow, command),
+                verdict(&broad, command)
+            )
+        })
+        .collect();
+    assert_pinned(NESTING, &lines);
 }

@@ -361,6 +361,87 @@ pub(crate) fn curated() -> Vec<String> {
     lines
 }
 
+/// What every nested command runs at its innermost level: two writes.
+const INNERMOST: &str = "rm tests/a; echo x >tests/b";
+
+/// One level of nesting: the command that runs `inner`, given its level.
+type Level = fn(usize, &str) -> String;
+
+/// `<shell> -c "<inner>"`, escaped as bash escapes inside double quotes.
+fn double_quoted(shell: &str, inner: &str) -> String {
+    let mut out = format!("{shell} -c \"");
+    for c in inner.chars() {
+        if matches!(c, '\\' | '"' | '$' | '`') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
+}
+
+/// `<prefix> '<inner>'`, a quote inside spelled `'\''`.
+fn single_quoted(prefix: &str, inner: &str) -> String {
+    format!("{prefix} '{}'", inner.replace('\'', r"'\''"))
+}
+
+fn bash_dq(_: usize, inner: &str) -> String {
+    double_quoted("bash", inner)
+}
+
+fn sh_dq(_: usize, inner: &str) -> String {
+    double_quoted("sh", inner)
+}
+
+fn sh_sq(_: usize, inner: &str) -> String {
+    single_quoted("sh -c", inner)
+}
+
+fn eval_sq(_: usize, inner: &str) -> String {
+    single_quoted("eval", inner)
+}
+
+fn substituted(_: usize, inner: &str) -> String {
+    format!("echo $({inner})")
+}
+
+/// A heredoc fed to `sh`, its delimiter quoted and unique to its level.
+fn heredoc(level: usize, inner: &str) -> String {
+    format!("sh <<'E{level}'\n{inner}\nE{level}\n")
+}
+
+/// Commands nested inside `bash -c`, `sh -c`, `eval`, `$(…)` and heredocs fed
+/// to `sh` — quoted, so each level really runs the next — at depths around
+/// both readers' limit of 8 and well past it, with [`INNERMOST`]'s writes at
+/// the bottom. Named, since the deepest are too long to record whole; the
+/// styles whose quoting grows as 3^depth stop at 10.
+pub(crate) fn nesting() -> Vec<(String, String)> {
+    let styles: [(&str, &[Level], &[usize]); 7] = [
+        ("bash-dq", &[bash_dq], &[1, 7, 8, 9, 10, 12, 16]),
+        ("sh-sq", &[sh_sq], &[1, 7, 8, 9, 10]),
+        ("eval-sq", &[eval_sq], &[1, 7, 8, 9, 10]),
+        ("subst", &[substituted], &[1, 7, 8, 9, 10, 12, 16]),
+        ("heredoc", &[heredoc], &[1, 7, 8, 9, 10, 12, 16]),
+        ("heredoc+sh-dq", &[heredoc, sh_dq], &[7, 8, 9, 10, 12, 16]),
+        (
+            "mixed",
+            &[bash_dq, sh_sq, substituted, heredoc, eval_sq],
+            &[5, 7, 8, 9, 10, 12],
+        ),
+    ];
+    let mut cases = Vec::new();
+    for (style, levels, depths) in styles {
+        for &depth in depths {
+            let mut command = INNERMOST.to_string();
+            for level in 0..depth {
+                command = levels[level % levels.len()](level, &command);
+            }
+            cases.push((format!("{style}x{depth}"), command));
+        }
+    }
+    cases
+}
+
 /// Every ordered pair of [`FRAGMENTS`], joined by a space and by nothing,
 /// grouped by the first fragment.
 pub(crate) fn generated() -> Vec<(&'static str, Vec<String>)> {
@@ -440,4 +521,39 @@ pub(crate) fn assert_pinned(golden: &str, actual: &[String]) {
         expected.len(),
         actual.len()
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{digest, double_quoted, esc, heredoc, nesting, single_quoted, INNERMOST};
+
+    /// Each level quotes the next the way the shell unquotes it.
+    #[test]
+    fn each_nesting_level_quotes_as_the_shell_unquotes() {
+        assert_eq!(
+            double_quoted("sh", r#"a "b" $c `d` \e"#),
+            r#"sh -c "a \"b\" \$c \`d\` \\e""#
+        );
+        assert_eq!(single_quoted("eval", "it's"), r"eval 'it'\''s'");
+        assert_eq!(heredoc(3, "x"), "sh <<'E3'\nx\nE3\n");
+    }
+
+    /// Every nesting case is named, and keeps the innermost writes intact.
+    #[test]
+    fn every_nesting_case_ends_in_the_innermost_writes() {
+        let cases = nesting();
+        assert_eq!(cases.len(), 43);
+        assert_eq!(
+            cases[0],
+            ("bash-dqx1".to_string(), format!("bash -c \"{INNERMOST}\""))
+        );
+        assert!(cases.iter().all(|(_, command)| command.contains(INNERMOST)));
+    }
+
+    /// The recording's spelling does not depend on the platform.
+    #[test]
+    fn digests_and_escapes_are_stable() {
+        assert_eq!(digest(""), "cbf29ce484222325");
+        assert_eq!(esc("é\"\\\n"), r#""\u{e9}\"\\\u{a}""#);
+    }
 }
