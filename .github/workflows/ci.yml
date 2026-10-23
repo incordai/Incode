@@ -58,6 +58,52 @@ jobs:
         if: matrix.node == 22
         working-directory: editors/vscode
 
+  # The Linux legs of release.yml, built exactly as it builds them: the same
+  # runners, packages and command. `test` above runs on ubuntu-latest, whose
+  # newer system headers once hid a dependency (libspa, through xcap) that
+  # cannot compile on the Ubuntu 22.04 a release is built on — so the release
+  # broke at tag time with every check green. Keep this in step with
+  # release.yml's Linux matrix entries and its build dependencies step.
+  release-build-linux:
+    name: release build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} -p incord-code -p incord-sandbox
+      # The released binary must run on a machine with no desktop libraries:
+      # screen capture talks to the X server over its socket, so nothing of
+      # Wayland, GBM, EGL, PipeWire or libxcb may be linked.
+      - name: incode links no desktop library
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/incode"
+          ldd "$bin"
+          if ldd "$bin" | grep -E 'libxcb|libwayland|libgbm|libEGL|libpipewire|libdbus'; then
+            echo "incode links a desktop library it must not need" >&2
+            exit 1
+          fi
+
   test:
     name: test (${{ matrix.os }})
     strategy:
@@ -70,17 +116,14 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      # The Linux desktop backends (xcap, enigo's x11rb, AT-SPI over zbus)
-      # link against these at build time — the same set the Linux live tests
-      # were built with.
+      # The same set release.yml installs. The desktop backends (x11rb for
+      # capture and input, AT-SPI over zbus) are pure Rust and link no system
+      # library; pkg-config is how openssl-sys finds the runner's OpenSSL.
       - name: Linux build dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            pkg-config clang libclang-dev libwayland-dev libpipewire-0.3-dev \
-            libxcb1-dev libxcb-randr0-dev libxcb-shm0-dev libdbus-1-dev \
-            libegl-dev libgbm-dev
+          sudo apt-get install -y --no-install-recommends pkg-config
       # fish and zsh, for the completion scripts' tests (main.rs
       # `fish_completes_from_the_table`, `zsh_completes_from_the_table`),
       # which run them in the real shell and skip where it is missing. Test

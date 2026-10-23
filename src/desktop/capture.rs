@@ -19,12 +19,19 @@
 //! mapping arithmetic. This module decides *what* to capture and how to encode
 //! it; it does not do geometry of its own.
 //!
+//! # Where the pixels come from
+//!
+//! On Windows and macOS, the xcap library. On Linux, the X server itself
+//! ([`x11`], over the x11rb connection input already uses): xcap cannot be
+//! built there without a Wayland and PipeWire backend this crate never uses,
+//! and that backend broke the release build on Ubuntu 22.04. Both answer the
+//! same accessors (`x`, `width`, `is_primary`, `capture_image`, ...), so
+//! everything below reads a display one way on every platform.
+//!
 //! # Built without capture
 //!
-//! The capture library is the `desktop-capture` cargo feature, on by default.
-//! On Linux it links Wayland, GBM, EGL and PipeWire — even though this crate
-//! drives X11 only — so a server that never runs computer use can be built
-//! without those libraries. Such a build answers every capture with a refusal
+//! Screen capture is the `desktop-capture` cargo feature, on by default, on
+//! every platform. A build without it answers every capture with a refusal
 //! that names the feature, rather than an empty or invented display.
 
 use std::io::Cursor;
@@ -32,13 +39,19 @@ use std::io::Cursor;
 use image::codecs::jpeg::JpegEncoder;
 use image::{ExtendedColorType, ImageEncoder, ImageFormat, RgbaImage};
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "desktop-capture")]
+#[cfg(all(feature = "desktop-capture", target_os = "linux"))]
+use x11::Monitor;
+#[cfg(all(feature = "desktop-capture", not(target_os = "linux")))]
 use xcap::Monitor;
 
 use super::coords::{PhysicalPoint, ViewTransform};
 #[cfg(feature = "desktop-capture")]
 use super::dpi;
 use super::{DesktopError, Rect};
+
+// Linux's capture backend. Its pure parts are tested on every platform.
+#[cfg(any(test, all(target_os = "linux", feature = "desktop-capture")))]
+mod x11;
 
 /// How a screenshot is encoded on the way to the model.
 ///
@@ -152,18 +165,18 @@ pub fn capture_monitor(
 pub fn capture_region(region: Rect, options: CaptureOptions) -> Result<Screenshot, DesktopError> {
     let monitors = all_monitors()?;
     let (cx, cy) = region.center();
-    let read = |what: &str, e: xcap::XCapError| {
+    let read = |what: &str, e: &dyn std::fmt::Display| {
         DesktopError::Os(format!("could not read a display's {what}: {e}"))
     };
     let mut chosen = None;
     for (index, monitor) in monitors.iter().enumerate() {
         let (x, y) = (
-            monitor.x().map_err(|e| read("x", e))?,
-            monitor.y().map_err(|e| read("y", e))?,
+            monitor.x().map_err(|e| read("x", &e))?,
+            monitor.y().map_err(|e| read("y", &e))?,
         );
         let (w, h) = (
-            monitor.width().map_err(|e| read("width", e))? as i32,
-            monitor.height().map_err(|e| read("height", e))? as i32,
+            monitor.width().map_err(|e| read("width", &e))? as i32,
+            monitor.height().map_err(|e| read("height", &e))? as i32,
         );
         if cx >= x && cx < x + w && cy >= y && cy < y + h {
             chosen = Some((
@@ -244,17 +257,17 @@ pub fn capture_region(region: Rect, options: CaptureOptions) -> Result<Screensho
     })
 }
 
-/// Every display as [`super::MonitorInfo`], from the capture library — the
+/// Every display as [`super::MonitorInfo`], from the capture backend — the
 /// monitor list on macOS and Linux, where its units are the ones input uses
 /// (points on macOS, pixels on X11). `id` is the position in this list, the
 /// same index [`capture_monitor`] takes.
 ///
-/// The library reports no reserved areas (menu bar, dock, panels), so the
+/// The backend reports no reserved areas (menu bar, dock, panels), so the
 /// work area is the whole display there.
 #[cfg(feature = "desktop-capture")]
 #[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn monitor_infos() -> Result<Vec<super::MonitorInfo>, DesktopError> {
-    let read = |what: &str, i: usize, e: xcap::XCapError| {
+    let read = |what: &str, i: usize, e: &dyn std::fmt::Display| {
         DesktopError::Os(format!("could not read display {i}'s {what}: {e}"))
     };
     let monitors = all_monitors()?;
@@ -264,23 +277,47 @@ pub(crate) fn monitor_infos() -> Result<Vec<super::MonitorInfo>, DesktopError> {
         .enumerate()
         .map(|(i, m)| {
             let rect = Rect {
-                x: m.x().map_err(|e| read("x", i, e))?,
-                y: m.y().map_err(|e| read("y", i, e))?,
-                width: m.width().map_err(|e| read("width", i, e))? as i32,
-                height: m.height().map_err(|e| read("height", i, e))? as i32,
+                x: m.x().map_err(|e| read("x", i, &e))?,
+                y: m.y().map_err(|e| read("y", i, &e))?,
+                width: m.width().map_err(|e| read("width", i, &e))? as i32,
+                height: m.height().map_err(|e| read("height", i, &e))? as i32,
             };
-            let scale = f64::from(m.scale_factor().map_err(|e| read("scale", i, e))?);
-            Ok(super::MonitorInfo {
-                id: i as u32,
-                name: m.friendly_name().or_else(|_| m.name()).unwrap_or_default(),
+            let scale = f64::from(m.scale_factor().map_err(|e| read("scale", i, &e))?);
+            Ok(describe(
+                i,
+                count,
+                m.friendly_name().or_else(|_| m.name()).unwrap_or_default(),
                 rect,
-                work_area: rect,
-                dpi: (96.0 * scale).round() as u32,
                 scale,
-                primary: is_primary(m.is_primary().unwrap_or(false), count),
-            })
+                m.is_primary().unwrap_or(false),
+            ))
         })
         .collect()
+}
+
+/// Display `index` of `count`, as [`super::MonitorInfo`]: numbered by its
+/// place in the list, its whole rectangle as the work area, and primary by
+/// [`is_primary`]. Called by [`monitor_infos`]; pure, so Linux's RandR
+/// reading is tested through it on every platform.
+#[cfg(any(test, feature = "desktop-capture"))]
+#[cfg_attr(all(windows, not(test)), allow(dead_code))]
+fn describe(
+    index: usize,
+    count: usize,
+    name: String,
+    rect: Rect,
+    scale: f64,
+    reported_primary: bool,
+) -> super::MonitorInfo {
+    super::MonitorInfo {
+        id: index as u32,
+        name,
+        rect,
+        work_area: rect,
+        dpi: (96.0 * scale).round() as u32,
+        scale,
+        primary: is_primary(reported_primary, count),
+    }
 }
 
 /// Whether a display is the primary one: what the OS says, or the only
@@ -296,7 +333,8 @@ fn is_primary(reported: bool, displays: usize) -> bool {
 fn all_monitors() -> Result<Vec<Monitor>, DesktopError> {
     // BEFORE the enumeration, not merely before the capture: xcap reads process
     // awareness while it works, so a late call would leave part of this answer
-    // computed under the old mode.
+    // computed under the old mode. (On Linux there is no awareness to set;
+    // the call is kept so every platform starts the same way.)
     dpi::ensure_per_monitor_aware();
 
     Monitor::all().map_err(|e| DesktopError::Os(format!("could not enumerate displays: {e}")))
