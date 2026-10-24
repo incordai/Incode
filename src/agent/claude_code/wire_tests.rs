@@ -31,6 +31,33 @@ fn a_cancelled_turn_stops_and_names_itself() {
     assert!(seen.is_empty(), "it must stop BEFORE handling more output");
 }
 
+/// **Only the init line naming incode's server as `failed` counts**, the
+/// measured shape; a connected server, another server failing, an init
+/// line without a server list, and any other line do not.
+#[test]
+fn only_a_failed_incode_server_in_the_init_line_counts() {
+    use super::wire::incode_server_failed;
+    let init = |servers: &str| {
+        format!(r#"{{"type":"system","subtype":"init","session_id":"s","mcp_servers":{servers}}}"#)
+    };
+    assert!(incode_server_failed(&init(
+        r#"[{"name":"incode","status":"failed","source":"dynamic"}]"#
+    )));
+    assert!(!incode_server_failed(&init(
+        r#"[{"name":"incode","status":"connected","source":"dynamic"}]"#
+    )));
+    assert!(!incode_server_failed(&init(
+        r#"[{"name":"other","status":"failed"},{"name":"incode","status":"connected"}]"#
+    )));
+    assert!(!incode_server_failed(
+        r#"{"type":"system","subtype":"init","session_id":"s"}"#
+    ));
+    assert!(!incode_server_failed(
+        r#"{"type":"assistant","message":{"content":[{"type":"text","text":"\"init\" incode failed"}]}}"#
+    ));
+    assert!(!incode_server_failed("not json, but \"init\""));
+}
+
 /// Without cancellation the same stream is read normally — the control
 /// that proves the test above is measuring the flag and not the fixture.
 #[test]

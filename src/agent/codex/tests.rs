@@ -476,13 +476,24 @@ fn fake_codex_child() {
         return;
     };
     let dir = PathBuf::from(dir);
-    let argv = std::fs::read(dir.join("argv")).expect("argv");
-    let args: Vec<String> = argv
-        .split(|b| *b == 0)
-        .filter(|a| !a.is_empty())
-        .map(|a| String::from_utf8_lossy(a).into_owned())
-        .collect();
-    let overrides = overrides_in(&args);
+    // The registration codex was handed: off its real argv where the
+    // stand-in's wrapper could record it (`printf '%s\0' "$@"`, Unix), else
+    // as the backend builds it (`argv.rs` `bridge_registration`), written by
+    // the test — `cmd` cannot hand on an argv carrying quotes intact.
+    let overrides = match std::fs::read(dir.join("argv")) {
+        Ok(argv) => {
+            let args: Vec<String> = argv
+                .split(|b| *b == 0)
+                .filter(|a| !a.is_empty())
+                .map(|a| String::from_utf8_lossy(a).into_owned())
+                .collect();
+            overrides_in(&args)
+        }
+        Err(_) => serde_json::from_slice(
+            &std::fs::read(dir.join("registration")).expect("the registration"),
+        )
+        .expect("a list of overrides"),
+    };
     let command = override_value(&overrides, "mcp_servers.incode.command")
         .trim_matches('"')
         .replace("\\\\", "\\");
@@ -491,13 +502,21 @@ fn fake_codex_child() {
     let passed: Vec<String> =
         serde_json::from_str(override_value(&overrides, "mcp_servers.incode.env_vars"))
             .expect("env_vars");
+    // Codex's own short list beside the named ones (`rmcp-client`
+    // `create_env_for_mcp_server`); on Windows that includes what a process
+    // needs to open a socket or run a `.cmd` at all.
+    #[cfg(windows)]
+    let defaults = ["PATH", "SystemRoot", "ComSpec", "PATHEXT", "TEMP", "TMP"];
+    #[cfg(not(windows))]
+    let defaults = ["PATH"];
     let mut server = std::process::Command::new(&command)
         .args(&server_args)
         .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .envs(
-            passed
+            defaults
                 .iter()
+                .copied()
+                .chain(passed.iter().map(String::as_str))
                 .filter_map(|name| Some((name, std::env::var_os(name)?))),
         )
         .stdin(Stdio::piped())
@@ -567,45 +586,70 @@ fn fake_codex_child() {
     std::process::exit(0);
 }
 
-/// A shell script at `path` that runs this test binary's `test` with
-/// `marker` set to `value`, after `before`.
-#[cfg(unix)]
-fn child_script(path: &Path, before: &str, marker: &str, value: &Path, test: &str) {
-    use std::os::unix::fs::PermissionsExt;
+/// A script at `path` that runs this test binary's `test` with `marker` set
+/// to `value`: a shell script on Unix, which first records its argv to
+/// `records_argv` when given; a `.cmd` on Windows, which records nothing
+/// (see [`fake_codex_child`]).
+fn child_script(path: &Path, records_argv: Option<&Path>, marker: &str, value: &Path, test: &str) {
     let exe = std::env::current_exe().expect("test binary");
-    let body = format!(
-        "#!/bin/sh\n{before}\n{marker}='{}' exec '{}' --exact '{test}' --nocapture -q --test-threads=1\n",
-        value.display(),
-        exe.display()
-    );
-    std::fs::write(path, body).expect("write the script");
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("runnable");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let before = records_argv
+            .map(|argv| format!("printf '%s\\0' \"$@\" > '{}'", argv.display()))
+            .unwrap_or_default();
+        let body = format!(
+            "#!/bin/sh\n{before}\n{marker}='{}' exec '{}' --exact '{test}' --nocapture -q --test-threads=1\n",
+            value.display(),
+            exe.display()
+        );
+        std::fs::write(path, body).expect("write the script");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("runnable");
+    }
+    #[cfg(windows)]
+    {
+        let _ = records_argv;
+        let body = format!(
+            "@echo off\r\nset \"{marker}={}\"\r\n\"{}\" --exact {test} --nocapture -q --test-threads=1\r\n",
+            value.display(),
+            exe.display()
+        );
+        std::fs::write(path, body).expect("write the script");
+    }
 }
 
 /// A bridged backend in `ws` whose "codex" is the stand-in in `bin` — which
-/// records its argv to `bin/argv` — and whose tool server is the stand-in
-/// server, returned beside it; with a deny rule on `Write(secret.txt)` in
-/// incode's toolbox.
+/// records its argv to `bin/argv` on Unix, and on Windows is handed the
+/// registration the backend builds, in `bin/registration` — and whose tool
+/// server is the stand-in server, returned beside it; with a deny rule on
+/// `Write(secret.txt)` in incode's toolbox.
 ///
-/// Called by [`a_bridged_turn_runs_its_calls_in_incodes_toolbox_and_a_deny_rule_refuses_one`].
-#[cfg(unix)]
-fn stand_in_bridged_backend(ws: &Path, bin: &Path) -> (CodexBackend, PathBuf) {
-    let codex = bin.join("codex.sh");
-    let server = bin.join("server.sh");
+/// Called by [`a_bridged_turn_runs_its_calls_in_incodes_toolbox_and_a_deny_rule_refuses_one`]
+/// and by `bridged_tests.rs`.
+pub(super) fn stand_in_bridged_backend(ws: &Path, bin: &Path) -> (CodexBackend, PathBuf) {
+    let script = if cfg!(windows) { "cmd" } else { "sh" };
+    let codex = bin.join(format!("codex.{script}"));
+    let server = bin.join(format!("server.{script}"));
     child_script(
         &codex,
-        &format!("printf '%s\\0' \"$@\" > '{}'", bin.join("argv").display()),
+        Some(&bin.join("argv")),
         FAKE_CODEX,
         bin,
         "agent::codex::tests::fake_codex_child",
     );
     child_script(
         &server,
-        "",
+        None,
         FAKE_TOOL_SERVER,
         Path::new("1"),
         "agent::codex::tests::tool_server_child",
     );
+    #[cfg(windows)]
+    std::fs::write(
+        bin.join("registration"),
+        serde_json::to_vec(&super::argv::bridge_registration(&server)).expect("json"),
+    )
+    .expect("write the registration");
 
     let mut backend = CodexBackend::new(ws.to_path_buf())
         .with_binary(codex.to_string_lossy())
@@ -631,7 +675,6 @@ fn stand_in_bridged_backend(ws: &Path, bin: &Path) -> (CodexBackend, PathBuf) {
 /// Every tool use a turn showed, as `(id, name)`.
 ///
 /// Called by [`a_bridged_turn_runs_its_calls_in_incodes_toolbox_and_a_deny_rule_refuses_one`].
-#[cfg(unix)]
 fn uses_in(seen: &[AgentEvent]) -> Vec<(&str, &str)> {
     seen.iter()
         .filter_map(|e| match e {
@@ -644,7 +687,6 @@ fn uses_in(seen: &[AgentEvent]) -> Vec<(&str, &str)> {
 /// Every tool result a turn showed, as `(id, is_error, output)`.
 ///
 /// Called by [`a_bridged_turn_runs_its_calls_in_incodes_toolbox_and_a_deny_rule_refuses_one`].
-#[cfg(unix)]
 fn results_in(seen: &[AgentEvent]) -> Vec<(&str, bool, &str)> {
     seen.iter()
         .filter_map(|e| match e {
@@ -666,7 +708,10 @@ fn results_in(seen: &[AgentEvent]) -> Vec<(&str, bool, &str)> {
 /// second is refused by a deny rule in incode's toolbox and nothing is
 /// written. Each call is shown once, under incode's id; codex's record of
 /// it is not shown again.
-#[cfg(unix)]
+///
+/// The test of `agent/codex/bridged.rs` `run_bridged`, on every platform.
+/// The argv codex was started with is checked on Unix only, where the
+/// stand-in can record it (see [`child_script`]).
 #[test]
 fn a_bridged_turn_runs_its_calls_in_incodes_toolbox_and_a_deny_rule_refuses_one() {
     let ws = tempfile::tempdir().expect("ws");
@@ -682,17 +727,22 @@ fn a_bridged_turn_runs_its_calls_in_incodes_toolbox_and_a_deny_rule_refuses_one(
     assert_eq!(backend.session_id(), Some("fake-thread"));
 
     // The argv codex was really started with: the bridged one.
-    let argv =
-        String::from_utf8(std::fs::read(bin.path().join("argv")).expect("argv")).expect("utf-8");
-    assert!(argv.contains("--ignore-user-config"), "{argv:?}");
-    assert!(argv.contains("features.shell_tool=false"), "{argv:?}");
-    assert!(
-        argv.contains(&format!(
-            "mcp_servers.incode.command=\"{}\"",
-            server.display()
-        )),
-        "{argv:?}"
-    );
+    #[cfg(unix)]
+    {
+        let argv = String::from_utf8(std::fs::read(bin.path().join("argv")).expect("argv"))
+            .expect("utf-8");
+        assert!(argv.contains("--ignore-user-config"), "{argv:?}");
+        assert!(argv.contains("features.shell_tool=false"), "{argv:?}");
+        assert!(
+            argv.contains(&format!(
+                "mcp_servers.incode.command=\"{}\"",
+                server.display()
+            )),
+            "{argv:?}"
+        );
+    }
+    #[cfg(windows)]
+    let _ = &server;
 
     // The model saw incode's tools.
     assert!(

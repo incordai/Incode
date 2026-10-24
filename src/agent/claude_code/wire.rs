@@ -257,6 +257,43 @@ pub(super) fn map_line(line: &str, outcome: &mut Option<TurnOutcome>) -> Vec<Age
     }
 }
 
+/// Whether this is the `init` line and it says incode's tool server failed
+/// to start.
+///
+/// The CLI connects its MCP servers before it starts the session, and the
+/// `init` line lists each with a status. Measured (Claude Code 2.1, Windows):
+/// `{"name":"incode","status":"connected"}` normally;
+/// `{"name":"incode","status":"failed"}` under a write-restricted token that
+/// stops the CLI starting any child with piped stdio (#68), after which the
+/// model runs with no tools until it gives up. Only `failed` counts: any
+/// other status, or no list at all, is left to the end-of-turn check
+/// (`tool_bridge::require_tools`).
+///
+/// Called by `consume` (`turn.rs`) for every line, before [`map_line`].
+pub(super) fn incode_server_failed(line: &str) -> bool {
+    if !line.contains("\"init\"") {
+        return false;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return false;
+    };
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("system")
+        || value.get("subtype").and_then(serde_json::Value::as_str) != Some("init")
+    {
+        return false;
+    }
+    value
+        .get("mcp_servers")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|server| {
+            server.get("name").and_then(serde_json::Value::as_str)
+                == Some(crate::tool_bridge::CLIENT_KEY)
+                && server.get("status").and_then(serde_json::Value::as_str) == Some("failed")
+        })
+}
+
 /// The session's start, from the `init` line. Every other `system` subtype —
 /// the hook events that precede `init`, among others — says nothing.
 ///

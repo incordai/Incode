@@ -2,6 +2,8 @@
 //! by incode's toolbox over the tool bridge.
 //!
 //! Wired to: [`super::CodexBackend`]'s `run_turn`, on [`super::CodexTools::Incode`].
+//! Tested end to end, on every platform, by `agent/codex/tests.rs`
+//! `a_bridged_turn_runs_its_calls_in_incodes_toolbox_and_a_deny_rule_refuses_one`.
 
 use std::io::BufReader;
 use std::process::{Command, Stdio};
@@ -72,7 +74,7 @@ impl CodexBackend {
                         tools.set_session(session_id);
                     }
                 }
-                events
+                Ok(events)
             },
         );
         let (outcome, usage) = reading.finish();
@@ -109,3 +111,7 @@ impl CodexBackend {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "bridged_tests.rs"]
+mod tests;
