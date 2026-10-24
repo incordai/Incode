@@ -64,6 +64,19 @@ jobs:
           $env:INCODE_INSTALL_DIR = Join-Path $env:RUNNER_TEMP 'incode-bin'
           ./scripts/install.ps1
 
+      # install.ps1 runs the sandbox's one-time setup itself (through the
+      # elevation prompt; the runner is already elevated). Proven here: network
+      # deny must be enforced natively once the install has finished.
+      - name: The installer set the sandbox up (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $sbx = Join-Path $env:RUNNER_TEMP 'incode-bin\sbx.exe'
+          & $sbx check --net deny
+          if ($LASTEXITCODE -ne 0) {
+            Write-Output "::error::after install.ps1, sbx check --net deny exited $LASTEXITCODE: the sandbox setup did not run"
+            exit 1
+          }
       - name: The installed programs report the tag's version
         shell: bash
         run: |
