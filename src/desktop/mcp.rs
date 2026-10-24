@@ -132,6 +132,36 @@ fn into(focused: &Option<WindowInfo>) -> String {
     }
 }
 
+/// Why a pointer action at `at` is refused, when no display in `screens`
+/// holds it. The decision [`refuse_point`] makes, apart from reading the
+/// displays.
+fn off_every_screen(at: PhysicalPoint, screens: &[super::Rect]) -> Option<String> {
+    if screens.iter().any(|screen| screen.contains(at.x, at.y)) {
+        return None;
+    }
+    Some(format!(
+        "refused: {},{} is on no display, so the pointer would be pushed to a screen edge and \
+         act on whatever is there; an element marked off-screen in ui_tree can be read, not \
+         clicked — scroll its window to bring it into view and call ui_tree again",
+        at.x, at.y
+    ))
+}
+
+/// Every display's rectangle, in the physical pixels pointer actions take.
+/// Refuses, as [`blocked_windows`] does, when they cannot be read: a point
+/// that cannot be checked is not acted on.
+///
+/// Called by [`refuse_point`] and by `ui_tree` (to mark off-screen elements).
+fn screen_rects() -> Result<Vec<super::Rect>, String> {
+    let info = super::screen_info().map_err(|e| {
+        format!(
+            "refused: the displays could not be read ({e}), so this cannot be checked to be on \
+             one"
+        )
+    })?;
+    Ok(info.monitors.into_iter().map(|m| m.rect).collect())
+}
+
 /// The blocked windows on screen. A desktop whose windows cannot be listed
 /// is refused rather than taken to have none: the check would otherwise
 /// pass exactly when it can see nothing.
@@ -154,7 +184,19 @@ fn blocked_windows() -> Result<Vec<WindowInfo>, String> {
 /// window is refused even where another window covers it, since stacking can
 /// change between this check and the click, and a click that falls through
 /// to a password manager is the one that must never happen.
+///
+/// And a point on no display at all: the OS clamps such a pointer to the
+/// nearest screen edge, so the action would land on whatever is there, not
+/// on what was aimed at — an element a page keeps 16,000 px off-screen for
+/// screen readers (#52), shown by `ui_tree` as `off-screen`, or a coordinate
+/// past the edge.
+///
+/// Called before every pointer action: `click`, `click_element`, `scroll`
+/// (over an element or at the cursor) and `drag` (both ends).
 fn refuse_point(at: PhysicalPoint) -> Result<(), String> {
+    if let Some(why) = off_every_screen(at, &screen_rects()?) {
+        return Err(why);
+    }
     match blocked_windows()?
         .iter()
         .find(|w| w.rect.contains(at.x, at.y))
@@ -733,7 +775,13 @@ impl Server {
                     .map_err(|e| e.to_string())?;
                 // Walked in this process, and discarded unread when blocked.
                 refuse_app(&tree.app)?;
-                Ok(vec![text(format!("{}\n{UNTRUSTED}", tree.render()))])
+                // With no displays readable the tree is still shown, unmarked:
+                // reading it is harmless, and every action re-checks its point.
+                let screens = screen_rects().unwrap_or_default();
+                Ok(vec![text(format!(
+                    "{}\n{UNTRUSTED}",
+                    tree.render_on(&screens)
+                ))])
             }
 
             "click_element" => {
@@ -1618,6 +1666,23 @@ mod tests {
         }
 
         #[test]
+        fn a_point_on_no_display_is_refused_and_one_on_any_display_is_not() {
+            let screens = [
+                crate::desktop::Rect::from_edges(-1920, 0, 0, 1080),
+                crate::desktop::Rect::from_edges(0, 0, 2560, 1440),
+            ];
+            let at = |x, y| PhysicalPoint { x, y };
+            for (x, y) in [(0, 0), (-1920, 500), (2559, 1439), (-1, 1079)] {
+                assert_eq!(off_every_screen(at(x, y), &screens), None, "{x},{y}");
+            }
+            for (x, y) in [(0, -16079), (2560, 0), (-1921, 10), (-500, 1100)] {
+                let why = off_every_screen(at(x, y), &screens)
+                    .unwrap_or_else(|| panic!("{x},{y} was not refused"));
+                assert!(why.contains("on no display"), "{why}");
+            }
+        }
+
+        #[test]
         fn an_image_block_is_base64_and_names_its_type() {
             let png = image(&[0x89, b'P', b'N', b'G'], ShotFormat::Png);
             assert_eq!(png["type"], "image");
@@ -2048,6 +2113,25 @@ mod tests {
                 why.contains("permanent"),
                 "the refusal reason did not survive the wire: {why}"
             );
+        }
+
+        /// **A CLICK ON NO DISPLAY IS REFUSED** (#52): sent, it would be
+        /// clamped to a screen edge and click whatever is there. Through the
+        /// real protocol path, on a running (not stopped) desktop, with this
+        /// machine's real displays. (The pointer is not compared before and
+        /// after: on a desktop a person is using, that measures the person.)
+        #[test]
+        fn a_click_on_no_display_is_refused() {
+            let mut s = server();
+            let reply = call(
+                &mut s,
+                r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"click","arguments":{"x":0,"y":-16079}}}"#,
+            );
+            assert_eq!(reply["result"]["isError"], true, "{reply}");
+            let why = reply["result"]["content"][0]["text"]
+                .as_str()
+                .expect("a reason");
+            assert!(why.contains("0,-16079 is on no display"), "{why}");
         }
 
         #[test]
