@@ -132,9 +132,6 @@ fn into(focused: &Option<WindowInfo>) -> String {
     }
 }
 
-/// The blocked windows on screen. A desktop whose windows cannot be listed
-/// is refused rather than taken to have none: the check would otherwise
-/// pass exactly when it can see nothing.
 /// Why a pointer action at `at` is refused, when no display in `screens`
 /// holds it. The decision [`refuse_point`] makes, apart from reading the
 /// displays.
@@ -165,6 +162,9 @@ fn screen_rects() -> Result<Vec<super::Rect>, String> {
     Ok(info.monitors.into_iter().map(|m| m.rect).collect())
 }
 
+/// The blocked windows on screen. A desktop whose windows cannot be listed
+/// is refused rather than taken to have none: the check would otherwise
+/// pass exactly when it can see nothing.
 fn blocked_windows() -> Result<Vec<WindowInfo>, String> {
     let windows = uia::list_windows().map_err(|e| {
         format!(
