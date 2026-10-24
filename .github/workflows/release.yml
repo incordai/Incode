@@ -151,3 +151,13 @@ jobs:
     uses: ./.github/workflows/install-check.yml
     with:
       tag: ${{ github.ref_name }}
+
+  # The winget, Scoop and Homebrew manifests for this release, made from its
+  # SHA256SUMS and installed with on each platform; uploaded ready to submit.
+  # Release tags only: package managers do not offer pre-releases.
+  package-check:
+    needs: install-check
+    if: ${{ !contains(github.ref_name, '-') }}
+    uses: ./.github/workflows/package-check.yml
+    with:
+      tag: ${{ github.ref_name }}

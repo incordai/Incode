@@ -1,0 +1,181 @@
+# The package-manager manifests for a published release, made from its own
+# SHA256SUMS (scripts/package_manifests.py) and then installed with, the way
+# a user would install with each: winget and Scoop on Windows, Homebrew on
+# macOS and Linux. Each install must report the tag's version from both
+# programs. The manifests are uploaded as the `package-manifests` artifact,
+# ready to submit (winget-pkgs pull request, a Scoop bucket, a Homebrew tap).
+#
+# release.yml calls this after the install check, for release tags only
+# (package managers do not offer pre-releases). A pull request that changes
+# the generator or this workflow runs it against the latest release. Run it
+# by hand with:
+#   gh workflow run package-check.yml -f tag=v0.1.0
+name: package check
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The release tag, such as v0.1.0.
+        required: true
+        type: string
+  pull_request:
+    paths:
+      - scripts/package_manifests.py
+      - scripts/tests/**
+      - .github/workflows/package-check.yml
+
+permissions:
+  contents: read
+
+jobs:
+  manifests:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Which release
+        id: tag
+        env:
+          GIVEN: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="${GIVEN:-$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)}"
+          echo "checking $tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+      - name: Test the generator
+        run: python3 -m unittest discover -s scripts/tests
+      - name: The release's checksums
+        run: gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern SHA256SUMS --dir "$RUNNER_TEMP"
+      - name: Make the manifests
+        run: python3 scripts/package_manifests.py --tag "$TAG" --sums "$RUNNER_TEMP/SHA256SUMS" --out manifests
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-manifests
+          path: manifests
+          if-no-files-found: error
+
+  winget:
+    needs: manifests
+    runs-on: windows-2025
+    env:
+      TAG: ${{ needs.manifests.outputs.tag }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: package-manifests
+          path: manifests
+      - name: Validate and install with winget
+        shell: pwsh
+        run: |
+          if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+            Write-Output "::error::winget is not on this runner; the manifest was not installed"
+            exit 1
+          }
+          winget --version
+          winget validate --manifest manifests/winget
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # A local manifest installs only once this is on (the runner is admin).
+          winget settings --enable LocalManifestFiles
+          winget install --manifest manifests/winget --accept-package-agreements --accept-source-agreements --disable-interactivity
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: The installed programs report the tag's version
+        shell: pwsh
+        run: |
+          # winget puts portable commands in this folder and adds it to the
+          # user PATH, which this already-running shell has not read.
+          $links = Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Links'
+          $want = $env:TAG.TrimStart('v')
+          foreach ($program in 'incode', 'sbx') {
+            $got = & (Join-Path $links "$program.exe") --version
+            Write-Output "$program --version: $got"
+            if ($got -ne "$program $want") {
+              Write-Output "::error::$program reports '$got', expected '$program $want'"
+              exit 1
+            }
+          }
+
+  scoop:
+    needs: manifests
+    runs-on: windows-latest
+    env:
+      TAG: ${{ needs.manifests.outputs.tag }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: package-manifests
+          path: manifests
+      - name: Install Scoop, then incode from the manifest
+        shell: pwsh
+        run: |
+          Invoke-RestMethod https://get.scoop.sh -OutFile "$env:RUNNER_TEMP\install-scoop.ps1"
+          & "$env:RUNNER_TEMP\install-scoop.ps1" -RunAsAdmin
+          $shims = Join-Path $env:USERPROFILE 'scoop\shims'
+          # An absolute path: a relative `manifests/scoop/incode.json` reads
+          # to Scoop as `<bucket>/<app>`, which it reports as not found and
+          # still exits 0 (measured), so the version check below is what
+          # proves the install.
+          $manifest = (Resolve-Path manifests/scoop/incode.json).Path
+          & (Join-Path $shims 'scoop.cmd') install $manifest
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Add-Content -Path $env:GITHUB_PATH -Value $shims
+      - name: The installed programs report the tag's version
+        shell: pwsh
+        run: |
+          $want = $env:TAG.TrimStart('v')
+          foreach ($program in 'incode', 'sbx') {
+            $got = & $program --version
+            Write-Output "$program --version: $got"
+            if ($got -ne "$program $want") {
+              Write-Output "::error::$program reports '$got', expected '$program $want'"
+              exit 1
+            }
+          }
+
+  homebrew:
+    needs: manifests
+    name: homebrew (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      TAG: ${{ needs.manifests.outputs.tag }}
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: package-manifests
+          path: manifests
+      - name: Put Homebrew on the PATH (Linux)
+        if: runner.os == 'Linux'
+        run: echo "/home/linuxbrew/.linuxbrew/bin" >> "$GITHUB_PATH"
+      - name: Install from a local tap, then run the formula's own test
+        run: |
+          set -euo pipefail
+          brew tap-new --no-git incode-check/local
+          cp manifests/homebrew/incode.rb "$(brew --repository)/Library/Taps/incode-check/homebrew-local/Formula/"
+          brew install incode-check/local/incode
+          brew test incode-check/local/incode
+      - name: The installed programs report the tag's version
+        run: |
+          set -euo pipefail
+          want="${TAG#v}"
+          for program in incode sbx; do
+            got="$("$(brew --prefix)/bin/$program" --version)"
+            echo "$program --version: $got"
+            if [ "$got" != "$program $want" ]; then
+              echo "::error::$program reports '$got', expected '$program $want'"
+              exit 1
+            fi
+          done
