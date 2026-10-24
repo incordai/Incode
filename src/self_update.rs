@@ -25,6 +25,14 @@
 //! `sbx`, the standalone sandbox, ships in the same archive. It is replaced
 //! too when it sits beside `incode` — where the installers put it — and left
 //! alone otherwise.
+//!
+//! # Installed by a package manager
+//!
+//! Homebrew, Scoop and winget keep track of the files they install. Replaced
+//! underneath them, the manager would still list the old version and its next
+//! upgrade would undo the update, so a program one of them installed is left
+//! as it is and the manager's own upgrade command is named instead
+//! ([`package_manager`]).
 
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
@@ -44,6 +52,95 @@ const API_BOUND: Duration = Duration::from_secs(30);
 const MAX_API_BYTES: usize = 4 * 1024 * 1024;
 /// The most of `SHA256SUMS` read: a line per platform, a few hundred bytes.
 const MAX_SUMS_BYTES: usize = 64 * 1024;
+
+/// The winget package. The same identifier is in
+/// `scripts/package_manifests.py` (`WINGET_ID`), which writes the manifest.
+const WINGET_ID: &str = "IncordAI.Incode";
+
+/// A package manager that owns this program's files.
+///
+/// Replacing them under it would leave the manager believing the old version
+/// is installed, and its next upgrade would undo the update. So `incode
+/// update` names the manager's own command instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Manager {
+    Homebrew,
+    Scoop,
+    Winget,
+}
+
+impl Manager {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Homebrew => "Homebrew",
+            Self::Scoop => "Scoop",
+            Self::Winget => "winget",
+        }
+    }
+
+    fn upgrade_command(self) -> String {
+        match self {
+            Self::Homebrew => "brew upgrade incode".to_string(),
+            Self::Scoop => "scoop update incode".to_string(),
+            Self::Winget => format!("winget upgrade {WINGET_ID}"),
+        }
+    }
+}
+
+/// Which package manager installed the program at `exe` (its resolved path),
+/// if one did, by where each puts it — as `scripts/package_manifests.py`'s
+/// manifests install it, measured by `.github/workflows/package-check.yml`:
+///
+/// - Homebrew: `<prefix>/Cellar/incode/<version>/bin/incode` (`bin` links
+///   there, and the path is resolved).
+/// - Scoop: `<root>\apps\incode\<version or current>\incode.exe`, the root
+///   being `scoop` under the profile or `ProgramData` unless `SCOOP` moved it.
+/// - winget: `<...>\WinGet\Packages\IncordAI.Incode_<source>\incode.exe`
+///   (`WinGet\Links` holds a link to it).
+///
+/// Read as text, split on either separator and without regard to case, so the
+/// same rules hold for a path from any platform.
+///
+/// Called by [`run`].
+#[must_use]
+pub fn package_manager(exe: &Path) -> Option<Manager> {
+    let text = exe.to_string_lossy().to_lowercase();
+    let parts: Vec<&str> = text.split(['/', '\\']).filter(|p| !p.is_empty()).collect();
+    let after = |i: usize, name: &str| parts.get(i + 1).is_some_and(|p| *p == name);
+    for (i, part) in parts.iter().enumerate() {
+        if *part == "cellar" && after(i, "incode") {
+            return Some(Manager::Homebrew);
+        }
+        if *part == "apps"
+            && after(i, "incode")
+            && i > 0
+            && (parts[i - 1] == "scoop" || scoop_root(&parts[..i]))
+        {
+            return Some(Manager::Scoop);
+        }
+        if *part == "winget"
+            && after(i, "packages")
+            && parts
+                .get(i + 2)
+                .is_some_and(|p| p.starts_with(&WINGET_ID.to_lowercase()))
+        {
+            return Some(Manager::Winget);
+        }
+    }
+    None
+}
+
+/// Whether `parts` is the Scoop root a `SCOOP` or `SCOOP_GLOBAL` variable
+/// names, for a Scoop moved away from its default folder.
+fn scoop_root(parts: &[&str]) -> bool {
+    ["SCOOP", "SCOOP_GLOBAL"].iter().any(|var| {
+        std::env::var(var).is_ok_and(|root| {
+            let root = root.to_lowercase();
+            let root: Vec<&str> = root.split(['/', '\\']).filter(|p| !p.is_empty()).collect();
+            !root.is_empty() && root == parts
+        })
+    })
+}
 
 /// The Rust target this program was built for, as release archives name it,
 /// or `None` on a platform no release is built for.
@@ -212,36 +309,70 @@ fn latest_release() -> Result<Release, String> {
     Ok(Release { tag, assets })
 }
 
+/// What `incode update` does, once the latest release is known.
+#[derive(Debug, PartialEq, Eq)]
+enum Step {
+    /// Nothing to do, or `--check`: say this, change nothing.
+    Say(String),
+    /// Stop without changing anything, for this reason.
+    Refuse(String),
+    /// Download and put the release in place.
+    Install,
+}
+
+/// The decision, apart from the network and the files: this program's
+/// version, the latest release's tag, the package manager that installed it
+/// (if any), and whether only to check.
+///
+/// Called by [`run`].
+fn next_step(current: &str, tag: &str, managed: Option<Manager>, check_only: bool) -> Step {
+    let (Some(have), Some(latest)) = (Version::parse(current), Version::parse(tag)) else {
+        return Step::Refuse(format!(
+            "the latest release is tagged `{tag}`, which is not a version incode can compare \
+             with its own {current}"
+        ));
+    };
+    if latest <= have {
+        return Step::Say(format!("incode {current} is up to date (latest: {tag})"));
+    }
+    if check_only {
+        let how = managed.map_or_else(
+            || "`incode update`".to_string(),
+            |m| format!("`{}`", m.upgrade_command()),
+        );
+        return Step::Say(format!(
+            "incode {tag} is available (this is {current}); run {how} to install it"
+        ));
+    }
+    match managed {
+        Some(manager) => Step::Refuse(format!(
+            "incode was installed by {}, which keeps track of its files; run `{}` to update \
+             it to {tag}. Nothing was changed",
+            manager.name(),
+            manager.upgrade_command()
+        )),
+        None => Step::Install,
+    }
+}
+
 /// Check for, and unless `check_only` install, the latest release. `Ok` is
 /// what to tell the operator; `Err` says what stopped it, and that the
 /// program in place was left as it was.
 pub fn run(check_only: bool) -> Result<String, String> {
     let current = env!("CARGO_PKG_VERSION");
     let release = latest_release()?;
-    let (Some(have), Some(latest)) = (Version::parse(current), Version::parse(&release.tag)) else {
-        return Err(format!(
-            "the latest release is tagged `{}`, which is not a version incode can compare \
-             with its own {current}",
-            release.tag
-        ));
-    };
-    if latest <= have {
-        return Ok(format!(
-            "incode {current} is up to date (latest: {})",
-            release.tag
-        ));
-    }
-    if check_only {
-        return Ok(format!(
-            "incode {} is available (this is {current}); run `incode update` to install it",
-            release.tag
-        ));
+    let exe = std::env::current_exe()
+        .and_then(std::fs::canonicalize)
+        .map_err(|e| format!("could not find this program's own file: {e}"));
+    let managed = exe.as_deref().ok().and_then(package_manager);
+    match next_step(current, &release.tag, managed, check_only) {
+        Step::Say(said) => return Ok(said),
+        Step::Refuse(why) => return Err(why),
+        Step::Install => {}
     }
     let triple = target_triple()
         .ok_or_else(|| "no release is built for this platform; build from source".to_string())?;
-    let exe = std::env::current_exe()
-        .and_then(std::fs::canonicalize)
-        .map_err(|e| format!("could not find this program's own file: {e}"))?;
+    let exe = exe?;
     let dir = exe
         .parent()
         .ok_or_else(|| format!("{} has no folder", exe.display()))?
@@ -369,6 +500,114 @@ mod tests {
 
     fn v(text: &str) -> Version {
         Version::parse(text).unwrap_or_else(|| panic!("`{text}` should parse"))
+    }
+
+    /// **A package manager's install is recognised from where it puts
+    /// incode**, on paths from every platform, so `incode update` names its
+    /// command instead of replacing files it keeps track of.
+    #[test]
+    fn a_package_managed_install_is_recognised_by_its_folder() {
+        for (path, want) in [
+            (
+                "/opt/homebrew/Cellar/incode/0.1.0/bin/incode",
+                Manager::Homebrew,
+            ),
+            (
+                "/usr/local/Cellar/incode/0.1.0/bin/incode",
+                Manager::Homebrew,
+            ),
+            (
+                "/home/linuxbrew/.linuxbrew/Cellar/incode/0.1.0/bin/incode",
+                Manager::Homebrew,
+            ),
+            (
+                r"C:\Users\me\scoop\apps\incode\0.1.0\incode.exe",
+                Manager::Scoop,
+            ),
+            (
+                r"C:\ProgramData\scoop\apps\incode\current\incode.exe",
+                Manager::Scoop,
+            ),
+            (
+                r"\\?\C:\Users\me\AppData\Local\Microsoft\WinGet\Packages\IncordAI.Incode_Microsoft.Winget.Source_8wekyb3d8bbwe\incode.exe",
+                Manager::Winget,
+            ),
+            (
+                r"C:\Program Files\WinGet\Packages\IncordAI.Incode_Microsoft.Winget.Source_8wekyb3d8bbwe\incode.exe",
+                Manager::Winget,
+            ),
+        ] {
+            assert_eq!(package_manager(Path::new(path)), Some(want), "{path}");
+        }
+    }
+
+    /// **Everything else updates itself**: the installer scripts' folder,
+    /// `cargo install`, a build, and paths that only look alike.
+    #[test]
+    fn an_install_no_manager_owns_is_left_to_update_itself() {
+        for path in [
+            r"C:\Users\me\AppData\Local\incode\bin\incode.exe",
+            "/home/me/.local/bin/incode",
+            "/home/me/.cargo/bin/incode",
+            r"D:\Projects\incord-code\target\release\incode.exe",
+            "/opt/homebrew/Cellar/other/1.0/bin/incode",
+            r"D:\work\apps\incode\incode.exe",
+            r"C:\Users\me\AppData\Local\Microsoft\WinGet\Packages\Other.Tool_x\incode.exe",
+        ] {
+            assert_eq!(package_manager(Path::new(path)), None, "{path}");
+        }
+    }
+
+    /// **A newer release over a package-managed install is refused with the
+    /// manager's command**, and nothing is installed; `--check` names that
+    /// command too. Without a manager the update goes ahead as before, and an
+    /// up-to-date program is told so whoever installed it.
+    #[test]
+    fn a_managed_install_is_pointed_at_its_manager_and_left_alone() {
+        let refused = next_step("0.1.0", "v0.2.0", Some(Manager::Homebrew), false);
+        assert_eq!(
+            refused,
+            Step::Refuse(
+                "incode was installed by Homebrew, which keeps track of its files; run \
+                 `brew upgrade incode` to update it to v0.2.0. Nothing was changed"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            next_step("0.1.0", "v0.2.0", Some(Manager::Winget), true),
+            Step::Say(
+                "incode v0.2.0 is available (this is 0.1.0); run `winget upgrade \
+                 IncordAI.Incode` to install it"
+                    .to_string()
+            )
+        );
+        assert_eq!(next_step("0.1.0", "v0.2.0", None, false), Step::Install);
+        assert_eq!(
+            next_step("0.1.0", "v0.2.0", None, true),
+            Step::Say(
+                "incode v0.2.0 is available (this is 0.1.0); run `incode update` to install it"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            next_step("0.2.0", "v0.2.0", Some(Manager::Scoop), false),
+            Step::Say("incode 0.2.0 is up to date (latest: v0.2.0)".to_string())
+        );
+        assert!(matches!(
+            next_step("0.1.0", "latest", None, false),
+            Step::Refuse(_)
+        ));
+    }
+
+    /// The command each manager is told to use.
+    #[test]
+    fn each_manager_names_its_own_upgrade_command() {
+        assert_eq!(Manager::Homebrew.upgrade_command(), "brew upgrade incode");
+        assert_eq!(Manager::Scoop.upgrade_command(), "scoop update incode");
+        assert_eq!(
+            Manager::Winget.upgrade_command(),
+            "winget upgrade IncordAI.Incode"
+        );
     }
 
     #[test]
