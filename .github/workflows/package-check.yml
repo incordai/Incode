@@ -120,7 +120,12 @@ jobs:
           Invoke-RestMethod https://get.scoop.sh -OutFile "$env:RUNNER_TEMP\install-scoop.ps1"
           & "$env:RUNNER_TEMP\install-scoop.ps1" -RunAsAdmin
           $shims = Join-Path $env:USERPROFILE 'scoop\shims'
-          & (Join-Path $shims 'scoop.cmd') install manifests/scoop/incode.json
+          # An absolute path: a relative `manifests/scoop/incode.json` reads
+          # to Scoop as `<bucket>/<app>`, which it reports as not found and
+          # still exits 0 (measured), so the version check below is what
+          # proves the install.
+          $manifest = (Resolve-Path manifests/scoop/incode.json).Path
+          & (Join-Path $shims 'scoop.cmd') install $manifest
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Add-Content -Path $env:GITHUB_PATH -Value $shims
       - name: The installed programs report the tag's version
