@@ -200,7 +200,7 @@ pub fn discover_in(project: Option<&Path>, user: &Path) -> Found {
 /// One plugin folder.
 fn load_one(root: &Path, scope: Scope) -> Result<Plugin, String> {
     let path = root.join(MANIFEST);
-    let text = std::fs::read_to_string(&path).map_err(|e| {
+    let text = crate::text::read_authored(&path).map_err(|e| {
         format!(
             "plugin at {} has no readable {MANIFEST}: {e}",
             root.display()
@@ -318,7 +318,7 @@ impl Plugin {
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                let text = std::fs::read_to_string(dir.join("SKILL.md")).unwrap_or_default();
+                let text = crate::text::read_authored(dir.join("SKILL.md")).unwrap_or_default();
                 let description = crate::subagents::split_front_matter(&text)
                     .and_then(|(front, _)| crate::subagents::parse_fields(front).ok())
                     .and_then(|fields| {
@@ -341,7 +341,7 @@ impl Plugin {
     /// Its hook commands, with [`ROOT_VAR`] filled in.
     pub fn hooks(&self) -> Result<crate::hooks::HookConfig, String> {
         let path = self.root.join("hooks.json");
-        let Ok(text) = std::fs::read_to_string(&path) else {
+        let Ok(text) = crate::text::read_authored(&path) else {
             return Ok(crate::hooks::HookConfig::default());
         };
         let mut config: crate::hooks::HookConfig =
@@ -366,7 +366,7 @@ impl Plugin {
             return Ok(Vec::new());
         };
         let text =
-            std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            crate::text::read_authored(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         let value: serde_json::Value =
             serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
         let Some(servers) = value
@@ -971,6 +971,25 @@ mod tests {
         assert_eq!(m.name, "web");
         assert_eq!(m.version, "0.2.0");
         assert_eq!(m.description, "say \"hi\"");
+    }
+
+    /// **A manifest saved with a byte-order mark installs.** The mark kept
+    /// the first key from reading as `name`, and the plugin was refused with
+    /// "`name` is missing" (found by hand under #22).
+    #[test]
+    fn a_manifest_with_a_byte_order_mark_installs() {
+        let dir = tempfile::tempdir().expect("dir");
+        let source = dir.path().join("src").join("demo");
+        std::fs::create_dir_all(&source).expect("mkdir");
+        std::fs::write(
+            source.join(MANIFEST),
+            b"\xEF\xBB\xBFname = \"demo\"\r\nversion = \"1.0.0\"\r\n",
+        )
+        .expect("write");
+        let target = dir.path().join("plugins");
+        let added = add(&source.to_string_lossy(), &target).expect("installs");
+        assert_eq!(added.manifest.name, "demo");
+        assert_eq!(added.manifest.version, "1.0.0");
     }
 
     #[test]

@@ -446,7 +446,7 @@ fn read_command(path: &Path, name: String) -> Result<CustomCommand, String> {
             path.display()
         ));
     }
-    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let text = crate::text::read_authored(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut command = parse(&text).map_err(|e| format!("{}: {e}", path.display()))?;
     command.name = name;
     command.path = path.to_path_buf();
@@ -763,6 +763,25 @@ mod tests {
         assert_eq!(c.model.as_deref(), Some("sonnet"));
         assert_eq!(c.allowed_tools, vec!["Bash(npm test:*)", "Read"]);
         assert_eq!(c.body, "Test $1");
+    }
+
+    /// **A command file that starts with a byte-order mark keeps its
+    /// `allowed-tools`.** The mark hid the opening `---`, so the front matter
+    /// was taken as body and the command ran with every tool, saying nothing.
+    #[test]
+    fn a_byte_order_mark_does_not_hide_the_front_matter() {
+        let dir = tempfile::tempdir().expect("dir");
+        std::fs::write(
+            dir.path().join("review.md"),
+            b"\xEF\xBB\xBF---\r\ndescription: Read only\r\nallowed-tools: Read\r\n---\r\nLook at $1\r\n",
+        )
+        .expect("write");
+        let (found, problems) = scan_dir(dir.path(), None);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].allowed_tools, vec!["Read"]);
+        assert_eq!(found[0].description, "Read only");
+        assert_eq!(found[0].body, "Look at $1");
     }
 
     #[test]

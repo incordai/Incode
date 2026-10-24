@@ -126,7 +126,7 @@ pub fn declared_dependencies(workspace: &Path) -> Vec<String> {
         if !path.is_file() {
             continue;
         }
-        if let Ok(text) = std::fs::read_to_string(&path) {
+        if let Ok(text) = crate::text::read_authored(&path) {
             add((kind.parse)(&text));
         }
     }
@@ -141,7 +141,7 @@ pub fn declared_dependencies(workspace: &Path) -> Vec<String> {
                 .and_then(|e| e.to_str())
                 .is_some_and(|e| matches!(e, "csproj" | "fsproj" | "vbproj"));
             if is_project {
-                if let Ok(text) = std::fs::read_to_string(&path) {
+                if let Ok(text) = crate::text::read_authored(&path) {
                     add(dotnet_dependencies(&text));
                 }
             }

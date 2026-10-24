@@ -189,7 +189,7 @@ pub fn parse(text: &str) -> Result<McpFile, String> {
 ///
 /// It could not be read, or is not valid.
 pub fn read(path: &Path) -> Result<McpFile, String> {
-    match std::fs::read_to_string(path) {
+    match crate::text::read_authored(path) {
         Ok(text) => parse(&text).map_err(|e| format!("{} is not valid: {e}", path.display())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(McpFile::default()),
         Err(e) => Err(format!("could not read {}: {e}", path.display())),

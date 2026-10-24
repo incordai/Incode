@@ -121,7 +121,7 @@ pub fn ensure_gitignore(incode_dir: &Path) -> std::io::Result<bool> {
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(e),
     }
-    let text = std::fs::read_to_string(&path)?;
+    let text = crate::text::read_authored(&path)?;
     let missing = missing_from(&text);
     if missing.is_empty() {
         return Ok(false);

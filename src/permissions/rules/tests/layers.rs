@@ -91,6 +91,32 @@ fn project_settings_are_read_from_the_workspace() {
         .is_some());
 }
 
+/// **A project's deny rule still denies when its settings file starts with a
+/// byte-order mark**, as Windows PowerShell 5.1 writes it. Unread, the file
+/// was a warning and the rule was simply not there.
+#[test]
+fn project_settings_with_a_byte_order_mark_still_deny() {
+    let dir = tempfile::tempdir().expect("dir");
+    std::fs::create_dir_all(dir.path().join(".incode")).expect("mkdir");
+    std::fs::write(
+        dir.path().join(PROJECT_SETTINGS),
+        b"\xEF\xBB\xBF{\"permissions\": {\"deny\": [\"Read(.env)\"]}}",
+    )
+    .expect("write");
+    let rules = PermissionRules::load(dir.path());
+    assert!(rules.warnings().is_empty(), "{:?}", rules.warnings());
+    let ws = PathContext {
+        workspace: dir.path().to_path_buf(),
+        home: None,
+    };
+    assert_eq!(
+        rules
+            .decide("Read", &Subject::Paths(vec![".env".to_string()]), &ws)
+            .map(|v| v.effect),
+        Some(Effect::Deny),
+    );
+}
+
 // --- a turn's allowlist ---------------------------------------------------
 
 fn listed(texts: &[&str]) -> Allowlist {

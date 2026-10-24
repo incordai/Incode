@@ -124,7 +124,7 @@ impl Guards {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let text = std::fs::read_to_string(&path)
+        let text = crate::text::read_authored(&path)
             .map_err(|e| format!("could not read {}: {e}", path.display()))?;
         if text.trim().is_empty() {
             return Ok(Self::default());

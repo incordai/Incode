@@ -43,6 +43,20 @@ fn a_dot_mcp_json_parses_stdio_and_http_servers() {
     assert!(parse("{\"mcpServers\": []}").is_err());
 }
 
+/// **A `.mcp.json` saved with a byte-order mark is read**, not refused as
+/// "not valid": its servers are all there.
+#[test]
+fn a_file_with_a_byte_order_mark_is_read() {
+    let dir = tempfile::tempdir().expect("dir");
+    let path = dir.path().join(".mcp.json");
+    let mut bytes = b"\xEF\xBB\xBF".to_vec();
+    bytes.extend_from_slice(SAMPLE.as_bytes());
+    std::fs::write(&path, bytes).expect("write");
+    let file = read(&path).expect("reads");
+    assert_eq!(file.servers.len(), 4);
+    assert_eq!(file.servers["github"].command.as_deref(), Some("npx"));
+}
+
 #[test]
 fn entries_become_specs_with_variables_expanded() {
     let file = parse(SAMPLE).expect("parses");
