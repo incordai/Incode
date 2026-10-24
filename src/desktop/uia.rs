@@ -147,6 +147,16 @@ impl Element {
         self.rect.x == i32::MIN || self.rect.y == i32::MIN
     }
 
+    /// Whether the control lies wholly outside every display in `screens`:
+    /// at a real place, unlike [`Self::is_offscreen`], but one no pointer can
+    /// reach. Pages keep text for screen readers this way (1x1, thousands of
+    /// pixels off, #52). It is kept in the tree, for its text, and marked so
+    /// it is not mistaken for something to click. `false` when `screens` is
+    /// empty: with no displays known, nothing is judged.
+    pub fn beyond_screens(&self, screens: &[super::Rect]) -> bool {
+        !screens.is_empty() && !screens.iter().any(|screen| screen.overlaps(self.rect))
+    }
+
     /// What `set_value` did, for its reply: `set e49 (Edit) to 17 chars`.
     /// Not the label: an edit field's name is often empty, and `set e49 ""`
     /// reads as though the value set were empty. The length, never the
@@ -196,6 +206,16 @@ fn is_zero(n: &u32) -> bool {
 impl Tree {
     /// Render as the indented text an agent reads.
     pub fn render(&self) -> String {
+        self.render_on(&[])
+    }
+
+    /// [`Self::render`], with each element that lies outside every display in
+    /// `screens` marked `off-screen` ([`Element::beyond_screens`]): its text
+    /// is still there to read, but a pointer cannot reach it, and an action
+    /// aimed at it by id is refused (`mcp.rs` `refuse_point`).
+    ///
+    /// Called by `mcp.rs`'s `ui_tree` with the displays `screen_info` reports.
+    pub fn render_on(&self, screens: &[super::Rect]) -> String {
         let mut out = String::new();
         out.push_str(&format!("Window \"{}\"", self.root_name));
         if !self.window.is_empty() {
@@ -210,7 +230,7 @@ impl Tree {
         }
         for e in &self.elements {
             out.push_str(&format!(
-                "{:indent$}[e{}] {:<10} \"{}\" ({},{},{}x{}){}{}\n",
+                "{:indent$}[e{}] {:<10} \"{}\" ({},{},{}x{}){}{}{}\n",
                 "",
                 e.id,
                 format!("{:?}", e.role),
@@ -221,6 +241,11 @@ impl Tree {
                 e.rect.height,
                 if e.enabled { "" } else { "  disabled" },
                 if e.secret { "  password" } else { "" },
+                if e.beyond_screens(screens) {
+                    "  off-screen"
+                } else {
+                    ""
+                },
                 indent = (e.depth as usize).min(12) * 2,
             ));
         }
@@ -1105,6 +1130,72 @@ mod tests {
         assert!(
             text.contains("Narrow the request"),
             "a truncated tree must say so: {text}"
+        );
+    }
+
+    /// **AN ELEMENT OFF EVERY SCREEN IS KEPT, AND MARKED** (#52, decided in
+    /// #56): a page's screen-reader text at y=-16079 keeps its name for the
+    /// model to read, but says `off-screen`, so it is not taken for something
+    /// to click. One past the edge of the left-hand display, or overlapping a
+    /// display by a pixel, is on a screen and is not marked; with no displays
+    /// known, nothing is.
+    #[test]
+    fn an_element_outside_every_display_is_kept_and_marked_off_screen() {
+        let screens = [
+            Rect::from_edges(-1920, 0, 0, 1080),
+            Rect::from_edges(0, 0, 2560, 1440),
+        ];
+        let tree = Tree {
+            root_name: "Page".to_string(),
+            window: String::new(),
+            app: String::new(),
+            no_positions: None,
+            elements: vec![
+                element(
+                    1,
+                    Role::Text,
+                    "press ? for shortcuts",
+                    Rect {
+                        x: 0,
+                        y: -16079,
+                        width: 1,
+                        height: 1,
+                    },
+                ),
+                element(
+                    2,
+                    Role::Button,
+                    "Left screen",
+                    Rect::from_edges(-1900, 10, -1800, 40),
+                ),
+                element(3, Role::Button, "Edge", Rect::from_edges(2559, 0, 2600, 20)),
+                element(
+                    4,
+                    Role::Button,
+                    "Past the right",
+                    Rect::from_edges(2600, 0, 2700, 20),
+                ),
+            ],
+            truncated: false,
+            offscreen: 0,
+        };
+        let text = tree.render_on(&screens);
+        let line = |name: &str| {
+            text.lines()
+                .find(|l| l.contains(name))
+                .unwrap_or_else(|| panic!("{name} was dropped: {text}"))
+                .to_string()
+        };
+        assert!(
+            line("press ? for shortcuts").ends_with("  off-screen"),
+            "{text}"
+        );
+        assert!(line("Past the right").ends_with("  off-screen"), "{text}");
+        assert!(!line("Left screen").contains("off-screen"), "{text}");
+        assert!(!line("Edge").contains("off-screen"), "{text}");
+        assert!(
+            !tree.render().contains("off-screen"),
+            "without displays nothing is judged"
         );
     }
 
