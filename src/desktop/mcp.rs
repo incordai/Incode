@@ -1340,7 +1340,7 @@ pub const CLIENT_KEY: &str = "desktop";
 /// Verified against the installed Claude CLI 2.1.273: `--mcp-config <configs...>`
 /// takes JSON, and `--strict-mcp-config` confines the agent to only what is
 /// passed there. Codex takes the same information as
-/// `-c mcp_servers.<key>.…` instead (`src/agent/codex.rs:207`), which is why
+/// `-c mcp_servers.<key>.…` instead (`src/agent/codex/argv.rs`), which is why
 /// this returns the SHAPE rather than a command line — each backend spells it
 /// differently, and the thing they agree on is what to launch.
 ///
