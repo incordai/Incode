@@ -96,6 +96,8 @@ pub struct Bridge {
     addr: SocketAddr,
     token: String,
     closed: Arc<AtomicBool>,
+    /// Set when the tool server asked, with the turn's token, for the tools.
+    listed: Arc<AtomicBool>,
     listener: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -120,9 +122,11 @@ impl Bridge {
             uuid::Uuid::new_v4().simple()
         );
         let closed = Arc::new(AtomicBool::new(false));
+        let listed = Arc::new(AtomicBool::new(false));
         let gate = Gate {
             token: token.clone(),
             closed: Arc::clone(&closed),
+            listed: Arc::clone(&listed),
             cancel,
             in_flight: Arc::new(AtomicUsize::new(0)),
         };
@@ -132,8 +136,20 @@ impl Bridge {
             addr,
             token,
             closed,
+            listed,
             listener: Some(handle),
         })
+    }
+
+    /// Whether the tool server reached this bridge and asked for the tools.
+    ///
+    /// An agent CLI lists its MCP servers' tools when it starts, before the
+    /// model runs. A turn that ends without that request ran with none of
+    /// incode's tools, whatever its reply says: the server never started or
+    /// never got through (see [`require_tools`]).
+    #[must_use]
+    pub fn tools_listed(&self) -> bool {
+        self.listed.load(Ordering::SeqCst)
     }
 
     /// What the agent CLI's environment must carry for its tool server to
@@ -161,6 +177,7 @@ impl Drop for Bridge {
 struct Gate {
     token: String,
     closed: Arc<AtomicBool>,
+    listed: Arc<AtomicBool>,
     cancel: Option<CancelToken>,
     in_flight: Arc<AtomicUsize>,
 }
@@ -195,6 +212,7 @@ fn accept_until_closed<M: Send + 'static>(
                 let conn = Gate {
                     token: gate.token.clone(),
                     closed: Arc::clone(&gate.closed),
+                    listed: Arc::clone(&gate.listed),
                     cancel: gate.cancel.clone(),
                     in_flight: Arc::clone(&gate.in_flight),
                 };
@@ -253,6 +271,7 @@ fn answer_connection<M>(
 
     let answer = match request.get("op").and_then(Value::as_str) {
         Some("list") => {
+            gate.listed.store(true, Ordering::SeqCst);
             let (reply, back) = std::sync::mpsc::channel();
             forward(to, wrap(Request::List { reply }));
             match back.recv() {
@@ -344,7 +363,13 @@ pub fn answer(
 ) {
     match request {
         Request::List { reply } => {
-            let _ = reply.send(Ok(mcp_definitions(tools)));
+            let definitions = mcp_definitions(tools);
+            crate::trace!(
+                "bridge",
+                "the tool server asked for the tools: {} offered",
+                definitions.len()
+            );
+            let _ = reply.send(Ok(definitions));
         }
         Request::Call { reply, .. } if stopped => {
             let _ = reply.send(Err(
@@ -459,23 +484,69 @@ impl Turn {
     }
 }
 
+/// Refuse a finished turn whose tool server never asked for the tools.
+///
+/// Such a turn ran with none of incode's tools: the model had nothing to act
+/// with, and a model with no tools may write tool calls out as plain text
+/// that nothing ran. Its reply is not a result, so the turn fails and says
+/// why rather than reporting success. Measured: under a Windows
+/// write-restricted token (sbx, native), Node cannot give a child piped
+/// stdio, so Claude Code starts no MCP server at all (#68).
+///
+/// Called by the Claude Code route (`agent/claude_code/turn.rs` `run_once`)
+/// once its turn produced a result. Not by the codex route
+/// (`agent/codex/bridged.rs`): whether codex always lists its servers' tools
+/// before the model runs is not yet measured (#19).
+///
+/// # Errors
+///
+/// `listed` is false.
+pub fn require_tools(listed: bool, agent: &str) -> Result<(), crate::agent::AgentError> {
+    if listed {
+        return Ok(());
+    }
+    Err(no_tools(agent))
+}
+
+/// Why a turn without incode's tools was stopped: the one wording for the
+/// end-of-turn check ([`require_tools`]) and for a CLI that says at once
+/// that the server failed (the Claude route's init line,
+/// `agent/claude_code/wire.rs` `incode_server_failed`).
+#[must_use]
+pub fn no_tools(agent: &str) -> crate::agent::AgentError {
+    crate::trace!("bridge", "{agent} never started incode's tool server");
+    crate::agent::AgentError::new(format!(
+        "{agent} never started incode's tool server, so the model had none of incode's tools \
+         and its reply was not used. If it runs inside a sandbox, the sandbox may stop it \
+         starting child processes; INCODE_TRACE=<file> shows the bridge's side"
+    ))
+}
+
+/// What [`drive`] hands each line the CLI prints: the events it means, or
+/// the error that ends the turn.
+pub type LineHandler<'a> =
+    dyn FnMut(String, &mut Toolbox) -> Result<Vec<AgentEvent>, crate::agent::AgentError> + 'a;
+
 /// The turn itself: every tool call the model makes run by `tools`, and
 /// every line the CLI prints handed to `on_line`, whose events are shown —
 /// until the CLI finishes or the turn is stopped.
 ///
 /// `on_line` is given the toolbox too, so a CLI that names its conversation
-/// can tell the engine which one the calls belong to.
+/// can tell the engine which one the calls belong to. It may end the turn
+/// with an error: a line that says the turn cannot go on (the CLI reporting
+/// that incode's tool server failed to start).
 ///
 /// # Errors
 ///
-/// [`CANCELLED`] when the turn was stopped; the CLI's output could not be read.
+/// [`CANCELLED`] when the turn was stopped; the CLI's output could not be
+/// read; `on_line` refused a line.
 pub fn drive(
     from: &std::sync::mpsc::Receiver<Incoming>,
     cancel: Option<&CancelToken>,
     tools: &mut Toolbox,
     calls: &mut u64,
     on_event: &mut dyn FnMut(&AgentEvent),
-    on_line: &mut dyn FnMut(String, &mut Toolbox) -> Vec<AgentEvent>,
+    on_line: &mut LineHandler<'_>,
 ) -> Result<(), crate::agent::AgentError> {
     let stopped = || cancel.is_some_and(CancelToken::is_cancelled);
     loop {
@@ -502,7 +573,7 @@ pub fn drive(
             Ok(Incoming::Ended) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
         };
-        for event in on_line(line, tools) {
+        for event in on_line(line, tools)? {
             on_event(&event);
         }
     }
@@ -564,7 +635,14 @@ impl ToolServer {
     /// One request to the parent, and its answer.
     fn ask(&self, mut body: Value) -> Result<Value, String> {
         body["token"] = json!(self.token);
-        let reach = |e: std::io::Error| format!("incode could not be reached: {e}");
+        let addr = self.addr;
+        let reach = |e: std::io::Error| {
+            crate::trace!(
+                "bridge",
+                "tool server could not reach incode at {addr}: {e}"
+            );
+            format!("incode could not be reached: {e}")
+        };
         let mut stream = TcpStream::connect_timeout(&self.addr, CONNECT_BOUND).map_err(reach)?;
         stream.set_read_timeout(Some(REPLY_BOUND)).map_err(reach)?;
         writeln!(stream, "{body}").map_err(reach)?;
@@ -630,8 +708,16 @@ impl crate::mcp_stdio::Handler for ToolServer {
 ///
 /// The parent could not be named from the environment, or the pipe failed.
 pub fn run_stdio() -> std::io::Result<()> {
-    let mut server = ToolServer::from_env()
-        .map_err(|why| std::io::Error::new(std::io::ErrorKind::InvalidInput, why))?;
+    let mut server = ToolServer::from_env().map_err(|why| {
+        crate::trace!("bridge", "tool server could not start: {why}");
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, why)
+    })?;
+    crate::trace!(
+        "bridge",
+        "tool server started (pid {}), answering to {}",
+        std::process::id(),
+        server.addr
+    );
     let stdin = std::io::stdin();
     let mut input = stdin.lock();
     let mut output = std::io::stdout();

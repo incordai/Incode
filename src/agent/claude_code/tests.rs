@@ -281,6 +281,46 @@ fn an_agent_that_floods_stderr_fails_promptly_with_a_bounded_clean_reason() {
     );
 }
 
+/// What a stand-in CLI runs first, as the real one does when it starts: its
+/// tool server reaches the bridge with the turn's token and asks for the
+/// tools. Without it a turn is refused, as a real one is when the server
+/// never started (`tool_bridge::require_tools`).
+///
+/// One line of the stand-in's script. On Windows it calls a PowerShell file
+/// written beside it (quoting JSON through `cmd` is not worth it); on Unix,
+/// bash's `/dev/tcp`, so those stand-ins start with `#!/bin/bash`.
+pub(crate) fn lists_the_tools(dir: &std::path::Path) -> String {
+    #[cfg(windows)]
+    {
+        let script = dir.join("list-tools.ps1");
+        std::fs::write(
+            &script,
+            "$a = $env:INCODE_TOOL_BRIDGE.Split(':')\r\n\
+             $c = New-Object Net.Sockets.TcpClient($a[0], [int]$a[1])\r\n\
+             $s = $c.GetStream()\r\n\
+             $w = New-Object IO.StreamWriter($s)\r\n\
+             $w.WriteLine('{\"op\":\"list\",\"token\":\"' + $env:INCODE_TOOL_TOKEN + '\"}')\r\n\
+             $w.Flush()\r\n\
+             [void](New-Object IO.StreamReader($s)).ReadLine()\r\n\
+             $c.Close()\r\n",
+        )
+        .expect("write the stand-in's tool server");
+        format!(
+            "\"%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile \
+             -ExecutionPolicy Bypass -File \"{}\" >nul\r\n",
+            script.display()
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = dir;
+        "exec 3<>\"/dev/tcp/${INCODE_TOOL_BRIDGE%:*}/${INCODE_TOOL_BRIDGE##*:}\"\n\
+         printf '{\"op\":\"list\",\"token\":\"%s\"}\\n' \"$INCODE_TOOL_TOKEN\" >&3\n\
+         read -r _ <&3\nexec 3>&-\n"
+            .to_string()
+    }
+}
+
 /// A stand-in CLI whose option parser does not know the thinking flag:
 /// named on its argv, it says so on stderr and exits 1 before any
 /// output; otherwise it prints a short turn. Every start is counted in
@@ -300,6 +340,7 @@ fn a_cli_without_the_thinking_flag(dir: &std::path::Path) -> PathBuf {
              echo error: unknown option '--thinking-display' 1>&2\r\n\
              exit /b 1\r\n)\r\n",
         );
+        body.push_str(&lists_the_tools(dir));
         for line in LINES {
             body.push_str(&format!("echo {line}\r\n"));
         }
@@ -311,10 +352,11 @@ fn a_cli_without_the_thinking_flag(dir: &std::path::Path) -> PathBuf {
     {
         use std::os::unix::fs::PermissionsExt;
         let mut body = String::from(
-            "#!/bin/sh\necho x >> \"$(dirname \"$0\")/starts.txt\"\n\
+            "#!/bin/bash\necho x >> \"$(dirname \"$0\")/starts.txt\"\n\
              case \"$*\" in *--thinking-display*) \
              echo \"error: unknown option '--thinking-display'\" >&2; exit 1;; esac\n",
         );
+        body.push_str(&lists_the_tools(dir));
         for line in LINES {
             body.push_str(&format!("echo '{line}'\n"));
         }
@@ -389,7 +431,7 @@ pub(crate) fn stand_in_cli(dir: &std::path::Path, waits: bool) -> PathBuf {
     ];
     #[cfg(windows)]
     {
-        let mut body = format!("@echo off\r\necho {}\r\n", LINES[0]);
+        let mut body = format!("@echo off\r\n{}echo {}\r\n", lists_the_tools(dir), LINES[0]);
         if waits {
             body.push_str("ping -n 30 127.0.0.1 >nul\r\n");
         }
@@ -403,7 +445,7 @@ pub(crate) fn stand_in_cli(dir: &std::path::Path, waits: bool) -> PathBuf {
     #[cfg(not(windows))]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut body = format!("#!/bin/sh\necho '{}'\n", LINES[0]);
+        let mut body = format!("#!/bin/bash\n{}echo '{}'\n", lists_the_tools(dir), LINES[0]);
         if waits {
             body.push_str("sleep 30\n");
         }
@@ -452,6 +494,132 @@ fn a_whole_turn_reports_these_events_and_this_outcome() {
         outcome_of("sub-conv-1", "end_turn", false, None, &[])
     );
     assert_eq!(backend.session_id(), Some("sub-conv-1"));
+}
+
+/// A stand-in that prints a whole, successful-looking turn but never starts
+/// incode's tool server: the shape measured under sbx on Windows, where the
+/// CLI could not start any child with piped stdio (#68).
+fn a_cli_whose_tool_server_never_starts(dir: &std::path::Path) -> PathBuf {
+    const LINES: [&str; 3] = [
+        r#"{"type":"system","subtype":"init","session_id":"no-tools-1","model":"m"}"#,
+        r#"{"type":"assistant","message":{"content":[{"type":"text","text":"I read the file: all good"}]},"parent_tool_use_id":null}"#,
+        r#"{"type":"result","is_error":false,"stop_reason":"end_turn","session_id":"no-tools-1","usage":{"input_tokens":1,"output_tokens":1}}"#,
+    ];
+    #[cfg(windows)]
+    {
+        let mut body = String::from("@echo off\r\n");
+        for line in LINES {
+            body.push_str(&format!("echo {line}\r\n"));
+        }
+        let path = dir.join("toolless-agent.cmd");
+        std::fs::write(&path, body).expect("write the stand-in agent");
+        path
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut body = String::from("#!/bin/sh\n");
+        for line in LINES {
+            body.push_str(&format!("echo '{line}'\n"));
+        }
+        let path = dir.join("toolless-agent.sh");
+        std::fs::write(&path, body).expect("write the stand-in agent");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("make it runnable");
+        path
+    }
+}
+
+/// **A TURN THAT NEVER REACHED incode's TOOLS IS NOT A RESULT.** The model
+/// had nothing to act with, so a reply like "I read the file" is made up;
+/// it was reported as `is_error: false`. Now the turn fails and says why.
+#[test]
+fn a_turn_whose_tool_server_never_started_fails_and_says_so() {
+    let dir = tempfile::tempdir().expect("scratch");
+    let fake = a_cli_whose_tool_server_never_starts(dir.path());
+    let mut backend =
+        ClaudeCodeBackend::new(dir.path().to_path_buf()).with_binary(fake.to_string_lossy());
+    let err = backend
+        .run_turn("read hello.txt", &mut |_| {})
+        .expect_err("a turn with none of incode's tools is not a finished one");
+    assert!(
+        err.to_string()
+            .starts_with("Claude Code never started incode's tool server"),
+        "{err}"
+    );
+}
+
+/// A stand-in whose `init` line says incode's server failed, as Claude Code
+/// says it under sbx on Windows (#68), and which then goes on, as the
+/// toolless model did until the wall clock: about five seconds later it
+/// writes `still-running.txt` beside itself, then a result.
+fn a_cli_reporting_the_tool_server_failed(dir: &std::path::Path) -> PathBuf {
+    const INIT: &str = r#"{"type":"system","subtype":"init","session_id":"failed-1","model":"m","mcp_servers":[{"name":"incode","status":"failed","source":"dynamic"}]}"#;
+    const RESULT: &str = r#"{"type":"result","is_error":false,"stop_reason":"end_turn","session_id":"failed-1","usage":{"input_tokens":1,"output_tokens":1}}"#;
+    #[cfg(windows)]
+    {
+        let path = dir.join("failed-server-agent.cmd");
+        std::fs::write(
+            &path,
+            format!(
+                "@echo off\r\necho {INIT}\r\nping -n 6 127.0.0.1 >nul\r\n\
+                 echo x>\"%~dp0still-running.txt\"\r\necho {RESULT}\r\n"
+            ),
+        )
+        .expect("write the stand-in agent");
+        path
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("failed-server-agent.sh");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\necho '{INIT}'\nsleep 5\n\
+                 touch \"$(dirname \"$0\")/still-running.txt\"\necho '{RESULT}'\n"
+            ),
+        )
+        .expect("write the stand-in agent");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("make it runnable");
+        path
+    }
+}
+
+/// **WHEN THE CLI SAYS AT ONCE THAT incode's SERVER FAILED, THE TURN STOPS
+/// AT ONCE**, with the reason, and the CLI is not left running. Before, the
+/// toolless model ran on until the wall clock (281 s measured).
+#[test]
+fn a_reported_server_failure_stops_the_turn_at_once() {
+    let dir = tempfile::tempdir().expect("scratch");
+    let fake = a_cli_reporting_the_tool_server_failed(dir.path());
+    let mut backend =
+        ClaudeCodeBackend::new(dir.path().to_path_buf()).with_binary(fake.to_string_lossy());
+    let started = std::time::Instant::now();
+    let err = backend
+        .run_turn("read hello.txt", &mut |_| {})
+        .expect_err("a turn whose tool server failed is not a finished one");
+    assert!(
+        err.to_string()
+            .starts_with("Claude Code never started incode's tool server"),
+        "{err}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "stopped only when the stand-in finished: {:?}",
+        started.elapsed()
+    );
+    // Past the moment it would have written its marker: a CLI left running
+    // would have. This catches a missing kill on Linux and macOS, where
+    // nothing else ends the process group; on Windows the turn's job object
+    // ends the CLI on drop as well (`agent/process_tree.rs`), so there the
+    // marker stays absent either way.
+    std::thread::sleep(std::time::Duration::from_secs(9));
+    assert!(
+        !dir.path().join("still-running.txt").exists(),
+        "the CLI was left running after its turn was stopped"
+    );
 }
 
 /// A CLI that cannot be started names itself in the error.

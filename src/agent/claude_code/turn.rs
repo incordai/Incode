@@ -7,8 +7,8 @@ use std::io::BufReader;
 use std::process::{Child, Command, Stdio};
 
 use super::command::{servers_for, user_message};
-use super::wire::map_line;
-use super::{ClaudeCodeBackend, CANCELLED};
+use super::wire::{incode_server_failed, map_line};
+use super::ClaudeCodeBackend;
 use crate::agent::process_tree::Tree;
 use crate::agent::stderr_tail::StderrTail;
 use crate::agent::{AgentError, AgentEvent, TurnOutcome};
@@ -61,7 +61,13 @@ pub(super) fn consume(
             }
         }
         if line.trim().is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
+        }
+        // Stopped here rather than at the end: a model with no tools runs on
+        // until it gives up or the wall clock ends it, and its reply is not
+        // a result either way.
+        if incode_server_failed(&line) {
+            return Err(crate::tool_bridge::no_tools("Claude Code"));
         }
         let events = map_line(&line, &mut outcome);
         for event in &events {
@@ -74,7 +80,7 @@ pub(super) fn consume(
                 }
             }
         }
-        events
+        Ok(events)
     })?;
     Ok(outcome)
 }
@@ -161,10 +167,13 @@ impl ClaudeCodeBackend {
             &mut self.tools,
             &mut self.calls,
         );
+        let listed = bridge.tools_listed();
         // Closed as soon as the turn's loop is done: a call that arrives from
         // here on is refused rather than left waiting on a loop that is gone.
         drop(bridge);
-        self.finish(outcome, &mut child, &tree, stderr)
+        let outcome = self.finish(outcome, &mut child, &tree, stderr)?;
+        crate::tool_bridge::require_tools(listed, "Claude Code")?;
+        Ok(outcome)
     }
 
     /// WHAT WAS ACTUALLY SPAWNED, on the ordinary trace. The flags decide the
@@ -278,11 +287,12 @@ impl ClaudeCodeBackend {
         tree: &Tree,
         stderr: StderrTail,
     ) -> Result<TurnOutcome, AgentError> {
-        // Whatever happened, the child must not outlive this call. A cancelled
-        // turn that left the agent running would keep writing files with
-        // nobody reading its output — and that includes whatever it started.
-        let cancelled = matches!(outcome, Err(ref e) if e.to_string() == CANCELLED);
-        if cancelled {
+        // Whatever happened, the child must not outlive this call. A turn that
+        // ended in an error (stopped, its tool server failed, its output
+        // unreadable) and left the agent running would keep writing files
+        // with nobody reading its output — and that includes whatever it
+        // started. The codex route does the same (`codex/bridged.rs`).
+        if outcome.is_err() {
             tree.kill(child);
         }
         let outcome = outcome?;
