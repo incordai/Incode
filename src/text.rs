@@ -10,6 +10,44 @@
 //! These helpers cut on a character boundary instead. Use [`truncate`] when the
 //! limit is about how much a human should read, and [`head_bytes`] when it is
 //! about how many bytes may be sent onward.
+//!
+//! [`read_authored`] is the reading side of the same concern: text a person
+//! wrote by hand arrives with whatever their editor put in front of it.
+
+/// The byte-order mark some Windows tools write at the start of a UTF-8 file.
+const BOM: char = '\u{feff}';
+
+/// A file a person writes by hand (a setting, a manifest, a definition), as
+/// text with any leading byte-order mark dropped.
+///
+/// Windows PowerShell 5.1's `Set-Content -Encoding utf8` and some editors
+/// start a UTF-8 file with U+FEFF. `str::trim` keeps it, and serde_json and
+/// the toml crate refuse it, so without this a hand-written file is rejected
+/// or, worse, half-read: a command's front matter stopped being recognised
+/// and its `allowed-tools` were never applied.
+///
+/// Errors are `std::fs::read_to_string`'s, unchanged, so a caller's
+/// `NotFound` handling still works.
+///
+/// Wired to: every reader of a file a person authors — admin.rs (admin.json),
+/// mcp_config.rs (mcp.json), plugins.rs (plugin.toml, hooks.json, mcp.json,
+/// SKILL.md), custom_commands.rs, styles.rs, cli/keys.rs, guards.rs,
+/// contracts.rs, permissions/rules/set.rs (settings.json),
+/// permissions/managed.rs, runtime/lifecycle.rs, harness.rs, spec.rs, goal.rs,
+/// brief.rs, folders.rs (.gitignore), research.rs (project manifests).
+/// Sibling: subagents.rs `parse` strips the mark from text it is handed.
+/// Not for files incode writes itself, nor for content passed through as is.
+///
+/// # Errors
+///
+/// The file could not be read, or is not UTF-8.
+pub fn read_authored(path: impl AsRef<std::path::Path>) -> std::io::Result<String> {
+    let mut text = std::fs::read_to_string(path)?;
+    if text.starts_with(BOM) {
+        text.drain(..BOM.len_utf8());
+    }
+    Ok(text)
+}
 
 /// Longest prefix of `s` holding at most `max_chars` characters.
 #[must_use]
@@ -232,6 +270,30 @@ mod tests {
             "names the workspace: {reply}"
         );
         assert!(!reply.is_empty());
+    }
+
+    /// **A hand-written file reads the same with or without a byte-order
+    /// mark**, and only a LEADING mark goes: one inside the text is the
+    /// person's own and stays.
+    #[test]
+    fn a_leading_byte_order_mark_is_dropped_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let with = dir.path().join("with.json");
+        let without = dir.path().join("without.json");
+        std::fs::write(&with, b"\xEF\xBB\xBF{\"a\": \"x\xEF\xBB\xBFy\"}").unwrap();
+        std::fs::write(&without, b"{\"a\": \"x\xEF\xBB\xBFy\"}").unwrap();
+        let read = read_authored(&with).unwrap();
+        assert_eq!(read, read_authored(&without).unwrap());
+        assert_eq!(read, "{\"a\": \"x\u{feff}y\"}");
+        assert!(serde_json::from_str::<serde_json::Value>(&read).is_ok());
+    }
+
+    /// A missing file is still `NotFound`, which callers treat as "none".
+    #[test]
+    fn a_missing_authored_file_is_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = read_authored(dir.path().join("absent.json")).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 
     #[test]

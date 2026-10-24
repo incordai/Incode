@@ -348,7 +348,7 @@ const EXCLUDED_HEADINGS: [&str; 5] = ["non-goal", "non goal", "assumption", "ris
 /// nobody wrote is worse than none.
 #[must_use]
 pub fn from_docs(workspace: &Path) -> BriefUpdate {
-    let Ok(prd) = std::fs::read_to_string(workspace.join(PRD_PATH)) else {
+    let Ok(prd) = crate::text::read_authored(workspace.join(PRD_PATH)) else {
         return BriefUpdate::default();
     };
     if prd.trim().is_empty() {

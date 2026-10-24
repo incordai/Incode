@@ -698,7 +698,7 @@ pub fn exists(workspace: &Path, file: &SpecFile) -> bool {
 /// The document's text, when it is written: present, not blank, and — for
 /// JSON — parseable. A corrupted JSON file does not satisfy the spec contract.
 fn written(workspace: &Path, file: &SpecFile) -> Option<String> {
-    let text = std::fs::read_to_string(workspace.join(file.path)).ok()?;
+    let text = crate::text::read_authored(workspace.join(file.path)).ok()?;
     if text.trim().is_empty() {
         return None;
     }

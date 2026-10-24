@@ -57,7 +57,7 @@ pub struct Routing {
 /// The routing in `dir`; `Ok(None)` when it has no routing file.
 pub fn routing_in(dir: &Path) -> Result<Option<Routing>, String> {
     let path = dir.join(ROUTING_FILE);
-    match std::fs::read_to_string(&path) {
+    match crate::text::read_authored(&path) {
         Ok(text) => serde_json::from_str(&text)
             .map(Some)
             .map_err(|e| format!("{}: {e}", path.display())),

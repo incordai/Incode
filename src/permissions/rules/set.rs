@@ -318,7 +318,7 @@ fn read_project(workspace: &Path) -> Result<Option<RuleLists>, String> {
         permissions: Option<RuleLists>,
     }
     let path = workspace.join(PROJECT_SETTINGS);
-    let text = match std::fs::read_to_string(&path) {
+    let text = match crate::text::read_authored(&path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("could not read {}: {e}", path.display())),

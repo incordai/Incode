@@ -186,7 +186,7 @@ impl Keymap {
     /// Read the bindings file in `data_dir`; empty when there is none.
     #[must_use]
     pub fn load(data_dir: &std::path::Path) -> (Self, Vec<String>) {
-        match std::fs::read_to_string(data_dir.join(KEYBINDINGS_FILE)) {
+        match crate::text::read_authored(data_dir.join(KEYBINDINGS_FILE)) {
             Ok(text) => Self::parse(&text),
             Err(_) => (Self::default(), Vec::new()),
         }
@@ -532,6 +532,24 @@ mod tests {
         assert_eq!(problems.len(), 2, "{problems:?}");
         assert!(problems[0].contains("explode"));
         assert!(problems[1].contains("line 6"));
+    }
+
+    /// **The first binding counts when the file starts with a byte-order
+    /// mark**; it was reported as an unknown key and dropped.
+    #[test]
+    fn a_byte_order_mark_does_not_spoil_the_first_binding() {
+        let dir = tempfile::tempdir().expect("dir");
+        std::fs::write(
+            dir.path().join(KEYBINDINGS_FILE),
+            b"\xEF\xBB\xBF\"ctrl-l\" = \"clear-line\"\r\n",
+        )
+        .expect("write");
+        let (map, problems) = Keymap::load(dir.path());
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(
+            map.lookup(KeyCode::Char('l'), KeyModifiers::CONTROL),
+            Some(Action::ClearLine)
+        );
     }
 
     #[test]

@@ -188,7 +188,7 @@ fn read_style(path: &Path, name: &str, origin: Origin) -> Result<Style, String> 
             "{size} bytes, over the {MAX_FILE_BYTES}-byte limit"
         ));
     }
-    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let text = crate::text::read_authored(path).map_err(|e| e.to_string())?;
     let (description, body) = match crate::subagents::split_front_matter(&text) {
         Some((front, body)) => {
             let mut description = None;

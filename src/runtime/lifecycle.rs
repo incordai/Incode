@@ -87,7 +87,7 @@ impl LifecycleHooks {
 
     /// Load from a JSON file (e.g. `.incode/lifecycle.json`).
     pub fn load_from_file(path: &Path) -> Option<Self> {
-        let content = std::fs::read_to_string(path).ok()?;
+        let content = crate::text::read_authored(path).ok()?;
         serde_json::from_str(&content).ok()
     }
 
@@ -104,7 +104,7 @@ impl LifecycleHooks {
 
         // Try workspace/.incode.json (lifecycle section)
         let config_path = workspace.join(".incode.json");
-        if let Ok(content) = std::fs::read_to_string(&config_path) {
+        if let Ok(content) = crate::text::read_authored(&config_path) {
             if let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) {
                 if let Some(lifecycle) = config.get("lifecycle") {
                     if let Ok(hooks) = serde_json::from_value::<Self>(lifecycle.clone()) {

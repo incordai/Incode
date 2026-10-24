@@ -126,7 +126,7 @@ impl Standing {
 /// over it would make this feature a gate rather than a report.
 #[must_use]
 pub fn checks_from_docs(workspace: &Path) -> Vec<GoalCheck> {
-    let Ok(text) = std::fs::read_to_string(workspace.join(VERIFICATION_PATH)) else {
+    let Ok(text) = crate::text::read_authored(workspace.join(VERIFICATION_PATH)) else {
         return Vec::new();
     };
     parse_checks(&text)
@@ -467,6 +467,25 @@ mod tests {
             "every bullet here is prose; `index.html` is a filename the owner \
              quoted, not a command to run: {checks:?}"
         );
+    }
+
+    /// **A check on the first line counts when the document starts with a
+    /// byte-order mark**; the mark kept the line from reading as a bullet, so
+    /// the check was silently not run.
+    #[test]
+    fn a_byte_order_mark_does_not_hide_the_first_check() {
+        let dir = tempfile::tempdir().expect("dir");
+        std::fs::create_dir_all(dir.path().join("docs")).expect("mkdir");
+        std::fs::write(
+            dir.path().join(VERIFICATION_PATH),
+            "\u{feff}- **b1 builds** — `make`\r\n- **b2 tests** — `make test`\r\n",
+        )
+        .expect("write");
+        let ids: Vec<String> = checks_from_docs(dir.path())
+            .into_iter()
+            .map(|c| c.roadmap_id)
+            .collect();
+        assert_eq!(ids, vec!["b1", "b2"]);
     }
 
     /// The three shapes a single backticked token can take.

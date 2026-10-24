@@ -660,7 +660,7 @@ impl AdminConfig {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let text = std::fs::read_to_string(&path)
+        let text = crate::text::read_authored(&path)
             .map_err(|e| format!("could not read {}: {e}", path.display()))?;
         if text.trim().is_empty() {
             return Ok(Self::default());
@@ -1488,6 +1488,21 @@ mod tests {
 
         let error = AdminConfig::load(dir.path()).expect_err("must not be silently empty");
         assert!(error.contains("not valid admin settings"), "got: {error}");
+    }
+
+    /// **Settings saved with a byte-order mark load**, rather than being
+    /// refused as "not valid admin settings": Windows PowerShell 5.1 writes
+    /// the mark with `Set-Content -Encoding utf8`.
+    #[test]
+    fn a_file_with_a_byte_order_mark_loads() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(
+            AdminConfig::path_in(dir.path()),
+            b"\xEF\xBB\xBF{\"notify\": \"bell\"}",
+        )
+        .expect("write");
+        let admin = AdminConfig::load(dir.path()).expect("loads");
+        assert_eq!(admin.notify.as_deref(), Some("bell"));
     }
 
     #[test]

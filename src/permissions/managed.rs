@@ -206,7 +206,7 @@ pub fn load() -> Managed {
         return Managed::Absent;
     }
     let path = managed_path();
-    match std::fs::read_to_string(&path) {
+    match crate::text::read_authored(&path) {
         Ok(text) => match parse(&text) {
             Ok(settings) => Managed::Loaded(settings),
             Err(why) => Managed::Broken(format!("{}: {why}", path.display())),
