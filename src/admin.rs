@@ -172,8 +172,8 @@ pub struct AdminConfig {
     /// owner asks (`/tools add <name>`, `incode --install-tools`), checked
     /// against its sha256, and started as an MCP server in every session —
     /// see [`crate::ext_tools`]. Exactly what the owner wrote: the built-in
-    /// defaults join it only in [`Self::tools_in_effect`], so a save never
-    /// writes them into the file.
+    /// defaults join it only in [`crate::ext_tools::in_effect`], so a save
+    /// never writes them into the file.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<crate::ext_tools::ToolEntry>,
     /// Whether the built-in tools (`defaults/tools.json`) are offered beside
@@ -680,35 +680,6 @@ impl AdminConfig {
         }
         serde_json::from_str(&text)
             .map_err(|e| format!("{} is not valid admin settings: {e}", path.display()))
-    }
-
-    /// The tools a session runs and an install installs: the owner's `tools`,
-    /// then each built-in default ([`crate::ext_tools::defaults`]) the owner
-    /// has not replaced — one whose name the owner already uses, or whose
-    /// capability an owner's entry already `provides`, is left out. None of
-    /// the defaults when `default_tools` is `false`.
-    ///
-    /// Read by every consumer of the tool list: `ext_tools::install_all` and
-    /// `ext_tools::command`, the REPL's and a task run's `connect_ext_tools`
-    /// (`cli/mod.rs`, `task_run.rs`), the ACP agent's `tool_servers`, and
-    /// `Toolbox::detect_browser`. A consumer reading `tools` directly would
-    /// silently lose the defaults.
-    #[must_use]
-    pub fn tools_in_effect(&self) -> Vec<crate::ext_tools::ToolEntry> {
-        let mut tools = self.tools.clone();
-        if self.default_tools == Some(false) {
-            return tools;
-        }
-        for default in crate::ext_tools::defaults() {
-            let replaced = self.tools.iter().any(|own| {
-                own.name == default.name
-                    || (default.provides.is_some() && own.provides == default.provides)
-            });
-            if !replaced {
-                tools.push(default);
-            }
-        }
-        tools
     }
 
     pub fn save(&self, data_dir: &Path) -> Result<(), String> {

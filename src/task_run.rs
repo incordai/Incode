@@ -571,7 +571,7 @@ fn connect_ext_tools(workspace: &Path) -> std::sync::Arc<crate::toolbox::Session
     let tools = crate::toolbox::SessionTools::new(true);
     let data_dir = crate::admin::AdminConfig::default_dir();
     let configured = crate::admin::AdminConfig::load(&data_dir)
-        .map(|admin| admin.tools_in_effect())
+        .map(|admin| crate::ext_tools::in_effect(&admin))
         .unwrap_or_default();
     let (mut specs, mut said) = crate::ext_tools::session_servers(&configured, &data_dir);
     let (plugin_specs, plugin_said) = crate::plugins::session_servers(workspace);

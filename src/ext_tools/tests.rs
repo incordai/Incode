@@ -578,11 +578,7 @@ fn the_built_in_entries_parse_and_pass_the_owners_checks() {
 #[test]
 fn a_built_in_entry_yields_to_the_owners() {
     let names = |admin: &crate::admin::AdminConfig| -> Vec<String> {
-        admin
-            .tools_in_effect()
-            .into_iter()
-            .map(|t| t.name)
-            .collect()
+        in_effect(admin).into_iter().map(|t| t.name).collect()
     };
     let none = crate::admin::AdminConfig::default();
     assert_eq!(names(&none), ["browser"]);
@@ -601,7 +597,7 @@ fn a_built_in_entry_yields_to_the_owners() {
         tools: vec![taken],
         ..crate::admin::AdminConfig::default()
     };
-    let effect = same_name.tools_in_effect();
+    let effect = in_effect(&same_name);
     assert_eq!(effect.len(), 1);
     assert_eq!(
         effect[0].provides, None,
@@ -621,7 +617,7 @@ fn a_built_in_entry_yields_to_the_owners() {
         default_tools: Some(false),
         ..crate::admin::AdminConfig::default()
     };
-    assert!(off.tools_in_effect().is_empty());
+    assert!(in_effect(&off).is_empty());
 }
 
 /// **A SAVE WRITES ONLY WHAT THE OWNER WROTE**: settings loaded and saved
@@ -630,7 +626,7 @@ fn a_built_in_entry_yields_to_the_owners() {
 fn saving_settings_never_writes_the_built_in_entries() {
     let data = tempfile::tempdir().expect("data");
     let loaded = crate::admin::AdminConfig::load(data.path()).expect("load");
-    assert_eq!(loaded.tools_in_effect().len(), defaults().len());
+    assert_eq!(in_effect(&loaded).len(), defaults().len());
     loaded.save(data.path()).expect("save");
     let text =
         std::fs::read_to_string(crate::admin::AdminConfig::path_in(data.path())).expect("written");
