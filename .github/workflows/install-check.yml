@@ -74,7 +74,7 @@ jobs:
           $sbx = Join-Path $env:RUNNER_TEMP 'incode-bin\sbx.exe'
           & $sbx check --net deny
           if ($LASTEXITCODE -ne 0) {
-            Write-Output "::error::after install.ps1, sbx check --net deny exited $LASTEXITCODE: the sandbox setup did not run"
+            Write-Output "::error::after install.ps1, sbx check --net deny exited ${LASTEXITCODE}: the sandbox setup did not run"
             exit 1
           }
       # Linux and macOS need no sandbox setup; install.sh checks what the
