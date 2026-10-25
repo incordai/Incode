@@ -6,9 +6,15 @@
 # Environment:
 #   INCODE_INSTALL_DIR  where the programs go (default: ~/.local/bin)
 #   INCODE_VERSION      a release tag such as v0.2.0 (default: the latest)
+#   INCODE_NO_SANDBOX_SETUP=1  skip the sandbox check at the end
 #
 # The archive is checked against the release's SHA256SUMS before anything is
 # unpacked; a mismatch, or no checksum for it, stops the install.
+#
+# The sandbox needs no setup here and no root: Landlock and seccomp (Linux)
+# and Seatbelt (macOS) are part of the system. What this system enforces is
+# checked at the end, so a gap (an older kernel) is known at install time.
+# Windows is different: scripts/install.ps1 runs `sbx setup-windows`.
 #
 # POSIX sh on purpose: it runs from a pipe on systems where bash is not there.
 
@@ -115,7 +121,28 @@ main() {
             say "    echo 'export PATH=\"$INSTALL_DIR:\$PATH\"' >> ~/.profile"
             ;;
     esac
+    sandbox_check
     say "keep it current with: incode update"
+}
+
+# `sbx check` exits 0 when this system enforces file and network confinement
+# natively, and otherwise prints, per part, what it cannot enforce.
+sandbox_check() {
+    sbx="$INSTALL_DIR/sbx"
+    if [ "${INCODE_NO_SANDBOX_SETUP:-}" = "1" ]; then
+        say "sandbox check skipped (INCODE_NO_SANDBOX_SETUP=1)"
+        return 0
+    fi
+    if [ ! -x "$sbx" ]; then
+        say "sandbox: this release has no sbx, so commands run unconfined"
+        return 0
+    fi
+    if report="$("$sbx" check --fs workspace-write --net deny 2>&1)"; then
+        say "sandbox ready: this system confines files and network natively"
+    else
+        say "sandbox: incode works, but this system does not enforce all of it:"
+        printf '%s\n' "$report" | while IFS= read -r line; do say "    $line"; done
+    fi
 }
 
 main "$@"

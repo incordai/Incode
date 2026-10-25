@@ -55,7 +55,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          INCODE_VERSION="$TAG" INCODE_INSTALL_DIR="$RUNNER_TEMP/incode-bin" sh scripts/install.sh
+          INCODE_VERSION="$TAG" INCODE_INSTALL_DIR="$RUNNER_TEMP/incode-bin" sh scripts/install.sh 2>&1 | tee "$RUNNER_TEMP/install.log"
       - name: Install with install.ps1
         if: runner.os == 'Windows'
         shell: pwsh
@@ -77,6 +77,22 @@ jobs:
             Write-Output "::error::after install.ps1, sbx check --net deny exited $LASTEXITCODE: the sandbox setup did not run"
             exit 1
           }
+      # Linux and macOS need no sandbox setup; install.sh checks what the
+      # system enforces and says so. Proven here: the installer reported it.
+      # What this runner enforces is printed either way, for the record.
+      - name: The installer reported the sandbox (Linux, macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -uo pipefail
+          sbx="$RUNNER_TEMP/incode-bin/sbx"
+          "$sbx" check --fs workspace-write --net deny
+          echo "sbx check exited $?"
+          "$sbx" doctor
+          if ! grep -Eq 'incode-install: sandbox( ready|: incode works)' "$RUNNER_TEMP/install.log"; then
+            echo "::error::install.sh did not report the sandbox's state"
+            exit 1
+          fi
       - name: The installed programs report the tag's version
         shell: bash
         run: |
