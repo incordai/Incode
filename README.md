@@ -177,6 +177,22 @@ curl -fsSL https://raw.githubusercontent.com/incordai/incode/main/scripts/instal
 irm https://raw.githubusercontent.com/incordai/incode/main/scripts/install.ps1 | iex
 ```
 
+At the end, both scripts set up the [sandbox](#the-os-sandbox) and install
+incode's [tools](#external-tools):
+
+- **Windows**: `sbx setup-windows` (an offline account and firewall filters, so
+  commands can be cut off the network) runs through the Windows administrator
+  prompt, once; it is skipped when already done.
+- **Linux and macOS**: nothing to set up and no root needed (Landlock and
+  seccomp, or Seatbelt, are part of the system); the script says whether this
+  system enforces file and network confinement, and what it cannot.
+- **Everywhere**: `incode --install-tools` installs the built-in headless
+  browser, sha256-checked.
+
+Declining the prompt or a failed download leaves incode installed and says what
+is missing. `INCODE_NO_SANDBOX_SETUP=1` skips the sandbox step and
+`INCODE_NO_TOOLS_INSTALL=1` the tools.
+
 Set `INCODE_VERSION=v0.2.0` to pin a release instead of the latest. Once
 installed, `incode update --check` says whether a newer release exists, and
 `incode update` installs it in place (sha256-checked; `sbx` is updated too when
@@ -805,9 +821,9 @@ see only a placeholder such as `[image 1280x720 png]`.
 
 ### Optional programs, and how they are found
 
-- **Headless browser.** A headless browser installed as a tool (e.g.
-  `release: "incordai/incord-browser"`): the installed
-  [external tool](#external-tools) whose entry says `"provides": "browser"`.
+- **Headless browser.** The installed [external tool](#external-tools) whose
+  entry says `"provides": "browser"`: the built-in `browser` entry
+  (`incordai/incord-browser`), or the owner's own, which replaces it.
   For development, `INCODE_BROWSER` (only
   there when set), then `admin.json` `browser_bin` (only there when set), name
   an executable directly and win over the installed tool. `PATH` is never
@@ -854,10 +870,18 @@ named in `admin.json` `tools` and downloaded from its release, never taken from
 - `sha256` pins the asset's digest: one hex digest, or one per target
   (`{ "x86_64-windows": "<hex>" }`).
 
-Nothing is downloaded until you ask: `/tools add <name>` (in the REPL or over
+**Built in.** incode carries one entry of its own (`defaults/tools.json`): the
+headless browser, `browser` from `incordai/incord-browser` (`obscura mcp`).
+It is offered beside yours unless you replace it — an entry of yours named
+`browser`, or one that `provides` `browser`, wins — and `"default_tools":
+false` in `admin.json` leaves out every built-in entry. It is never written
+into `admin.json`.
+
+Nothing is downloaded until asked: `/tools add <name>` (in the REPL or over
 `--acp`), `/tools update [name]`, `/tools remove <name>`, or
-`incode --install-tools` for every entry. A session that finds an entry not
-installed says so once and downloads nothing. An install:
+`incode --install-tools` for every entry, which the install scripts run at
+the end. A session that finds an entry not installed says so once and
+downloads nothing. An install:
 
 1. resolves the release through GitHub's API (`releases/latest` or
    `releases/tags/<version>`);
@@ -1369,6 +1393,7 @@ and `--admin` prints which layer decided each value.
 | `cli_agents` | [Agent CLIs](#cli-agents) to look for, changed or added: `id`, `commands`, `protocol`, `version_args`, `display_name`, `default_sub_agent` |
 | `web_search` | `WebSearch`'s endpoint (`url`, the query sent as `q`) and the name of its key's variable. The key is sent only over https or to loopback |
 | `tools` | [External tools](#external-tools): each one's release, version, asset, `run` and `provides` |
+| `default_tools` | `false` leaves out incode's built-in tool entries (the headless browser); unset offers them beside `tools` |
 | `browser_bin` · `pdf_renderer` | For development, a headless browser executable that wins over the installed one · which program `RenderPdf` uses |
 | `sandbox` | `off` · `workspace-write` · `read-only`; unset follows the permission mode |
 | `sandbox_network` | `allow` (default) · `deny` — see [the OS sandbox](#the-os-sandbox) |

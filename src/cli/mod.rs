@@ -99,7 +99,7 @@ impl CliApp {
 /// became of each server is traced, never printed over the prompt.
 fn connect_ext_tools(prepared: &Prepared) {
     let (mut specs, mut said) =
-        crate::ext_tools::session_servers(&prepared.admin.tools, &prepared.incode_dir);
+        crate::ext_tools::session_servers(&prepared.admin.tools_in_effect(), &prepared.incode_dir);
     let (plugin_specs, plugin_said) = crate::plugins::session_servers(&prepared.workspace);
     specs.extend(plugin_specs);
     said.extend(plugin_said);

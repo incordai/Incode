@@ -17,12 +17,22 @@
 //! file name. A source that is not a GitHub release gives `url` instead of
 //! `release`: a template over the same names and `{version}`.
 //!
+//! # Built-in entries
+//!
+//! `defaults/tools.json` ([`defaults`]) holds entries offered beside the
+//! owner's: today the headless browser. Each is left out when the owner has
+//! an entry of the same name or one that `provides` the same capability, and
+//! all of them when `admin.json` says `"default_tools": false`
+//! (`AdminConfig::tools_in_effect`). They are installed exactly like the
+//! owner's, through the same checks.
+//!
 //! # Installing
 //!
-//! Only when the owner asks: `/tools add <name>`, `/tools update [name]`,
+//! Only when asked: `/tools add <name>`, `/tools update [name]`,
 //! `/tools remove <name>` (the REPL and ACP), or `incode --install-tools` for
-//! every entry. A session that finds an entry not installed says how to
-//! install it, and downloads nothing.
+//! every entry, which the installers (`scripts/install.ps1`,
+//! `scripts/install.sh`) run at the end of an install. A session that finds
+//! an entry not installed says how to install it, and downloads nothing.
 //!
 //! 1. The release is resolved through GitHub's API ([`fetch::GITHUB_API`]):
 //!    `releases/latest`, or `releases/tags/<version>`.
@@ -335,6 +345,22 @@ pub(crate) fn inside_path(path: &str) -> Result<PathBuf, String> {
     Ok(out)
 }
 
+/// The tools offered when the owner has not replaced them: the entries of
+/// `defaults/tools.json`, compiled in. Data, like `defaults/agents`, so no
+/// program is named in code. Joined to the owner's `tools` only by
+/// `AdminConfig::tools_in_effect`.
+pub(crate) fn defaults() -> Vec<ToolEntry> {
+    static DEFAULTS: std::sync::OnceLock<Vec<ToolEntry>> = std::sync::OnceLock::new();
+    DEFAULTS
+        .get_or_init(|| {
+            // The file is part of this build and a test parses and checks
+            // every entry in it, so a malformed one never ships.
+            serde_json::from_str(include_str!("../../defaults/tools.json"))
+                .expect("defaults/tools.json is a list of tool entries")
+        })
+        .clone()
+}
+
 /// Where every tool is installed: `<data dir>/tools`.
 pub(crate) fn tools_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("tools")
@@ -632,7 +658,7 @@ fn said(outcome: &Result<Installed, String>) -> String {
 #[must_use]
 pub fn install_all(data_dir: &Path) -> (Vec<String>, bool) {
     let tools = match crate::admin::AdminConfig::load(data_dir) {
-        Ok(admin) => admin.tools,
+        Ok(admin) => admin.tools_in_effect(),
         Err(why) => return (vec![why], false),
     };
     if tools.is_empty() {
@@ -664,7 +690,7 @@ pub(crate) fn command(arg: &str, data_dir: &Path) -> Vec<String> {
     let verb = words.next().unwrap_or_default().to_ascii_lowercase();
     let names: Vec<&str> = words.collect();
     let tools = match crate::admin::AdminConfig::load(data_dir) {
-        Ok(admin) => admin.tools,
+        Ok(admin) => admin.tools_in_effect(),
         Err(why) => return vec![why],
     };
     let find = |name: &str| tools.iter().find(|t| t.name == name);

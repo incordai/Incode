@@ -81,7 +81,8 @@ jobs:
         run: |
           $env:INCODE_VERSION = $env:TAG
           $env:INCODE_INSTALL_DIR = Join-Path $env:RUNNER_TEMP 'incode-bin'
-          ./scripts/install.ps1
+          # Say is Write-Host, the information stream: *>&1 keeps it.
+          ./scripts/install.ps1 *>&1 | Tee-Object -FilePath (Join-Path $env:RUNNER_TEMP 'install.log')
 
       # install.ps1 runs the sandbox's one-time setup itself (through the
       # elevation prompt; the runner is already elevated). Proven here: network
@@ -110,6 +111,19 @@ jobs:
           "$sbx" doctor
           if ! grep -Eq 'incode-install: sandbox( ready|: incode works)' "$RUNNER_TEMP/install.log"; then
             echo "::error::install.sh did not report the sandbox's state"
+            exit 1
+          fi
+      # Both installers end with `incode --install-tools`; it must have
+      # installed every tool in effect (the built-in browser among them, from
+      # the release that has one), each checked against its sha256.
+      - name: The installer installed incode's tools
+        shell: bash
+        run: |
+          set -uo pipefail
+          log="$RUNNER_TEMP/install.log"
+          grep -E 'incode-install: (tools|    )' "$log" || true
+          if ! grep -q 'incode-install: tools installed:' "$log"; then
+            echo "::error::the installer did not install incode's tools"
             exit 1
           fi
       - name: The installed programs report the tag's version
