@@ -1071,7 +1071,6 @@ impl AdminConfig {
     pub fn report(&self, workspace: &Path, flag_model: Option<&str>) -> String {
         let model = self.resolve_model(flag_model);
         let roles = self.resolve_roles();
-        let budget = self.resolve_budget();
 
         let mut out = String::from("Admin settings (value <- where it was decided)\n");
         // Named first, because the next thing an operator does with this report
@@ -1086,7 +1085,32 @@ impl AdminConfig {
             model.source.as_str()
         ));
         out.push_str(&self.agent_line());
+        out.push_str(&self.roles_report(&roles));
+        out.push_str(&self.budget_and_verify_report(workspace));
 
+        let codex_tools = self.resolve_codex_tools();
+        out.push_str(&format!(
+            "  codex tools    {}  <- {}\n",
+            codex_tools.value.as_str(),
+            codex_tools.source.as_str()
+        ));
+        out.push_str(&format!(
+            "  telemetry      {}\n",
+            crate::telemetry::describe(self.telemetry)
+        ));
+        out.push_str(&self.output_style_line(workspace));
+        out.push_str(&self.plugins_report());
+
+        if let Some(warning) = roles.value.review_independence_warning() {
+            out.push_str(&format!("\n  ! {warning}\n"));
+        }
+        out
+    }
+
+    /// The roles and the tier ladder they draw on, for [`Self::report`], with
+    /// a warning per role that names a tier nobody defined.
+    fn roles_report(&self, roles: &Resolved<crate::roles::RoleTable>) -> String {
+        let mut out = String::new();
         if roles.value.is_empty() {
             out.push_str(
                 "  roles          none assigned — delegated work runs on the session model\n",
@@ -1100,15 +1124,10 @@ impl AdminConfig {
                 ));
             }
         }
-
         // The ladder itself, so "why did plan run on that model" is answerable
         // without opening the file.
         for (tier, models) in &self.tiers {
-            out.push_str(&format!(
-                "  tier {tier:<9} {}
-",
-                models.join(" > ")
-            ));
+            out.push_str(&format!("  tier {tier:<9} {}\n", models.join(" > ")));
         }
         // A REFERENCE THAT RESOLVED TO NOTHING IS NOT AN ABSENCE. Without this
         // the role simply loses its candidates and falls back to the session
@@ -1119,48 +1138,43 @@ impl AdminConfig {
                 unknown_tier_warning(&role, &reference)
             ));
         }
+        out
+    }
 
-        match budget.value.ceiling() {
-            Some(ceiling) => out.push_str(&format!(
+    /// The token budget and the verify command, for [`Self::report`].
+    fn budget_and_verify_report(&self, workspace: &Path) -> String {
+        let budget = self.resolve_budget();
+        let mut out = match budget.value.ceiling() {
+            Some(ceiling) => format!(
                 "  budget         {ceiling} tokens  <- {}\n",
                 budget.source.as_str()
-            )),
-            None => out.push_str("  budget         no ceiling — a run is unbounded\n"),
-        }
-
-        match self.resolve_verify(workspace) {
-            Some(verify) => out.push_str(&format!(
+            ),
+            None => "  budget         no ceiling — a run is unbounded\n".to_string(),
+        };
+        out.push_str(&match self.resolve_verify(workspace) {
+            Some(verify) => format!(
                 "  verify         {}  <- {}\n",
                 verify.value.join(" "),
                 verify.source.as_str()
-            )),
+            ),
             // WHY, not just THAT. "none" told an operator they had a problem
             // and nothing about which one, so the two cases — nothing here
             // names an ecosystem, versus two do and running one's tests would
             // not prove the other's code — read identically. They need
             // opposite responses, and `detection_note` already wrote both.
-            None => out.push_str(&format!(
+            None => format!(
                 "  verify         none — nothing can prove a task finished\n                 {}\n",
                 crate::verify::detection_note(workspace)
-            )),
-        }
+            ),
+        });
+        out
+    }
 
-        let codex_tools = self.resolve_codex_tools();
-        out.push_str(&format!(
-            "  codex tools    {}  <- {}\n",
-            codex_tools.value.as_str(),
-            codex_tools.source.as_str()
-        ));
-        out.push_str(&format!(
-            "  telemetry      {}\n",
-            crate::telemetry::describe(self.telemetry)
-        ));
-
+    /// The output style in force and the file it comes from, for
+    /// [`Self::report`].
+    fn output_style_line(&self, workspace: &Path) -> String {
         let env_style = std::env::var(crate::styles::ENV).ok();
-        out.push_str(&match crate::styles::chosen(
-            env_style.as_deref(),
-            self.output_style.as_deref(),
-        ) {
+        match crate::styles::chosen(env_style.as_deref(), self.output_style.as_deref()) {
             Some(style) => format!(
                 "  output style   {}  <- {}{}\n",
                 style.value,
@@ -1171,49 +1185,39 @@ impl AdminConfig {
                 }
             ),
             None => "  output style   none\n".to_string(),
-        });
-
-        // Every one of these is optional. Saying which are OFF is the point: a
-        // harness quietly doing less looks exactly like one doing nothing.
-        let off = self.plugins.disabled();
-        if off.is_empty() {
-            out.push_str(
-                "  plugins        all on (owner, auditor, recorder, guards, skills, mcp)
-",
-            );
-        } else {
-            out.push_str(&format!(
-                "  plugins        OFF: {}
-",
-                off.join(", ")
-            ));
         }
+    }
+
+    /// Which plugins are off, for [`Self::report`]. Every one of these is
+    /// optional; saying which are OFF is the point, since a harness quietly
+    /// doing less looks exactly like one doing nothing.
+    fn plugins_report(&self) -> String {
+        let off = self.plugins.disabled();
+        let mut out = if off.is_empty() {
+            "  plugins        all on (owner, auditor, recorder, guards, skills, mcp)\n".to_string()
+        } else {
+            format!("  plugins        OFF: {}\n", off.join(", "))
+        };
         // Reported INDEPENDENTLY of the globals: an operator who removed three
         // skills while leaving skills on would otherwise see "all on", which is
         // the exact "silently doing less" this report exists to prevent.
         if !self.plugins.disabled_skills.is_empty() {
             out.push_str(&format!(
-                "                 skills removed: {}
-",
+                "                 skills removed: {}\n",
                 self.plugins.disabled_skills.join(", ")
             ));
         }
         if !self.plugins.disabled_mcp.is_empty() {
             out.push_str(&format!(
-                "                 mcp servers removed: {}
-",
+                "                 mcp servers removed: {}\n",
                 self.plugins.disabled_mcp.join(", ")
             ));
         }
         if !self.plugins.owner {
             out.push_str(
-                "                 with the owner channel off the runner STOPS at a decision it must not make, rather than asking
-",
+                "                 with the owner channel off the runner STOPS at a decision it must \
+                 not make, rather than asking\n",
             );
-        }
-
-        if let Some(warning) = roles.value.review_independence_warning() {
-            out.push_str(&format!("\n  ! {warning}\n"));
         }
         out
     }
