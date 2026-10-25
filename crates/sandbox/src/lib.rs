@@ -699,7 +699,8 @@ impl Sandbox {
             let allowlist = proxy::Allowlist::new(
                 &self.policy.network.allow,
                 self.policy.network.allow_private,
-            )?;
+            )?
+            .with_loopback_ports(&self.policy.network.loopback_ports);
             let upstream = proxy::Upstream::from_env(|k| std::env::var(k).ok());
             // As the offline account, the command may only reach the
             // loopback ports the setup's filter permits: listen on one.

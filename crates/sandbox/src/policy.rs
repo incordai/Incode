@@ -12,6 +12,7 @@
 //! mode = "proxy"                  # allow | deny | proxy
 //! allow = ["crates.io", "*.crates.io:443", "registry.npmjs.org"]
 //! allow_private = false           # may an allowed name resolve to a private address?
+//! loopback_ports = [5173]         # this machine's own ports the proxy may reach
 //!
 //! [env]
 //! inherit = "all"                 # all | none
@@ -133,6 +134,12 @@ pub struct Network {
     /// private, link-local or cloud-metadata address. Off by default, so a
     /// DNS answer cannot turn an allowed host into the metadata service.
     pub allow_private: bool,
+    /// Under `proxy`: this machine's own ports the command may reach, on
+    /// `localhost`, `127.0.0.1` or `::1` — a dev server a browser test loads,
+    /// say. Only a loopback address is connected to, and nothing else private
+    /// opens: `allow_private` stays as it is. The operator's setting alone:
+    /// `sbx mcp` gives an agent no way to ask for it.
+    pub loopback_ports: Vec<u16>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -384,6 +391,8 @@ mod tests {
         assert_eq!(policy.fs.mode, FsMode::WorkspaceWrite);
         assert_eq!(policy.network.mode, NetMode::Proxy);
         assert_eq!(policy.network.allow.len(), 3);
+        assert_eq!(policy.network.loopback_ports, [5173]);
+        assert!(!policy.network.allow_private);
         assert_eq!(policy.env.set.get("CI").map(String::as_str), Some("1"));
         assert_eq!(policy.limits.wall_secs, Some(1800));
     }

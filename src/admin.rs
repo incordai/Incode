@@ -206,6 +206,13 @@ pub struct AdminConfig {
     /// `INCODE_SANDBOX_ALLOW_HOSTS` (comma-separated) wins over it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sandbox_allow_hosts: Vec<String>,
+    /// Under the sbx engine: this machine's own ports a command may reach
+    /// when the network is not denied (a dev server a browser test loads),
+    /// on `localhost`, `127.0.0.1` or `::1` only; nothing else private opens.
+    /// Like `sandbox_allow_hosts` it puts the network behind sbx's proxy.
+    /// Set here only, by the owner: no variable overrides it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sandbox_loopback_ports: Vec<u16>,
     /// Under the sbx engine on Windows: `native`, `wsl` or `auto` (the
     /// default). `INCODE_SANDBOX_BACKEND` wins over it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1636,6 +1643,7 @@ mod tests {
             sandbox_network: Some("deny".to_string()),
             sandbox_engine: Some("sbx".to_string()),
             sandbox_allow_hosts: vec!["crates.io".to_string()],
+            sandbox_loopback_ports: vec![5173],
             sandbox_backend: Some("wsl".to_string()),
             // The Bash tool's shell, which the owner may pin on Windows.
             shell: Some("C:/Program Files/Git/bin/bash.exe".to_string()),
