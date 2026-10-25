@@ -1,0 +1,10 @@
+[
+  {
+    "name": "browser",
+    "release": "incordai/incord-browser",
+    "version": "latest",
+    "asset": "obscura-{arch}-{os}.{ext}",
+    "run": ["obscura", "mcp"],
+    "provides": "browser"
+  }
+]

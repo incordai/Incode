@@ -7,6 +7,7 @@
 #   INCODE_INSTALL_DIR  where the programs go (default: %LOCALAPPDATA%\incode\bin)
 #   INCODE_VERSION      a release tag such as v0.2.0 (default: the latest)
 #   INCODE_NO_SANDBOX_SETUP=1  skip the sandbox's one-time machine setup
+#   INCODE_NO_TOOLS_INSTALL=1  skip installing incode's tools at the end
 #
 # The archive is checked against the release's SHA256SUMS before anything is
 # unpacked; a mismatch, or no checksum for it, stops the install. The folder is
@@ -15,7 +16,9 @@
 # setup-windows`: an offline account and firewall filters) is run at the end
 # through the Windows elevation prompt, so nobody has to run it by hand. It is
 # skipped when already done; declining the prompt leaves incode installed and
-# says what was not set up.
+# says what was not set up. Last, `incode --install-tools` installs the tools
+# incode runs (the headless browser among them), each checked against its
+# release's sha256.
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -127,5 +130,23 @@ if ($env:INCODE_NO_SANDBOX_SETUP -eq '1') {
             Say "sandbox setup was not allowed ($($_.Exception.Message)); incode works, network deny under sbx is not available yet"
         }
     }
+} else {
+    Say 'sandbox: this release has no sbx.exe, so commands run unconfined'
+}
+
+# `incode --install-tools` prints a line per tool on stdout and exits non-zero
+# when one was not installed; incode itself is installed either way. Only
+# stdout is captured: with ErrorActionPreference Stop, redirecting a native
+# program's stderr would make its first line a terminating error.
+if ($env:INCODE_NO_TOOLS_INSTALL -eq '1') {
+    Say 'tools install skipped (INCODE_NO_TOOLS_INSTALL=1)'
+} else {
+    $said = & (Join-Path $InstallDir 'incode.exe') --install-tools
+    if ($LASTEXITCODE -eq 0) {
+        Say 'tools installed:'
+    } else {
+        Say 'tools: not every one was installed; incode works without them, and `incode --install-tools` retries:'
+    }
+    foreach ($line in @($said)) { Say "    $line" }
 }
 Say 'keep it current with: incode update'

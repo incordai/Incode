@@ -285,7 +285,7 @@ impl SessionFactory for CliSessions {
     fn tool_servers(&self) -> (Vec<crate::toolbox::ServerSpec>, Vec<String>) {
         let data_dir = self.data_dir();
         let tools = crate::admin::AdminConfig::load(&data_dir)
-            .map(|admin| admin.tools)
+            .map(|admin| admin.tools_in_effect())
             .unwrap_or_default();
         crate::ext_tools::session_servers(&tools, &data_dir)
     }

@@ -518,6 +518,18 @@ fn a_tool_not_installed_is_named_not_started() {
 #[test]
 fn the_tools_command_lists_refuses_and_removes() {
     let data = tempfile::tempdir().expect("data");
+    // No admin.json: the built-in browser is the one tool, not installed.
+    let listed = command("", data.path());
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert!(
+        listed[0].contains("tool `browser`: not installed, provides browser"),
+        "{listed:?}"
+    );
+    let without_defaults = crate::admin::AdminConfig {
+        default_tools: Some(false),
+        ..crate::admin::AdminConfig::default()
+    };
+    without_defaults.save(data.path()).expect("save");
     assert!(command("", data.path())[0].contains("no tools are configured"));
     let admin = crate::admin::AdminConfig {
         tools: vec![entry("browser")],
@@ -535,4 +547,92 @@ fn the_tools_command_lists_refuses_and_removes() {
     assert!(said[0].contains("removed"), "{said:?}");
     assert!(!tools_dir(data.path()).join("browser").exists());
     assert!(command("remove ../x", data.path())[0].contains("not a tool name"));
+}
+
+/// **THE BUILT-IN ENTRIES ARE USABLE**: `defaults/tools.json` parses, every
+/// entry passes the same check an owner's does, names an asset for every
+/// target a release is built for, and the browser is among them.
+#[test]
+fn the_built_in_entries_parse_and_pass_the_owners_checks() {
+    let defaults = defaults();
+    assert!(!defaults.is_empty());
+    for tool in &defaults {
+        tool.check().unwrap_or_else(|why| panic!("{why}"));
+        for os in ["windows", "macos", "linux"] {
+            for arch in ["x86_64", "aarch64"] {
+                let asset = tool
+                    .asset_for(Target { os, arch }, "v1")
+                    .unwrap_or_else(|why| panic!("{why}"));
+                assert!(asset.contains(arch) && asset.contains(os), "{asset}");
+            }
+        }
+    }
+    assert!(defaults
+        .iter()
+        .any(|t| t.provides.as_deref() == Some("browser")));
+}
+
+/// **THE OWNER'S ENTRY WINS**: a built-in entry joins the owner's list unless
+/// the owner already uses its name or provides its capability, and none
+/// join with `default_tools: false`.
+#[test]
+fn a_built_in_entry_yields_to_the_owners() {
+    let names = |admin: &crate::admin::AdminConfig| -> Vec<String> {
+        admin
+            .tools_in_effect()
+            .into_iter()
+            .map(|t| t.name)
+            .collect()
+    };
+    let none = crate::admin::AdminConfig::default();
+    assert_eq!(names(&none), ["browser"]);
+
+    // Another name that provides the browser replaces the built-in one.
+    let own_browser = crate::admin::AdminConfig {
+        tools: vec![entry("my-browser")],
+        ..crate::admin::AdminConfig::default()
+    };
+    assert_eq!(names(&own_browser), ["my-browser"]);
+
+    // The same name, for something else, is the owner's: no second `browser`.
+    let mut taken = entry("browser");
+    taken.provides = None;
+    let same_name = crate::admin::AdminConfig {
+        tools: vec![taken],
+        ..crate::admin::AdminConfig::default()
+    };
+    let effect = same_name.tools_in_effect();
+    assert_eq!(effect.len(), 1);
+    assert_eq!(
+        effect[0].provides, None,
+        "the owner's entry, not the default"
+    );
+
+    // An unrelated tool keeps the built-in browser beside it.
+    let mut other = entry("search");
+    other.provides = None;
+    let unrelated = crate::admin::AdminConfig {
+        tools: vec![other],
+        ..crate::admin::AdminConfig::default()
+    };
+    assert_eq!(names(&unrelated), ["search", "browser"]);
+
+    let off = crate::admin::AdminConfig {
+        default_tools: Some(false),
+        ..crate::admin::AdminConfig::default()
+    };
+    assert!(off.tools_in_effect().is_empty());
+}
+
+/// **A SAVE WRITES ONLY WHAT THE OWNER WROTE**: settings loaded and saved
+/// again (as `/agents` does) never gain the built-in entries.
+#[test]
+fn saving_settings_never_writes_the_built_in_entries() {
+    let data = tempfile::tempdir().expect("data");
+    let loaded = crate::admin::AdminConfig::load(data.path()).expect("load");
+    assert_eq!(loaded.tools_in_effect().len(), defaults().len());
+    loaded.save(data.path()).expect("save");
+    let text =
+        std::fs::read_to_string(crate::admin::AdminConfig::path_in(data.path())).expect("written");
+    assert!(!text.contains("\"tools\""), "{text}");
 }

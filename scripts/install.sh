@@ -7,6 +7,10 @@
 #   INCODE_INSTALL_DIR  where the programs go (default: ~/.local/bin)
 #   INCODE_VERSION      a release tag such as v0.2.0 (default: the latest)
 #   INCODE_NO_SANDBOX_SETUP=1  skip the sandbox check at the end
+#   INCODE_NO_TOOLS_INSTALL=1  skip installing incode's tools at the end
+#
+# Last, `incode --install-tools` installs the tools incode runs (the headless
+# browser among them), each checked against its release's sha256.
 #
 # The archive is checked against the release's SHA256SUMS before anything is
 # unpacked; a mismatch, or no checksum for it, stops the install.
@@ -122,7 +126,23 @@ main() {
             ;;
     esac
     sandbox_check
+    tools_install
     say "keep it current with: incode update"
+}
+
+# `incode --install-tools` prints a line per tool and exits non-zero when one
+# was not installed; incode itself is installed either way.
+tools_install() {
+    if [ "${INCODE_NO_TOOLS_INSTALL:-}" = "1" ]; then
+        say "tools install skipped (INCODE_NO_TOOLS_INSTALL=1)"
+        return 0
+    fi
+    if said="$("$INSTALL_DIR/incode" --install-tools 2>&1)"; then
+        say "tools installed:"
+    else
+        say "tools: not every one was installed; incode works without them, and \`incode --install-tools\` retries:"
+    fi
+    printf '%s\n' "$said" | while IFS= read -r line; do say "    $line"; done
 }
 
 # `sbx check` exits 0 when this system enforces file and network confinement

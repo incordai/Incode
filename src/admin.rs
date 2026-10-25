@@ -171,9 +171,15 @@ pub struct AdminConfig {
     /// External tools, each downloaded from a configured release when the
     /// owner asks (`/tools add <name>`, `incode --install-tools`), checked
     /// against its sha256, and started as an MCP server in every session —
-    /// see [`crate::ext_tools`].
+    /// see [`crate::ext_tools`]. Exactly what the owner wrote: the built-in
+    /// defaults join it only in [`Self::tools_in_effect`], so a save never
+    /// writes them into the file.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<crate::ext_tools::ToolEntry>,
+    /// Whether the built-in tools (`defaults/tools.json`) are offered beside
+    /// `tools`. Unset is yes; `false` offers only the owner's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_tools: Option<bool>,
     /// Which program `RenderPdf` prints with. Unset is `auto`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pdf_renderer: Option<PdfRenderer>,
@@ -667,6 +673,35 @@ impl AdminConfig {
         }
         serde_json::from_str(&text)
             .map_err(|e| format!("{} is not valid admin settings: {e}", path.display()))
+    }
+
+    /// The tools a session runs and an install installs: the owner's `tools`,
+    /// then each built-in default ([`crate::ext_tools::defaults`]) the owner
+    /// has not replaced — one whose name the owner already uses, or whose
+    /// capability an owner's entry already `provides`, is left out. None of
+    /// the defaults when `default_tools` is `false`.
+    ///
+    /// Read by every consumer of the tool list: `ext_tools::install_all` and
+    /// `ext_tools::command`, the REPL's and a task run's `connect_ext_tools`
+    /// (`cli/mod.rs`, `task_run.rs`), the ACP agent's `tool_servers`, and
+    /// `Toolbox::detect_browser`. A consumer reading `tools` directly would
+    /// silently lose the defaults.
+    #[must_use]
+    pub fn tools_in_effect(&self) -> Vec<crate::ext_tools::ToolEntry> {
+        let mut tools = self.tools.clone();
+        if self.default_tools == Some(false) {
+            return tools;
+        }
+        for default in crate::ext_tools::defaults() {
+            let replaced = self.tools.iter().any(|own| {
+                own.name == default.name
+                    || (default.provides.is_some() && own.provides == default.provides)
+            });
+            if !replaced {
+                tools.push(default);
+            }
+        }
+        tools
     }
 
     pub fn save(&self, data_dir: &Path) -> Result<(), String> {
@@ -1594,6 +1629,8 @@ mod tests {
                 provides: Some("browser".to_string()),
                 ..crate::ext_tools::ToolEntry::default()
             }],
+            // Turning the built-in tools off is a choice that must come back.
+            default_tools: Some(false),
             pdf_renderer: Some(PdfRenderer::Browser),
             sandbox: Some("read-only".to_string()),
             sandbox_network: Some("deny".to_string()),
