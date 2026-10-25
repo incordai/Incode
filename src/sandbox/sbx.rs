@@ -7,7 +7,9 @@
 //! - **A host allowlist.** `sandbox_allow_hosts` (or
 //!   [`ALLOW_HOSTS_ENV`]) lets a command reach only those hosts, through a
 //!   proxy sbx runs for the command; the built-in engine can only allow or
-//!   deny the network whole.
+//!   deny the network whole. `sandbox_loopback_ports` adds this machine's own
+//!   ports (a dev server a browser test loads) without opening anything
+//!   else private.
 //! - **A seccomp filter on Linux** that refuses terminal injection
 //!   (`TIOCSTI`), `io_uring` and vsock, whatever the filesystem mode.
 //! - **`.git/hooks` and `.git/config` kept as they were** in every writable
@@ -57,6 +59,10 @@ pub const BACKEND_ENV: &str = "INCODE_SANDBOX_BACKEND";
 pub struct Settings {
     /// Hosts a command may reach; empty leaves the network as the switch says.
     pub allow_hosts: Vec<String>,
+    /// This machine's own ports a command may reach (`admin.json`
+    /// `sandbox_loopback_ports`); like hosts, they put the network behind
+    /// sbx's proxy.
+    pub loopback_ports: Vec<u16>,
     /// Windows: where `sbx.exe` runs the command. `None` is sbx's own `auto`.
     pub backend: Option<String>,
 }
@@ -76,8 +82,14 @@ impl Settings {
             .filter(|b| !b.is_empty());
         Self {
             allow_hosts,
+            loopback_ports: admin.sandbox_loopback_ports,
             backend,
         }
+    }
+
+    /// Whether an open network goes through sbx's proxy instead.
+    fn limits_network(&self) -> bool {
+        !self.allow_hosts.is_empty() || !self.loopback_ports.is_empty()
     }
 }
 
@@ -97,12 +109,13 @@ fn hosts(raw: &str) -> Vec<String> {
 }
 
 /// The sbx policy for incode's: the same filesystem mode over the same
-/// roots, and the network denied, limited to `allow_hosts`, or open.
+/// roots, and the network denied, limited to the settings' hosts and this
+/// machine's ports, or open.
 #[must_use]
 pub fn policy(
     policy: SandboxPolicy,
     roots: &[PathBuf],
-    allow_hosts: &[String],
+    reach: &Settings,
 ) -> incord_sandbox::Policy {
     use incord_sandbox::{FsMode, NetMode};
     let mut out = incord_sandbox::Policy::default();
@@ -116,11 +129,12 @@ pub fn policy(
     }
     out.network.mode = match policy.network {
         SandboxNetwork::Deny => NetMode::Deny,
-        SandboxNetwork::Allow if !allow_hosts.is_empty() => NetMode::Proxy,
+        SandboxNetwork::Allow if reach.limits_network() => NetMode::Proxy,
         SandboxNetwork::Allow => NetMode::Allow,
     };
     if out.network.mode == NetMode::Proxy {
-        out.network.allow = allow_hosts.to_vec();
+        out.network.allow = reach.allow_hosts.clone();
+        out.network.loopback_ports = reach.loopback_ports.clone();
     }
     out
 }
@@ -129,11 +143,18 @@ pub fn policy(
 /// cannot.
 #[must_use]
 pub fn note(policy: SandboxPolicy, roots: &[PathBuf]) -> String {
-    let hosts = &settings().allow_hosts;
+    let reach = settings();
     let network = match policy.network {
         SandboxNetwork::Deny => "network denied".to_string(),
-        SandboxNetwork::Allow if !hosts.is_empty() => {
-            format!("network limited to {}", hosts.join(", "))
+        SandboxNetwork::Allow if reach.limits_network() => {
+            let mut to: Vec<String> = reach.allow_hosts.clone();
+            to.extend(
+                reach
+                    .loopback_ports
+                    .iter()
+                    .map(|p| format!("this machine's port {p}")),
+            );
+            format!("network limited to {}", to.join(", "))
         }
         SandboxNetwork::Allow => "network open".to_string(),
     };
@@ -146,7 +167,7 @@ pub fn note(policy: SandboxPolicy, roots: &[PathBuf]) -> String {
     }
     #[cfg(not(windows))]
     {
-        let gaps = incord_sandbox::enforcement(&self::policy(policy, roots, hosts)).gaps();
+        let gaps = incord_sandbox::enforcement(&self::policy(policy, roots, reach)).gaps();
         if gaps.is_empty() {
             head
         } else {
@@ -203,7 +224,7 @@ pub(super) fn wrap(
     env: Option<&HashMap<String, String>>,
 ) -> Result<(Command, Keep), String> {
     use std::ffi::OsString;
-    let policy = policy(sandbox_policy, roots, &settings().allow_hosts);
+    let policy = policy(sandbox_policy, roots, settings());
     let mut sandbox = incord_sandbox::Sandbox::new(policy).strict(false);
     if let Some(env) = env {
         sandbox = sandbox.inherit_from(
@@ -242,7 +263,7 @@ pub(super) fn wrap(
     cmd.args(sbx_args(
         sandbox_policy,
         roots,
-        &settings.allow_hosts,
+        settings,
         settings.backend.as_deref() == Some("wsl"),
         shell,
         command,
@@ -263,7 +284,7 @@ pub(super) fn wrap(
 fn sbx_args(
     policy: SandboxPolicy,
     roots: &[PathBuf],
-    allow_hosts: &[String],
+    reach: &Settings,
     in_wsl: bool,
     shell: &Shell,
     command: &str,
@@ -284,9 +305,13 @@ fn sbx_args(
     match policy.network {
         SandboxNetwork::Deny => args.extend(["--net".to_string(), "deny".to_string()]),
         SandboxNetwork::Allow => {
-            for host in allow_hosts {
+            for host in &reach.allow_hosts {
                 args.push("--allow-host".to_string());
                 args.push(host.clone());
+            }
+            for port in &reach.loopback_ports {
+                args.push("--allow-loopback-port".to_string());
+                args.push(port.to_string());
             }
         }
     }
@@ -330,15 +355,25 @@ mod tests {
         }
     }
 
+    /// Settings naming `hosts` and this machine's `ports`.
+    fn reach(hosts: &[&str], ports: &[u16]) -> Settings {
+        Settings {
+            allow_hosts: hosts.iter().map(|h| (*h).to_string()).collect(),
+            loopback_ports: ports.to_vec(),
+            backend: None,
+        }
+    }
+
     /// The mode and the roots carry over; read-only gets no writable root.
     #[test]
     fn the_filesystem_mode_and_roots_carry_over() {
         use incord_sandbox::FsMode;
         let roots = vec![PathBuf::from("/w"), PathBuf::from("/extra")];
+        let open = reach(&[], &[]);
         let p = policy(
             incode(SandboxMode::WorkspaceWrite, SandboxNetwork::Allow),
             &roots,
-            &[],
+            &open,
         );
         assert_eq!(p.fs.mode, FsMode::WorkspaceWrite);
         assert_eq!(p.fs.write, roots);
@@ -346,39 +381,47 @@ mod tests {
         let p = policy(
             incode(SandboxMode::ReadOnly, SandboxNetwork::Allow),
             &roots,
-            &[],
+            &open,
         );
         assert_eq!(p.fs.mode, FsMode::ReadOnly);
         assert!(p.fs.write.is_empty());
-        let p = policy(incode(SandboxMode::Off, SandboxNetwork::Allow), &roots, &[]);
+        let p = policy(
+            incode(SandboxMode::Off, SandboxNetwork::Allow),
+            &roots,
+            &open,
+        );
         assert_eq!(p.fs.mode, FsMode::Off);
     }
 
-    /// Deny wins over an allowlist; an allowlist turns an open network into
-    /// the proxy; no allowlist leaves it open.
+    /// Deny wins over an allowlist and over this machine's ports; either one
+    /// turns an open network into the proxy; neither leaves it open.
     #[test]
     fn the_network_follows_the_switch_and_the_allowlist() {
         use incord_sandbox::NetMode;
-        let hosts = vec!["crates.io".to_string()];
         let roots = [PathBuf::from("/w")];
+        let write = |network| incode(SandboxMode::WorkspaceWrite, network);
+        let hosts = reach(&["crates.io"], &[]);
         let p = policy(
-            incode(SandboxMode::WorkspaceWrite, SandboxNetwork::Deny),
+            write(SandboxNetwork::Deny),
             &roots,
-            &hosts,
+            &reach(&["crates.io"], &[5173]),
         );
         assert_eq!(p.network.mode, NetMode::Deny);
-        let p = policy(
-            incode(SandboxMode::WorkspaceWrite, SandboxNetwork::Allow),
-            &roots,
-            &hosts,
-        );
+        assert!(p.network.loopback_ports.is_empty(), "deny opens no port");
+        let p = policy(write(SandboxNetwork::Allow), &roots, &hosts);
         assert_eq!(p.network.mode, NetMode::Proxy);
-        assert_eq!(p.network.allow, hosts);
-        let p = policy(
-            incode(SandboxMode::WorkspaceWrite, SandboxNetwork::Allow),
-            &roots,
-            &[],
+        assert_eq!(p.network.allow, ["crates.io"]);
+        assert!(p.network.loopback_ports.is_empty());
+        let p = policy(write(SandboxNetwork::Allow), &roots, &reach(&[], &[5173]));
+        assert_eq!(
+            p.network.mode,
+            NetMode::Proxy,
+            "a port alone means the proxy"
         );
+        assert!(p.network.allow.is_empty());
+        assert_eq!(p.network.loopback_ports, [5173]);
+        assert!(!p.network.allow_private, "nothing else private opens");
+        let p = policy(write(SandboxNetwork::Allow), &roots, &reach(&[], &[]));
         assert_eq!(p.network.mode, NetMode::Allow);
     }
 
@@ -401,7 +444,7 @@ mod tests {
         let args = sbx_args(
             incode(SandboxMode::WorkspaceWrite, SandboxNetwork::Allow),
             &[PathBuf::from("/w")],
-            &["crates.io".to_string()],
+            &reach(&["crates.io"], &[5173]),
             false,
             &shell,
             "echo hi",
@@ -418,6 +461,8 @@ mod tests {
                 "/w",
                 "--allow-host",
                 "crates.io",
+                "--allow-loopback-port",
+                "5173",
                 "--",
                 "bash",
                 "-c",
@@ -427,7 +472,7 @@ mod tests {
         let args = sbx_args(
             incode(SandboxMode::ReadOnly, SandboxNetwork::Deny),
             &[PathBuf::from("/w")],
-            &["crates.io".to_string()],
+            &reach(&["crates.io"], &[5173]),
             true,
             &shell,
             "ls",

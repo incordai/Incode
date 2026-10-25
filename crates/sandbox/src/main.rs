@@ -47,7 +47,10 @@ POLICY (a file, then flags on top of it):
         --net <MODE>         allow | deny | proxy
         --allow-host <HOST>  host the proxy lets through (implies --net proxy; repeatable)
         --allow-private      an allowed host may resolve to a private address
-        --env-none           start from an empty environment (essentials kept)
+        --allow-loopback-port <PORT>
+                             this machine's own port the proxy may reach (localhost,
+                             127.0.0.1, ::1 only; implies --net proxy; repeatable)
+        --env-none          start from an empty environment (essentials kept)
         --pass-env <NAME>    keep this variable with --env-none (repeatable; NAME* for a prefix)
         --unset-env <NAME>   remove this variable (repeatable; NAME* for a prefix)
         --set-env <K=V>      set a variable (repeatable)
@@ -495,6 +498,7 @@ fn parse(args: &[OsString]) -> Result<Options, String> {
                 | "--deny-read"
                 | "--net"
                 | "--allow-host"
+                | "--allow-loopback-port"
                 | "--pass-env"
                 | "--unset-env"
                 | "--set-env"
@@ -560,6 +564,15 @@ fn parse(args: &[OsString]) -> Result<Options, String> {
                 policy.network.allow.push(v);
             }
             "--allow-private" => policy.network.allow_private = true,
+            "--allow-loopback-port" => {
+                let port: u16 = v
+                    .parse()
+                    .ok()
+                    .filter(|p| *p != 0)
+                    .ok_or(format!("--allow-loopback-port: `{v}` is not a port"))?;
+                policy.network.mode = NetMode::Proxy;
+                policy.network.loopback_ports.push(port);
+            }
             "--env-none" => policy.env.inherit = Inherit::None,
             "--pass-env" => policy.env.pass.push(v),
             "--unset-env" => policy.env.remove.push(v),
@@ -637,4 +650,46 @@ fn doctor() {
     }
     #[cfg(windows)]
     windows_backend::doctor();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(words: &[&str]) -> Vec<OsString> {
+        words.iter().map(OsString::from).collect()
+    }
+
+    /// `--allow-loopback-port` names this machine's port, puts the network
+    /// behind the proxy, repeats, and leaves `allow_private` off.
+    #[test]
+    fn a_loopback_port_flag_sets_the_port_and_the_proxy() {
+        let o = parse(&args(&[
+            "--allow-loopback-port",
+            "5173",
+            "--allow-loopback-port",
+            "8080",
+            "--",
+            "true",
+        ]))
+        .expect("parses");
+        assert_eq!(o.policy.network.mode, NetMode::Proxy);
+        assert_eq!(o.policy.network.loopback_ports, [5173, 8080]);
+        assert!(o.policy.network.allow.is_empty());
+        assert!(!o.policy.network.allow_private);
+        assert_eq!(o.command, args(&["true"]));
+    }
+
+    /// Port 0, a word and a number past 65535 are refused, as is the flag
+    /// with no value.
+    #[test]
+    fn a_loopback_port_that_is_not_a_port_is_refused() {
+        for bad in ["0", "web", "70000", "-1"] {
+            let err = parse(&args(&["--allow-loopback-port", bad, "--", "true"]))
+                .err()
+                .unwrap_or_else(|| panic!("`{bad}` should be refused"));
+            assert!(err.contains("is not a port"), "{bad}: {err}");
+        }
+        assert!(parse(&args(&["--allow-loopback-port"])).is_err());
+    }
 }

@@ -120,6 +120,9 @@ fn normalise_host(host: &str) -> String {
 pub struct Allowlist {
     rules: Vec<Rule>,
     allow_private: bool,
+    /// This machine's ports a request may reach on a loopback name
+    /// (`network.loopback_ports`), connected to on a loopback address only.
+    loopback_ports: Vec<u16>,
 }
 
 impl Allowlist {
@@ -133,14 +136,43 @@ impl Allowlist {
         Ok(Self {
             rules,
             allow_private,
+            loopback_ports: Vec::new(),
         })
+    }
+
+    /// The same list, also letting a request reach `ports` on this machine
+    /// (`localhost`, `127.0.0.1`, `::1`). Set from the policy by
+    /// `Sandbox::run` (`lib.rs`) only.
+    #[must_use]
+    pub fn with_loopback_ports(mut self, ports: &[u16]) -> Self {
+        self.loopback_ports = ports.to_vec();
+        self
     }
 
     #[must_use]
     pub fn allows(&self, host: &str, port: u16) -> bool {
         let host = normalise_host(host);
-        self.rules.iter().any(|r| r.allows(&host, port))
+        self.rules.iter().any(|r| r.allows(&host, port)) || self.reaches_loopback(&host, port)
     }
+
+    /// Whether `host:port` is one of this machine's ports the list opens.
+    fn reaches_loopback(&self, host: &str, port: u16) -> bool {
+        self.loopback_ports.contains(&port) && is_loopback_name(&normalise_host(host))
+    }
+}
+
+/// `localhost`, or a loopback address written out (`127.0.0.0/8`, `::1`).
+/// No other name: one that merely resolves to loopback is not this machine
+/// by the client's own words.
+fn is_loopback_name(host: &str) -> bool {
+    host == "localhost"
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback() || is_mapped_loopback(ip))
+}
+
+fn is_mapped_loopback(ip: IpAddr) -> bool {
+    matches!(ip, IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()))
 }
 
 /// Whether an address is one an allowed public name must never lead to.
@@ -373,7 +405,11 @@ fn serve(
         });
     }
 
+    // One of this machine's own ports goes straight to a loopback address:
+    // an upstream proxy cannot reach it, and nothing else private opens.
+    let to_loopback = allowlist.reaches_loopback(&head.host, head.port);
     let upstream_conn = match upstream {
+        _ if to_loopback => connect_loopback(&head.host, head.port),
         Some(up) => connect_via(up, &head.host, head.port),
         None => connect_direct(&head.host, head.port, allowlist.allow_private),
     };
@@ -508,6 +544,28 @@ fn connect_direct(host: &str, port: u16, allow_private: bool) -> Result<TcpStrea
     }
     let mut last = String::from("no address answered");
     for addr in usable {
+        match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
+            Ok(s) => return Ok(s),
+            Err(e) => last = format!("{addr}: {e}"),
+        }
+    }
+    Err(last)
+}
+
+/// Connect to `port` on this machine: `host` is a loopback name, and only a
+/// loopback answer is used, so a hosts file that points `localhost`
+/// elsewhere leads nowhere.
+fn connect_loopback(host: &str, port: u16) -> Result<TcpStream, String> {
+    let addrs: Vec<SocketAddr> = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| format!("cannot resolve: {e}"))?
+        .filter(|a| a.ip().is_loopback() || is_mapped_loopback(a.ip()))
+        .collect();
+    if addrs.is_empty() {
+        return Err(format!("{host} resolves to no loopback address"));
+    }
+    let mut last = String::from("no address answered");
+    for addr in addrs {
         match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
             Ok(s) => return Ok(s),
             Err(e) => last = format!("{addr}: {e}"),
@@ -775,6 +833,92 @@ mod tests {
         assert!(
             !seen.to_ascii_lowercase().contains("proxy-connection"),
             "{seen}"
+        );
+    }
+
+    #[test]
+    fn only_a_loopback_name_is_this_machine() {
+        for host in [
+            "localhost",
+            "127.0.0.1",
+            "127.8.9.10",
+            "::1",
+            "::ffff:127.0.0.1",
+        ] {
+            assert!(is_loopback_name(host), "{host}");
+        }
+        for host in [
+            "localhost.example.com",
+            "0.0.0.0",
+            "10.0.0.1",
+            "169.254.169.254",
+            "example.com",
+            "::",
+        ] {
+            assert!(!is_loopback_name(host), "{host}");
+        }
+    }
+
+    /// A port this machine serves (`network.loopback_ports`) is reached on a
+    /// loopback name, plain HTTP or CONNECT, without `allow_private`, and
+    /// straight to loopback even with an upstream proxy configured; another
+    /// port stays refused.
+    #[test]
+    fn a_loopback_port_opens_that_port_and_nothing_else() {
+        let origin = TcpListener::bind(("127.0.0.1", 0)).expect("binds");
+        let port = origin.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut conn, _) = origin.accept().expect("accepts");
+                let mut buf = [0u8; 4096];
+                let _ = conn.read(&mut buf).expect("reads");
+                conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .expect("writes");
+            }
+        });
+        // An upstream that answers nothing: a loopback request must not
+        // depend on it.
+        let dead = TcpListener::bind(("127.0.0.1", 0)).expect("binds");
+        let dead_port = dead.local_addr().expect("addr").port();
+        drop(dead);
+        let upstream = Upstream::from_env(|k| {
+            (k == "https_proxy").then(|| format!("http://127.0.0.1:{dead_port}"))
+        });
+        assert!(upstream.is_some());
+        let proxy = Proxy::start(list(&[]).with_loopback_ports(&[port]), upstream).expect("starts");
+
+        let ask = |request: String| {
+            let mut s = TcpStream::connect(("127.0.0.1", proxy.port())).expect("connects");
+            s.write_all(request.as_bytes()).expect("writes");
+            let mut reply = String::new();
+            s.read_to_string(&mut reply).expect("reads");
+            reply
+        };
+        let plain = ask(format!(
+            "GET http://127.0.0.1:{port}/x HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+        ));
+        assert!(plain.ends_with("ok"), "{plain}");
+        let tunnelled = ask(format!(
+            "CONNECT localhost:{port} HTTP/1.1\r\nHost: localhost\r\n\r\nGET / HTTP/1.1\r\n\r\n"
+        ));
+        assert!(
+            tunnelled.starts_with("HTTP/1.1 200 Connection established"),
+            "{tunnelled}"
+        );
+        assert!(tunnelled.ends_with("ok"), "{tunnelled}");
+        server.join().expect("server");
+
+        let other = if port == u16::MAX { port - 1 } else { port + 1 };
+        let refused = ask(format!(
+            "GET http://127.0.0.1:{other}/ HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+        ));
+        assert!(refused.starts_with("HTTP/1.1 403"), "{refused}");
+        let named_elsewhere = ask(format!(
+            "GET http://10.0.0.1:{port}/ HTTP/1.1\r\nHost: 10.0.0.1\r\n\r\n"
+        ));
+        assert!(
+            named_elsewhere.starts_with("HTTP/1.1 403"),
+            "{named_elsewhere}"
         );
     }
 }

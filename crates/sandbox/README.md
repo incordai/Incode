@@ -35,6 +35,7 @@ deny_read = ["../private"]      # hidden: not even readable
 mode = "proxy"                  # allow | deny | proxy
 allow = ["crates.io", "*.crates.io:443", "registry.npmjs.org"]
 allow_private = false           # may an allowed name resolve to a private address?
+loopback_ports = [5173]         # this machine's own ports the proxy may reach
 
 [env]
 inherit = "all"                 # all | none (essentials kept)
@@ -115,8 +116,15 @@ and forwards it to the Linux `sbx` inside WSL2 when it doesn't (see
   - It resolves each name once and connects to the checked address, so DNS
     can't redirect an allowed name to a private address or the cloud
     metadata service. Turn this check off with `allow_private`.
+  - `loopback_ports` (`--allow-loopback-port 5173`) lets the command reach
+    those ports on this machine, say a dev server a browser test loads,
+    without `allow_private`. The request must name `localhost`, `127.0.0.1`
+    or `::1`, and only a loopback address is connected to. Nothing else
+    private opens, and other ports stay refused. `sbx mcp` never gives a
+    sandbox these ports, even when its base policy names some.
   - When `sbx` itself runs behind an HTTP proxy, allowed requests are chained
-    through it, and that proxy does the resolving.
+    through it, and that proxy does the resolving. Requests for this
+    machine's own ports go straight to loopback, never through it.
 - **`deny_read`.** Landlock only grants, so a hidden path is carved out by
   granting its siblings, level by level from `/`.
   - Directories *above* a hidden path can't be listed (`ls /` is refused);

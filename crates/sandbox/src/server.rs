@@ -13,7 +13,9 @@
 //! network a sandbox may ever have, which hosts, the longest a run may take.
 //! The AGENT (whoever sends the tool calls) chooses within them, and gets
 //! less by default: no network, no inherited secrets. A request above a
-//! ceiling is refused, not quietly lowered, so the agent knows why.
+//! ceiling is refused, not quietly lowered, so the agent knows why. This
+//! machine's own ports (`network.loopback_ports`) are never reachable from a
+//! sandbox made here, even when the base policy names some.
 //!
 //! # Files the server touches for the agent
 //!
@@ -90,6 +92,7 @@ impl Ceilings {
         p.fs.write = vec![self.root.clone()];
         p.network.mode = self.network;
         p.network.allow = self.hosts.clone();
+        p.network.loopback_ports = Vec::new();
         p.limits.wall_secs = Some(self.max_wall_secs);
         p
     }
@@ -292,6 +295,9 @@ impl Server {
         p.fs.write = vec![b.dir.clone()];
         p.network.mode = b.network;
         p.network.allow = b.hosts.clone();
+        // This machine's own ports are never an agent's to reach, whatever
+        // the operator's base policy says (`network.loopback_ports`).
+        p.network.loopback_ports = Vec::new();
         p.limits.wall_secs = Some(timeout);
         p
     }
@@ -752,6 +758,28 @@ mod tests {
         assert_eq!(p.network.allow, ["pypi.org"]);
         assert_eq!(p.limits.wall_secs, Some(600));
         assert_eq!(p.env.inherit, Inherit::None);
+    }
+
+    /// This machine's own ports in the operator's base policy reach no
+    /// sandbox an agent makes: not its run policy, not the widest one.
+    #[test]
+    fn a_sandbox_never_gets_this_machines_ports() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut c = Ceilings::new(root.path().to_path_buf());
+        c.network = NetMode::Proxy;
+        c.hosts = vec!["pypi.org".into()];
+        c.base.network.loopback_ports = vec![5173];
+        assert!(c.widest_policy().network.loopback_ports.is_empty());
+        let server = Server::new(c);
+        let b = Box_ {
+            dir: root.path().to_path_buf(),
+            network: NetMode::Proxy,
+            hosts: vec!["pypi.org".into()],
+            runs: 0,
+        };
+        let p = server.policy_for(&b, 60);
+        assert_eq!(p.network.allow, ["pypi.org"]);
+        assert!(p.network.loopback_ports.is_empty(), "{p:?}");
     }
 
     #[test]
