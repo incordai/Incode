@@ -191,7 +191,6 @@ pub(crate) struct Manifest {
 }
 
 impl ToolEntry {
-    /// Whether the entry can be installed and run at all; `Err` says why not.
     /// Whether the name is 1 to [`MAX_NAME`] letters, digits, `-` or `_`.
     fn name_ok(&self) -> bool {
         !self.name.is_empty()
@@ -202,6 +201,9 @@ impl ToolEntry {
                 .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     }
 
+    /// Whether the entry can be installed and run at all; `Err` says why not.
+    /// Its name, then its source ([`Self::check_source`]), its version
+    /// ([`Self::check_version`]) and the program it runs.
     pub(crate) fn check(&self) -> Result<(), String> {
         let name = &self.name;
         if !self.name_ok() {
@@ -209,9 +211,23 @@ impl ToolEntry {
                 "tool `{name}`: a name is 1 to {MAX_NAME} letters, digits, `-` or `_`"
             ));
         }
+        self.check_source()?;
+        self.check_version()?;
+        let Some(program) = self.run.first() else {
+            return Err(format!(
+                "tool `{name}`: `run` names the program inside the release, and its arguments"
+            ));
+        };
+        inside_path(program).map_err(|why| format!("tool `{name}`: `run[0]` {why}"))?;
+        Ok(())
+    }
+
+    /// Exactly one source: `release` as `<owner>/<repo>` of plain names, or
+    /// an http(s) `url`.
+    fn check_source(&self) -> Result<(), String> {
+        let name = &self.name;
         match (&self.release, &self.url) {
             (Some(release), None) => {
-                let parts: Vec<&str> = release.split('/').collect();
                 let part_ok = |p: &str| {
                     !p.is_empty()
                         && p != "."
@@ -219,32 +235,36 @@ impl ToolEntry {
                         && p.chars()
                             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
                 };
-                if parts.len() != 2 || !parts.iter().all(|p| part_ok(p)) {
-                    return Err(format!(
+                let parts: Vec<&str> = release.split('/').collect();
+                if parts.len() == 2 && parts.iter().all(|p| part_ok(p)) {
+                    Ok(())
+                } else {
+                    Err(format!(
                         "tool `{name}`: `release` is `<owner>/<repo>`, not `{release}`"
-                    ));
+                    ))
                 }
             }
-            (None, Some(url)) => {
-                if !url.starts_with("https://") && !url.starts_with("http://") {
-                    return Err(format!("tool `{name}`: `url` must be an https address"));
-                }
+            (None, Some(url)) if url.starts_with("https://") || url.starts_with("http://") => {
+                Ok(())
             }
-            (Some(_), Some(_)) => {
-                return Err(format!("tool `{name}`: give `release` or `url`, not both"))
-            }
-            (None, None) => {
-                return Err(format!(
-                    "tool `{name}`: needs `release` (`<owner>/<repo>`) or `url`"
-                ))
-            }
+            (None, Some(_)) => Err(format!("tool `{name}`: `url` must be an https address")),
+            (Some(_), Some(_)) => Err(format!("tool `{name}`: give `release` or `url`, not both")),
+            (None, None) => Err(format!(
+                "tool `{name}`: needs `release` (`<owner>/<repo>`) or `url`"
+            )),
         }
+    }
+
+    /// `latest` or a tag of letters, digits, `.`, `-`, `_` or `+`; and a
+    /// `url` that names `{version}` needs a real one.
+    fn check_version(&self) -> Result<(), String> {
+        let name = &self.name;
         let version = self.version();
-        if version.is_empty()
-            || !version
+        let plain = !version.is_empty()
+            && version
                 .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+'))
-        {
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+'));
+        if !plain {
             return Err(format!(
                 "tool `{name}`: `version` is `latest` or a tag of letters, digits, `.`, `-`, `_` \
                  or `+`"
@@ -255,12 +275,6 @@ impl ToolEntry {
                 "tool `{name}`: a `url` source cannot resolve `latest`; name the version"
             ));
         }
-        let Some(program) = self.run.first() else {
-            return Err(format!(
-                "tool `{name}`: `run` names the program inside the release, and its arguments"
-            ));
-        };
-        inside_path(program).map_err(|why| format!("tool `{name}`: `run[0]` {why}"))?;
         Ok(())
     }
 
@@ -483,50 +497,18 @@ pub(crate) enum Installed {
 
 /// Install `entry`'s release, or its newer one, under `data_dir`. `api` is
 /// GitHub's API root ([`fetch::GITHUB_API`]; a test serves its own).
+///
+/// The steps, in order: [`resolve_release`] (what to fetch), then
+/// [`expected_sha256`] (what it must hash to, known BEFORE fetching), then
+/// [`download_and_unpack`] into a staging folder, [`place_version`] to swap
+/// it in, [`write_manifest`], and [`remove_old_versions`].
 pub(crate) fn install(entry: &ToolEntry, data_dir: &Path, api: &str) -> Result<Installed, String> {
     entry.check()?;
     let target =
         Target::current().ok_or_else(|| "no release is built for this platform".to_string())?;
     let name = &entry.name;
-    // Resolve what to fetch, and what its sha256 must be, before fetching.
-    let resolved = match &entry.release {
-        Some(release) => fetch::resolve_github(api, release, entry, target)?,
-        None => {
-            let version = entry.version().to_string();
-            let url = target.expand(entry.url.as_deref().unwrap_or_default(), &version);
-            fetch::Resolved {
-                asset: entry.asset_for(target, &version)?,
-                version,
-                source: url.clone(),
-                url,
-                digest: None,
-                size: None,
-            }
-        }
-    };
-    let pinned = entry.pinned_for(target);
-    let expected = match (&resolved.digest, &pinned) {
-        (Some(released), Some(pinned)) if released != pinned => {
-            return Err(format!(
-                "tool `{name}`: refused — the release says sha256 {released} for {}, the \
-                 entry pins {pinned}; nothing was downloaded",
-                resolved.asset
-            ))
-        }
-        (Some(sha), _) | (None, Some(sha)) => sha.clone(),
-        (None, None) => {
-            return Err(format!(
-                "tool `{name}`: refused — {} has no sha256 to check it against (the release \
-                 publishes no digest for it, and the entry pins none); nothing was downloaded",
-                resolved.asset
-            ))
-        }
-    };
-    if expected.len() != 64 || !expected.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(format!(
-            "tool `{name}`: `{expected}` is not a sha256 (64 hex digits)"
-        ));
-    }
+    let resolved = resolve_release(entry, target, api)?;
+    let expected = expected_sha256(entry, &resolved, target)?;
     let dir = safe_dir(&resolved.version);
     if let Some(have) = manifest(data_dir, name) {
         if have.version == resolved.version
@@ -549,23 +531,7 @@ pub(crate) fn install(entry: &ToolEntry, data_dir: &Path, api: &str) -> Result<I
         let _ = std::fs::remove_dir_all(&staging);
         return Err(format!("tool `{name}`: {why}"));
     }
-    let folder = home.join(&dir);
-    if folder.exists() {
-        std::fs::remove_dir_all(&folder).map_err(|e| {
-            let _ = std::fs::remove_dir_all(&staging);
-            format!(
-                "tool `{name}`: {} is in use or locked ({e}); stop what runs it and try again",
-                folder.display()
-            )
-        })?;
-    }
-    std::fs::rename(&staging, &folder).map_err(|e| {
-        let _ = std::fs::remove_dir_all(&staging);
-        format!(
-            "tool `{name}`: could not move it into {}: {e}",
-            folder.display()
-        )
-    })?;
+    place_version(name, &staging, &home.join(&dir))?;
     let written = Manifest {
         name: name.clone(),
         version: resolved.version.clone(),
@@ -574,22 +540,112 @@ pub(crate) fn install(entry: &ToolEntry, data_dir: &Path, api: &str) -> Result<I
         sha256: expected,
         source: resolved.source.clone(),
     };
-    let text = serde_json::to_string_pretty(&written)
+    write_manifest(&home, &written)?;
+    remove_old_versions(&home, &dir);
+    Ok(Installed::Fresh(written))
+}
+
+/// What to fetch for `entry` on `target`: from GitHub's API for a `release`
+/// entry, or the `url` template filled in (no digest: the entry must pin
+/// one).
+fn resolve_release(
+    entry: &ToolEntry,
+    target: Target,
+    api: &str,
+) -> Result<fetch::Resolved, String> {
+    if let Some(release) = &entry.release {
+        return fetch::resolve_github(api, release, entry, target);
+    }
+    let version = entry.version().to_string();
+    let url = target.expand(entry.url.as_deref().unwrap_or_default(), &version);
+    Ok(fetch::Resolved {
+        asset: entry.asset_for(target, &version)?,
+        version,
+        source: url.clone(),
+        url,
+        digest: None,
+        size: None,
+    })
+}
+
+/// The sha256 the download must have: the release's digest or the entry's
+/// pin, which must agree when both exist. Neither, or a value that is not
+/// 64 hex digits, is refused before anything is fetched.
+fn expected_sha256(
+    entry: &ToolEntry,
+    resolved: &fetch::Resolved,
+    target: Target,
+) -> Result<String, String> {
+    let name = &entry.name;
+    let expected = match (&resolved.digest, &entry.pinned_for(target)) {
+        (Some(released), Some(pinned)) if released != pinned => {
+            return Err(format!(
+                "tool `{name}`: refused — the release says sha256 {released} for {}, the \
+                 entry pins {pinned}; nothing was downloaded",
+                resolved.asset
+            ))
+        }
+        (Some(sha), _) | (None, Some(sha)) => sha.clone(),
+        (None, None) => {
+            return Err(format!(
+                "tool `{name}`: refused — {} has no sha256 to check it against (the release \
+                 publishes no digest for it, and the entry pins none); nothing was downloaded",
+                resolved.asset
+            ))
+        }
+    };
+    if expected.len() != 64 || !expected.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!(
+            "tool `{name}`: `{expected}` is not a sha256 (64 hex digits)"
+        ));
+    }
+    Ok(expected)
+}
+
+/// Swap the checked `staging` folder in as `folder`, replacing a copy of the
+/// same version. On any failure the staging folder is removed and nothing
+/// half-installed is left.
+fn place_version(name: &str, staging: &Path, folder: &Path) -> Result<(), String> {
+    if folder.exists() {
+        std::fs::remove_dir_all(folder).map_err(|e| {
+            let _ = std::fs::remove_dir_all(staging);
+            format!(
+                "tool `{name}`: {} is in use or locked ({e}); stop what runs it and try again",
+                folder.display()
+            )
+        })?;
+    }
+    std::fs::rename(staging, folder).map_err(|e| {
+        let _ = std::fs::remove_dir_all(staging);
+        format!(
+            "tool `{name}`: could not move it into {}: {e}",
+            folder.display()
+        )
+    })
+}
+
+/// Record what was installed in `home`'s `installed.json`.
+fn write_manifest(home: &Path, written: &Manifest) -> Result<(), String> {
+    let name = &written.name;
+    let text = serde_json::to_string_pretty(written)
         .map_err(|e| format!("tool `{name}`: the manifest could not be encoded: {e}"))?;
     std::fs::write(home.join(MANIFEST), text)
-        .map_err(|e| format!("tool `{name}`: the manifest could not be written: {e}"))?;
-    // Older versions go; one still running (Windows keeps its files locked)
-    // stays until the next update.
-    if let Ok(read) = std::fs::read_dir(&home) {
-        for old in read.flatten() {
-            let is_old_version = old.file_type().is_ok_and(|t| t.is_dir())
-                && old.file_name().to_string_lossy() != dir;
-            if is_old_version {
-                let _ = std::fs::remove_dir_all(old.path());
-            }
+        .map_err(|e| format!("tool `{name}`: the manifest could not be written: {e}"))
+}
+
+/// Remove every version folder in `home` but `keep`. One still running
+/// (Windows keeps its files locked) stays until the next update.
+fn remove_old_versions(home: &Path, keep: &str) {
+    let Ok(read) = std::fs::read_dir(home) else {
+        return;
+    };
+    for old in read.flatten() {
+        let is_old_version =
+            old.file_type().is_ok_and(|t| t.is_dir()) && old.file_name().to_string_lossy() != keep;
+        if is_old_version {
+            let _ = std::fs::remove_dir_all(old.path());
         }
     }
-    Ok(Installed::Fresh(written))
 }
 
 /// Download the asset to `part`, check it against `expected`, and unpack it
