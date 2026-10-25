@@ -8,10 +8,17 @@
 #   gh workflow run install-check.yml -f tag=v0.1.0-rc.2
 #
 # The installers are taken from the tag itself, so what is checked is what
-# that release's users were told to run.
+# that release's users were told to run. A pull request that changes an
+# installer runs its own installers against the latest release instead, so
+# an installer change is proven before any tag carries it.
 name: install check
 
 on:
+  pull_request:
+    paths:
+      - scripts/install.sh
+      - scripts/install.ps1
+      - .github/workflows/install-check.yml
   workflow_call:
     inputs:
       tag:
@@ -36,16 +43,28 @@ jobs:
         os: [ubuntu-22.04, ubuntu-22.04-arm, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     env:
-      TAG: ${{ inputs.tag }}
+      TAG_INPUT: ${{ inputs.tag }}
     steps:
-      - name: Check the tag
+      # The tag is checked before it is written to GITHUB_ENV: any character
+      # outside a version tag's (a newline above all) is refused, so an input
+      # cannot add variables of its own.
+      - name: The release to install
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          case "$TAG" in
+          tag="$TAG_INPUT"
+          if [ -z "$tag" ]; then
+            tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)"
+          fi
+          case "$tag" in
+            *[!0-9A-Za-z.+-]*) echo "::error::install check: the tag holds a character no version tag has"; exit 1 ;;
             v[0-9]*) ;;
-            *) echo "::error::install check: '$TAG' is not a version tag"; exit 1 ;;
+            *) echo "::error::install check: '$tag' is not a version tag"; exit 1 ;;
           esac
+          echo "installing $tag"
+          echo "TAG=$tag" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tag }}
@@ -55,7 +74,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          INCODE_VERSION="$TAG" INCODE_INSTALL_DIR="$RUNNER_TEMP/incode-bin" sh scripts/install.sh
+          INCODE_VERSION="$TAG" INCODE_INSTALL_DIR="$RUNNER_TEMP/incode-bin" sh scripts/install.sh 2>&1 | tee "$RUNNER_TEMP/install.log"
       - name: Install with install.ps1
         if: runner.os == 'Windows'
         shell: pwsh
@@ -64,6 +83,35 @@ jobs:
           $env:INCODE_INSTALL_DIR = Join-Path $env:RUNNER_TEMP 'incode-bin'
           ./scripts/install.ps1
 
+      # install.ps1 runs the sandbox's one-time setup itself (through the
+      # elevation prompt; the runner is already elevated). Proven here: network
+      # deny must be enforced natively once the install has finished.
+      - name: The installer set the sandbox up (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $sbx = Join-Path $env:RUNNER_TEMP 'incode-bin\sbx.exe'
+          & $sbx check --net deny
+          if ($LASTEXITCODE -ne 0) {
+            Write-Output "::error::after install.ps1, sbx check --net deny exited ${LASTEXITCODE}: the sandbox setup did not run"
+            exit 1
+          }
+      # Linux and macOS need no sandbox setup; install.sh checks what the
+      # system enforces and says so. Proven here: the installer reported it.
+      # What this runner enforces is printed either way, for the record.
+      - name: The installer reported the sandbox (Linux, macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -uo pipefail
+          sbx="$RUNNER_TEMP/incode-bin/sbx"
+          "$sbx" check --fs workspace-write --net deny
+          echo "sbx check exited $?"
+          "$sbx" doctor
+          if ! grep -Eq 'incode-install: sandbox( ready|: incode works)' "$RUNNER_TEMP/install.log"; then
+            echo "::error::install.sh did not report the sandbox's state"
+            exit 1
+          fi
       - name: The installed programs report the tag's version
         shell: bash
         run: |
