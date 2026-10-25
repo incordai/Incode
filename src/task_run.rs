@@ -422,45 +422,32 @@ fn run_task_hooked(
     // takes the person's line, stops, and ends.
     let session_id = uuid::Uuid::new_v4().to_string();
     report.session.clone_from(&session_id);
-    // The operator's `user_prompt_submit` hooks see the instruction first,
-    // as in a session (`cli::plan_turn`): one that refuses it stops the run
-    // before the memory engine or an agent hears it. What they print rides
-    // the turn as context.
-    //
     // `session_start` first, as a session's start comes before its first
     // line; what it prints goes to stderr, which a JSON run keeps apart.
     if let Some(hooks) = &operator_hooks {
-        for said in hooks
-            .session_start("startup", &session_id, Some(workspace))
-            .messages()
-        {
-            eprintln!("incode: [session_start hook] {said}");
-        }
+        announce(
+            "session_start",
+            &hooks.session_start("startup", &session_id, Some(workspace)),
+        );
     }
     // Every way out after the start runs this, a refused line included, so
     // no `session_start` is left without its `session_end`.
     let operator_end = || {
         if let Some(hooks) = &operator_hooks {
-            for said in hooks
-                .session_end("other", &session_id, Some(workspace))
-                .messages()
-            {
-                eprintln!("incode: [session_end hook] {said}");
-            }
+            announce(
+                "session_end",
+                &hooks.session_end("other", &session_id, Some(workspace)),
+            );
         }
     };
-    let hooked: Vec<String> = match &operator_hooks {
-        Some(hooks) => {
-            let ran = hooks.user_prompt_submit(instruction, &session_id, Some(workspace));
-            if ran.is_denied() {
+    let hooked = match &operator_hooks {
+        Some(hooks) => match prompt_hook_context(hooks, instruction, &session_id, workspace) {
+            Ok(said) => said,
+            Err(refused) => {
                 operator_end();
-                return Err(format!(
-                    "not run: the operator's user_prompt_submit hook refused it. {}",
-                    ran.messages().join("\n")
-                ));
+                return Err(refused);
             }
-            ran.messages().to_vec()
-        }
+        },
         None => Vec::new(),
     };
     // The operator's collector, when telemetry is on (`crate::telemetry`).
@@ -470,34 +457,14 @@ fn run_task_hooked(
     // The owner's installed external tools, started as MCP servers now, in
     // the background, so they connect while the memory session opens.
     let tools = connect_ext_tools(workspace);
-    // A custom command's `allowed-tools` hold the whole run — it is the
-    // command's one turn — on every candidate whose tools are incode's.
-    let _held_to = (!command_tools.is_empty()).then(|| {
-        let (list, warnings) = crate::permissions::rules::Allowlist::parse(
-            command_tools,
-            crate::admin::home_dir().as_deref(),
-        );
-        for warning in warnings {
-            eprintln!("incode: {warning}");
-        }
-        tools.restrict_turn(list)
-    });
+    let _held_to = hold_to_command_tools(&tools, command_tools);
     let mut memory = crate::hooks::memory::MemoryHooks::new(
         crate::hooks::engine::Engine::locate(),
         workspace,
         &session_id,
     );
     let start = memory.start("startup");
-    let turn = memory.prompt(instruction);
-    // The hooks' context, then the engine's: one block for the turn.
-    let turn = {
-        let mut blocks: Vec<String> = hooked
-            .iter()
-            .map(|said| crate::hooks::prompt_context_block(said))
-            .collect();
-        blocks.extend(turn);
-        (!blocks.is_empty()).then(|| blocks.join("\n\n"))
-    };
+    let turn = turn_context(&hooked, memory.prompt(instruction));
     let spec_gate = crate::spec::for_this_run();
     if spec_gate == crate::spec::SpecGate::Off {
         // The text run's record of it, and stderr's under the JSON forms,
@@ -514,29 +481,7 @@ fn run_task_hooked(
         turn.as_deref(),
         spec_gate,
     );
-    // The output style (`crate::styles`), as a session has it. On stderr,
-    // which a JSON run keeps apart from its output.
-    let admin_style =
-        match crate::admin::AdminConfig::load(&crate::admin::AdminConfig::default_dir()) {
-            Ok(admin) => admin.output_style,
-            Err(e) => {
-                eprintln!("incode: {e}; no output style is read from it");
-                None
-            }
-        };
-    let style = crate::styles::for_session(workspace, admin_style.as_deref());
-    for line in style.notes.iter().chain(&style.warnings) {
-        eprintln!("incode: {line}");
-    }
-    // What rides the system context rather than the prompt: the project's
-    // own instruction files, the harness's standing instructions, the
-    // engine's session-start block, and the output style, last.
-    let system: Vec<String> = crate::instructions::project_block(workspace)
-        .into_iter()
-        .chain(crate::harness::instructions_block())
-        .chain(start)
-        .chain(style.block)
-        .collect();
+    let system = system_context(workspace, start);
     let task = Task {
         workspace,
         instruction,
@@ -562,6 +507,89 @@ fn run_task_hooked(
     crate::telemetry::turn_finished(&model, &report.spent(), begun.elapsed().as_secs_f64());
     crate::telemetry::export_now();
     ran
+}
+
+/// What an operator hook printed, on stderr (which a JSON run keeps apart
+/// from its output), named by the event it ran for.
+fn announce(event: &str, ran: &crate::hooks::HookRunResult) {
+    for said in ran.messages() {
+        eprintln!("incode: [{event} hook] {said}");
+    }
+}
+
+/// The operator's `user_prompt_submit` hooks see the instruction first, as in
+/// a session (`cli::plan_turn`): one that refuses it stops the run before the
+/// memory engine or an agent hears it (`Err`, the refusal to report). What
+/// they print rides the turn as context (`Ok`).
+fn prompt_hook_context(
+    hooks: &crate::hooks::HookRunner,
+    instruction: &str,
+    session_id: &str,
+    workspace: &Path,
+) -> Result<Vec<String>, String> {
+    let ran = hooks.user_prompt_submit(instruction, session_id, Some(workspace));
+    if ran.is_denied() {
+        return Err(format!(
+            "not run: the operator's user_prompt_submit hook refused it. {}",
+            ran.messages().join("\n")
+        ));
+    }
+    Ok(ran.messages().to_vec())
+}
+
+/// A custom command's `allowed-tools` hold the whole run — it is the
+/// command's one turn — on every candidate whose tools are incode's. `None`
+/// when the run is not a command's; the restriction lasts while it is held.
+fn hold_to_command_tools(
+    tools: &std::sync::Arc<crate::toolbox::SessionTools>,
+    command_tools: &[String],
+) -> Option<crate::toolbox::TurnRestriction> {
+    (!command_tools.is_empty()).then(|| {
+        let (list, warnings) = crate::permissions::rules::Allowlist::parse(
+            command_tools,
+            crate::admin::home_dir().as_deref(),
+        );
+        for warning in warnings {
+            eprintln!("incode: {warning}");
+        }
+        tools.restrict_turn(list)
+    })
+}
+
+/// The turn's context block: what the operator's prompt hooks printed, then
+/// the memory engine's block, joined; `None` when there is neither.
+fn turn_context(hooked: &[String], engine: Option<String>) -> Option<String> {
+    let mut blocks: Vec<String> = hooked
+        .iter()
+        .map(|said| crate::hooks::prompt_context_block(said))
+        .collect();
+    blocks.extend(engine);
+    (!blocks.is_empty()).then(|| blocks.join("\n\n"))
+}
+
+/// What rides the system context rather than the prompt: the project's own
+/// instruction files, the harness's standing instructions, the engine's
+/// session-start block, and the output style (`crate::styles`) last. The
+/// style's notes and warnings go to stderr, which a JSON run keeps apart.
+fn system_context(workspace: &Path, start: Option<String>) -> Vec<String> {
+    let admin_style =
+        match crate::admin::AdminConfig::load(&crate::admin::AdminConfig::default_dir()) {
+            Ok(admin) => admin.output_style,
+            Err(e) => {
+                eprintln!("incode: {e}; no output style is read from it");
+                None
+            }
+        };
+    let style = crate::styles::for_session(workspace, admin_style.as_deref());
+    for line in style.notes.iter().chain(&style.warnings) {
+        eprintln!("incode: {line}");
+    }
+    crate::instructions::project_block(workspace)
+        .into_iter()
+        .chain(crate::harness::instructions_block())
+        .chain(start)
+        .chain(style.block)
+        .collect()
 }
 
 /// Session tools for one run, with the installed external tools connecting
