@@ -8,10 +8,17 @@
 #   gh workflow run install-check.yml -f tag=v0.1.0-rc.2
 #
 # The installers are taken from the tag itself, so what is checked is what
-# that release's users were told to run.
+# that release's users were told to run. A pull request that changes an
+# installer runs its own installers against the latest release instead, so
+# an installer change is proven before any tag carries it.
 name: install check
 
 on:
+  pull_request:
+    paths:
+      - scripts/install.sh
+      - scripts/install.ps1
+      - .github/workflows/install-check.yml
   workflow_call:
     inputs:
       tag:
@@ -36,16 +43,28 @@ jobs:
         os: [ubuntu-22.04, ubuntu-22.04-arm, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     env:
-      TAG: ${{ inputs.tag }}
+      TAG_INPUT: ${{ inputs.tag }}
     steps:
-      - name: Check the tag
+      # The tag is checked before it is written to GITHUB_ENV: any character
+      # outside a version tag's (a newline above all) is refused, so an input
+      # cannot add variables of its own.
+      - name: The release to install
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          case "$TAG" in
+          tag="$TAG_INPUT"
+          if [ -z "$tag" ]; then
+            tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)"
+          fi
+          case "$tag" in
+            *[!0-9A-Za-z.+-]*) echo "::error::install check: the tag holds a character no version tag has"; exit 1 ;;
             v[0-9]*) ;;
-            *) echo "::error::install check: '$TAG' is not a version tag"; exit 1 ;;
+            *) echo "::error::install check: '$tag' is not a version tag"; exit 1 ;;
           esac
+          echo "installing $tag"
+          echo "TAG=$tag" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tag }}
