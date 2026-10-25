@@ -174,6 +174,41 @@ pub struct EnterSpec {
     pub offline_record: Option<PathBuf>,
 }
 
+/// Who a run's command runs as, for its [`EnterSpec`]: the run's private SID
+/// and, under network deny or proxy on Windows, the offline account.
+struct RunIdentity {
+    sid: Option<String>,
+    offline: Offline,
+    offline_record: Option<PathBuf>,
+}
+
+impl RunIdentity {
+    /// The caller's own user, unrestricted by a SID: every run off Windows.
+    #[cfg(not(windows))]
+    fn caller() -> Self {
+        Self {
+            sid: None,
+            offline: Offline::No,
+            offline_record: None,
+        }
+    }
+
+    /// Windows: the lease's SID when there is one, and the offline account
+    /// when the setup is ready for this run.
+    #[cfg(windows)]
+    fn of(lease: Option<&windows::acl::Lease>, offline: Option<&windows::offline::Ready>) -> Self {
+        Self {
+            sid: lease.map(|l| l.sid().to_string()),
+            offline: if offline.is_some() {
+                Offline::Launch
+            } else {
+                Offline::No
+            },
+            offline_record: offline.map(|r| r.record.clone()),
+        }
+    }
+}
+
 /// The helper's part in running a command as the offline account (Windows,
 /// network deny).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -250,104 +285,24 @@ fn sandbox_err(message: impl Into<String>) -> EnterError {
 /// The helper: `<spec-json> -- <program> [args...]`, or on Windows the
 /// second helper of a network-deny run, [`INNER_ARG`] alone with the rest in
 /// [`INNER_ENV`].
+///
+/// The steps: the Windows inner helper ([`enter_inner`]), the arguments
+/// ([`helper_args`]), the tie to the parent ([`bind_to_parent`]), the
+/// confinement ([`confine`]), then supervise or exec the command.
 fn enter(args: &[OsString]) -> Result<Never, EnterError> {
     #[cfg(windows)]
     if args.len() == 1 && args[0] == INNER_ARG {
-        let json = std::env::var(INNER_ENV)
-            .map_err(|_| sandbox_err(format!("helper started without {INNER_ENV}")))?;
-        // Not for the command, nor anything it starts.
-        std::env::remove_var(INNER_ENV);
-        let launch: InnerLaunch = serde_json::from_str(&json)
-            .map_err(|e| sandbox_err(format!("helper spec does not parse: {e}")))?;
-        if launch.spec.offline != Offline::Inner {
-            return Err(sandbox_err("helper spec is not an inner one"));
-        }
-        let args: Vec<OsString> = launch.args.into_iter().map(OsString::from).collect();
-        return match windows::enter(&launch.spec, &OsString::from(launch.program), &args) {
-            Ok(code) => std::process::exit(code),
-            Err((message, code)) => Err(EnterError { message, code }),
-        };
+        return enter_inner();
     }
-    let spec_json = args
-        .first()
-        .and_then(|a| a.to_str())
-        .ok_or_else(|| sandbox_err("helper started without its spec"))?;
-    let spec: EnterSpec = serde_json::from_str(spec_json)
-        .map_err(|e| sandbox_err(format!("helper spec does not parse: {e}")))?;
-    if args.get(1).map(|a| a.as_os_str()) != Some(std::ffi::OsStr::new("--")) {
-        return Err(sandbox_err("helper expected `--` before the command"));
-    }
-    let program = args
-        .get(2)
-        .ok_or_else(|| sandbox_err("helper started without a command"))?;
-    let program_args = &args[3..];
+    let (spec, program, program_args) = helper_args(args)?;
     // Off Unix and Windows nothing in the spec is enforced by the helper: the
     // parent already refused (strict) or reported (best effort) every gap.
     #[cfg(not(any(unix, windows)))]
     let _ = &spec;
-
-    // If the parent dies (SIGKILL included, which nothing can forward), the
-    // command must not run on unsupervised. In the caller's process group a
-    // parent-death SIGKILL on the command is enough (the caller's group kill
-    // reaches the rest); in its own group the supervisor below handles it.
     #[cfg(unix)]
-    let parent = {
-        // SAFETY: getppid has no preconditions.
-        unsafe { libc::getppid() }
-    };
-    #[cfg(target_os = "linux")]
-    {
-        let signal = if spec.supervise {
-            libc::SIGTERM
-        } else {
-            libc::SIGKILL
-        };
-        // SAFETY: prctl with integer arguments.
-        unsafe {
-            libc::prctl(libc::PR_SET_PDEATHSIG, signal);
-        }
-    }
+    let parent = bind_to_parent(spec.supervise)?;
     #[cfg(unix)]
-    {
-        // SAFETY: getppid has no preconditions.
-        if unsafe { libc::getppid() } != parent {
-            return Err(sandbox_err("the parent exited before the command started"));
-        }
-    }
-
-    #[cfg(unix)]
-    if let Err(e) = limits::apply(&spec.limits) {
-        if spec.strict {
-            return Err(sandbox_err(e));
-        }
-        eprintln!("sbx: limit not applied (best effort): {e}");
-    }
-    #[cfg(target_os = "linux")]
-    if let Err(e) = linux::restrict(&spec) {
-        if spec.strict {
-            return Err(sandbox_err(format!("Landlock: {e}")));
-        }
-        eprintln!("sbx: Landlock not applied (best effort): {e}");
-    }
-    // After Landlock, before exec: refuse terminal input injection, vsock and
-    // io_uring whenever anything is confined, and under deny/proxy also the
-    // sockets Landlock does not see (UDP, raw, ...). See `seccomp`. Only the
-    // socket layer is part of the network policy, so only it is fatal in
-    // strict mode; with the filesystem alone, an architecture without a
-    // filter is skipped quietly and a kernel refusal is reported.
-    #[cfg(target_os = "linux")]
-    {
-        let network = spec.net_mode != NetMode::Allow;
-        let fs = spec.fs_mode != FsMode::Off && seccomp::available();
-        if network || fs {
-            if let Err(e) = seccomp::install(network) {
-                if spec.strict && network {
-                    return Err(sandbox_err(format!("seccomp: {e}")));
-                }
-                eprintln!("sbx: seccomp not applied (best effort): {e}");
-            }
-        }
-    }
+    confine(&spec)?;
 
     #[cfg(unix)]
     if spec.supervise {
@@ -364,6 +319,114 @@ fn enter(args: &[OsString]) -> Result<Never, EnterError> {
     }
     #[cfg(not(windows))]
     exec(program, program_args)
+}
+
+/// Windows, the second helper of a network-deny run: the spec, program and
+/// arguments come in [`INNER_ENV`], which the command never sees.
+#[cfg(windows)]
+fn enter_inner() -> Result<Never, EnterError> {
+    let json = std::env::var(INNER_ENV)
+        .map_err(|_| sandbox_err(format!("helper started without {INNER_ENV}")))?;
+    // Not for the command, nor anything it starts.
+    std::env::remove_var(INNER_ENV);
+    let launch: InnerLaunch = serde_json::from_str(&json)
+        .map_err(|e| sandbox_err(format!("helper spec does not parse: {e}")))?;
+    if launch.spec.offline != Offline::Inner {
+        return Err(sandbox_err("helper spec is not an inner one"));
+    }
+    let args: Vec<OsString> = launch.args.into_iter().map(OsString::from).collect();
+    match windows::enter(&launch.spec, &OsString::from(launch.program), &args) {
+        Ok(code) => std::process::exit(code),
+        Err((message, code)) => Err(EnterError { message, code }),
+    }
+}
+
+/// `<spec-json> -- <program> [args...]`: the spec, the program and its
+/// arguments.
+fn helper_args(args: &[OsString]) -> Result<(EnterSpec, &OsString, &[OsString]), EnterError> {
+    let spec_json = args
+        .first()
+        .and_then(|a| a.to_str())
+        .ok_or_else(|| sandbox_err("helper started without its spec"))?;
+    let spec: EnterSpec = serde_json::from_str(spec_json)
+        .map_err(|e| sandbox_err(format!("helper spec does not parse: {e}")))?;
+    if args.get(1).map(|a| a.as_os_str()) != Some(std::ffi::OsStr::new("--")) {
+        return Err(sandbox_err("helper expected `--` before the command"));
+    }
+    let program = args
+        .get(2)
+        .ok_or_else(|| sandbox_err("helper started without a command"))?;
+    Ok((spec, program, &args[3..]))
+}
+
+/// If the parent dies (SIGKILL included, which nothing can forward), the
+/// command must not run on unsupervised. In the caller's process group a
+/// parent-death SIGKILL on the command is enough (the caller's group kill
+/// reaches the rest); in its own group (`supervise`) the supervisor handles
+/// it. Returns the parent's pid; a parent already gone refuses the run.
+#[cfg(unix)]
+fn bind_to_parent(supervise: bool) -> Result<libc::pid_t, EnterError> {
+    // SAFETY: getppid has no preconditions.
+    let parent = unsafe { libc::getppid() };
+    #[cfg(target_os = "linux")]
+    {
+        let signal = if supervise {
+            libc::SIGTERM
+        } else {
+            libc::SIGKILL
+        };
+        // SAFETY: prctl with integer arguments.
+        unsafe {
+            libc::prctl(libc::PR_SET_PDEATHSIG, signal);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = supervise;
+    // SAFETY: getppid has no preconditions.
+    if unsafe { libc::getppid() } != parent {
+        return Err(sandbox_err("the parent exited before the command started"));
+    }
+    Ok(parent)
+}
+
+/// Apply the spec to this process before it execs the command: the resource
+/// limits, then (Linux) Landlock, then seccomp. In strict mode a part that
+/// does not take refuses the run; best effort says so and goes on.
+///
+/// Seccomp comes after Landlock, before exec: it refuses terminal input
+/// injection, vsock and io_uring whenever anything is confined, and under
+/// deny/proxy also the sockets Landlock does not see (UDP, raw, ...). See
+/// `seccomp`. Only the socket layer is part of the network policy, so only it
+/// is fatal in strict mode; with the filesystem alone, an architecture
+/// without a filter is skipped quietly and a kernel refusal is reported.
+#[cfg(unix)]
+fn confine(spec: &EnterSpec) -> Result<(), EnterError> {
+    if let Err(e) = limits::apply(&spec.limits) {
+        if spec.strict {
+            return Err(sandbox_err(e));
+        }
+        eprintln!("sbx: limit not applied (best effort): {e}");
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Err(e) = linux::restrict(spec) {
+            if spec.strict {
+                return Err(sandbox_err(format!("Landlock: {e}")));
+            }
+            eprintln!("sbx: Landlock not applied (best effort): {e}");
+        }
+        let network = spec.net_mode != NetMode::Allow;
+        let fs = spec.fs_mode != FsMode::Off && seccomp::available();
+        if network || fs {
+            if let Err(e) = seccomp::install(network) {
+                if spec.strict && network {
+                    return Err(sandbox_err(format!("seccomp: {e}")));
+                }
+                eprintln!("sbx: seccomp not applied (best effort): {e}");
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -612,24 +675,7 @@ impl Sandbox {
             ));
         }
         let roots = self.policy.resolved_roots(cwd)?;
-        #[allow(unused_mut)]
-        let mut deny_read = self.policy.resolved_deny_read(cwd, &roots)?;
-        // Inside WSL2 a Windows program started from the sandbox would run
-        // outside it altogether: hide the interop interpreter and sockets.
-        #[cfg(target_os = "linux")]
-        let block_interop = self.policy.fs.mode != FsMode::Off
-            && self.policy.fs.block_wsl_interop
-            && wsl::detected();
-        #[cfg(not(target_os = "linux"))]
-        let block_interop = false;
-        #[cfg(target_os = "linux")]
-        if block_interop {
-            for p in wsl::interop_paths() {
-                if !deny_read.contains(&p) && !roots.iter().any(|r| p.starts_with(r)) {
-                    deny_read.push(p);
-                }
-            }
-        }
+        let (deny_read, block_interop) = self.hidden_paths(cwd, &roots)?;
         let protected = (self.policy.fs.mode == FsMode::WorkspaceWrite
             && self.policy.fs.protect_git)
             .then(|| protect::Snapshot::take(protect::git_paths(&roots)));
@@ -650,89 +696,21 @@ impl Sandbox {
         } else {
             windows::setup::ready().as_ref().ok().cloned()
         };
-        // Windows: grant the writable roots and the temp directory to a
-        // private SID for this run, before the helper restricts the
-        // command's token to it; under network deny to the offline account
-        // as well, with the current folder and the helper program to read.
-        // A grant that fails refuses the run in strict mode; best effort
-        // runs it with the writes unconfined (and the network open), and
-        // says so.
         #[cfg(windows)]
-        let lease = if self.policy.fs.mode == FsMode::Off && offline.is_none() {
-            None
-        } else {
-            let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-            let mut grant = roots.clone();
-            if self.policy.fs.mode == FsMode::Off {
-                // Not confined, but another account: give it the folder it
-                // was started in, so it can work there at all.
-                grant.push(real(cwd));
-            }
-            grant.push(temp.path.clone());
-            let account = offline.as_ref().map(|ready| {
-                let reads = windows::offline_reads(&grant, &real(cwd), &real(&helper));
-                windows::acl::OfflineGrant {
-                    user: ready.sid.clone(),
-                    // PowerShell lists the current folder's parent to start
-                    // in it at all.
-                    parents: windows::offline_parents(
-                        &grant,
-                        &reads,
-                        &real(cwd),
-                        windows::profiles_dir().as_deref(),
-                    ),
-                    reads,
-                }
-            });
-            match windows::acl::Lease::acquire(&grant, account) {
-                Ok(lease) => Some(lease),
-                Err(e) if self.strict => return Err(e),
-                Err(e) => {
-                    eprintln!("sbx: writes not confined and network not denied (best effort): {e}");
-                    offline = None;
-                    None
-                }
-            }
-        };
-
-        let proxy = if self.policy.network.mode == NetMode::Proxy {
-            let allowlist = proxy::Allowlist::new(
-                &self.policy.network.allow,
-                self.policy.network.allow_private,
-            )?
-            .with_loopback_ports(&self.policy.network.loopback_ports);
-            let upstream = proxy::Upstream::from_env(|k| std::env::var(k).ok());
-            // As the offline account, the command may only reach the
-            // loopback ports the setup's filter permits: listen on one.
-            #[cfg(windows)]
-            let ports = offline.as_ref().map(|r| r.proxy_ports);
-            #[cfg(not(windows))]
-            let ports: Option<(u16, u16)> = None;
-            let started = match ports {
-                Some(range) => proxy::Proxy::start_in(allowlist, upstream, range),
-                None => proxy::Proxy::start(allowlist, upstream),
-            };
-            Some(started.map_err(|e| format!("proxy: {e}"))?)
-        } else {
-            None
-        };
-
-        let mut extra: Vec<(String, String)> = Vec::new();
-        let temp_str = temp.path.to_string_lossy().into_owned();
-        for k in ["TMPDIR", "TMP", "TEMP"] {
-            extra.push((k.into(), temp_str.clone()));
-        }
-        if let Some(p) = &proxy {
-            extra.extend(p.client_env());
-        }
-        let inherited = match &self.base_env {
-            Some(vars) => vars.clone(),
-            None => std::env::vars_os().collect(),
-        };
-        let mut environment = env::compute(&self.policy.env, inherited, &extra);
-        if block_interop {
-            environment.retain(|(k, _)| k != "WSL_INTEROP");
-        }
+        let lease = self.windows_lease(&roots, &temp, cwd, &helper, &mut offline)?;
+        // As the offline account, the command may only reach the loopback
+        // ports the setup's filter permits: the proxy listens on one.
+        #[cfg(windows)]
+        let proxy_ports = offline.as_ref().map(|r| r.proxy_ports);
+        #[cfg(not(windows))]
+        let proxy_ports: Option<(u16, u16)> = None;
+        let proxy = self.start_proxy(proxy_ports)?;
+        let environment = self.environment(&temp, proxy.as_ref(), block_interop);
+        // Windows: who the command runs as. Elsewhere the caller, always.
+        #[cfg(windows)]
+        let identity = RunIdentity::of(lease.as_ref(), offline.as_ref());
+        #[cfg(not(windows))]
+        let identity = RunIdentity::caller();
 
         let spec = EnterSpec {
             fs_mode: self.policy.fs.mode,
@@ -748,23 +726,10 @@ impl Sandbox {
             limits: self.policy.limits.clone(),
             strict: self.strict,
             supervise: own_group,
-            #[cfg(windows)]
-            sid: lease.as_ref().map(|l| l.sid().to_string()),
-            #[cfg(not(windows))]
-            sid: None,
+            sid: identity.sid,
             parent_pid: Some(std::process::id()),
-            #[cfg(windows)]
-            offline: if offline.is_some() {
-                Offline::Launch
-            } else {
-                Offline::No
-            },
-            #[cfg(not(windows))]
-            offline: Offline::No,
-            #[cfg(windows)]
-            offline_record: offline.as_ref().map(|r| r.record.clone()),
-            #[cfg(not(windows))]
-            offline_record: None,
+            offline: identity.offline,
+            offline_record: identity.offline_record,
         };
         let spec_json = serde_json::to_string(&spec).map_err(|e| e.to_string())?;
 
@@ -793,6 +758,132 @@ impl Sandbox {
                 own_group,
             },
         ))
+    }
+
+    /// The paths the command may not read (`deny_read`, resolved), and
+    /// whether WSL interop is blocked. Inside WSL2 a Windows program started
+    /// from the sandbox would run outside it altogether, so the interop
+    /// interpreter and sockets are hidden too, unless a writable root holds
+    /// them.
+    fn hidden_paths(&self, cwd: &Path, roots: &[PathBuf]) -> Result<(Vec<PathBuf>, bool), String> {
+        #[allow(unused_mut)]
+        let mut deny_read = self.policy.resolved_deny_read(cwd, roots)?;
+        #[cfg(target_os = "linux")]
+        let block_interop = self.policy.fs.mode != FsMode::Off
+            && self.policy.fs.block_wsl_interop
+            && wsl::detected();
+        #[cfg(not(target_os = "linux"))]
+        let block_interop = false;
+        #[cfg(target_os = "linux")]
+        if block_interop {
+            for p in wsl::interop_paths() {
+                if !deny_read.contains(&p) && !roots.iter().any(|r| p.starts_with(r)) {
+                    deny_read.push(p);
+                }
+            }
+        }
+        Ok((deny_read, block_interop))
+    }
+
+    /// Windows: grant the writable roots and the temp directory to a private
+    /// SID for this run, before the helper restricts the command's token to
+    /// it; under network deny to the offline account as well, with the
+    /// current folder and the helper program to read. A grant that fails
+    /// refuses the run in strict mode; best effort runs it with the writes
+    /// unconfined and the network open (`offline` is cleared), and says so.
+    #[cfg(windows)]
+    fn windows_lease(
+        &self,
+        roots: &[PathBuf],
+        temp: &TempDir,
+        cwd: &Path,
+        helper: &Path,
+        offline: &mut Option<windows::offline::Ready>,
+    ) -> Result<Option<windows::acl::Lease>, String> {
+        if self.policy.fs.mode == FsMode::Off && offline.is_none() {
+            return Ok(None);
+        }
+        let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let mut grant = roots.to_vec();
+        if self.policy.fs.mode == FsMode::Off {
+            // Not confined, but another account: give it the folder it was
+            // started in, so it can work there at all.
+            grant.push(real(cwd));
+        }
+        grant.push(temp.path.clone());
+        let account = offline.as_ref().map(|ready| {
+            let reads = windows::offline_reads(&grant, &real(cwd), &real(helper));
+            windows::acl::OfflineGrant {
+                user: ready.sid.clone(),
+                // PowerShell lists the current folder's parent to start in
+                // it at all.
+                parents: windows::offline_parents(
+                    &grant,
+                    &reads,
+                    &real(cwd),
+                    windows::profiles_dir().as_deref(),
+                ),
+                reads,
+            }
+        });
+        match windows::acl::Lease::acquire(&grant, account) {
+            Ok(lease) => Ok(Some(lease)),
+            Err(e) if self.strict => Err(e),
+            Err(e) => {
+                eprintln!("sbx: writes not confined and network not denied (best effort): {e}");
+                *offline = None;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Under `proxy`: the allowlisting proxy for this run, listening in
+    /// `ports` when the offline account may reach only those, otherwise on
+    /// any loopback port. `None` for every other network mode.
+    fn start_proxy(&self, ports: Option<(u16, u16)>) -> Result<Option<proxy::Proxy>, String> {
+        if self.policy.network.mode != NetMode::Proxy {
+            return Ok(None);
+        }
+        let allowlist = proxy::Allowlist::new(
+            &self.policy.network.allow,
+            self.policy.network.allow_private,
+        )?
+        .with_loopback_ports(&self.policy.network.loopback_ports);
+        let upstream = proxy::Upstream::from_env(|k| std::env::var(k).ok());
+        let started = match ports {
+            Some(range) => proxy::Proxy::start_in(allowlist, upstream, range),
+            None => proxy::Proxy::start(allowlist, upstream),
+        };
+        started.map(Some).map_err(|e| format!("proxy: {e}"))
+    }
+
+    /// The command's environment: the policy's filter over the caller's (or
+    /// the given base) environment, with the private temp directory as
+    /// `TMPDIR`/`TMP`/`TEMP`, the proxy's variables, and no `WSL_INTEROP`
+    /// when interop is blocked.
+    fn environment(
+        &self,
+        temp: &TempDir,
+        proxy: Option<&proxy::Proxy>,
+        block_interop: bool,
+    ) -> Vec<(OsString, OsString)> {
+        let mut extra: Vec<(String, String)> = Vec::new();
+        let temp_str = temp.path.to_string_lossy().into_owned();
+        for k in ["TMPDIR", "TMP", "TEMP"] {
+            extra.push((k.into(), temp_str.clone()));
+        }
+        if let Some(p) = proxy {
+            extra.extend(p.client_env());
+        }
+        let inherited = match &self.base_env {
+            Some(vars) => vars.clone(),
+            None => std::env::vars_os().collect(),
+        };
+        let mut environment = env::compute(&self.policy.env, inherited, &extra);
+        if block_interop {
+            environment.retain(|(k, _)| k != "WSL_INTEROP");
+        }
+        environment
     }
 
     /// Run `program args` in `cwd` with the caller's stdio, enforcing the

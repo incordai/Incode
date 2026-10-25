@@ -203,66 +203,12 @@ impl Server {
         }
     }
 
+    /// `sandbox_create`: the network the agent asked for, checked against the
+    /// ceilings ([`Self::requested_network`]) and against what this machine
+    /// enforces ([`Self::refuse_unenforceable`]), then a fresh folder.
     fn create(&mut self, args: &Value) -> Result<Value, String> {
-        let network = match args.get("network").and_then(Value::as_str) {
-            None => NetMode::Deny,
-            Some(w) => NetMode::parse(w).ok_or(format!("network: unknown mode `{w}`"))?,
-        };
-        if rank(network) > rank(self.ceilings.network) {
-            return Err(format!(
-                "network `{}` is above what this server allows (`{}`)",
-                network.as_str(),
-                self.ceilings.network.as_str()
-            ));
-        }
-        let hosts: Vec<String> = match args.get("allow_hosts") {
-            None => Vec::new(),
-            Some(v) => serde_json::from_value(v.clone())
-                .map_err(|_| "allow_hosts: expected a list of host names".to_string())?,
-        };
-        if network == NetMode::Proxy {
-            if hosts.is_empty() {
-                return Err("network `proxy` needs allow_hosts".to_string());
-            }
-            if self.ceilings.network == NetMode::Proxy {
-                let ceiling = crate::proxy::Allowlist::new(&self.ceilings.hosts, false)?;
-                for h in &hosts {
-                    let (name, port) = match h.rsplit_once(':') {
-                        Some((n, p)) => (n, p.parse().unwrap_or(443)),
-                        None => (h.as_str(), 443),
-                    };
-                    if !ceiling.allows(name.trim_start_matches("*."), port) {
-                        return Err(format!(
-                            "host `{h}` is not among the hosts this server allows: {}",
-                            self.ceilings.hosts.join(", ")
-                        ));
-                    }
-                }
-            }
-            crate::proxy::Allowlist::new(&hosts, false)?;
-        } else if !hosts.is_empty() {
-            return Err("allow_hosts needs network `proxy`".to_string());
-        }
-        // On native Windows, where `deny` and `proxy` need `sbx setup-windows`
-        // first, say so now rather than at every run, which would each be
-        // refused anyway.
-        // (Elsewhere enforcement depends on the kernel, and each run says.)
-        if cfg!(windows) && !self.ceilings.best_effort {
-            let mut probe = Policy::default();
-            probe.network.mode = network;
-            if let crate::Status::NotEnforced(why) = crate::enforcement(&probe).network {
-                return Err(format!(
-                    "network `{}` cannot be enforced on this machine: {why}{}",
-                    network.as_str(),
-                    if rank(self.ceilings.network) >= rank(NetMode::Allow) {
-                        " (this server allows `allow`, if an open network will do)"
-                    } else {
-                        ""
-                    }
-                ));
-            }
-        }
-
+        let (network, hosts) = self.requested_network(args)?;
+        self.refuse_unenforceable(network)?;
         self.next += 1;
         let id = format!("sbx-{}-{}", std::process::id(), self.next);
         let dir = self.ceilings.root.join(&id);
@@ -279,6 +225,85 @@ impl Server {
         );
         let info = self.info(&json!({ "id": id }))?;
         Ok(info)
+    }
+
+    /// The network mode and hosts `args` ask for, refused when above the
+    /// ceilings: a mode above the ceiling's, a host outside the ceiling's
+    /// list, `proxy` without hosts, or hosts without `proxy`.
+    fn requested_network(&self, args: &Value) -> Result<(NetMode, Vec<String>), String> {
+        let network = match args.get("network").and_then(Value::as_str) {
+            None => NetMode::Deny,
+            Some(w) => NetMode::parse(w).ok_or(format!("network: unknown mode `{w}`"))?,
+        };
+        if rank(network) > rank(self.ceilings.network) {
+            return Err(format!(
+                "network `{}` is above what this server allows (`{}`)",
+                network.as_str(),
+                self.ceilings.network.as_str()
+            ));
+        }
+        let hosts: Vec<String> = match args.get("allow_hosts") {
+            None => Vec::new(),
+            Some(v) => serde_json::from_value(v.clone())
+                .map_err(|_| "allow_hosts: expected a list of host names".to_string())?,
+        };
+        if network != NetMode::Proxy {
+            return if hosts.is_empty() {
+                Ok((network, hosts))
+            } else {
+                Err("allow_hosts needs network `proxy`".to_string())
+            };
+        }
+        if hosts.is_empty() {
+            return Err("network `proxy` needs allow_hosts".to_string());
+        }
+        if self.ceilings.network == NetMode::Proxy {
+            self.refuse_hosts_above_ceiling(&hosts)?;
+        }
+        crate::proxy::Allowlist::new(&hosts, false)?;
+        Ok((network, hosts))
+    }
+
+    /// Each host must be one the ceiling's own allowlist lets through.
+    fn refuse_hosts_above_ceiling(&self, hosts: &[String]) -> Result<(), String> {
+        let ceiling = crate::proxy::Allowlist::new(&self.ceilings.hosts, false)?;
+        for h in hosts {
+            let (name, port) = match h.rsplit_once(':') {
+                Some((n, p)) => (n, p.parse().unwrap_or(443)),
+                None => (h.as_str(), 443),
+            };
+            if !ceiling.allows(name.trim_start_matches("*."), port) {
+                return Err(format!(
+                    "host `{h}` is not among the hosts this server allows: {}",
+                    self.ceilings.hosts.join(", ")
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// On native Windows, where `deny` and `proxy` need `sbx setup-windows`
+    /// first, say so now rather than at every run, which would each be
+    /// refused anyway. (Elsewhere enforcement depends on the kernel, and each
+    /// run says.)
+    fn refuse_unenforceable(&self, network: NetMode) -> Result<(), String> {
+        if !cfg!(windows) || self.ceilings.best_effort {
+            return Ok(());
+        }
+        let mut probe = Policy::default();
+        probe.network.mode = network;
+        match crate::enforcement(&probe).network {
+            crate::Status::NotEnforced(why) => Err(format!(
+                "network `{}` cannot be enforced on this machine: {why}{}",
+                network.as_str(),
+                if rank(self.ceilings.network) >= rank(NetMode::Allow) {
+                    " (this server allows `allow`, if an open network will do)"
+                } else {
+                    ""
+                }
+            )),
+            _ => Ok(()),
+        }
     }
 
     fn sandbox(&self, args: &Value) -> Result<(&str, &Box_), String> {
