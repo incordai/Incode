@@ -29,11 +29,11 @@
 //!
 //! 1. [`ENGINE_BIN_ENV`], when set.
 //! 2. `engine_bin` in the operator's settings ([`crate::admin::AdminConfig`]).
-//! 3. The engine's install location. On Windows that is where its installer
-//!    runs from, `%LOCALAPPDATA%\Incord Memory\incord-memory-service.exe` —
-//!    the path it writes into the hooks of every agent it installs for — and
-//!    then the spaceless copy it makes at `%USERPROFILE%\.incord\` for agents
-//!    whose shell cannot quote a path. No default is known elsewhere.
+//! 3. The engine's install location. On Windows that is first where it ships
+//!    now, inside Watchman — `%LOCALAPPDATA%\Watchman\incord-memory-service.exe`
+//!    — then its older installer's `%LOCALAPPDATA%\Incord Memory\`, then the
+//!    spaceless copy at `%USERPROFILE%\.incord\` for agents whose shell cannot
+//!    quote a path. No default is known elsewhere.
 //!
 //! A path the operator NAMED is used even when it does not exist: the spawn
 //! then fails, and that failure is the guard's failure policy (see
@@ -96,6 +96,10 @@ pub enum Event {
     Capture,
     /// The session is over.
     SessionEnd,
+    /// The conversation is about to be compacted: the engine records the turns
+    /// before they are summarised away and re-arms what a session must do
+    /// again after a compaction (`hook_precompact.rs` in the engine).
+    PreCompact,
 }
 
 impl Event {
@@ -108,6 +112,7 @@ impl Event {
             Self::CodeEdit => "code-edit",
             Self::Capture => "capture",
             Self::SessionEnd => "session-end",
+            Self::PreCompact => "pre-compact",
         }
     }
 
@@ -121,6 +126,7 @@ impl Event {
             Self::CodeEdit => "PostToolUse",
             Self::Capture => "Stop",
             Self::SessionEnd => "SessionEnd",
+            Self::PreCompact => "PreCompact",
         }
     }
 
@@ -128,7 +134,8 @@ impl Event {
         match self {
             Self::PreTool => PRE_TOOL_BOUND,
             Self::PermissionRequest => PERMISSION_REQUEST_BOUND,
-            Self::Capture => CAPTURE_BOUND,
+            // A capture of the turns, as at a stop.
+            Self::Capture | Self::PreCompact => CAPTURE_BOUND,
             Self::SessionEnd => SESSION_END_BOUND,
             Self::SessionStart | Self::UserPrompt | Self::CodeEdit => CONTEXT_BOUND,
         }
@@ -430,6 +437,25 @@ impl Engine {
         let _ = self.run(Event::SessionEnd, &event, at.cwd, &|| false);
     }
 
+    /// The conversation is about to be compacted (`trigger` is `manual` or
+    /// `auto`), and the engine is not waited for.
+    ///
+    /// Bookkeeping, like [`Self::code_edit`]: the engine reads the turns from
+    /// the transcript, which compaction never shortens, so a thread of its own
+    /// loses nothing and holds up no one. Without it a session that compacted
+    /// mid-task recorded none of what was summarised away until its next stop.
+    ///
+    /// Called by `MemoryHooks::pre_compact` (a `/compact`) and
+    /// `Toolbox::operator_pre_compact` (the API route compacting on its own).
+    pub fn pre_compact(&self, at: Conversation<'_>, trigger: &str) {
+        let event = lifecycle(Event::PreCompact, at, json!({ "trigger": trigger }));
+        let engine = self.clone();
+        let cwd = at.cwd.to_path_buf();
+        std::thread::spawn(move || {
+            let _ = engine.run(Event::PreCompact, &event, &cwd, &|| false);
+        });
+    }
+
     fn run(&self, event: Event, payload: &Value, cwd: &Path, abandon: &dyn Fn() -> bool) -> Ran {
         let bound = self.cap.unwrap_or_else(|| event.bound());
         let began = std::time::Instant::now();
@@ -527,6 +553,17 @@ fn default_locations() -> Vec<PathBuf> {
     #[cfg(windows)]
     {
         if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            // Where the engine ships now: inside Watchman. Without this the
+            // engine was never found on a machine that runs it from there —
+            // the old folders held only backups — and every session ran
+            // with no memory, no guard and no transcript, said only in the
+            // trace (measured 2026-10-26: a `-t` run left no `.incode` at all
+            // while the engine answered on its port).
+            out.push(
+                PathBuf::from(&local)
+                    .join("Watchman")
+                    .join("incord-memory-service.exe"),
+            );
             out.push(
                 PathBuf::from(local)
                     .join("Incord Memory")
@@ -608,6 +645,19 @@ fn text_at<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty())
+}
+
+/// The heading the engine opens a SERVED result with: the recorder already
+/// ran this exact call, and the recorded output is the answer
+/// (`pre_tool_decide.rs` in the engine). It arrives the way a refusal does —
+/// exit 2, on stderr — so this is the one thing that tells the two apart.
+pub const SERVED_MARK: &str = "WATCHMAN HAS ALREADY RUN THIS CALL";
+
+/// Whether a pre-tool `Block` is the engine serving the call's recorded output
+/// rather than refusing it.
+#[must_use]
+pub fn is_served(reason: &str) -> bool {
+    reason.contains(SERVED_MARK)
 }
 
 fn read_pre_tool(ran: Ran) -> PreTool {
@@ -1047,5 +1097,19 @@ mod tests {
         );
         assert_eq!(bin(locate_from(None, None, &defaults)), Some(installed));
         assert_eq!(bin(locate_from(None, None, &[missing])), None);
+    }
+
+    /// **WHERE THE ENGINE SHIPS NOW IS LOOKED AT FIRST.** It runs from inside
+    /// Watchman, and the older install folders hold only backups; looked for
+    /// only there, it was never found, and every session ran without it.
+    #[cfg(windows)]
+    #[test]
+    fn the_engine_is_looked_for_inside_watchman_first() {
+        let first = default_locations().into_iter().next().expect("a location");
+        assert!(
+            first.ends_with(std::path::Path::new("Watchman").join("incord-memory-service.exe")),
+            "{}",
+            first.display()
+        );
     }
 }

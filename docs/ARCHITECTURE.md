@@ -428,8 +428,9 @@ and Antigravity still run their own tools inside their own processes, so no call
 make passes this gate.
 
 - **Binary:** `INCORD_ENGINE_BIN`, then `engine_bin` in `admin.json`, then the engine's
-  install location — `%LOCALAPPDATA%\Incord Memory\incord-memory-service.exe`, which is
-  what the engine's installer writes into Claude's and Codex's hooks, then the spaceless
+  install location — `%LOCALAPPDATA%\Watchman\incord-memory-service.exe`, where it ships
+  inside Watchman, then `%LOCALAPPDATA%\Incord Memory\incord-memory-service.exe`, which is
+  what the engine's older installer writes into Claude's and Codex's hooks, then the spaceless
   copy at `%USERPROFILE%\.incord\` it makes for Antigravity. No default elsewhere. A
   NAMED path that is missing is a spawn failure (the failure policy below); nothing
   named and nothing installed skips the hooks.

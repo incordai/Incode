@@ -524,7 +524,14 @@ impl AgentSession {
                 .to_vec(),
             None => Vec::new(),
         };
-        match self.backend.compact(instructions) {
+        let compacted = self.backend.compact(instructions);
+        // The memory engine records the turns that were summarised away. Told
+        // only when a compaction happened, and safely after it: the engine
+        // reads the turns from the transcript, which compaction never shortens.
+        if matches!(compacted, Some(Ok(_))) {
+            self.memory.pre_compact("manual");
+        }
+        match compacted {
             Some(Ok(done)) if !said.is_empty() => {
                 let lines: Vec<String> = said
                     .iter()
@@ -1242,6 +1249,9 @@ impl AgentSession {
         }
 
         let mut outcome = attempt;
+        // What the tools did, whether or not the turn then succeeded: a tool
+        // that ran, ran, and the engine's recorder learns from it.
+        self.memory.tools_ran(&said);
         if outcome.is_ok() {
             self.memory
                 .said(crate::hooks::memory::Speaker::Agent, &said.whole());
@@ -1285,6 +1295,7 @@ impl AgentSession {
                             _ => {}
                         }
                     });
+                self.memory.tools_ran(&replied);
                 if !replied.last().is_empty() {
                     self.memory
                         .said(crate::hooks::memory::Speaker::Agent, &replied.whole());
@@ -1332,6 +1343,7 @@ impl AgentSession {
                 &mut observer,
             );
             outcome = judged(self.backend.as_ref(), next).0;
+            self.memory.tools_ran(&said);
             if outcome.is_ok() {
                 self.memory
                     .said(crate::hooks::memory::Speaker::Agent, &said.whole());

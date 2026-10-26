@@ -21,7 +21,7 @@ fn run_bridged_runs_the_turn_it_is_handed() {
 
     let mut seen = Vec::new();
     let outcome = backend
-        .run_bridged(command, turn, &mut |e| seen.push(e.clone()))
+        .run_bridged(command, None, turn, &mut |e| seen.push(e.clone()))
         .expect("the turn completes");
     assert!(!outcome.is_error, "{outcome:?}");
     assert_eq!(outcome.session_id, "fake-thread");

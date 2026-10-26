@@ -38,6 +38,10 @@ pub const READ_PATH: &str = "/v1/memory/code/edits/read";
 /// The route a session's end is told on: its claims released, its reads and
 /// marks dropped.
 pub const END_PATH: &str = "/v1/memory/code/edits/end";
+/// The route a shell command's window is opened and closed on: a file the
+/// command changes inside it is credited to the agent that ran it
+/// (`code_edits_api.rs` `shell` in the engine).
+pub const SHELL_PATH: &str = "/v1/memory/code/edits/shell";
 
 /// The agent the operator started, as the engine names it; a sub-agent is
 /// `incode/sub-1`, its own sub-agent `incode/sub-1/sub-1`.
@@ -51,12 +55,40 @@ pub const MAX_RANGES: usize = 1_000;
 /// this is not a ping's bound.
 const CALL_BOUND: Duration = Duration::from_secs(15);
 
-/// The two routes, so a test's ledger can tell them apart.
+/// What `/code/edits/shell` is sent for one command's window: the checkout,
+/// the phase, who ran it, and — opening it — the command, cut to the 1,000
+/// characters the engine keeps of it.
+#[must_use]
+pub fn shell_body(
+    workspace: &std::path::Path,
+    phase: &str,
+    agent_id: &str,
+    session_id: &str,
+    command: &str,
+    call_id: &str,
+) -> Value {
+    let mut body = json!({
+        "cwd": workspace.to_string_lossy(),
+        "phase": phase,
+        "agent_id": agent_id,
+        "session_id": session_id,
+    });
+    if phase == "begin" {
+        body["command"] = json!(command.chars().take(1_000).collect::<String>());
+    }
+    if !call_id.is_empty() {
+        body["tool_use_id"] = json!(call_id);
+    }
+    body
+}
+
+/// The routes, so a test's ledger can tell them apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Route {
     Mark,
     Read,
     End,
+    Shell,
 }
 
 /// Why a call to the engine brought no answer to act on. Either way it means
@@ -121,6 +153,7 @@ impl EditLedger for EngineLedger {
                 Route::Mark => MARK_PATH,
                 Route::Read => READ_PATH,
                 Route::End => END_PATH,
+                Route::Shell => SHELL_PATH,
             }
         );
         let body = body.clone();
@@ -466,6 +499,36 @@ impl Toolbox {
         match edits.ledger.post(Route::End, &body) {
             Ok(said) => crate::trace!("edits", "session {} ended: {said}", body["session_id"]),
             Err(why) => crate::trace!("edits", "session {} not ended: {why}", body["session_id"]),
+        }
+    }
+
+    /// Open (`begin`) or close (`end`) the engine's window around one shell
+    /// command, so a file it changes is credited to this agent rather than to
+    /// nobody: a write through the shell is not a write tool, and has no mark
+    /// of its own (`announce_writes` plans only the write tools).
+    ///
+    /// Foreground commands only, called around `run_shell` in
+    /// `Toolbox::run_tool`. A background job is given none: the engine
+    /// credits nobody while two windows overlap, so one held open for as long
+    /// as a job runs would hide every foreground command's changes meanwhile.
+    /// Bounded, like every call here; no answer is traced, never a refusal.
+    pub(super) fn shell_window(&self, phase: &str, command: &str, call_id: &str) {
+        let Some(edits) = &self.code_edits else {
+            return;
+        };
+        if self.session.is_empty() || command.trim().is_empty() {
+            return;
+        }
+        let body = shell_body(
+            &self.workspace,
+            phase,
+            &edits.agent_id(),
+            &edits.session_of(&self.session),
+            command,
+            call_id,
+        );
+        if let Err(why) = edits.ledger.post(Route::Shell, &body) {
+            crate::trace!("edits", "shell window {phase} not told: {why}");
         }
     }
 

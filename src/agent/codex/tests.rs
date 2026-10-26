@@ -58,14 +58,42 @@ fn harness_context_is_carried_in_prompt() {
     let bare = CodexBackend::new(PathBuf::from("."));
     assert_eq!(
         bare.full_prompt("fix the bug").expect("sent"),
-        "fix the bug"
+        ("fix the bug".to_string(), false)
     );
 
     let briefed = CodexBackend::new(PathBuf::from("."))
         .with_system_context(vec!["Guards: no writes outside src/".to_string()]);
-    let sent = briefed.full_prompt("fix the bug").expect("sent");
+    let (sent, on_stdin) = briefed.full_prompt("fix the bug").expect("sent");
     assert!(sent.contains("Guards: no writes outside src/"));
     assert!(sent.ends_with("fix the bug"));
+    assert!(!on_stdin, "a short prompt stays an argument");
+}
+
+/// **A PROMPT TOO LONG FOR THE COMMAND LINE GOES ON STDIN, WHOLE** — `codex
+/// exec -` — never cut and never spilled into a file the model must read.
+#[test]
+fn a_prompt_too_long_for_the_command_line_goes_on_stdin_whole() {
+    let dir = tempfile::tempdir().expect("scratch");
+    let briefed = CodexBackend::new(dir.path().to_path_buf())
+        .with_system_context(vec!["Guards: no writes outside src/".to_string()]);
+    let long = format!(
+        "{}\nthe question itself",
+        "context ".repeat(crate::agent::MAX_CMDLINE_PAYLOAD_LEN / 8 + 100)
+    );
+    let (sent, on_stdin) = briefed.full_prompt(&long).expect("sent");
+    assert!(on_stdin, "over the cap it goes on stdin");
+    assert!(
+        sent.starts_with("Guards: no writes outside src/"),
+        "context first"
+    );
+    assert!(
+        sent.ends_with("the question itself"),
+        "and the whole prompt, last line kept"
+    );
+    assert!(
+        !dir.path().join(crate::hooks::memory::CONTEXT).exists(),
+        "nothing was spilled to a file"
+    );
 }
 
 #[test]

@@ -80,6 +80,48 @@ fn toolbox_as(root: &std::path::Path, edits: CodeEdits) -> Toolbox {
 
 const SOURCE: &str = "fn one() {\n    1\n}\n\nfn two() {\n    2\n}\n";
 
+/// **A SHELL COMMAND RUNS INSIDE THE ENGINE'S WINDOW**, opened before it with
+/// the command and closed after it, as this agent in this session — so a file
+/// it writes is credited to the agent rather than to nobody. A write through
+/// the shell has no mark of its own.
+#[test]
+fn a_shell_command_runs_inside_the_engines_window() {
+    let ws = workspace();
+    let ledger = Recorder::allowing();
+    let tools = toolbox(ws.path(), Arc::clone(&ledger));
+
+    tools
+        .run_call("call-9", "Bash", &json!({ "command": "echo hi" }))
+        .expect("the command runs");
+
+    let shell: Vec<Value> = ledger
+        .calls()
+        .into_iter()
+        .filter(|(r, _)| *r == Route::Shell)
+        .map(|(_, b)| b)
+        .collect();
+    assert_eq!(shell.len(), 2, "{shell:?}");
+    assert_eq!(shell[0]["phase"], "begin");
+    assert_eq!(shell[0]["command"], "echo hi");
+    assert_eq!(shell[0]["agent_id"], "incode");
+    assert_eq!(shell[0]["session_id"], "session-1");
+    assert_eq!(shell[0]["tool_use_id"], "call-9");
+    assert_eq!(shell[1]["phase"], "end");
+    assert!(
+        shell[1].get("command").is_none(),
+        "only the opening names it"
+    );
+}
+
+/// The command the engine is told is cut to what it keeps of one.
+#[test]
+fn a_long_command_is_cut_to_what_the_engine_keeps() {
+    let long = "x".repeat(5_000);
+    let body = shell_body(std::path::Path::new("."), "begin", "incode", "s", &long, "");
+    assert_eq!(body["command"].as_str().map(str::len), Some(1_000));
+    assert!(body.get("tool_use_id").is_none());
+}
+
 /// **AN EDIT ANNOUNCES EXACTLY THE TEXT IT REPLACES**, as this agent in this
 /// session for this call, then confirms it once it landed.
 #[test]
