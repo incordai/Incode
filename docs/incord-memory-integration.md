@@ -144,11 +144,13 @@ about how incord-code starts the child limit that:
 
 The Claude settings merge is `engine:hooks.rs:427-500`. Every `incord-code` hit in `engine:src` is a test fixture or a comment (e.g. `api/skills_api.rs:593`, `proxy.rs:4103`). None of them is an installer.
 
-The file `D:\Projects\incord-code\.agents\hooks.json` is **Antigravity's workspace hooks file**:
+The repo once carried `.agents/hooks.json`, **Antigravity's workspace hooks file**:
 
-- It carries `pre-tool --agy` and `session-start --agy`.
+- It carried `pre-tool --agy` and `session-start --agy`.
 - It matches the Antigravity writer's workspace target, `.agents/hooks.json` (`engine:cli/agent_files.rs:530`).
 - incord-code never reads it (no `hooks.json` reference anywhere in `src/`).
+
+It was removed on 2026-10-26: it named `%USERPROFILE%\.incord\incord-memory-service.exe`, which no longer exists, and committed one machine's path into the repo. The engine writes Antigravity's hooks into `~/.gemini/{config,antigravity-cli,antigravity}/hooks.json` (`engine:providers/agy/install.rs::hook_dirs`). Those files name the installed engine, so agy runs anywhere still get them.
 
 The engine's per-agent reply shapes are keyed by a flag (`engine:cli/hook_agent.rs:23-30`: `Default`, `Codex`, `Antigravity`). **incord-code should use the `Default` (Claude Code) contract, so it needs no flag.**
 
@@ -192,7 +194,7 @@ These are the same calls `src/hooks/mod.rs:202-205` already makes.
 today. Resolve it in this order:
 1. The environment variable `INCORD_ENGINE_BIN` (new).
 2. A new `AdminConfig` field `engine_bin: Option<String>`, next to `memory_url` (`src/admin.rs:160`).
-3. The default install location, `%USERPROFILE%\.incord\incord-memory-service.exe`. That is the path the engine's own installer wrote on this machine (`D:\Projects\incord-code\.agents\hooks.json:4`). The non-Windows default path is **UNVERIFIED**.
+3. The default install location, `%USERPROFILE%\.incord\incord-memory-service.exe`. That is the path the engine's own installer wrote on this machine (the workspace `.agents/hooks.json`, since removed). The non-Windows default path is **UNVERIFIED**.
 
    **Corrected in phase 2.** `.incord\` is only the spaceless COPY the installer makes for Antigravity, whose shell cannot quote a path (`engine:cli/agent_files.rs:566-584`). The Claude and Codex hooks the installer writes use its own `current_exe()` (`engine:cli/hooks_install.rs:241-245`), which on this machine is `%LOCALAPPDATA%\Incord Memory\incord-memory-service.exe` — 8 hooks each in `~/.claude/settings.json` and `~/.codex/hooks.json`. The two files were byte-identical when checked. The runner looks at the `%LOCALAPPDATA%` path first, then the `.incord` copy. incode spawns without a shell, so the space needs no quoting.
 
@@ -222,7 +224,7 @@ Two things the existing operator runner does wrong for this purpose must not be 
 | PermissionRequest | `hook permission-request` | 600 s (`:500`); the engine itself waits ≤ 540 s (`engine:cli/permission_request.rs:26`) | **≥ 600 s** |
 | SessionEnd | `hook session-end` | 120 s (`:478`) | ≥ 120 s |
 | PreCompact | `hook pre-compact` | 30 s (`:456`) | ≥ 30 s |
-| SessionStart / UserPromptSubmit / PostToolUse | `hook session-start` / `user-prompt` / `code-edit` | none set; the agent's default applies (value **UNVERIFIED**). The engine's Antigravity file uses 60 (`.agents/hooks.json:5-6`) | 60 s |
+| SessionStart / UserPromptSubmit / PostToolUse | `hook session-start` / `user-prompt` / `code-edit` | none set; the agent's default applies (value **UNVERIFIED**). The engine's Antigravity file uses 60 (`~/.gemini/config/hooks.json`) | 60 s |
 
 Use one constant per event, and add a small margin (for example +10 s) so the engine's own deadline fires first. Do **not** reuse `HOOK_TIMEOUT` (10 s, `src/hooks/mod.rs:45`).
 
