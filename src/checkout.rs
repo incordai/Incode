@@ -53,8 +53,14 @@ pub fn main_checkout(workspace: &Path) -> Option<PathBuf> {
     common.parent().map(Path::to_path_buf)
 }
 
-/// Whether two paths name one file, compared after resolving each.
-fn same_file(a: &Path, b: &Path) -> bool {
+/// Whether two paths name one file or folder, compared after resolving each
+/// — so `/var/x` and `/private/var/x`, a short and a long Windows name, or a
+/// path through `..` all count as the same place. Both must exist.
+///
+/// Called by [`crate::brief::brief_for`] when a brief's spelling of the main
+/// checkout differs from git's, and by [`main_checkout`]'s back-pointer check.
+#[must_use]
+pub fn same_file(a: &Path, b: &Path) -> bool {
     match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
         (Ok(a), Ok(b)) => a == b,
         _ => false,
@@ -161,6 +167,25 @@ mod tests {
             main.display().to_string(),
             "a brief saved from the worktree completes the main checkout's"
         );
+    }
+
+    /// A brief that names the main checkout by ANOTHER SPELLING of the same
+    /// folder still covers its worktree. CI found it: git records the folder
+    /// as it resolves it — `/private/var/…` behind macOS's `/var` link, the
+    /// long name behind a Windows `RUNNER~1` — while the brief keeps the
+    /// spelling it was written with. `..` reproduces that on every system.
+    #[test]
+    fn a_brief_spelled_differently_still_covers_the_worktree() {
+        let root = tempfile::tempdir().expect("tmp");
+        let (_main, worktree) = repo_with_worktree(root.path());
+        let other_spelling = root.path().join("game-worktrees").join("..").join("game");
+        let briefs = vec![crate::brief::ProjectBrief {
+            project: other_spelling.display().to_string(),
+            about: "a ball game".to_string(),
+            ..Default::default()
+        }];
+        let found = crate::brief::brief_for(&briefs, &worktree).map(|b| b.about.as_str());
+        assert_eq!(found, Some("a ball game"));
     }
 
     /// A `.git` file pointing at another worktree's private dir is refused: that

@@ -841,7 +841,23 @@ fn normalise(value: &str) -> String {
 #[must_use]
 pub fn brief_for<'a>(briefs: &'a [ProjectBrief], workspace: &Path) -> Option<&'a ProjectBrief> {
     brief_at(briefs, workspace).or_else(|| {
-        crate::checkout::main_checkout(workspace).and_then(|main| brief_at(briefs, &main))
+        let main = crate::checkout::main_checkout(workspace)?;
+        brief_at(briefs, &main).or_else(|| same_folder_as(briefs, &main))
+    })
+}
+
+/// The brief whose `project` is an absolute path to the same folder as
+/// `main`, however differently the two are spelled.
+///
+/// git records the main checkout as it resolves it — `/private/var/…` behind
+/// macOS's `/var` link, the long name behind a Windows short one — while a
+/// brief keeps the spelling it was written with; CI met both. Only absolute
+/// paths are compared: a bare name would resolve against whatever folder the
+/// process happens to run in.
+fn same_folder_as<'a>(briefs: &'a [ProjectBrief], main: &Path) -> Option<&'a ProjectBrief> {
+    briefs.iter().find(|b| {
+        let project = Path::new(b.project.trim());
+        project.is_absolute() && crate::checkout::same_file(project, main)
     })
 }
 
