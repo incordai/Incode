@@ -18,6 +18,8 @@
 //! grows a cache, that cache becomes a second memory that can disagree with the
 //! first — which is the defect this whole direction exists to remove.
 
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 
 use crate::brief::memory_url;
@@ -27,6 +29,9 @@ pub const INDEX_PATH: &str = "/v1/memory/recall/index";
 
 /// Stage two: full content for chosen refs.
 pub const GET_PATH: &str = "/v1/memory/recall/get";
+
+/// Widening one hit: the turns around it in its own conversation, as previews.
+pub const TIMELINE_PATH: &str = "/v1/memory/recall/timeline";
 
 /// How many previews to ask for when the caller has no opinion.
 ///
@@ -188,16 +193,36 @@ pub fn as_context(hits: &[Hit]) -> Option<String> {
 /// opening a socket: a service that accepts a connection and cannot serve a
 /// query is down for every purpose that matters here.
 pub fn probe() -> Result<(), String> {
-    index("health check", 1).map(|_| ())
+    index("health check", 1, None).map(|_| ())
 }
 
-pub fn index(query: &str, top_k: usize) -> Result<Vec<Hit>, String> {
+/// Ranked previews for `query` — from the project `cwd` is in, or from every
+/// project when `cwd` is `None`.
+///
+/// The engine scopes recall by the folder it is given (`search_api.rs`
+/// `recall_index`: "the SAME routing capture uses, so recall reads where the
+/// work was written"). Sent without one, a model's recall in this project came
+/// back led by another project's conversation (measured 2026-10-26).
+pub fn index(query: &str, top_k: usize, cwd: Option<&Path>) -> Result<Vec<Hit>, String> {
     let query = query.trim();
     if query.is_empty() {
         return Ok(Vec::new());
     }
-    let body = serde_json::json!({ "query": query, "top_k": top_k }).to_string();
-    parse_index(&post(INDEX_PATH, body)?)
+    parse_index(&post(
+        INDEX_PATH,
+        index_body(query, top_k, cwd).to_string(),
+    )?)
+}
+
+/// What [`index`] sends: the question, and the folder whose project it is
+/// confined to when there is one.
+#[must_use]
+pub fn index_body(query: &str, top_k: usize, cwd: Option<&Path>) -> serde_json::Value {
+    let mut body = serde_json::json!({ "query": query, "top_k": top_k });
+    if let Some(cwd) = cwd {
+        body["cwd"] = serde_json::json!(cwd.display().to_string());
+    }
+    body
 }
 
 /// Fetch full content for chosen refs.
@@ -253,6 +278,84 @@ pub const INDEX_TOOL: &str = "recall_index";
 /// The tool that fetches chosen messages in full.
 pub const GET_TOOL: &str = "recall_get";
 
+/// The tool that widens one hit to the turns around it.
+pub const TIMELINE_TOOL: &str = "recall_timeline";
+
+/// How many turns either side of a hit, when the caller has no opinion. The
+/// engine's own default; it caps the window at 25.
+const DEFAULT_WINDOW: u64 = 3;
+
+/// `recall_timeline` as advertised to the model.
+#[must_use]
+pub fn timeline_tool_definition() -> serde_json::Value {
+    serde_json::json!({
+        "name": TIMELINE_TOOL,
+        "description": "Widen one recall_index hit: the turns just before and after \
+            it in the same conversation, as previews. Use it when a hit is the \
+            middle of a story — a decision whose reason came earlier, a fix whose \
+            result came later — before paying recall_get for any of them.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "conv_id": {"type": "string", "description": "From a recall_index hit."},
+                "idx": {"type": "integer", "description": "From the same hit."},
+                "window": {"type": "integer", "description": "Turns either side, 1-25 (default 3)."}
+            },
+            "required": ["conv_id", "idx"]
+        }
+    })
+}
+
+/// Run a `recall_timeline` call and render it the way `recall_index` renders.
+pub fn run_timeline_tool(input: &str) -> Result<String, String> {
+    let parsed: serde_json::Value = serde_json::from_str(input)
+        .map_err(|e| format!("`{TIMELINE_TOOL}` needs a JSON object: {e}"))?;
+    let conv_id = parsed
+        .get("conv_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    let idx = parsed.get("idx").and_then(serde_json::Value::as_u64);
+    let (false, Some(idx)) = (conv_id.is_empty(), idx) else {
+        return Err(format!(
+            "`{TIMELINE_TOOL}` needs the `conv_id` and `idx` of a recall_index hit."
+        ));
+    };
+    let window = parsed
+        .get("window")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(DEFAULT_WINDOW)
+        .clamp(1, 25);
+    let body = serde_json::json!({ "conv_id": conv_id, "idx": idx, "window": window });
+    // Same shape as recall_index's answer (`search_api.rs` answers `{hits}` of
+    // the same IndexHit), so the same reader.
+    let hits = parse_index(&post(TIMELINE_PATH, body.to_string())?)?;
+    if hits.is_empty() {
+        return Ok(format!(
+            "No conversation `{conv_id}` is held, or it has no turns around {idx}."
+        ));
+    }
+    Ok(render_hits(&hits, "turn(s) in order"))
+}
+
+/// Hits as the model reads them, each with the ref `recall_get` takes.
+fn render_hits(hits: &[Hit], what: &str) -> String {
+    let mut out = format!(
+        "{} {what}. Use recall_get for the ones worth reading:",
+        hits.len()
+    );
+    for hit in hits {
+        out.push_str(&format!(
+            "\n- conv_id={} idx={} score={:.2}\n  {}",
+            hit.conv_id,
+            hit.idx,
+            hit.score,
+            hit.preview.trim()
+        ));
+    }
+    out
+}
+
 /// `recall_index` as advertised to the model.
 #[must_use]
 pub fn index_tool_definition() -> serde_json::Value {
@@ -307,8 +410,9 @@ pub fn get_tool_definition() -> serde_json::Value {
     })
 }
 
-/// Run a `recall_index` call and render it for the model.
-pub fn run_index_tool(input: &str) -> Result<String, String> {
+/// Run a `recall_index` call, scoped to the project `workspace` is in, and
+/// render it for the model.
+pub fn run_index_tool(input: &str, workspace: &Path) -> Result<String, String> {
     let parsed: serde_json::Value = serde_json::from_str(input)
         .map_err(|e| format!("`{INDEX_TOOL}` needs a JSON object: {e}"))?;
     let query = parsed
@@ -324,24 +428,11 @@ pub fn run_index_tool(input: &str) -> Result<String, String> {
         .and_then(serde_json::Value::as_u64)
         .map_or(DEFAULT_TOP_K, |k| (k as usize).clamp(1, 50));
 
-    let hits = index(query, top_k)?;
+    let hits = index(query, top_k, Some(workspace))?;
     if hits.is_empty() {
-        return Ok("Nothing remembered matches that.".to_string());
+        return Ok("Nothing remembered in this project matches that.".to_string());
     }
-    let mut out = format!(
-        "{} hit(s). Use recall_get for the ones worth reading:",
-        hits.len()
-    );
-    for hit in &hits {
-        out.push_str(&format!(
-            "\n- conv_id={} idx={} score={:.2}\n  {}",
-            hit.conv_id,
-            hit.idx,
-            hit.score,
-            hit.preview.trim()
-        ));
-    }
-    Ok(out)
+    Ok(render_hits(&hits, "hit(s)"))
 }
 
 /// Run a `recall_get` call and render it for the model.
@@ -434,8 +525,33 @@ mod tests {
     fn an_empty_query_asks_nothing_at_all() {
         // No server is running in this test; reaching the network would fail.
         // Returning early is what keeps a blank line from costing a request.
-        assert_eq!(index("   ", 5), Ok(Vec::new()));
+        assert_eq!(index("   ", 5, None), Ok(Vec::new()));
         assert_eq!(get(&[]), Ok(Vec::new()));
+    }
+
+    /// A model's recall is confined to the project it works in: the engine
+    /// routes by `cwd`, and without one it answered from every project — led,
+    /// when measured, by another project's conversation.
+    #[test]
+    fn recall_names_the_folder_whose_project_it_reads() {
+        let scoped = index_body("how is it built", 8, Some(Path::new("D:/work/app")));
+        assert_eq!(scoped["cwd"], "D:/work/app");
+        assert_eq!(scoped["query"], "how is it built");
+        // The health probe asks no project's question.
+        assert!(index_body("health check", 1, None).get("cwd").is_none());
+    }
+
+    #[test]
+    fn the_timeline_tool_needs_the_hit_it_widens() {
+        for bad in [
+            r#"{}"#,
+            r#"{"conv_id":"c"}"#,
+            r#"{"idx":3}"#,
+            r#"{"conv_id":" ","idx":3}"#,
+        ] {
+            let error = run_timeline_tool(bad).expect_err(bad);
+            assert!(error.contains("`conv_id` and `idx`"), "{bad}: {error}");
+        }
     }
 
     #[test]
@@ -498,7 +614,7 @@ mod tests {
 
     #[test]
     fn the_index_tool_refuses_a_call_with_no_question() {
-        let error = run_index_tool(r#"{"top_k":5}"#).expect_err("must be refused");
+        let error = run_index_tool(r#"{"top_k":5}"#, Path::new(".")).expect_err("must be refused");
         assert!(error.contains("needs a `query`"), "got: {error}");
     }
 

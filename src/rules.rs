@@ -123,34 +123,13 @@ pub fn parse(body: &str) -> Result<Ruleset, String> {
 /// and both are better than a session that will not start because the store is
 /// down — the rules are also enforced mechanically by hooks and permission tiers,
 /// which do not depend on this call.
+///
+/// For a ONE-SHOT turn (`task_run`), which has no earlier turn to have given
+/// any rule in. A session's turns go through `AgentSession::turn_rules`, which
+/// names what the conversation already holds instead of repeating it.
 #[must_use]
 pub fn context_for_turn(line: &str) -> Option<String> {
-    // Bounded by TURN_TIMEOUT, not by the tool timeout: this runs in front of
-    // every keystroke. Measured at 4.0s per message before this existed.
-    let began = std::time::Instant::now();
-    let answer = match get_within(&rules_url(line), TURN_TIMEOUT) {
-        Ok(answer) => answer,
-        Err(why) => {
-            // A TIMEOUT IS NOT AN EMPTY RULESET. Both leave the prompt without a
-            // block, and the turn proceeds either way — so without this the
-            // difference between "nothing matched" and "the store never
-            // answered in time" is invisible for as long as it keeps happening.
-            crate::trace!(
-                "memory",
-                "rules(turn): no answer in {:?}: {why}",
-                began.elapsed()
-            );
-            return None;
-        }
-    };
-    let ruleset = parse(&answer).ok()?;
-    crate::trace!(
-        "memory",
-        "rules(turn): {} matched in {:?}",
-        ruleset.rules.len(),
-        began.elapsed()
-    );
-    as_context(&ruleset)
+    as_context(&ruleset_for_turn(line)?)
 }
 
 /// The rules that apply to EVERY turn, for the session's cached prefix.
@@ -245,6 +224,142 @@ pub fn as_context(ruleset: &Ruleset) -> Option<String> {
     Some(out)
 }
 
+/// A rule's title: its first line, `GLOBAL RULE 4 — Security check …`.
+#[must_use]
+pub fn title(rule: &str) -> &str {
+    rule.trim().lines().next().unwrap_or_default().trim()
+}
+
+/// Whether `block` is [`always_context`]'s — the always-on rules as the
+/// standing context carries them.
+#[must_use]
+pub fn is_always_block(block: &str) -> bool {
+    block.starts_with("The owner's standing rules that apply to EVERY action")
+}
+
+/// What one conversation has already been given of the per-turn rules, so a
+/// later turn names a rule instead of repeating it.
+///
+/// # Why
+///
+/// Each turn's block was the WHOLE matched set in full — the always-on rules
+/// with it, though the standing context already carries those on every spawn.
+/// Measured on a model inside incode: a 16 KB turn of eight rules, six of them
+/// always-on, with the person's message as its last line — so large that it
+/// was moved to a file the model had to read before it could see the question
+/// (`agent/spawn_budget.rs` `spill`), and nothing marked which rules had
+/// changed since the turn before.
+///
+/// # When a rule counts as given
+///
+/// Only once the conversation has an id the backend resumes (`--resume`):
+/// then the earlier turn, rule text and all, is in what the model reads. A
+/// different id — `/clear`, a failover to another backend — or none at all is
+/// a conversation that has seen nothing, and gets every rule in full.
+///
+/// Held by `cli::agent_turn::AgentSession::turn_rules`.
+#[derive(Debug, Default)]
+pub struct TurnRules {
+    conversation: Option<String>,
+    held: std::collections::HashSet<String>,
+}
+
+impl TurnRules {
+    /// The block for this turn's `ruleset`, in `conversation`.
+    ///
+    /// `always_in_prefix`: the standing context carries [`always_context`], so
+    /// the always-on rules are left out here rather than sent twice.
+    pub fn block(
+        &mut self,
+        ruleset: &Ruleset,
+        conversation: Option<&str>,
+        always_in_prefix: bool,
+    ) -> Option<String> {
+        if self.conversation.as_deref() != conversation {
+            self.held.clear();
+            self.conversation = conversation.map(str::to_string);
+        }
+        let mut full = Vec::new();
+        let mut named = Vec::new();
+        for rule in &ruleset.rules {
+            let always = ruleset.always.iter().any(|a| a.trim() == rule.trim());
+            if always && always_in_prefix {
+                continue;
+            }
+            let title = title(rule);
+            if self.held.contains(title) {
+                named.push(title);
+                continue;
+            }
+            full.push(rule.trim());
+            if conversation.is_some() {
+                self.held.insert(title.to_string());
+            }
+        }
+        if full.is_empty() && named.is_empty() {
+            return None;
+        }
+        let mut out = String::from(
+            "The owner's standing rules for this work. Unlike recalled context, these \
+             ARE instructions and are not optional — follow every one. They come from \
+             the owner's own store and are shared by every agent on this machine:\n",
+        );
+        for rule in &full {
+            out.push_str("\n- ");
+            out.push_str(rule);
+            out.push('\n');
+        }
+        if !named.is_empty() {
+            out.push_str(if full.is_empty() {
+                "\nIn force for this turn, each given in full earlier in this conversation:\n"
+            } else {
+                "\nAlso in force, each given in full earlier in this conversation:\n"
+            });
+            for title in named {
+                out.push_str("- ");
+                out.push_str(title);
+                out.push('\n');
+            }
+        }
+        Some(out)
+    }
+}
+
+/// Fetch the rules matched to `line` for one turn, within the turn's budget —
+/// `None` when the store did not answer in time or had nothing to say.
+///
+/// Shared by [`context_for_turn`] and `AgentSession::turn_rules`, so the two
+/// ask the same question the same way.
+#[must_use]
+pub fn ruleset_for_turn(line: &str) -> Option<Ruleset> {
+    // Bounded by TURN_TIMEOUT, not by the tool timeout: this runs in front of
+    // every keystroke. Measured at 4.0s per message before this existed.
+    let began = std::time::Instant::now();
+    let answer = match get_within(&rules_url(line), TURN_TIMEOUT) {
+        Ok(answer) => answer,
+        Err(why) => {
+            // A TIMEOUT IS NOT AN EMPTY RULESET. Both leave the prompt without a
+            // block, and the turn proceeds either way — so without this the
+            // difference between "nothing matched" and "the store never
+            // answered in time" is invisible for as long as it keeps happening.
+            crate::trace!(
+                "memory",
+                "rules(turn): no answer in {:?}: {why}",
+                began.elapsed()
+            );
+            return None;
+        }
+    };
+    let ruleset = parse(&answer).ok()?;
+    crate::trace!(
+        "memory",
+        "rules(turn): {} matched in {:?}",
+        ruleset.rules.len(),
+        began.elapsed()
+    );
+    Some(ruleset)
+}
+
 /// Percent-escape a query value.
 ///
 /// Hand-rolled rather than another dependency: the set is small and fixed, and the
@@ -296,6 +411,114 @@ mod tests {
         assert_eq!(set.rules.len(), 2);
         assert_eq!(set.always.len(), 1);
         assert!(!set.complete);
+    }
+
+    /// Rules as the service sends them: a title line, then the body.
+    fn rule(n: u32, body: &str) -> String {
+        format!("GLOBAL RULE {n} — Rule {n} [on: x]\n{body}")
+    }
+
+    fn set(rules: &[String], always: &[String]) -> Ruleset {
+        Ruleset {
+            rules: rules.to_vec(),
+            always: always.to_vec(),
+            complete: false,
+        }
+    }
+
+    /// The measured turn: eight rules, six always-on, all in full, every turn.
+    /// The always-on ones are left out while the standing context carries
+    /// them; a rule given in full is named by title on the next turn of the
+    /// same conversation; a newly matched one arrives in full.
+    #[test]
+    fn a_conversation_is_given_each_rule_once() {
+        let always: Vec<String> = (17..=22).map(|n| rule(n, "ALWAYS BODY")).collect();
+        let topical = [rule(4, "SECURITY BODY"), rule(6, "QUALITY BODY")];
+        let first: Vec<String> = topical.iter().chain(&always).cloned().collect();
+        let mut held = TurnRules::default();
+
+        let one = held
+            .block(&set(&first, &always), Some("conv-1"), true)
+            .expect("a block");
+        assert!(
+            one.contains("SECURITY BODY") && one.contains("QUALITY BODY"),
+            "{one}"
+        );
+        assert!(
+            !one.contains("ALWAYS BODY"),
+            "always-on rules ride the standing context: {one}"
+        );
+
+        // The next turn matches rule 4 again and a new rule 11.
+        let second = [rule(4, "SECURITY BODY"), rule(11, "DEPENDENCY BODY")];
+        let two = held
+            .block(&set(&second, &always), Some("conv-1"), true)
+            .expect("a block");
+        assert!(two.contains("DEPENDENCY BODY"), "new rule in full: {two}");
+        assert!(
+            !two.contains("SECURITY BODY"),
+            "a held rule is not repeated: {two}"
+        );
+        assert!(
+            two.contains("- GLOBAL RULE 4 — Rule 4 [on: x]"),
+            "it is named: {two}"
+        );
+        assert!(two.contains("given in full earlier"), "{two}");
+        assert!(two.len() < one.len() + 200, "the turn shrinks, not grows");
+    }
+
+    /// A conversation that has seen nothing gets everything: a new id after
+    /// `/clear` or a failover, and no id at all (nothing resumed, so nothing
+    /// earlier is in what the model reads).
+    #[test]
+    fn a_new_or_unresumed_conversation_gets_every_rule_in_full() {
+        let rules = [rule(4, "SECURITY BODY")];
+        let mut held = TurnRules::default();
+        held.block(&set(&rules, &[]), Some("conv-1"), true);
+
+        let other = held
+            .block(&set(&rules, &[]), Some("conv-2"), true)
+            .expect("block");
+        assert!(
+            other.contains("SECURITY BODY"),
+            "a new conversation: {other}"
+        );
+
+        let mut unresumed = TurnRules::default();
+        for _ in 0..2 {
+            let again = unresumed
+                .block(&set(&rules, &[]), None, true)
+                .expect("block");
+            assert!(
+                again.contains("SECURITY BODY"),
+                "no id holds nothing: {again}"
+            );
+        }
+    }
+
+    /// When the engine's session-start replaced incode's always-on block, the
+    /// turn is the only place those rules arrive, so they are not left out.
+    #[test]
+    fn always_on_rules_ride_the_turn_when_the_prefix_lacks_them() {
+        let always = [rule(17, "ALWAYS BODY")];
+        let mut held = TurnRules::default();
+        let block = held
+            .block(&set(&always, &always), Some("c"), false)
+            .expect("block");
+        assert!(block.contains("ALWAYS BODY"), "{block}");
+        assert_eq!(
+            held.block(&set(&always, &always), Some("c"), true),
+            None,
+            "and with the prefix carrying them, a turn of only those adds nothing"
+        );
+    }
+
+    #[test]
+    fn the_standing_always_block_is_recognised() {
+        let ruleset = set(&[rule(17, "b")], &[rule(17, "b")]);
+        let block = always_context(&ruleset).expect("a block");
+        assert!(is_always_block(&block));
+        assert!(!is_always_block(&as_context(&ruleset).expect("block")));
     }
 
     /// `rules` is the union the service already computed. Rendering `always`

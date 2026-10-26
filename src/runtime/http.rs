@@ -255,6 +255,36 @@ where
     })
 }
 
+/// [`request_text`], except a refusal carries what the service said.
+///
+/// For the memory WRITES the model makes (`crate::knowledge::remember`,
+/// `crate::session_record`): the engine answers a malformed note with a 400
+/// whose body names the fix — "a decision needs why", "a fact is one line" —
+/// and [`request_text`]'s bare status left the model resending the same call.
+/// Bounded, because a body is the service's to size.
+pub fn request_text_explained<F>(build: F, service_name: &'static str) -> Result<String, String>
+where
+    F: FnOnce(&reqwest::Client) -> reqwest::RequestBuilder + Send + 'static,
+{
+    run_async(async move {
+        let response = send_shared(build).await?;
+        let status = response.status();
+        if status.is_success() {
+            return response
+                .text()
+                .await
+                .map_err(|e| format!("reading the response failed: {e}"));
+        }
+        let said = response.text().await.unwrap_or_default();
+        let said = crate::text::head_bytes(said.trim(), 600);
+        Err(if said.is_empty() {
+            format!("the {service_name} answered {status}")
+        } else {
+            format!("the {service_name} answered {status}: {said}")
+        })
+    })
+}
+
 /// Execute an HTTP request with the shared client and return `()` if successful.
 pub fn request_empty<F>(build: F, service_name: &'static str) -> Result<(), String>
 where
