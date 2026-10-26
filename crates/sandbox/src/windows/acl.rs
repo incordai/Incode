@@ -20,6 +20,20 @@
 //! and leaves read access when another only reads it
 //! ([`super::offline::still_needed`]).
 //!
+//! # Network deny: what the account creates stays the user's to re-ACL
+//!
+//! A file the command creates under the offline account is OWNED by the
+//! account, and the user's `Modify` on it holds no `WRITE_DAC`. A later run's
+//! grant reaches a file only by being propagated onto it, which the user may
+//! not do there, so that run's command could not write a file an earlier run
+//! made (cargo's build cache, the second `cargo test`), and the earlier run's
+//! SID could not be revoked from it. So each root also gets one inheritable
+//! ACE for the user's own SID, `READ_CONTROL | WRITE_DAC`, which is what
+//! owning the file would give ([`keep_acl_rights`]). It is never revoked: it
+//! names only the user, on the user's own folder, and a revoke would strip
+//! it from those files again. It gives the command nothing: a network-deny
+//! command runs as the account, whose token does not hold the user's SID.
+//!
 //! # Network deny: listing the current folder's parent
 //!
 //! PowerShell finds its first location by looking the current folder up in
@@ -76,7 +90,7 @@ use windows_sys::Win32::System::Threading::{
 };
 
 use super::offline::{still_needed, Need};
-use super::token::{last_error, sid, sid_to_string, wide, LocalPtr, OwnedHandle};
+use super::token::{current_user_sid, last_error, sid, sid_to_string, wide, LocalPtr, OwnedHandle};
 use super::{fold_nested, is_listed, is_session_sid, refuse_broad, session_sid, GrantRecord};
 
 /// The rights granted on a root: `icacls`'s `M` (read, write, execute,
@@ -88,6 +102,9 @@ const READ_EXECUTE: u32 = 0x0012_00A9;
 /// FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE`. Names and
 /// attributes of what is in it; no file's contents, no ACL, no write.
 const LIST_ONLY: u32 = 0x0010_00A1;
+/// The rights the user keeps beneath a root the offline account writes to:
+/// what owning a file gives, reading and changing its ACL.
+const ACL_RIGHTS: u32 = READ_CONTROL | WRITE_DAC;
 
 /// How long a grant or revoke waits for another process changing an ACL at
 /// the same moment. Propagation over a very large tree takes tens of
@@ -212,7 +229,8 @@ impl Lease {
                     .record
                     .user
                 {
-                    Some(user) => grant_account(root, user, MODIFY),
+                    Some(user) => grant_account(root, user, MODIFY)
+                        .and_then(|()| keep_acl_rights(root).map(|_| ())),
                     None => Ok(()),
                 });
             if let Err(e) = granted {
@@ -359,6 +377,84 @@ fn grant_account(path: &Path, user: &str, rights: u32) -> Result<(), String> {
         set_list(path, user, true)?;
     }
     Ok(())
+}
+
+/// Let the user keep reading and changing the ACL of everything beneath
+/// `root`, the files the offline account creates included, so a later run's
+/// grant and revoke reach them (see the module docs). Added once: a root
+/// that already passes these rights down to the user is left alone, which
+/// spares a second walk of a large tree on every run. Whether it was added.
+fn keep_acl_rights(root: &Path) -> Result<bool, String> {
+    let user = current_user_sid()?;
+    if passes_down(root, &user, ACL_RIGHTS)? {
+        return Ok(false);
+    }
+    change(root, &user, Change::Grant(ACL_RIGHTS)).map(|()| true)
+}
+
+/// Whether `path`'s DACL allows `sid_text` all of `rights` on everything
+/// created beneath it: an allow ACE inherited by both files and folders.
+fn passes_down(path: &Path, sid_text: &str, rights: u32) -> Result<bool, String> {
+    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+    const TO_FILES_AND_FOLDERS: u8 = 0x1 | 0x2; // OBJECT_ | CONTAINER_INHERIT_ACE
+    let trustee = sid(sid_text)?;
+    // SAFETY: the DACL points into `descriptor`, freed only at the end of
+    // the block; each ACE read is inside the DACL `GetAce` returned it from,
+    // and only its header and fixed part are read; each call is checked.
+    unsafe {
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut descriptor: *mut core::ffi::c_void = std::ptr::null_mut();
+        let err = GetNamedSecurityInfoW(
+            wide(path).as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut descriptor,
+        );
+        if err != 0 {
+            return Err(format!(
+                "reading the ACL of {} failed with error {err}",
+                path.display()
+            ));
+        }
+        let _descriptor = LocalPtr(descriptor);
+        if dacl.is_null() {
+            // No DACL: everyone may do anything already.
+            return Ok(true);
+        }
+        let mut info = ACL_SIZE_INFORMATION::default();
+        if GetAclInformation(
+            dacl,
+            (&raw mut info).cast(),
+            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        ) == 0
+        {
+            return Err(last_error("GetAclInformation"));
+        }
+        for index in 0..info.AceCount {
+            let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
+            if GetAce(dacl, index, &mut ace) == 0 {
+                return Err(last_error("GetAce"));
+            }
+            let header = *ace.cast::<ACE_HEADER>();
+            if header.AceType != ACCESS_ALLOWED_ACE_TYPE
+                || header.AceFlags & TO_FILES_AND_FOLDERS != TO_FILES_AND_FOLDERS
+            {
+                continue;
+            }
+            let allowed = ace.cast::<ACCESS_ALLOWED_ACE>();
+            if (*allowed).Mask & rights == rights
+                && EqualSid((&raw mut (*allowed).SidStart).cast(), trustee.0) != 0
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
 }
 
 /// What every other live run granted the offline account.
@@ -891,5 +987,73 @@ impl Drop for AclLock {
             ReleaseMutex(self.0);
             CloseHandle(self.0);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A folder with the ACL a data drive gives (`D:\Projects\...`): the
+    /// user reaches it through `Authenticated Users`' `Modify`, with no ACE
+    /// of the user's own passing anything down. The profile's folders (the
+    /// temp folder included) pass the user full control, which hides the
+    /// case.
+    fn data_drive_folder() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let set = std::process::Command::new("icacls")
+            .arg(dir.path())
+            .args([
+                "/inheritance:r",
+                "/grant:r",
+                "*S-1-5-18:(OI)(CI)F",
+                "*S-1-5-32-544:(OI)(CI)F",
+                "*S-1-5-11:(OI)(CI)M",
+                "*S-1-5-32-545:(OI)(CI)RX",
+            ])
+            .output()
+            .expect("icacls");
+        assert!(
+            set.status.success(),
+            "{}",
+            String::from_utf8_lossy(&set.stdout)
+        );
+        dir
+    }
+
+    /// **THE USER KEEPS READING AND CHANGING THE ACL OF WHAT IS CREATED
+    /// BENEATH A ROOT**, so a later run's grant reaches a file the offline
+    /// account owns; and the ACE is added once, not on every run.
+    #[test]
+    fn the_user_keeps_acl_rights_beneath_a_root_and_they_are_added_once() {
+        let dir = data_drive_folder();
+        let user = current_user_sid().expect("the user's SID");
+        assert!(
+            !passes_down(dir.path(), &user, ACL_RIGHTS).expect("reads the ACL"),
+            "a data-drive folder starts without it"
+        );
+
+        assert!(keep_acl_rights(dir.path()).expect("kept"), "added");
+        assert!(passes_down(dir.path(), &user, ACL_RIGHTS).expect("reads the ACL"));
+        // What is created beneath it afterwards inherits the right.
+        let file = dir.path().join("made-later.txt");
+        std::fs::write(&file, "x").expect("write");
+        let file_acl = std::process::Command::new("icacls")
+            .arg(&file)
+            .output()
+            .expect("icacls");
+        let file_acl = String::from_utf8_lossy(&file_acl.stdout);
+        let name = std::env::var("USERNAME").expect("USERNAME");
+        assert!(
+            file_acl
+                .lines()
+                .any(|l| l.contains(&format!("\\{name}:")) && l.contains("WDAC")),
+            "{file_acl}"
+        );
+
+        assert!(
+            !keep_acl_rights(dir.path()).expect("kept"),
+            "a root that already passes it down is left alone"
+        );
     }
 }

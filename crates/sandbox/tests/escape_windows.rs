@@ -779,6 +779,66 @@ fn network_deny_refuses_udp() {
     assert_eq!(o.status.code(), Some(0), "PowerShell ran: {}", text(&o));
 }
 
+/// A file one network-deny run creates is owned by the offline account; the
+/// next run must still write it, as a second `cargo test` rewrites the build
+/// cache the first one made. It failed with "Access is denied" before the
+/// user kept `READ_CONTROL | WRITE_DAC` beneath the root, because the second
+/// run's grant could not be propagated onto a file the user does not own.
+#[test]
+fn a_second_network_deny_run_writes_what_the_first_created() {
+    if !needs_offline("a_second_network_deny_run_writes_what_the_first_created") {
+        return;
+    }
+    let d = dirs();
+    // The ACL a folder on a data drive (`D:\Projects\...`) inherits, not the
+    // profile's: there the user's access is `Authenticated Users`' Modify,
+    // with no `WRITE_DAC` on a file someone else owns. Under the profile
+    // (the temp folder) an inherited full-control ACE for the user hid the
+    // failure.
+    let set = Command::new("icacls")
+        .arg(&d.ws)
+        .args([
+            "/inheritance:r",
+            "/grant:r",
+            "*S-1-5-18:(OI)(CI)F",
+            "*S-1-5-32-544:(OI)(CI)F",
+            "*S-1-5-11:(OI)(CI)M",
+            "*S-1-5-32-545:(OI)(CI)RX",
+        ])
+        .output()
+        .expect("icacls");
+    assert!(
+        set.status.success(),
+        "{}",
+        String::from_utf8_lossy(&set.stdout)
+    );
+    let flags = ["--net", "deny", "-w", "."];
+    let file = d.ws.join(r"cache\f.txt");
+    let first = cmd(&d.ws, &flags, r"mkdir cache & echo one> cache\f.txt");
+    let read = || std::fs::read_to_string(&file).unwrap_or_default();
+    assert_eq!(read().trim(), "one", "{}", text(&first));
+    // The case that failed: the file is the account's, not the user's.
+    let owner = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command"])
+        .arg(format!("(Get-Acl -LiteralPath '{}').Owner", file.display()))
+        .output()
+        .expect("powershell");
+    assert!(
+        String::from_utf8_lossy(&owner.stdout).contains(OFFLINE),
+        "the first run's file should be the offline account's: {}",
+        String::from_utf8_lossy(&owner.stdout)
+    );
+
+    let second = cmd(&d.ws, &flags, r"echo two> cache\f.txt");
+    assert_eq!(
+        read().trim(),
+        "two",
+        "the second run could not write the first run's file: {}\n{}",
+        text(&second),
+        icacls(&file)
+    );
+}
+
 #[test]
 fn under_network_deny_writes_stay_confined_and_exit_codes_pass_through() {
     if !needs_offline("under_network_deny_writes_stay_confined") {
