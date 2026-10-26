@@ -312,6 +312,14 @@ impl WorkJournal for MemoryJournal {
     ) -> Result<(), String> {
         let (text, subject) =
             crate::knowledge::work_note(attribution, &task.id, &task.title, evidence);
-        crate::knowledge::remember(&text, "fact", &subject).map(|_| ())
+        // The folder the run works in, which `work_note`'s subject is named
+        // from too: the engine files a lesson by the project its `cwd` is in.
+        let cwd = std::env::current_dir()
+            .map_err(|e| format!("the run's folder could not be read: {e}"))?;
+        crate::knowledge::remember(&crate::knowledge::Lesson {
+            subject: &subject,
+            ..crate::knowledge::Lesson::new("fact", &text, &cwd)
+        })
+        .map(|_| ())
     }
 }

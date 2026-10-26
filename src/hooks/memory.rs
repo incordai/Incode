@@ -207,6 +207,13 @@ impl MemoryHooks {
         &self.session
     }
 
+    /// Whether this session has the engine — the condition every memory
+    /// request it makes is gated on (`crate::turn_memory`).
+    #[must_use]
+    pub fn has_engine(&self) -> bool {
+        self.engine.is_some()
+    }
+
     /// The workspace this session works in.
     #[must_use]
     pub fn cwd(&self) -> &Path {

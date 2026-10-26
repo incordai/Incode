@@ -72,7 +72,9 @@ mod todo;
 mod validate;
 
 pub(crate) use client_servers::{OnConnected, ServerSpec, Transport};
-pub use code_edits::{CodeEdits, EditLedger, EngineLedger, LedgerError, Route as EditRoute};
+pub use code_edits::{
+    CodeEdits, EditLedger, EngineLedger, LedgerError, Route as EditRoute, ROOT_AGENT,
+};
 pub use desktop::DesktopSetup;
 pub use image::{Image, ImageFormat, ToolOutput, MAX_IMAGES_PER_RESULT, MAX_IMAGE_EDGE};
 pub(crate) use todo::{parse_todos, Priority, TodoStatus};
@@ -184,11 +186,17 @@ pub fn reach_of(name: &str) -> Option<Reach> {
     Some(match name {
         READ | GLOB | GREP | LS | OUTLINE | BASH_OUTPUT | SKILL => Reach::Observe,
         crate::web::FETCH_TOOL | crate::web::SEARCH_TOOL => Reach::Observe,
-        crate::recall::INDEX_TOOL | crate::recall::GET_TOOL => Reach::Observe,
+        crate::recall::INDEX_TOOL | crate::recall::GET_TOOL | crate::recall::TIMELINE_TOOL => {
+            Reach::Observe
+        }
         SEARCH_TOOL | SYMBOL_TOOL | SKELETON_TOOL | BLAST_RADIUS_TOOL => Reach::Observe,
         crate::recorder::LOOKUP_TOOL | crate::team_mcp::READ_TOOL => Reach::Observe,
+        crate::brief_read::READ_TOOL | crate::verify::PLAN_TOOL => Reach::Observe,
         TODO_WRITE | ASK_USER_QUESTION => Reach::Session,
         REMEMBER_TOOL | FORGET_TOOL | crate::brief::SAVE_TOOL => Reach::Record,
+        crate::session_record::NOTE_TOOL
+        | crate::session_record::RESOLVE_TOOL
+        | crate::session_record::FACT_TOOL => Reach::Record,
         crate::team_mcp::ASK_TOOL | crate::team_mcp::TELL_TOOL | crate::team_mcp::ANSWER_TOOL => {
             Reach::Record
         }
@@ -1634,15 +1642,19 @@ fn catalogue() -> Vec<Value> {
                 }
             }),
             crate::verify::tool_definition(),
+            crate::verify::plan_tool_definition(),
             crate::recall::index_tool_definition(),
             crate::recall::get_tool_definition(),
+            crate::recall::timeline_tool_definition(),
             crate::recorder::lookup_tool_definition(),
             // The intake gate TELLS the model to call this. Offering the gate
             // without the tool is an instruction that cannot be followed, and
             // the loop stalls on a brief that can never be saved.
             crate::brief::save_tool_definition(),
+            crate::brief_read::tool_definition(),
         ]);
     all.extend(crate::knowledge::tool_definitions());
+    all.extend(crate::session_record::tool_definitions());
     all.extend(crate::web::tool_definitions());
     all.push(browser::definition());
     all.push(pdf::definition());
@@ -2512,8 +2524,10 @@ impl Toolbox {
             TODO_WRITE => todo::write(&mut self.state.todos(), input),
             DIAGNOSTICS => checks::diagnostics(ws, input, &|path| self.resolve(path)),
             crate::verify::VERIFY_TOOL => crate::verify::run_tool(ws),
-            crate::recall::INDEX_TOOL => crate::recall::run_index_tool(&raw),
+            crate::verify::PLAN_TOOL => Ok(crate::verify::run_plan_tool(ws)),
+            crate::recall::INDEX_TOOL => crate::recall::run_index_tool(&raw, ws),
             crate::recall::GET_TOOL => crate::recall::run_get_tool(&raw),
+            crate::recall::TIMELINE_TOOL => crate::recall::run_timeline_tool(&raw),
             crate::recorder::LOOKUP_TOOL => {
                 crate::recorder::run_lookup_tool(ws, input).map(|found| {
                     if let Some(watch) = &self.watch {
@@ -2526,14 +2540,26 @@ impl Toolbox {
             AGENT => self.run_subagent(input),
             ASK_USER_QUESTION => self.ask_here(input),
             crate::brief::SAVE_TOOL => self.save_brief(&raw),
+            crate::brief_read::READ_TOOL => crate::brief_read::run(ws),
             other => crate::knowledge::handle_tool(
                 other,
                 input,
                 &crate::knowledge::CodeContext {
                     cwd: &self.workspace,
+                    session: &self.session,
                     resolve: &|path| self.resolve(path),
                 },
             )
+            .or_else(|| {
+                crate::session_record::handle_tool(
+                    other,
+                    input,
+                    &crate::session_record::Record {
+                        session: &self.session,
+                        workspace: &self.workspace,
+                    },
+                )
+            })
             .or_else(|| crate::web::handle_tool(other, input, render))
             .or_else(|| self.team.handle(other, input))
             .unwrap_or_else(|| Err(format!("there is no tool called `{other}`"))),

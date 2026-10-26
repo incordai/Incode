@@ -10,7 +10,12 @@ pub fn handle_remember(text: &str, workspace: &std::path::Path) {
     }
     // Saved against the workspace, so a fact about this project is recallable
     // as a fact about this project rather than as a loose note.
-    match crate::knowledge::remember(text, "fact", &workspace.display().to_string()) {
+    let subject = workspace.display().to_string();
+    let lesson = crate::knowledge::Lesson {
+        subject: &subject,
+        ..crate::knowledge::Lesson::new("fact", text, workspace)
+    };
+    match crate::knowledge::remember(&lesson) {
         Ok(id) => render::print_info(&format!("Saved to the shared memory as {id}.")),
         Err(e) => render::print_error(&format!("NOT saved: {e}")),
     }

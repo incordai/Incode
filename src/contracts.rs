@@ -221,6 +221,40 @@ impl Contracts {
 pub fn parse_contracts(text: &str) -> Result<Contracts, String> {
     let value: serde_json::Value =
         serde_json::from_str(text).map_err(|e| format!("not valid JSON: {e}"))?;
+    let object = value
+        .as_object()
+        .ok_or("the file must be a JSON object with `schemas` and/or `endpoints`")?;
+    // STRUCTURE under a key this does not read is a contract that is not
+    // checked: `interfaces` or a top-level `routes` would parse as NOTHING
+    // declared and every verify would pass over it (reported by a model inside
+    // incode, 2026-10-26). A scalar is a note — the generated file this parser
+    // was measured against carries `"project": "symptom-intake"` — and so is
+    // anything under a key starting `_`, as `_about` and `_boundaries` are in
+    // this repository's own file.
+    let unread: Vec<&str> = object
+        .iter()
+        .filter(|(k, v)| {
+            !k.starts_with('_')
+                && !["schemas", "endpoints"].contains(&k.as_str())
+                && (v.is_object() || v.is_array())
+        })
+        .map(|(k, _)| k.as_str())
+        .collect();
+    if !unread.is_empty() {
+        return Err(format!(
+            "`{}` holds declarations the checker does not read, so nothing in it \
+             would be checked. Declare shapes under `schemas` and routes under \
+             `endpoints`; keys starting with `_` are notes",
+            unread.join("`, `")
+        ));
+    }
+    if !object.contains_key("schemas") && !object.contains_key("endpoints") {
+        return Err(
+            "the file declares neither `schemas` nor `endpoints`, so it checks nothing; \
+             delete it if there is nothing to freeze"
+                .to_string(),
+        );
+    }
 
     let mut schemas = BTreeMap::new();
     if let Some(declared) = value.get("schemas") {
@@ -260,7 +294,15 @@ pub fn parse_contracts(text: &str) -> Result<Contracts, String> {
                     let route_path = route.get("route").and_then(|r| r.as_str())?;
                     Some(format!("{method} {route_path}"))
                 })
-                .unwrap_or_default();
+                .filter(|p| !p.trim().is_empty())
+                // `check` skips a route with no path, so one parsed as empty was
+                // a declared endpoint that was never checked.
+                .ok_or_else(|| {
+                    format!(
+                        "an endpoint names no route — give it `path`, or `method` \
+                         and `route`: {route}"
+                    )
+                })?;
             endpoints.push(Endpoint {
                 path,
                 response: route
@@ -831,12 +873,48 @@ mod tests {
             r#"{"schemas": [{"name":"User"}]}"#,
             r#"{"schemas":{"User":{"fields":"id, email"}}}"#,
             r#"{"endpoints": "POST /users"}"#,
+            // Under a key the checker does not read: was parsed as NOTHING
+            // declared, and every verify passed over it.
+            r#"{"interfaces":{"User":{"fields":{"id":"uuid"}}}}"#,
+            r#"{"routes":[{"path":"POST /users"}]}"#,
+            // Beside a real declaration, so only the unread-key check can
+            // catch it: `Order` would go unchecked while `User` is.
+            r#"{"schemas":{"User":{}},"interfaces":{"Order":{"fields":{"id":"uuid"}}}}"#,
+            // Declares nothing at all, so checks nothing.
+            r#"{}"#,
+            r#"{"_about":"notes only"}"#,
+            r#"[]"#,
+            // A route with no path was skipped by `check`, never checked.
+            r#"{"endpoints":[{"response":"User"}]}"#,
+            r#"{"endpoints":[{"path":"   "}]}"#,
         ] {
             assert!(
                 parse_contracts(bad).is_err(),
                 "this must not read as an empty contract: {bad}"
             );
         }
+    }
+
+    /// The refusal says which key went unread, so the writer can move it.
+    #[test]
+    fn an_unread_key_is_named_in_the_refusal() {
+        let why = parse_contracts(r#"{"schemas":{},"interfaces":{}}"#).expect_err("unread key");
+        assert!(why.contains("`interfaces`"), "{why}");
+    }
+
+    /// Notes beside the declarations stay allowed: this repository's own file
+    /// carries `_about` and `_boundaries`, and it must keep parsing.
+    #[test]
+    fn underscore_notes_beside_the_declarations_are_allowed() {
+        let annotated = r#"{"_about":"why","_boundaries":"three processes","project":"intake",
+            "_unnamed_shapes":{"Anything":"goes under a note"},
+            "schemas":{"User":{"fields":{"id":"uuid"}}}}"#;
+        let contracts = parse_contracts(annotated).expect("notes are not declarations");
+        assert_eq!(contracts.schemas.len(), 1);
+
+        let ours = parse_contracts(include_str!("../.incode/contracts.json"))
+            .expect("this repository's own contracts must stay readable");
+        assert!(!ours.is_empty(), "and must still declare something");
     }
 
     /// Both shapes coexist: the map form this crate writes still works.

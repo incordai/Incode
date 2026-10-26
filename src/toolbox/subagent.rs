@@ -127,11 +127,20 @@ impl Toolbox {
         } else {
             asked
         };
+        // What memory holds for the task — past work, the code it is about,
+        // the owner's rules — delivered with it, as the lead's turns get theirs
+        // (`crate::turn_memory`). Only when this session has the engine.
+        let memory = self
+            .engine
+            .is_some()
+            .then(|| crate::turn_memory::for_subagent(task, &self.workspace, &self.session))
+            .flatten();
         let spec = Child {
             role,
             definition: definition.as_ref(),
             tools: self.child_tools(definition.as_ref()),
             edits: self.code_edits.as_ref().map(super::CodeEdits::child),
+            memory,
         };
         // The parent's own route: a model chosen by name hands work to the
         // same service. No other place configures one.
@@ -279,12 +288,14 @@ impl Toolbox {
     }
 
     /// The instructions a sub-agent works under: the note on its position,
-    /// then its definition's own, when it has one.
-    fn child_system(definition: Option<&crate::subagents::AgentDef>) -> Vec<String> {
+    /// then its definition's own, when it has one, then what memory holds for
+    /// its task.
+    fn child_system(spec: &Child<'_>) -> Vec<String> {
         let mut blocks = vec![SUBAGENT_SYSTEM.to_string()];
-        if let Some(def) = definition {
+        if let Some(def) = spec.definition {
             blocks.push(def.prompt.clone());
         }
+        blocks.extend(spec.memory.clone());
         blocks
     }
 
@@ -340,7 +351,7 @@ impl Toolbox {
         let mut child = crate::agent::api::ApiBackend::new(
             settings,
             &self.workspace,
-            &Self::child_system(spec.definition).join("\n\n"),
+            &Self::child_system(spec).join("\n\n"),
             self.filter_env,
         )
         .at_depth(self.depth + 1)
@@ -365,7 +376,7 @@ impl Toolbox {
         let mut child = crate::agent::claude_code::ClaudeCodeBackend::new(self.workspace.clone())
             .with_binary(binary)
             .streaming(true)
-            .with_system_context(Self::child_system(spec.definition))
+            .with_system_context(Self::child_system(spec))
             .with_engine(self.engine.clone())
             .with_code_edits(spec.edits.clone())
             .with_operator_hooks(self.hooks.clone())
@@ -409,6 +420,8 @@ struct Child<'a> {
     tools: Option<Vec<String>>,
     /// Its side of the engine's edit check: a name and a session of its own.
     edits: Option<super::CodeEdits>,
+    /// What memory holds for its task ([`crate::turn_memory::for_subagent`]).
+    memory: Option<String>,
 }
 
 #[cfg(test)]
@@ -441,6 +454,7 @@ mod tests {
             definition: Some(&def),
             tools: parent.child_tools(Some(&def)),
             edits: None,
+            memory: None,
         };
         let child = parent.cli_child("claude", &spec);
         assert!(
@@ -455,6 +469,38 @@ mod tests {
         let mut offered = child.offered_tools();
         offered.sort();
         assert_eq!(offered, ["Grep", "Read"]);
+    }
+
+    /// **A sub-agent starts with what memory holds for its task**, on either
+    /// route — its system context carried only its position note and its
+    /// definition before, while the lead it works for had memory and code.
+    #[test]
+    fn a_sub_agent_carries_the_memory_for_its_task() {
+        let ws = tempfile::tempdir().expect("ws");
+        let parent = Toolbox::new(ws.path(), true);
+        let def = reviewer(None);
+        let spec = Child {
+            role: "",
+            definition: Some(&def),
+            tools: None,
+            edits: None,
+            memory: Some(
+                "<memory_context>\n## Code (read these)\n### src/a.rs:1-9\n</memory_context>"
+                    .to_string(),
+            ),
+        };
+        let child = parent.cli_child("claude", &spec);
+        let blocks = child.system_context();
+        assert!(
+            blocks.iter().any(|b| b.contains("## Code (read these)")),
+            "{blocks:?}"
+        );
+        assert!(
+            blocks.iter().any(|b| b.contains("REVIEWER-INSTRUCTIONS")),
+            "its definition still rides with it: {blocks:?}"
+        );
+        let system = Toolbox::child_system(&spec);
+        assert_eq!(system.last(), spec.memory.as_ref(), "memory comes last");
     }
 
     /// **A sub-agent of an API model runs on that model's `sub_model`** — the
@@ -477,6 +523,7 @@ mod tests {
             definition: None,
             tools: None,
             edits: None,
+            memory: None,
         };
         let child = parent.api_child(settings.clone(), &plain);
         assert_eq!(child.model(), Some("fast-model"));
@@ -487,6 +534,7 @@ mod tests {
             definition: Some(&def),
             tools: None,
             edits: None,
+            memory: None,
         };
         assert_eq!(
             parent.api_child(settings.clone(), &defined).model(),

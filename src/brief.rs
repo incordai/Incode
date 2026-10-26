@@ -822,15 +822,31 @@ fn normalise(value: &str) -> String {
 /// Find the brief covering `workspace`.
 ///
 /// Matches a full path first, then a project named after the workspace's own
-/// folder — the two conventions actually present in the store.
+/// folder — the two conventions actually present in the store. A linked git
+/// worktree that matches neither is then matched as its MAIN checkout
+/// ([`crate::checkout::main_checkout`]): a worktree is the same project in
+/// another folder, and every `git worktree add` used to start as if the
+/// project had no brief at all (reported from
+/// `D:\ball-game-worktrees\mc-56ec3fe2`, 2026-10-26).
 ///
 /// **The authoritative routing lives in the proxy**, which owns a folder map
 /// this endpoint does not expose. This is the subset resolvable from the brief
 /// list alone; a workspace mapped to a differently-named project through that
 /// map will read as having no brief here. Exposing the proxy's own resolution
 /// would remove this duplication and should replace it.
+///
+/// Called by [`check`] (reading) and [`canonical_project_for`] (saving), so a
+/// brief saved from a worktree completes the main checkout's rather than
+/// starting a second one.
 #[must_use]
 pub fn brief_for<'a>(briefs: &'a [ProjectBrief], workspace: &Path) -> Option<&'a ProjectBrief> {
+    brief_at(briefs, workspace).or_else(|| {
+        crate::checkout::main_checkout(workspace).and_then(|main| brief_at(briefs, &main))
+    })
+}
+
+/// [`brief_for`]'s matching for one folder: its full path, then its name.
+fn brief_at<'a>(briefs: &'a [ProjectBrief], workspace: &Path) -> Option<&'a ProjectBrief> {
     let wanted = normalise(&workspace.to_string_lossy());
     if let Some(exact) = briefs.iter().find(|b| normalise(&b.project) == wanted) {
         return Some(exact);
@@ -3139,7 +3155,12 @@ No auth in v1.
         );
         remember_locally(dir.path(), &brief);
 
-        // Nothing is listening there.
+        // Nothing is listening there. Under ENV_LOCK, like every test that
+        // moves the address: without it, this test removing the variable
+        // mid-way through another's sent THAT test's request to the real
+        // engine on this machine — harmless while the save route 404'd, a
+        // write to the owner's live memory once it worked.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var(MEMORY_URL_ENV, "http://127.0.0.1:9/");
         let gate = check(dir.path());
         std::env::remove_var(MEMORY_URL_ENV);
@@ -3162,6 +3183,7 @@ No auth in v1.
     #[test]
     fn an_outage_with_nothing_cached_still_says_so() {
         let dir = tempfile::tempdir().expect("temp dir");
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var(MEMORY_URL_ENV, "http://127.0.0.1:9/");
         let gate = check(dir.path());
         std::env::remove_var(MEMORY_URL_ENV);
@@ -3187,6 +3209,7 @@ No auth in v1.
             },
         );
 
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var(MEMORY_URL_ENV, "http://127.0.0.1:9/");
         let gate = check(dir.path());
         std::env::remove_var(MEMORY_URL_ENV);

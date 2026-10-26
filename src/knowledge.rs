@@ -22,8 +22,13 @@
 
 use std::time::Duration;
 
-/// Where a durable fact is written.
-pub const REMEMBER_PATH: &str = "/v1/memory/remember";
+/// Where a durable lesson is written: the engine's `lesson_write`, over REST.
+///
+/// It was `/v1/memory/remember` until the engine retired that tool for
+/// `lesson_write` — after which every save from here answered 404 (measured
+/// 2026-10-26), the model's `remember`, `/remember` and the runner's record of
+/// finished work alike, and nothing on this side said why.
+pub const REMEMBER_PATH: &str = "/v1/memory/lesson_write";
 
 /// Where the ranked snippet search lives.
 pub const SEARCH_PATH: &str = "/v1/memory/search";
@@ -49,9 +54,110 @@ const TIMEOUT: Duration = Duration::from_secs(8);
 /// Default number of snippets, small because each one is paid for in context.
 const DEFAULT_TOP_K: u64 = 5;
 
-/// The kinds the store recognises, pinned here so a rejected kind is caught
-/// before a round trip rather than after one.
-pub const KINDS: [&str; 5] = ["fact", "decision", "preference", "todo", "entity"];
+/// The kinds `lesson_write` keeps that one line of text can carry, pinned here
+/// so a rejected kind is caught before a round trip rather than after one.
+///
+/// The engine's own list is issue, finding, decision, convention, fact,
+/// preference, todo (its refusal names them). `issue` is left out because it
+/// needs fields one line cannot hold; `entity` is gone because the engine keeps
+/// entities as graph nodes, not as memories.
+pub const KINDS: [&str; 6] = [
+    "fact",
+    "decision",
+    "preference",
+    "todo",
+    "convention",
+    "finding",
+];
+
+/// One durable thing to save, and where it belongs.
+///
+/// Built by [`run_remember`] for the model, by `/remember`
+/// (`cli/slash_commands/memory.rs`) and by the runner's journal
+/// (`runner/seams.rs` `MemoryJournal`) — the three writers of a lesson.
+#[derive(Debug, Clone)]
+pub struct Lesson<'a> {
+    pub kind: &'a str,
+    pub text: &'a str,
+    /// The reason. Required for a `decision`, which the engine refuses without.
+    pub why: &'a str,
+    /// A project, person or file the lesson is about; filed as a tag.
+    pub subject: &'a str,
+    /// A folder inside the project — how the engine decides which project's
+    /// memory this lands in, and which checkout `locations` are checked in.
+    pub cwd: &'a std::path::Path,
+    /// The session the lesson was learned in, so it can be traced back.
+    pub session: &'a str,
+    /// Code it is about, as `[{file, symbol}]`. The engine checks each one
+    /// against the checkout and links the lesson to it.
+    pub locations: Option<&'a serde_json::Value>,
+}
+
+impl<'a> Lesson<'a> {
+    /// A lesson of `kind` saying `text`, filed in the project `cwd` is in. The
+    /// folder is not optional: the engine refuses a lesson that names no project.
+    #[must_use]
+    pub fn new(kind: &'a str, text: &'a str, cwd: &'a std::path::Path) -> Self {
+        Self {
+            kind,
+            text,
+            why: "",
+            subject: "",
+            cwd,
+            session: "",
+            locations: None,
+        }
+    }
+}
+
+/// The `lesson_write` body for `lesson`, or why there is none.
+///
+/// Pure, so the shape the engine reads (`project_stores/tools.rs` `write`,
+/// and the engine's own CLI `cli/mem_cmds.rs`, whose mapping this mirrors) is
+/// checked without one running.
+pub fn lesson_body(lesson: &Lesson<'_>) -> Result<serde_json::Value, String> {
+    let text = lesson.text.trim();
+    if text.is_empty() {
+        return Err("nothing to remember: the text is empty".to_string());
+    }
+    let why = lesson.why.trim();
+    let mut record = match lesson.kind {
+        "fact" | "preference" | "todo" => serde_json::json!({ "text": text }),
+        "decision" if why.is_empty() => {
+            return Err("a decision needs `why`: the reason it was made".to_string())
+        }
+        "decision" => serde_json::json!({ "decision": text, "why": why }),
+        "convention" if why.is_empty() => serde_json::json!({ "convention": text }),
+        "convention" => serde_json::json!({ "convention": text, "why": why }),
+        "finding" => serde_json::json!({ "issue": text }),
+        other => {
+            return Err(format!(
+                "`{other}` is not a kind this store keeps. Use one of: {}",
+                KINDS.join(", ")
+            ))
+        }
+    };
+    let subject = lesson.subject.trim();
+    if !subject.is_empty() {
+        record["tags"] = serde_json::json!([subject]);
+    }
+    let mut body = serde_json::json!({
+        "kind": lesson.kind,
+        "record": record,
+        "cwd": lesson.cwd.display().to_string(),
+        "agent_id": crate::toolbox::ROOT_AGENT,
+    });
+    if !lesson.session.trim().is_empty() {
+        body["session_id"] = serde_json::json!(lesson.session.trim());
+    }
+    if let Some(locations) = lesson.locations.filter(|l| !l.is_null()) {
+        if !locations.is_array() {
+            return Err("`locations` must be a list of {file, symbol}".to_string());
+        }
+        body["locations"] = locations.clone();
+    }
+    Ok(body)
+}
 
 /// One thing the store found.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,30 +226,32 @@ fn project_subject() -> String {
         .unwrap_or_else(|| "incord-code".to_string())
 }
 
-/// Save a durable fact.
+/// Save a durable lesson.
 ///
-/// Returns the identifier the store assigned, so a caller can say what to
-/// correct later.
-pub fn remember(text: &str, kind: &str, subject: &str) -> Result<String, String> {
-    if text.trim().is_empty() {
-        return Err("nothing to remember: the text is empty".to_string());
-    }
-    if !KINDS.contains(&kind) {
-        return Err(format!(
-            "`{kind}` is not a kind this store keeps. Use one of: {}",
-            KINDS.join(", ")
-        ));
-    }
-    let body = serde_json::json!({ "text": text, "kind": kind, "subject": subject }).to_string();
-    parse_remember(&post(&url(REMEMBER_PATH), body)?)
+/// Returns what the store assigned — its id, and whether it was already
+/// held — so a caller can say what to correct later.
+pub fn remember(lesson: &Lesson<'_>) -> Result<String, String> {
+    let body = lesson_body(lesson)?.to_string();
+    let url = url(REMEMBER_PATH);
+    let answer = crate::runtime::http::request_text_explained(
+        move |c| {
+            c.post(&url)
+                .header("content-type", "application/json")
+                .body(body)
+                .timeout(TIMEOUT)
+        },
+        "memory service",
+    )?;
+    parse_remember(&answer)
 }
 
-/// Read the identifier out of a save.
+/// Read what a save did out of `lesson_write`'s answer.
 ///
-/// The endpoint answers in the tool-call envelope — `{content:[{text}], isError}`
-/// — where the payload is JSON *as a string* inside `content[0].text`. Measured,
-/// not assumed: the search endpoint beside it answers with a plain body, so one
-/// parser written for both would have quietly found nothing.
+/// The REST bridge answers with the tool's OWN JSON (`tools_api.rs`
+/// `rest_body`), no longer the `{content:[{text}]}` envelope this once
+/// unwrapped — reading the envelope now would turn every successful save into
+/// "no usable result". The envelope is still read, so an engine from before
+/// that change is not misread either.
 pub fn parse_remember(body: &str) -> Result<String, String> {
     let value: serde_json::Value =
         serde_json::from_str(body).map_err(|e| format!("the store's answer did not parse: {e}"))?;
@@ -154,15 +262,17 @@ pub fn parse_remember(body: &str) -> Result<String, String> {
     {
         return Err("the store refused to save it".to_string());
     }
-    let inner = value
+    let enveloped = value
         .get("content")
         .and_then(|c| c.as_array())
         .and_then(|a| a.first())
         .and_then(|f| f.get("text"))
-        .and_then(|t| t.as_str())
-        .unwrap_or_default();
-    let payload: serde_json::Value = serde_json::from_str(inner)
-        .map_err(|e| format!("the store's answer carried no usable result: {e}"))?;
+        .and_then(|t| t.as_str());
+    let payload = match enveloped {
+        Some(inner) => serde_json::from_str(inner)
+            .map_err(|e| format!("the store's answer carried no usable result: {e}"))?,
+        None => value,
+    };
     if !payload
         .get("stored")
         .and_then(serde_json::Value::as_bool)
@@ -170,13 +280,24 @@ pub fn parse_remember(body: &str) -> Result<String, String> {
     {
         // "Accepted but not stored" is the one outcome that reads as success and
         // is not: the caller would report a fact saved that nobody can recall.
-        return Err("the store accepted the call but did not store anything".to_string());
+        return Err(payload.get("error").and_then(|e| e.as_str()).map_or_else(
+            || "the store accepted the call but did not store anything".to_string(),
+            |e| format!("the store did not save it: {e}"),
+        ));
     }
-    Ok(payload
-        .get("msg_id")
-        .and_then(|m| m.as_str())
-        .unwrap_or("saved")
-        .to_string())
+    let id = ["id", "msg_id"]
+        .iter()
+        .find_map(|k| payload.get(*k).and_then(|v| v.as_str()))
+        .unwrap_or("saved");
+    let held = payload
+        .get("duplicate")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    Ok(if held {
+        format!("{id} (it was already held)")
+    } else {
+        id.to_string()
+    })
 }
 
 /// Search the store for snippets.
@@ -298,16 +419,33 @@ pub fn tool_definitions() -> Vec<serde_json::Value> {
     vec![
         serde_json::json!({
             "name": REMEMBER_TOOL,
-            "description": "Save one durable fact, decision, preference, todo or \
-                entity to the shared memory every agent on this machine reads. \
-                Use it when something worth recalling later comes up. Never save \
-                secrets, credentials, API keys, internal URLs, or raw source.",
+            "description": "Save one durable lesson — a fact, decision, preference, \
+                todo, convention or finding — to this project's shared memory, which \
+                every agent on this machine reads. Use it when something worth \
+                recalling in a later session comes up. Point at code with \
+                `locations` rather than quoting it: the lesson is then linked to \
+                those symbols and surfaces when they are worked on. This is the \
+                memory rules' `lesson_write`. Never save secrets, credentials, API \
+                keys, internal URLs, or raw source.",
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "text": {"type": "string", "description": "The thing to remember, stated plainly."},
                     "kind": {"type": "string", "enum": KINDS, "description": "What kind of knowledge this is."},
-                    "subject": {"type": "string", "description": "Optional: the project, person or file it is about."}
+                    "why": {"type": "string", "description": "The reason. Required for a decision; optional for a convention."},
+                    "subject": {"type": "string", "description": "Optional: the project, person or file it is about."},
+                    "locations": {
+                        "type": "array",
+                        "description": "Optional: the code it is about.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "file": {"type": "string", "description": "Path relative to the workspace."},
+                                "symbol": {"type": "string", "description": "A function, type or constant in it."}
+                            },
+                            "required": ["file"]
+                        }
+                    }
                 },
                 "required": ["text", "kind"]
             }
@@ -385,11 +523,13 @@ pub fn tool_definitions() -> Vec<serde_json::Value> {
     ]
 }
 
-/// What the code tools need of the session: the folder the engine resolves the
-/// checkout from, and how a path the model named is resolved — the way the
-/// file tools resolve it, inside the workspace.
+/// What these tools need of the session: the folder the engine resolves the
+/// project and checkout from, the session a lesson is filed under, and how a
+/// path the model named is resolved — the way the file tools resolve it,
+/// inside the workspace.
 pub struct CodeContext<'a> {
     pub cwd: &'a std::path::Path,
+    pub session: &'a str,
     pub resolve: &'a dyn Fn(&str) -> Result<std::path::PathBuf, String>,
 }
 
@@ -400,7 +540,7 @@ pub fn handle_tool(
     code: &CodeContext<'_>,
 ) -> Option<Result<String, String>> {
     match name {
-        REMEMBER_TOOL => Some(run_remember(input)),
+        REMEMBER_TOOL => Some(run_remember(input, code)),
         SEARCH_TOOL => Some(run_search(input)),
         FORGET_TOOL => Some(run_forget(input)),
         SYMBOL_TOOL => Some(run_symbol(input, code)),
@@ -434,11 +574,19 @@ fn run_symbol(input: &serde_json::Value, code: &CodeContext<'_>) -> Result<Strin
     )
 }
 
-fn run_remember(input: &serde_json::Value) -> Result<String, String> {
-    let text = input.get("text").and_then(|t| t.as_str()).unwrap_or("");
+fn run_remember(input: &serde_json::Value, code: &CodeContext<'_>) -> Result<String, String> {
+    let text = |key: &str| input.get(key).and_then(|v| v.as_str()).unwrap_or("");
     let kind = input.get("kind").and_then(|k| k.as_str()).unwrap_or("fact");
-    let subject = input.get("subject").and_then(|s| s.as_str()).unwrap_or("");
-    remember(text, kind, subject).map(|id| format!("Saved as {id}."))
+    remember(&Lesson {
+        kind,
+        text: text("text"),
+        why: text("why"),
+        subject: text("subject"),
+        cwd: code.cwd,
+        session: code.session,
+        locations: input.get("locations"),
+    })
+    .map(|id| format!("Saved as {id}."))
 }
 
 fn run_search(input: &serde_json::Value) -> Result<String, String> {
@@ -825,8 +973,97 @@ mod tests {
     /// a round trip, and must not save nothing at all.
     #[test]
     fn a_save_is_checked_before_it_is_sent() {
-        assert!(remember("   ", "fact", "").is_err());
-        assert!(remember("something", "not-a-kind", "").is_err());
+        let here = std::path::Path::new(".");
+        assert!(remember(&Lesson::new("fact", "   ", here)).is_err());
+        assert!(remember(&Lesson::new("not-a-kind", "something", here)).is_err());
+        // The engine keeps entities as graph nodes, not memories.
+        assert!(lesson_body(&Lesson::new("entity", "Ravi", here)).is_err());
+    }
+
+    /// The body is what the engine's `lesson_write` reads: the kind's own
+    /// fields inside `record`, and the folder that names the project. The old
+    /// `{text, kind, subject}` went to a route the engine no longer has.
+    #[test]
+    fn each_kind_is_sent_in_the_fields_lesson_write_reads() {
+        let here = std::path::Path::new("D:/work/app");
+        let fact = lesson_body(&Lesson {
+            subject: "app",
+            session: "s-1",
+            ..Lesson::new("fact", "  the build needs --locked  ", here)
+        })
+        .expect("a fact is sendable");
+        assert_eq!(fact["kind"], "fact");
+        assert_eq!(fact["record"]["text"], "the build needs --locked");
+        assert_eq!(fact["record"]["tags"][0], "app");
+        assert_eq!(fact["cwd"], "D:/work/app");
+        assert_eq!(fact["session_id"], "s-1");
+        assert_eq!(fact["agent_id"], crate::toolbox::ROOT_AGENT);
+
+        let decision = lesson_body(&Lesson {
+            why: "the engine retired it",
+            ..Lesson::new("decision", "save through lesson_write", here)
+        })
+        .expect("a decision with its reason is sendable");
+        assert_eq!(decision["record"]["decision"], "save through lesson_write");
+        assert_eq!(decision["record"]["why"], "the engine retired it");
+
+        let finding = lesson_body(&Lesson::new("finding", "x leaks", here)).expect("sendable");
+        assert_eq!(finding["record"]["issue"], "x leaks");
+        let convention =
+            lesson_body(&Lesson::new("convention", "tests beside code", here)).expect("sendable");
+        assert_eq!(convention["record"]["convention"], "tests beside code");
+    }
+
+    /// A decision without its reason is refused HERE, in words that name the
+    /// fix, rather than after a round trip that answers 400.
+    #[test]
+    fn a_decision_without_a_reason_is_refused_before_it_is_sent() {
+        let here = std::path::Path::new(".");
+        let why = lesson_body(&Lesson::new("decision", "do X", here)).expect_err("no why");
+        assert!(why.contains("why"), "{why}");
+    }
+
+    /// Locations go to the engine as given, so it can check and link them;
+    /// anything but a list is refused rather than sent to be misread.
+    #[test]
+    fn code_locations_ride_along_and_must_be_a_list() {
+        let here = std::path::Path::new(".");
+        let list = serde_json::json!([{ "file": "src/a.rs", "symbol": "run" }]);
+        let body = lesson_body(&Lesson {
+            locations: Some(&list),
+            ..Lesson::new("fact", "run is the entry", here)
+        })
+        .expect("sendable");
+        assert_eq!(body["locations"][0]["symbol"], "run");
+
+        let not_a_list = serde_json::json!({ "file": "src/a.rs" });
+        assert!(lesson_body(&Lesson {
+            locations: Some(&not_a_list),
+            ..Lesson::new("fact", "t", here)
+        })
+        .is_err());
+    }
+
+    /// The body `lesson_write` answers with today: its own JSON, unwrapped by
+    /// the REST bridge (`tools_api.rs` `rest_body`). Reading only the old
+    /// envelope turned this success into "no usable result".
+    #[test]
+    fn the_bare_lesson_write_answer_yields_its_id() {
+        let saved = r#"{"id":"m-7f3a","kind":"fact","stored":true,"duplicate":false,
+            "updated_existing":null,"similar":[],"topic_id":"t-1","topic_ids":["t-1"]}"#;
+        assert_eq!(parse_remember(saved).expect("parses"), "m-7f3a");
+
+        let held = r#"{"id":"m-7f3a","stored":true,"duplicate":true}"#;
+        assert!(parse_remember(held)
+            .expect("parses")
+            .contains("already held"));
+
+        let refused = r#"{"error":"lesson_write: code blocks are not stored","stored":false}"#;
+        let why = parse_remember(refused).expect_err("not stored");
+        assert!(
+            why.contains("code blocks"),
+            "the engine's reason is kept: {why}"
+        );
     }
 
     /// Every tool is offered, and the two dangerous ones say so in words the
@@ -877,11 +1114,14 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         std::env::set_var(crate::brief::MEMORY_URL_ENV, "http://127.0.0.1:1");
-        let saved = remember("a fact", "fact", "");
+        let saved = remember(&Lesson::new("fact", "a fact", std::path::Path::new(".")));
         let searched = search("anything", 3);
         std::env::remove_var(crate::brief::MEMORY_URL_ENV);
-        assert!(saved.is_err(), "a lost write must never look saved");
-        assert!(searched.is_err());
+        assert!(
+            saved.is_err(),
+            "a lost write must never look saved: {saved:?}"
+        );
+        assert!(searched.is_err(), "{searched:?}");
     }
 
     /// The store's own answer, taken from a live call rather than written from
@@ -946,6 +1186,7 @@ mod tests {
         let refuse = |_: &str| Err("outside the workspace".to_string());
         let code = CodeContext {
             cwd: std::path::Path::new("."),
+            session: "",
             resolve: &refuse,
         };
         for (tool, input, said) in [
