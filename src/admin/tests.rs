@@ -308,64 +308,114 @@ fn a_missing_or_empty_file_behaves_as_no_opinion() {
     );
 }
 
+/// A provider comes back holding the key variable's NAME, which is all it
+/// ever holds.
+fn a_provider() -> ApiProvider {
+    ApiProvider {
+        name: "team".to_string(),
+        url: "http://127.0.0.1:9".to_string(),
+        key_env: "TEAM_KEY_VARIABLE".to_string(),
+        agents_path: Some("/agents".to_string()),
+        turns_path: Some("/chat".to_string()),
+        list_timeout_secs: Some(7),
+    }
+}
+
+/// An agent CLI changed, and one added, by the protocol's name.
+fn a_changed_and_an_added_cli_agent() -> Vec<CliAgent> {
+    vec![
+        CliAgent {
+            id: "codex".to_string(),
+            commands: vec!["codex-nightly".to_string()],
+            ..CliAgent::default()
+        },
+        CliAgent {
+            id: "mine".to_string(),
+            display_name: Some("My agent".to_string()),
+            commands: vec!["my-agent".to_string()],
+            version_args: Some(vec!["-V".to_string()]),
+            protocol: Some(crate::agent::Protocol::ClaudeStreamJson),
+            default_sub_agent: Some("codex".to_string()),
+        },
+    ]
+}
+
+/// A configured model with every field set, holding its key variable's NAME
+/// only.
+fn a_model() -> ApiModel {
+    ApiModel {
+        name: "router".to_string(),
+        format: crate::agent::api::WireFormat::Openai,
+        url: "https://router.invalid/v1/chat/completions".to_string(),
+        key_env: "ROUTER_KEY_VARIABLE".to_string(),
+        model: "a-model".to_string(),
+        sub_model: "a-fast-model".to_string(),
+        aliases: BTreeMap::from([("haiku".to_string(), "a-fast-model".to_string())]),
+        max_tokens: Some(64_000),
+        max_steps: Some(60),
+        timeout_secs: Some(600),
+        max_retries: Some(0),
+        prompt_cache: Some(false),
+        auth: Some(crate::agent::api::KeyHeader::Bearer),
+        api_version: Some("2099-01-01".to_string()),
+        context_window: Some(1_000_000),
+    }
+}
+
+/// An external tool, as `/tools add` reads it back.
+fn a_tool() -> crate::ext_tools::ToolEntry {
+    crate::ext_tools::ToolEntry {
+        name: "browser".to_string(),
+        release: Some("owner/repo".to_string()),
+        asset: Some("b-{arch}-{os}.{ext}".to_string()),
+        run: vec!["b".to_string(), "mcp".to_string()],
+        provides: Some("browser".to_string()),
+        ..crate::ext_tools::ToolEntry::default()
+    }
+}
+
+/// A hook on every desktop event. An operator who writes a guard and gets it
+/// back empty has no guard and no way to tell. No `..Default`: a new event
+/// fails to compile here until it is given a hook.
+fn a_hook_on_every_desktop_event() -> crate::hooks::HookConfig {
+    crate::hooks::HookConfig {
+        pre_tool_use: vec!["a-guard-command".to_string()],
+        post_tool_use: vec!["a-logging-command".to_string()],
+        user_prompt_submit: vec!["a-prompt-check".to_string()],
+        pre_compact: vec!["a-compact-note".to_string()],
+        stop: vec!["a-stop-note".to_string()],
+        notification: vec!["a-notify-hook".to_string()],
+        session_start: vec!["a-start-note".to_string()],
+        session_end: vec!["a-end-note".to_string()],
+        subagent_stop: vec!["a-subagent-note".to_string()],
+    }
+}
+
+/// One permission rule of each kind, or a `/roles` save would drop them.
+fn one_rule_of_each_kind() -> crate::permissions::rules::RuleLists {
+    crate::permissions::rules::RuleLists {
+        allow: vec!["Bash(npm test:*)".to_string()],
+        ask: vec!["Bash(git push:*)".to_string()],
+        deny: vec!["Read(.env)".to_string()],
+    }
+}
+
+/// Every setting written, saved and loaded back unchanged. The literal below
+/// names every `AdminConfig` field with no `..Default`, so a new setting
+/// fails to compile here until it is given a value that has to survive the
+/// file. The larger values are built by the helpers above.
 #[test]
 fn settings_round_trip_through_the_file() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let mut roles = BTreeMap::new();
-    roles.insert(
-        "implement".to_string(),
-        vec!["a@lab-a".to_string(), "b@lab-b".to_string()],
-    );
     let admin = AdminConfig {
         model: Some("a-model".to_string()),
         // A pinned agent has to survive the file too, or the setting is one
         // an operator can write and never get back.
         agent: Some("an-agent".to_string()),
-        // The sub-agent choice and the providers too — and a provider comes
-        // back holding the variable's NAME, which is all it ever holds.
         sub_agent: Some("another-agent".to_string()),
-        api_providers: vec![ApiProvider {
-            name: "team".to_string(),
-            url: "http://127.0.0.1:9".to_string(),
-            key_env: "TEAM_KEY_VARIABLE".to_string(),
-            agents_path: Some("/agents".to_string()),
-            turns_path: Some("/chat".to_string()),
-            list_timeout_secs: Some(7),
-        }],
-        // An agent CLI changed, and one added, by the protocol's name.
-        cli_agents: vec![
-            CliAgent {
-                id: "codex".to_string(),
-                commands: vec!["codex-nightly".to_string()],
-                ..CliAgent::default()
-            },
-            CliAgent {
-                id: "mine".to_string(),
-                display_name: Some("My agent".to_string()),
-                commands: vec!["my-agent".to_string()],
-                version_args: Some(vec!["-V".to_string()]),
-                protocol: Some(crate::agent::Protocol::ClaudeStreamJson),
-                default_sub_agent: Some("codex".to_string()),
-            },
-        ],
-        // A configured model too, holding its key variable's NAME only.
-        api_models: vec![ApiModel {
-            name: "router".to_string(),
-            format: crate::agent::api::WireFormat::Openai,
-            url: "https://router.invalid/v1/chat/completions".to_string(),
-            key_env: "ROUTER_KEY_VARIABLE".to_string(),
-            model: "a-model".to_string(),
-            sub_model: "a-fast-model".to_string(),
-            aliases: BTreeMap::from([("haiku".to_string(), "a-fast-model".to_string())]),
-            max_tokens: Some(64_000),
-            max_steps: Some(60),
-            timeout_secs: Some(600),
-            max_retries: Some(0),
-            prompt_cache: Some(false),
-            auth: Some(crate::agent::api::KeyHeader::Bearer),
-            api_version: Some("2099-01-01".to_string()),
-            context_window: Some(1_000_000),
-        }],
+        api_providers: vec![a_provider()],
+        cli_agents: a_changed_and_an_added_cli_agent(),
+        api_models: vec![a_model()],
         // The search provider too, holding its key variable's NAME only.
         web_search: Some(SearchProvider {
             url: "https://search.invalid/q".to_string(),
@@ -373,15 +423,7 @@ fn settings_round_trip_through_the_file() {
         }),
         // The browser and the PDF switch, which the owner flips by hand.
         browser_bin: Some("C:/tools/incord-browser.exe".to_string()),
-        // An external tool, as `/tools add` reads it back.
-        tools: vec![crate::ext_tools::ToolEntry {
-            name: "browser".to_string(),
-            release: Some("owner/repo".to_string()),
-            asset: Some("b-{arch}-{os}.{ext}".to_string()),
-            run: vec!["b".to_string(), "mcp".to_string()],
-            provides: Some("browser".to_string()),
-            ..crate::ext_tools::ToolEntry::default()
-        }],
+        tools: vec![a_tool()],
         // Turning the built-in tools off is a choice that must come back.
         default_tools: Some(false),
         pdf_renderer: Some(PdfRenderer::Browser),
@@ -400,7 +442,10 @@ fn settings_round_trip_through_the_file() {
             "top".to_string(),
             vec!["a-model".to_string(), "other:big".to_string()],
         )]),
-        roles,
+        roles: BTreeMap::from([(
+            "implement".to_string(),
+            vec!["a@lab-a".to_string(), "b@lab-b".to_string()],
+        )]),
         budget_tokens: Some(50_000),
         verify_command: Some(vec!["cargo".to_string(), "test".to_string()]),
         // A pinned generator is the owner's standing preference for a new
@@ -411,20 +456,7 @@ fn settings_round_trip_through_the_file() {
         // operator chose must come back, or the default quietly replaces it.
         engine_bin: Some("C:\\engine\\incord-memory-service.exe".to_string()),
         plugins: Plugins::default(),
-        // A guard on the desktop has to survive the file too. An operator
-        // who writes one and gets it back empty has no guard and no way
-        // to tell.
-        desktop_hooks: crate::hooks::HookConfig {
-            pre_tool_use: vec!["a-guard-command".to_string()],
-            post_tool_use: vec!["a-logging-command".to_string()],
-            user_prompt_submit: vec!["a-prompt-check".to_string()],
-            pre_compact: vec!["a-compact-note".to_string()],
-            stop: vec!["a-stop-note".to_string()],
-            notification: vec!["a-notify-hook".to_string()],
-            session_start: vec!["a-start-note".to_string()],
-            session_end: vec!["a-end-note".to_string()],
-            subagent_stop: vec!["a-subagent-note".to_string()],
-        },
+        desktop_hooks: a_hook_on_every_desktop_event(),
         desktop_display: Some("xvfb:1280x800".to_string()),
         desktop_limits: crate::desktop::limits::DesktopLimits {
             max_actions_per_minute: Some(60),
@@ -437,12 +469,7 @@ fn settings_round_trip_through_the_file() {
         statusline_command: Some("~/.incode/statusline.sh".to_string()),
         editing_mode: Some("vi".to_string()),
         output_style: Some("concise".to_string()),
-        // The permission rules, or a `/roles` save would drop them.
-        permissions: crate::permissions::rules::RuleLists {
-            allow: vec!["Bash(npm test:*)".to_string()],
-            ask: vec!["Bash(git push:*)".to_string()],
-            deny: vec!["Read(.env)".to_string()],
-        },
+        permissions: one_rule_of_each_kind(),
         // Telemetry the owner turned on must stay on.
         telemetry: Some(true),
     };
