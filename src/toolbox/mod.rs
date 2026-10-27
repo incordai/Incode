@@ -832,7 +832,8 @@ impl Toolbox {
     fn detect_browser() -> Option<browser::Found> {
         let data_dir = crate::admin::AdminConfig::default_dir();
         let admin = crate::admin::AdminConfig::load_default();
-        let provided = crate::ext_tools::provider("browser", &admin.tools_in_effect(), &data_dir);
+        let provided =
+            crate::ext_tools::provider("browser", &crate::ext_tools::in_effect(&admin), &data_dir);
         browser::find(
             &|name| std::env::var_os(name),
             admin.browser_bin.as_deref(),

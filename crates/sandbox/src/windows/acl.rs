@@ -20,6 +20,20 @@
 //! and leaves read access when another only reads it
 //! ([`super::offline::still_needed`]).
 //!
+//! # Network deny: what the account creates stays the user's to re-ACL
+//!
+//! A file the command creates under the offline account is OWNED by the
+//! account, and the user's `Modify` on it holds no `WRITE_DAC`. A later run's
+//! grant reaches a file only by being propagated onto it, which the user may
+//! not do there, so that run's command could not write a file an earlier run
+//! made (cargo's build cache, the second `cargo test`), and the earlier run's
+//! SID could not be revoked from it. So each root also gets one inheritable
+//! ACE for the user's own SID, `READ_CONTROL | WRITE_DAC`, which is what
+//! owning the file would give ([`keep_acl_rights`]). It is never revoked: it
+//! names only the user, on the user's own folder, and a revoke would strip
+//! it from those files again. It gives the command nothing: a network-deny
+//! command runs as the account, whose token does not hold the user's SID.
+//!
 //! # Network deny: listing the current folder's parent
 //!
 //! PowerShell finds its first location by looking the current folder up in
@@ -76,7 +90,7 @@ use windows_sys::Win32::System::Threading::{
 };
 
 use super::offline::{still_needed, Need};
-use super::token::{last_error, sid, sid_to_string, wide, LocalPtr, OwnedHandle};
+use super::token::{current_user_sid, last_error, sid, sid_to_string, wide, LocalPtr, OwnedHandle};
 use super::{fold_nested, is_listed, is_session_sid, refuse_broad, session_sid, GrantRecord};
 
 /// The rights granted on a root: `icacls`'s `M` (read, write, execute,
@@ -88,6 +102,9 @@ const READ_EXECUTE: u32 = 0x0012_00A9;
 /// FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE`. Names and
 /// attributes of what is in it; no file's contents, no ACL, no write.
 const LIST_ONLY: u32 = 0x0010_00A1;
+/// The rights the user keeps beneath a root the offline account writes to:
+/// what owning a file gives, reading and changing its ACL.
+const ACL_RIGHTS: u32 = READ_CONTROL | WRITE_DAC;
 
 /// How long a grant or revoke waits for another process changing an ACL at
 /// the same moment. Propagation over a very large tree takes tens of
@@ -105,6 +122,61 @@ pub(crate) struct OfflineGrant {
     /// Folders it may only list, by an ACE on the folder alone: the current
     /// folder's parent ([`super::offline_parents`]).
     pub parents: Vec<PathBuf>,
+}
+
+impl OfflineGrant {
+    /// The share a run may give the account, for [`Lease::acquire`]: a read
+    /// folder that would reach far past a workspace refuses the run, and a
+    /// read path or parent this process may not re-ACL is left out.
+    fn grantable(self, profile: Option<&str>) -> Result<Self, String> {
+        for read in self.reads.iter().filter(|r| r.is_dir()) {
+            refuse_broad(&read.to_string_lossy(), profile).map_err(|e| {
+                format!(
+                    "network deny runs the command as the offline account, which must \
+                     be granted the current folder; {e} (run from a project folder)"
+                )
+            })?;
+        }
+        // Only what this process may re-ACL: anything else (an sbx.exe under
+        // Program Files) is the system's, readable by `Users` already or not
+        // this run's to open up. If it is not readable, starting the command
+        // says so.
+        let reads = self
+            .reads
+            .into_iter()
+            .filter(|r| may_change_acl(r))
+            .collect();
+        // The same for a parent: one this process may not re-ACL is not the
+        // user's (a folder of the system's), and is listable by `Users`
+        // already or not this run's to open up.
+        let parents = self
+            .parents
+            .into_iter()
+            .filter(|p| p.is_dir() && may_change_acl(p))
+            .collect();
+        Ok(Self {
+            user: self.user,
+            reads,
+            parents,
+        })
+    }
+}
+
+/// Refuse the run when a root may not be granted, for [`Lease::acquire`]: it
+/// would reach far past a workspace ([`refuse_broad`]), or it is not a
+/// folder. Checked for every root before anything is granted.
+fn refuse_ungrantable(roots: &[PathBuf], profile: Option<&str>) -> Result<(), String> {
+    for root in roots {
+        refuse_broad(&root.to_string_lossy(), profile)
+            .map_err(|e| format!("workspace-write {e}"))?;
+        if !root.is_dir() {
+            return Err(format!(
+                "workspace-write cannot grant {}: not a directory",
+                root.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// One run's grant on its roots. Dropping it revokes them.
@@ -136,47 +208,26 @@ impl Lease {
     /// # Errors
     /// When a root may not or could not be granted. Nothing this call granted
     /// is left behind on failure.
+    ///
+    /// The steps: the roots are checked ([`refuse_ungrantable`]) and folded,
+    /// the account's share narrowed ([`OfflineGrant::grantable`]), the sweep
+    /// run and the grant written down, then the roots granted
+    /// ([`Lease::grant_roots`]), the account's read paths
+    /// ([`Lease::grant_reads`]) and its parents ([`Lease::grant_parents`]).
+    /// A step that fails returns with the lease, which drops and so takes
+    /// back what the steps before it listed.
     pub(crate) fn acquire(
         roots: &[PathBuf],
         offline: Option<OfflineGrant>,
     ) -> Result<Self, String> {
         let profile = std::env::var("USERPROFILE").ok();
-        for root in roots {
-            refuse_broad(&root.to_string_lossy(), profile.as_deref())
-                .map_err(|e| format!("workspace-write {e}"))?;
-            if !root.is_dir() {
-                return Err(format!(
-                    "workspace-write cannot grant {}: not a directory",
-                    root.display()
-                ));
-            }
-        }
+        refuse_ungrantable(roots, profile.as_deref())?;
         let roots = fold_nested(roots);
+        let offline = offline
+            .map(|o| o.grantable(profile.as_deref()))
+            .transpose()?;
         let (user, reads, parents) = match offline {
-            Some(o) => {
-                for read in o.reads.iter().filter(|r| r.is_dir()) {
-                    refuse_broad(&read.to_string_lossy(), profile.as_deref()).map_err(|e| {
-                        format!(
-                            "network deny runs the command as the offline account, which must \
-                             be granted the current folder; {e} (run from a project folder)"
-                        )
-                    })?;
-                }
-                // Only what this process may re-ACL: anything else (an
-                // sbx.exe under Program Files) is the system's, readable by
-                // `Users` already or not this run's to open up. If it is not
-                // readable, starting the command says so.
-                let reads = o.reads.into_iter().filter(|r| may_change_acl(r)).collect();
-                // The same for a parent: one this process may not re-ACL is
-                // not the user's (a folder of the system's), and is listable
-                // by `Users` already or not this run's to open up.
-                let parents = o
-                    .parents
-                    .into_iter()
-                    .filter(|p| p.is_dir() && may_change_acl(p))
-                    .collect();
-                (Some(o.user), reads, parents)
-            }
+            Some(o) => (Some(o.user), o.reads, o.parents),
             None => (None, Vec::new(), Vec::new()),
         };
         let dir = records_dir();
@@ -202,50 +253,58 @@ impl Lease {
         // after this is swept.
         std::fs::write(&lease.path, lease.record.to_text())
             .map_err(|e| format!("{}: {e}", lease.path.display()))?;
-        for root in &roots {
+        lease.grant_roots(&roots)?;
+        if let Some(user) = lease.record.user.clone() {
+            lease.grant_reads(&reads, &user)?;
+            lease.grant_parents(&parents, &user);
+        }
+        Ok(lease)
+    }
+
+    /// Grant each root in turn ([`grant_root`]), for [`Lease::acquire`],
+    /// stopping at the first that fails.
+    fn grant_roots(&mut self, roots: &[PathBuf]) -> Result<(), String> {
+        for root in roots {
             // Listed first: a propagation can fail part-way (a file the user
             // may not re-ACL), and dropping the lease takes back whatever
             // landed.
-            lease.roots.push(root.clone());
-            let granted =
-                change(root, &lease.record.sid, Change::Grant(MODIFY)).and_then(|()| match &lease
-                    .record
-                    .user
-                {
-                    Some(user) => grant_account(root, user, MODIFY),
-                    None => Ok(()),
-                });
-            if let Err(e) = granted {
-                return Err(format!(
-                    "workspace-write could not grant {}: {e}",
-                    root.display()
-                ));
+            self.roots.push(root.clone());
+            grant_root(root, &self.record.sid, self.record.user.as_deref())
+                .map_err(|e| format!("workspace-write could not grant {}: {e}", root.display()))?;
+        }
+        Ok(())
+    }
+
+    /// Let the offline account `user` read each of `reads`, for
+    /// [`Lease::acquire`], stopping at the first that fails.
+    fn grant_reads(&mut self, reads: &[PathBuf], user: &str) -> Result<(), String> {
+        for read in reads {
+            self.reads.push(read.clone());
+            grant_account(read, user, READ_EXECUTE).map_err(|e| {
+                format!(
+                    "could not let the offline account read {}: {e}",
+                    read.display()
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Let the offline account `user` list each of `parents`, for
+    /// [`Lease::acquire`]. Not a confinement matter: without it the run goes
+    /// on, and only PowerShell's starting location suffers, so a failure is
+    /// said and the next parent tried.
+    fn grant_parents(&mut self, parents: &[PathBuf], user: &str) {
+        for parent in parents {
+            self.parents.push(parent.clone());
+            if let Err(e) = set_list(parent, user, true) {
+                eprintln!(
+                    "sbx: could not let the offline account list {} ({e}); PowerShell \
+                     may start at the drive root instead of the current folder",
+                    parent.display()
+                );
             }
         }
-        if let Some(user) = lease.record.user.clone() {
-            for read in &reads {
-                lease.reads.push(read.clone());
-                grant_account(read, &user, READ_EXECUTE).map_err(|e| {
-                    format!(
-                        "could not let the offline account read {}: {e}",
-                        read.display()
-                    )
-                })?;
-            }
-            // Not a confinement matter: without it the run goes on, and
-            // only PowerShell's starting location suffers, so say so.
-            for parent in &parents {
-                lease.parents.push(parent.clone());
-                if let Err(e) = set_list(parent, &user, true) {
-                    eprintln!(
-                        "sbx: could not let the offline account list {} ({e}); PowerShell \
-                         may start at the drive root instead of the current folder",
-                        parent.display()
-                    );
-                }
-            }
-        }
-        Ok(lease)
     }
 
     /// The SID the command's token is restricted to.
@@ -346,6 +405,19 @@ fn release_list(parent: &Path, user: &str, others: &Others) -> Result<(), String
     set_list(parent, user, false).map(|_| ())
 }
 
+/// Grant one root, for [`Lease::grant_roots`]: `Modify` to the run's SID
+/// and, with the offline account `user`, to the account as well, with the
+/// user's own ACL rights kept beneath it ([`keep_acl_rights`]). Stops at the
+/// first that fails.
+fn grant_root(root: &Path, sid_text: &str, user: Option<&str>) -> Result<(), String> {
+    change(root, sid_text, Change::Grant(MODIFY))?;
+    if let Some(user) = user {
+        grant_account(root, user, MODIFY)?;
+        keep_acl_rights(root)?;
+    }
+    Ok(())
+}
+
 /// Grant the account `rights` on `path`, inherited beneath a folder. A
 /// listing ACE already on the folder (another run's parent) is taken off
 /// first and put back after: `SetEntriesInAclW` may merge a grant into an
@@ -359,6 +431,84 @@ fn grant_account(path: &Path, user: &str, rights: u32) -> Result<(), String> {
         set_list(path, user, true)?;
     }
     Ok(())
+}
+
+/// Let the user keep reading and changing the ACL of everything beneath
+/// `root`, the files the offline account creates included, so a later run's
+/// grant and revoke reach them (see the module docs). Added once: a root
+/// that already passes these rights down to the user is left alone, which
+/// spares a second walk of a large tree on every run. Whether it was added.
+fn keep_acl_rights(root: &Path) -> Result<bool, String> {
+    let user = current_user_sid()?;
+    if passes_down(root, &user, ACL_RIGHTS)? {
+        return Ok(false);
+    }
+    change(root, &user, Change::Grant(ACL_RIGHTS)).map(|()| true)
+}
+
+/// Whether `path`'s DACL allows `sid_text` all of `rights` on everything
+/// created beneath it: an allow ACE inherited by both files and folders.
+fn passes_down(path: &Path, sid_text: &str, rights: u32) -> Result<bool, String> {
+    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+    const TO_FILES_AND_FOLDERS: u8 = 0x1 | 0x2; // OBJECT_ | CONTAINER_INHERIT_ACE
+    let trustee = sid(sid_text)?;
+    // SAFETY: the DACL points into `descriptor`, freed only at the end of
+    // the block; each ACE read is inside the DACL `GetAce` returned it from,
+    // and only its header and fixed part are read; each call is checked.
+    unsafe {
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut descriptor: *mut core::ffi::c_void = std::ptr::null_mut();
+        let err = GetNamedSecurityInfoW(
+            wide(path).as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut descriptor,
+        );
+        if err != 0 {
+            return Err(format!(
+                "reading the ACL of {} failed with error {err}",
+                path.display()
+            ));
+        }
+        let _descriptor = LocalPtr(descriptor);
+        if dacl.is_null() {
+            // No DACL: everyone may do anything already.
+            return Ok(true);
+        }
+        let mut info = ACL_SIZE_INFORMATION::default();
+        if GetAclInformation(
+            dacl,
+            (&raw mut info).cast(),
+            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        ) == 0
+        {
+            return Err(last_error("GetAclInformation"));
+        }
+        for index in 0..info.AceCount {
+            let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
+            if GetAce(dacl, index, &mut ace) == 0 {
+                return Err(last_error("GetAce"));
+            }
+            let header = *ace.cast::<ACE_HEADER>();
+            if header.AceType != ACCESS_ALLOWED_ACE_TYPE
+                || header.AceFlags & TO_FILES_AND_FOLDERS != TO_FILES_AND_FOLDERS
+            {
+                continue;
+            }
+            let allowed = ace.cast::<ACCESS_ALLOWED_ACE>();
+            if (*allowed).Mask & rights == rights
+                && EqualSid((&raw mut (*allowed).SidStart).cast(), trustee.0) != 0
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
 }
 
 /// What every other live run granted the offline account.
@@ -890,6 +1040,216 @@ impl Drop for AclLock {
         unsafe {
             ReleaseMutex(self.0);
             CloseHandle(self.0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `path`'s owner and ACL, as Windows reports them, for a failure
+    /// message: what a test's precondition actually found, so a run on
+    /// another machine (an elevated CI runner) says why it differs.
+    fn acl_of(path: &Path) -> String {
+        // Without `PSModulePath`: Windows PowerShell started from a
+        // PowerShell 7 shell (a CI step) inherits 7's module path, cannot
+        // load `Get-Acl`'s module and prints nothing.
+        let run = |program: &str, args: &[&std::ffi::OsStr]| {
+            std::process::Command::new(program)
+                .env_remove("PSModulePath")
+                .args(args)
+                .output()
+                .map(|o| {
+                    format!(
+                        "{} {}",
+                        String::from_utf8_lossy(&o.stdout).trim(),
+                        String::from_utf8_lossy(&o.stderr).trim()
+                    )
+                })
+                .unwrap_or_else(|e| format!("{program}: {e}"))
+        };
+        let owner = run(
+            "powershell",
+            &[
+                "-NoProfile".as_ref(),
+                "-Command".as_ref(),
+                format!("(Get-Acl -LiteralPath '{}').Owner", path.display()).as_ref(),
+            ],
+        );
+        format!("owner: {owner}\n{}", run("icacls", &[path.as_os_str()]))
+    }
+
+    /// A folder with the ACL a data drive gives (`D:\Projects\...`): the
+    /// user reaches it through `Authenticated Users`' `Modify`, with no ACE
+    /// of the user's own passing anything down. The profile's folders (the
+    /// temp folder included) pass the user full control, which hides the
+    /// case.
+    fn data_drive_folder() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let set = std::process::Command::new("icacls")
+            .arg(dir.path())
+            .args([
+                "/inheritance:r",
+                "/grant:r",
+                "*S-1-5-18:(OI)(CI)F",
+                "*S-1-5-32-544:(OI)(CI)F",
+                "*S-1-5-11:(OI)(CI)M",
+                "*S-1-5-32-545:(OI)(CI)RX",
+            ])
+            .output()
+            .expect("icacls");
+        assert!(
+            set.status.success(),
+            "{}",
+            String::from_utf8_lossy(&set.stdout)
+        );
+        // None of the user's own: an elevated process (a CI runner) gives a
+        // new folder an explicit ACE for its user, which `/inheritance:r`
+        // does not take off and which would pass the user everything.
+        remove_grants(dir.path(), &[&current_user_sid().expect("the user's SID")]);
+        dir
+    }
+
+    /// Take every allow ACE for each of `sids` off `path`, explicit ones
+    /// included — what `/grant:r` of other SIDs leaves in place.
+    fn remove_grants(path: &Path, sids: &[&str]) {
+        for sid in sids {
+            let removed = std::process::Command::new("icacls")
+                .arg(path)
+                .args(["/remove:g", &format!("*{sid}")])
+                .output()
+                .expect("icacls");
+            assert!(
+                removed.status.success(),
+                "{}",
+                String::from_utf8_lossy(&removed.stdout)
+            );
+        }
+    }
+
+    /// **THE USER KEEPS READING AND CHANGING THE ACL OF WHAT IS CREATED
+    /// BENEATH A ROOT**, so a later run's grant reaches a file the offline
+    /// account owns; and the ACE is added once, not on every run.
+    #[test]
+    fn the_user_keeps_acl_rights_beneath_a_root_and_they_are_added_once() {
+        let dir = data_drive_folder();
+        let user = current_user_sid().expect("the user's SID");
+        assert!(
+            !passes_down(dir.path(), &user, ACL_RIGHTS).expect("reads the ACL"),
+            "a data-drive folder starts without it (user {user}, elevated: {}):\n{}",
+            super::super::token::is_elevated(),
+            acl_of(dir.path())
+        );
+
+        assert!(keep_acl_rights(dir.path()).expect("kept"), "added");
+        assert!(passes_down(dir.path(), &user, ACL_RIGHTS).expect("reads the ACL"));
+        // What is created beneath it afterwards inherits the right.
+        let file = dir.path().join("made-later.txt");
+        std::fs::write(&file, "x").expect("write");
+        let file_acl = std::process::Command::new("icacls")
+            .arg(&file)
+            .output()
+            .expect("icacls");
+        let file_acl = String::from_utf8_lossy(&file_acl.stdout);
+        let name = std::env::var("USERNAME").expect("USERNAME");
+        assert!(
+            file_acl
+                .lines()
+                .any(|l| l.contains(&format!("\\{name}:")) && l.contains("WDAC")),
+            "{file_acl}"
+        );
+
+        assert!(
+            !keep_acl_rights(dir.path()).expect("kept"),
+            "a root that already passes it down is left alone"
+        );
+    }
+
+    /// **A GRANT THAT FAILS PART-WAY TAKES BACK WHAT IT ALREADY GRANTED**:
+    /// the first root is granted, the second refuses (its ACL may be read but
+    /// not changed: an `OWNER RIGHTS` ACE takes the owner's implicit
+    /// `WRITE_DAC` away), and the lease the failure drops revokes the first
+    /// root and what propagated beneath it. The second root's revoke fails as
+    /// its grant did, so the record is kept for the next sweep, naming that
+    /// root alone.
+    #[test]
+    fn a_grant_that_fails_part_way_takes_back_what_it_granted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Folded in this order: `a-` before `b-`.
+        let granted = dir.path().join("a-granted");
+        let locked = dir.path().join("b-locked");
+        std::fs::create_dir(&granted).expect("granted root");
+        std::fs::create_dir(&locked).expect("locked root");
+        let beneath = granted.join("made-before.txt");
+        std::fs::write(&beneath, "x").expect("write");
+        // An elevated process (a CI runner) leaves explicit full-control ACEs
+        // for its user and for Administrators on a new folder; either one
+        // would let it re-ACL the root, which is what must fail here. Taken
+        // off BEFORE the lock below: after it, nobody here may change the ACL.
+        let user = current_user_sid().expect("the user's SID");
+        remove_grants(&locked, &[&user, "S-1-5-32-544"]);
+        let set = std::process::Command::new("icacls")
+            .arg(&locked)
+            .args([
+                "/inheritance:r",
+                "/grant:r",
+                "*S-1-3-4:(OI)(CI)R",
+                "*S-1-5-11:(OI)(CI)M",
+            ])
+            .output()
+            .expect("icacls");
+        assert!(
+            set.status.success(),
+            "{}",
+            String::from_utf8_lossy(&set.stdout)
+        );
+
+        let err = match Lease::acquire(&[granted.clone(), locked.clone()], None) {
+            Err(err) => err,
+            Ok(_) => panic!(
+                "the locked root refused nothing (elevated: {}):\n{}",
+                super::super::token::is_elevated(),
+                acl_of(&locked)
+            ),
+        };
+        assert!(
+            err.starts_with(&format!(
+                "workspace-write could not grant {}:",
+                locked.display()
+            )),
+            "{err}"
+        );
+
+        let kept: Vec<(PathBuf, GrantRecord)> = std::fs::read_dir(records_dir())
+            .expect("records")
+            .flatten()
+            .map(|e| e.path())
+            .filter_map(|p| {
+                let record = GrantRecord::parse(&std::fs::read_to_string(&p).ok()?)?;
+                Some((p, record))
+            })
+            .filter(|(_, r)| r.roots.contains(&locked) || r.roots.contains(&granted))
+            .collect();
+        for (path, _) in &kept {
+            // This test's own record: the locked root goes with the tempdir.
+            let _ = std::fs::remove_file(path);
+        }
+        assert_eq!(kept.len(), 1, "one record kept for the next sweep");
+        let record = &kept[0].1;
+        assert_eq!(
+            record.roots,
+            vec![locked.clone()],
+            "the granted root was revoked"
+        );
+
+        for path in [&granted, &beneath] {
+            let acl = std::process::Command::new("icacls")
+                .arg(path)
+                .output()
+                .expect("icacls");
+            let acl = String::from_utf8_lossy(&acl.stdout);
+            assert!(!acl.contains(&record.sid), "{}: {acl}", path.display());
         }
     }
 }

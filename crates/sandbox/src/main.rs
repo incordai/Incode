@@ -489,27 +489,7 @@ fn parse(args: &[OsString]) -> Result<Options, String> {
             command = args[i + 1..].to_vec();
             break;
         }
-        let takes_value = matches!(
-            arg,
-            "-p" | "--policy"
-                | "--fs"
-                | "-w"
-                | "--write"
-                | "--deny-read"
-                | "--net"
-                | "--allow-host"
-                | "--allow-loopback-port"
-                | "--pass-env"
-                | "--unset-env"
-                | "--set-env"
-                | "--wall"
-                | "--cpu"
-                | "--mem"
-                | "--fsize"
-                | "--nofile"
-                | "--cwd"
-        );
-        let value = if takes_value {
+        let value = if takes_value(arg) {
             i += 1;
             Some(
                 args.get(i)
@@ -536,62 +516,7 @@ fn parse(args: &[OsString]) -> Result<Options, String> {
     // Flags apply on top of the file, whatever order they were given in.
     let mut policy = policy.unwrap_or_default();
     for (flag, value) in flags {
-        let v = value.unwrap_or_default();
-        let num = |v: &str| {
-            v.parse::<u64>()
-                .map_err(|_| format!("{flag}: `{v}` is not a number"))
-        };
-        match flag.as_str() {
-            "--fs" => {
-                policy.fs.mode = FsMode::parse(&v).ok_or(format!("--fs: unknown mode `{v}`"))?;
-            }
-            "-w" | "--write" => {
-                policy.fs.mode = FsMode::WorkspaceWrite;
-                policy.fs.write.push(PathBuf::from(v));
-            }
-            "--deny-read" => {
-                if policy.fs.mode == FsMode::Off {
-                    policy.fs.mode = FsMode::ReadOnly;
-                }
-                policy.fs.deny_read.push(PathBuf::from(v));
-            }
-            "--net" => {
-                policy.network.mode =
-                    NetMode::parse(&v).ok_or(format!("--net: unknown mode `{v}`"))?;
-            }
-            "--allow-host" => {
-                policy.network.mode = NetMode::Proxy;
-                policy.network.allow.push(v);
-            }
-            "--allow-private" => policy.network.allow_private = true,
-            "--allow-loopback-port" => {
-                let port: u16 = v
-                    .parse()
-                    .ok()
-                    .filter(|p| *p != 0)
-                    .ok_or(format!("--allow-loopback-port: `{v}` is not a port"))?;
-                policy.network.mode = NetMode::Proxy;
-                policy.network.loopback_ports.push(port);
-            }
-            "--env-none" => policy.env.inherit = Inherit::None,
-            "--pass-env" => policy.env.pass.push(v),
-            "--unset-env" => policy.env.remove.push(v),
-            "--set-env" => {
-                let (k, val) = v
-                    .split_once('=')
-                    .ok_or(format!("--set-env: expected K=V, got `{v}`"))?;
-                policy.env.set.insert(k.to_string(), val.to_string());
-            }
-            "--keep-agent-session" => policy.env.strip_agent_session = false,
-            "--keep-git-redirects" => policy.env.strip_git_redirects = false,
-            "--no-protect-git" => policy.fs.protect_git = false,
-            "--wall" => policy.limits.wall_secs = Some(num(&v)?),
-            "--cpu" => policy.limits.cpu_secs = Some(num(&v)?),
-            "--mem" => policy.limits.memory_mb = Some(num(&v)?),
-            "--fsize" => policy.limits.file_size_mb = Some(num(&v)?),
-            "--nofile" => policy.limits.open_files = Some(num(&v)?),
-            other => return Err(format!("unknown option `{other}` (try `sbx --help`)")),
-        }
+        apply_flag(&mut policy, &flag, value.unwrap_or_default())?;
     }
 
     let cwd = match cwd {
@@ -606,6 +531,133 @@ fn parse(args: &[OsString]) -> Result<Options, String> {
         json,
         command,
     })
+}
+
+/// Whether `arg` is a `sbx run`/`check` option followed by a value.
+fn takes_value(arg: &str) -> bool {
+    matches!(
+        arg,
+        "-p" | "--policy"
+            | "--fs"
+            | "-w"
+            | "--write"
+            | "--deny-read"
+            | "--net"
+            | "--allow-host"
+            | "--allow-loopback-port"
+            | "--pass-env"
+            | "--unset-env"
+            | "--set-env"
+            | "--wall"
+            | "--cpu"
+            | "--mem"
+            | "--fsize"
+            | "--nofile"
+            | "--cwd"
+    )
+}
+
+/// One policy flag applied on top of the policy file: the filesystem,
+/// network, environment or limits option it names, or an error for one that
+/// is none of them.
+fn apply_flag(policy: &mut Policy, flag: &str, v: String) -> Result<(), String> {
+    let handled = apply_fs_flag(policy, flag, &v)?
+        || apply_net_flag(policy, flag, &v)?
+        || apply_env_flag(policy, flag, &v)?
+        || apply_limit_flag(policy, flag, &v)?;
+    if handled {
+        Ok(())
+    } else {
+        Err(format!("unknown option `{flag}` (try `sbx --help`)"))
+    }
+}
+
+/// `--fs`, `-w`/`--write`, `--deny-read`, `--no-protect-git`; `Ok(false)` for
+/// any other flag.
+fn apply_fs_flag(policy: &mut Policy, flag: &str, v: &str) -> Result<bool, String> {
+    match flag {
+        "--fs" => {
+            policy.fs.mode = FsMode::parse(v).ok_or(format!("--fs: unknown mode `{v}`"))?;
+        }
+        "-w" | "--write" => {
+            policy.fs.mode = FsMode::WorkspaceWrite;
+            policy.fs.write.push(PathBuf::from(v));
+        }
+        "--deny-read" => {
+            if policy.fs.mode == FsMode::Off {
+                policy.fs.mode = FsMode::ReadOnly;
+            }
+            policy.fs.deny_read.push(PathBuf::from(v));
+        }
+        "--no-protect-git" => policy.fs.protect_git = false,
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+/// `--net`, `--allow-host`, `--allow-private`, `--allow-loopback-port`;
+/// `Ok(false)` for any other flag.
+fn apply_net_flag(policy: &mut Policy, flag: &str, v: &str) -> Result<bool, String> {
+    match flag {
+        "--net" => {
+            policy.network.mode = NetMode::parse(v).ok_or(format!("--net: unknown mode `{v}`"))?;
+        }
+        "--allow-host" => {
+            policy.network.mode = NetMode::Proxy;
+            policy.network.allow.push(v.to_string());
+        }
+        "--allow-private" => policy.network.allow_private = true,
+        "--allow-loopback-port" => {
+            let port: u16 = v
+                .parse()
+                .ok()
+                .filter(|p| *p != 0)
+                .ok_or(format!("--allow-loopback-port: `{v}` is not a port"))?;
+            policy.network.mode = NetMode::Proxy;
+            policy.network.loopback_ports.push(port);
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+/// `--env-none`, `--pass-env`, `--unset-env`, `--set-env`,
+/// `--keep-agent-session`, `--keep-git-redirects`; `Ok(false)` for any other
+/// flag.
+fn apply_env_flag(policy: &mut Policy, flag: &str, v: &str) -> Result<bool, String> {
+    match flag {
+        "--env-none" => policy.env.inherit = Inherit::None,
+        "--pass-env" => policy.env.pass.push(v.to_string()),
+        "--unset-env" => policy.env.remove.push(v.to_string()),
+        "--set-env" => {
+            let (k, val) = v
+                .split_once('=')
+                .ok_or(format!("--set-env: expected K=V, got `{v}`"))?;
+            policy.env.set.insert(k.to_string(), val.to_string());
+        }
+        "--keep-agent-session" => policy.env.strip_agent_session = false,
+        "--keep-git-redirects" => policy.env.strip_git_redirects = false,
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+/// `--wall`, `--cpu`, `--mem`, `--fsize`, `--nofile`; `Ok(false)` for any
+/// other flag.
+fn apply_limit_flag(policy: &mut Policy, flag: &str, v: &str) -> Result<bool, String> {
+    let num = || {
+        v.parse::<u64>()
+            .map_err(|_| format!("{flag}: `{v}` is not a number"))
+    };
+    match flag {
+        "--wall" => policy.limits.wall_secs = Some(num()?),
+        "--cpu" => policy.limits.cpu_secs = Some(num()?),
+        "--mem" => policy.limits.memory_mb = Some(num()?),
+        "--fsize" => policy.limits.file_size_mb = Some(num()?),
+        "--nofile" => policy.limits.open_files = Some(num()?),
+        _ => return Ok(false),
+    }
+    Ok(true)
 }
 
 fn doctor() {
@@ -678,6 +730,67 @@ mod tests {
         assert!(o.policy.network.allow.is_empty());
         assert!(!o.policy.network.allow_private);
         assert_eq!(o.command, args(&["true"]));
+    }
+
+    /// Each kind of flag lands in its part of the policy, on top of the
+    /// defaults; a bad value and an unknown flag are refused by name.
+    #[test]
+    fn each_policy_flag_lands_where_it_belongs() {
+        let o = parse(&args(&[
+            "-w",
+            "/w",
+            "--deny-read",
+            "/secret",
+            "--no-protect-git",
+            "--allow-host",
+            "crates.io",
+            "--allow-private",
+            "--env-none",
+            "--pass-env",
+            "KEEP",
+            "--set-env",
+            "CI=1",
+            "--keep-git-redirects",
+            "--wall",
+            "30",
+            "--nofile",
+            "64",
+            "--",
+            "true",
+        ]))
+        .expect("parses");
+        let p = &o.policy;
+        assert_eq!(p.fs.mode, FsMode::WorkspaceWrite);
+        assert_eq!(p.fs.write, [PathBuf::from("/w")]);
+        assert_eq!(p.fs.deny_read, [PathBuf::from("/secret")]);
+        assert!(!p.fs.protect_git);
+        assert_eq!(p.network.mode, NetMode::Proxy);
+        assert_eq!(p.network.allow, ["crates.io"]);
+        assert!(p.network.allow_private);
+        assert_eq!(p.env.inherit, Inherit::None);
+        assert_eq!(p.env.pass, ["KEEP"]);
+        assert_eq!(p.env.set.get("CI").map(String::as_str), Some("1"));
+        assert!(!p.env.strip_git_redirects);
+        assert!(
+            p.env.strip_agent_session,
+            "a flag not given keeps its default"
+        );
+        assert_eq!(p.limits.wall_secs, Some(30));
+        assert_eq!(p.limits.open_files, Some(64));
+
+        for (bad, reason) in [
+            (&["--wall", "soon"][..], "is not a number"),
+            (&["--fs", "everything"][..], "unknown mode"),
+            (&["--set-env", "NOEQUALS"][..], "expected K=V"),
+            (&["--frobnicate"][..], "unknown option `--frobnicate`"),
+        ] {
+            let mut words = bad.to_vec();
+            words.extend(["--", "true"]);
+            let err = parse(&args(&words))
+                .err()
+                .unwrap_or_else(|| panic!("{bad:?} should be refused"));
+            assert!(err.contains(reason), "{bad:?}: {err}");
+        }
     }
 
     /// Port 0, a word and a number past 65535 are refused, as is the flag

@@ -454,7 +454,26 @@ fn serve(
     })
 }
 
+/// The request head: its lines ([`head_lines`]), then a `CONNECT` target
+/// ([`connect_head`]) or a plain-HTTP request rewritten for the origin
+/// ([`forward_head`]).
 fn read_head(reader: &mut BufReader<TcpStream>) -> Result<Head, String> {
+    let lines = head_lines(reader)?;
+    let first = lines.first().ok_or("empty request")?;
+    let mut parts = first.split_whitespace();
+    let method = parts.next().ok_or("no method")?.to_string();
+    let target = parts.next().ok_or("no target")?.to_string();
+    let version = parts.next().unwrap_or("HTTP/1.1").to_string();
+    if method.eq_ignore_ascii_case("CONNECT") {
+        connect_head(&target)
+    } else {
+        forward_head(method, &target, &version, &lines[1..])
+    }
+}
+
+/// The head's lines, without their endings, up to the blank line; at most
+/// [`HEAD_LIMIT`] bytes.
+fn head_lines(reader: &mut BufReader<TcpStream>) -> Result<Vec<String>, String> {
     let mut lines = Vec::new();
     let mut total = 0;
     loop {
@@ -467,29 +486,35 @@ fn read_head(reader: &mut BufReader<TcpStream>) -> Result<Head, String> {
             return Err("incomplete or oversized request head".into());
         }
         if line == "\r\n" || line == "\n" {
-            break;
+            return Ok(lines);
         }
         lines.push(line.trim_end_matches(['\r', '\n']).to_string());
     }
-    let first = lines.first().ok_or("empty request")?;
-    let mut parts = first.split_whitespace();
-    let method = parts.next().ok_or("no method")?.to_string();
-    let target = parts.next().ok_or("no target")?.to_string();
-    let version = parts.next().unwrap_or("HTTP/1.1").to_string();
+}
 
-    if method.eq_ignore_ascii_case("CONNECT") {
-        let (host, port) = split_host_port(&target);
-        let port = port
-            .and_then(|p| p.parse().ok())
-            .ok_or("CONNECT needs host:port")?;
-        return Ok(Head {
-            method: "CONNECT".into(),
-            host: normalise_host(host),
-            port,
-            forward: None,
-        });
-    }
+/// `CONNECT host:port`: a tunnel, nothing to forward.
+fn connect_head(target: &str) -> Result<Head, String> {
+    let (host, port) = split_host_port(target);
+    let port = port
+        .and_then(|p| p.parse().ok())
+        .ok_or("CONNECT needs host:port")?;
+    Ok(Head {
+        method: "CONNECT".into(),
+        host: normalise_host(host),
+        port,
+        forward: None,
+    })
+}
 
+/// `GET http://host[:port]/path`: the head rewritten in origin form, with
+/// every `Connection` and `Proxy-*` header dropped and `Connection: close`
+/// added, so a kept-alive connection cannot carry a second host unseen.
+fn forward_head(
+    method: String,
+    target: &str,
+    version: &str,
+    headers: &[String],
+) -> Result<Head, String> {
     let rest = target
         .strip_prefix("http://")
         .ok_or("only absolute http:// requests and CONNECT are proxied")?;
@@ -503,16 +528,14 @@ fn read_head(reader: &mut BufReader<TcpStream>) -> Result<Head, String> {
         None => 80,
     };
     let mut forward = format!("{method} {path} {version}\r\n");
-    for line in &lines[1..] {
+    for line in headers {
         let name = line.split(':').next().unwrap_or("").trim();
-        if name.eq_ignore_ascii_case("connection")
-            || name.eq_ignore_ascii_case("proxy-connection")
-            || name.to_ascii_lowercase().starts_with("proxy-")
-        {
-            continue;
+        let dropped = name.eq_ignore_ascii_case("connection")
+            || name.to_ascii_lowercase().starts_with("proxy-");
+        if !dropped {
+            forward.push_str(line);
+            forward.push_str("\r\n");
         }
-        forward.push_str(line);
-        forward.push_str("\r\n");
     }
     forward.push_str("Connection: close\r\n\r\n");
     Ok(Head {

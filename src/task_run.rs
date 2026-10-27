@@ -35,7 +35,10 @@ use std::path::Path;
 
 use serde_json::{json, Value};
 
-use crate::agent::{AgentBackend, AgentEvent};
+use crate::agent::AgentEvent;
+
+mod drive;
+use drive::{drive, Task};
 
 /// How `incode -t` reports what happens.
 ///
@@ -422,45 +425,32 @@ fn run_task_hooked(
     // takes the person's line, stops, and ends.
     let session_id = uuid::Uuid::new_v4().to_string();
     report.session.clone_from(&session_id);
-    // The operator's `user_prompt_submit` hooks see the instruction first,
-    // as in a session (`cli::plan_turn`): one that refuses it stops the run
-    // before the memory engine or an agent hears it. What they print rides
-    // the turn as context.
-    //
     // `session_start` first, as a session's start comes before its first
     // line; what it prints goes to stderr, which a JSON run keeps apart.
     if let Some(hooks) = &operator_hooks {
-        for said in hooks
-            .session_start("startup", &session_id, Some(workspace))
-            .messages()
-        {
-            eprintln!("incode: [session_start hook] {said}");
-        }
+        announce(
+            "session_start",
+            &hooks.session_start("startup", &session_id, Some(workspace)),
+        );
     }
     // Every way out after the start runs this, a refused line included, so
     // no `session_start` is left without its `session_end`.
     let operator_end = || {
         if let Some(hooks) = &operator_hooks {
-            for said in hooks
-                .session_end("other", &session_id, Some(workspace))
-                .messages()
-            {
-                eprintln!("incode: [session_end hook] {said}");
-            }
+            announce(
+                "session_end",
+                &hooks.session_end("other", &session_id, Some(workspace)),
+            );
         }
     };
-    let hooked: Vec<String> = match &operator_hooks {
-        Some(hooks) => {
-            let ran = hooks.user_prompt_submit(instruction, &session_id, Some(workspace));
-            if ran.is_denied() {
+    let hooked = match &operator_hooks {
+        Some(hooks) => match prompt_hook_context(hooks, instruction, &session_id, workspace) {
+            Ok(said) => said,
+            Err(refused) => {
                 operator_end();
-                return Err(format!(
-                    "not run: the operator's user_prompt_submit hook refused it. {}",
-                    ran.messages().join("\n")
-                ));
+                return Err(refused);
             }
-            ran.messages().to_vec()
-        }
+        },
         None => Vec::new(),
     };
     // The operator's collector, when telemetry is on (`crate::telemetry`).
@@ -470,34 +460,14 @@ fn run_task_hooked(
     // The owner's installed external tools, started as MCP servers now, in
     // the background, so they connect while the memory session opens.
     let tools = connect_ext_tools(workspace);
-    // A custom command's `allowed-tools` hold the whole run — it is the
-    // command's one turn — on every candidate whose tools are incode's.
-    let _held_to = (!command_tools.is_empty()).then(|| {
-        let (list, warnings) = crate::permissions::rules::Allowlist::parse(
-            command_tools,
-            crate::admin::home_dir().as_deref(),
-        );
-        for warning in warnings {
-            eprintln!("incode: {warning}");
-        }
-        tools.restrict_turn(list)
-    });
+    let _held_to = hold_to_command_tools(&tools, command_tools);
     let mut memory = crate::hooks::memory::MemoryHooks::new(
         crate::hooks::engine::Engine::locate(),
         workspace,
         &session_id,
     );
     let start = memory.start("startup");
-    let turn = memory.prompt(instruction);
-    // The hooks' context, then the engine's: one block for the turn.
-    let turn = {
-        let mut blocks: Vec<String> = hooked
-            .iter()
-            .map(|said| crate::hooks::prompt_context_block(said))
-            .collect();
-        blocks.extend(turn);
-        (!blocks.is_empty()).then(|| blocks.join("\n\n"))
-    };
+    let turn = turn_context(&hooked, memory.prompt(instruction));
     let spec_gate = crate::spec::for_this_run();
     if spec_gate == crate::spec::SpecGate::Off {
         // The text run's record of it, and stderr's under the JSON forms,
@@ -514,29 +484,7 @@ fn run_task_hooked(
         turn.as_deref(),
         spec_gate,
     );
-    // The output style (`crate::styles`), as a session has it. On stderr,
-    // which a JSON run keeps apart from its output.
-    let admin_style =
-        match crate::admin::AdminConfig::load(&crate::admin::AdminConfig::default_dir()) {
-            Ok(admin) => admin.output_style,
-            Err(e) => {
-                eprintln!("incode: {e}; no output style is read from it");
-                None
-            }
-        };
-    let style = crate::styles::for_session(workspace, admin_style.as_deref());
-    for line in style.notes.iter().chain(&style.warnings) {
-        eprintln!("incode: {line}");
-    }
-    // What rides the system context rather than the prompt: the project's
-    // own instruction files, the harness's standing instructions, the
-    // engine's session-start block, and the output style, last.
-    let system: Vec<String> = crate::instructions::project_block(workspace)
-        .into_iter()
-        .chain(crate::harness::instructions_block())
-        .chain(start)
-        .chain(style.block)
-        .collect();
+    let system = system_context(workspace, start);
     let task = Task {
         workspace,
         instruction,
@@ -564,6 +512,89 @@ fn run_task_hooked(
     ran
 }
 
+/// What an operator hook printed, on stderr (which a JSON run keeps apart
+/// from its output), named by the event it ran for.
+fn announce(event: &str, ran: &crate::hooks::HookRunResult) {
+    for said in ran.messages() {
+        eprintln!("incode: [{event} hook] {said}");
+    }
+}
+
+/// The operator's `user_prompt_submit` hooks see the instruction first, as in
+/// a session (`cli::plan_turn`): one that refuses it stops the run before the
+/// memory engine or an agent hears it (`Err`, the refusal to report). What
+/// they print rides the turn as context (`Ok`).
+fn prompt_hook_context(
+    hooks: &crate::hooks::HookRunner,
+    instruction: &str,
+    session_id: &str,
+    workspace: &Path,
+) -> Result<Vec<String>, String> {
+    let ran = hooks.user_prompt_submit(instruction, session_id, Some(workspace));
+    if ran.is_denied() {
+        return Err(format!(
+            "not run: the operator's user_prompt_submit hook refused it. {}",
+            ran.messages().join("\n")
+        ));
+    }
+    Ok(ran.messages().to_vec())
+}
+
+/// A custom command's `allowed-tools` hold the whole run — it is the
+/// command's one turn — on every candidate whose tools are incode's. `None`
+/// when the run is not a command's; the restriction lasts while it is held.
+fn hold_to_command_tools(
+    tools: &std::sync::Arc<crate::toolbox::SessionTools>,
+    command_tools: &[String],
+) -> Option<crate::toolbox::TurnRestriction> {
+    (!command_tools.is_empty()).then(|| {
+        let (list, warnings) = crate::permissions::rules::Allowlist::parse(
+            command_tools,
+            crate::admin::home_dir().as_deref(),
+        );
+        for warning in warnings {
+            eprintln!("incode: {warning}");
+        }
+        tools.restrict_turn(list)
+    })
+}
+
+/// The turn's context block: what the operator's prompt hooks printed, then
+/// the memory engine's block, joined; `None` when there is neither.
+fn turn_context(hooked: &[String], engine: Option<String>) -> Option<String> {
+    let mut blocks: Vec<String> = hooked
+        .iter()
+        .map(|said| crate::hooks::prompt_context_block(said))
+        .collect();
+    blocks.extend(engine);
+    (!blocks.is_empty()).then(|| blocks.join("\n\n"))
+}
+
+/// What rides the system context rather than the prompt: the project's own
+/// instruction files, the harness's standing instructions, the engine's
+/// session-start block, and the output style (`crate::styles`) last. The
+/// style's notes and warnings go to stderr, which a JSON run keeps apart.
+fn system_context(workspace: &Path, start: Option<String>) -> Vec<String> {
+    let admin_style =
+        match crate::admin::AdminConfig::load(&crate::admin::AdminConfig::default_dir()) {
+            Ok(admin) => admin.output_style,
+            Err(e) => {
+                eprintln!("incode: {e}; no output style is read from it");
+                None
+            }
+        };
+    let style = crate::styles::for_session(workspace, admin_style.as_deref());
+    for line in style.notes.iter().chain(&style.warnings) {
+        eprintln!("incode: {line}");
+    }
+    crate::instructions::project_block(workspace)
+        .into_iter()
+        .chain(crate::harness::instructions_block())
+        .chain(start)
+        .chain(style.block)
+        .collect()
+}
+
 /// Session tools for one run, with the installed external tools connecting
 /// in the background. A configured tool that is not installed is named on
 /// stderr, which a JSON run keeps apart from its output.
@@ -571,7 +602,7 @@ fn connect_ext_tools(workspace: &Path) -> std::sync::Arc<crate::toolbox::Session
     let tools = crate::toolbox::SessionTools::new(true);
     let data_dir = crate::admin::AdminConfig::default_dir();
     let configured = crate::admin::AdminConfig::load(&data_dir)
-        .map(|admin| admin.tools_in_effect())
+        .map(|admin| crate::ext_tools::in_effect(&admin))
         .unwrap_or_default();
     let (mut specs, mut said) = crate::ext_tools::session_servers(&configured, &data_dir);
     let (plugin_specs, plugin_said) = crate::plugins::session_servers(workspace);
@@ -611,398 +642,6 @@ fn parse_allowed_tools(raw: &str) -> Option<Vec<String>> {
         .map(str::to_string)
         .collect();
     (!names.is_empty()).then_some(names)
-}
-
-/// One instruction, as it is handed to each agent that might run it.
-struct Task<'a> {
-    workspace: &'a Path,
-    instruction: &'a str,
-    model: Option<&'a str>,
-    guards: &'a crate::guards::Guards,
-    sentinel: &'a crate::guards::Sentinel,
-    /// What the agent is sent.
-    prompt: &'a str,
-    /// What rides its system context.
-    system: &'a [String],
-    /// The run's session tools, with the external tools' servers.
-    tools: &'a std::sync::Arc<crate::toolbox::SessionTools>,
-    /// The custom command's `allowed-tools` the run is held to, if any.
-    command_tools: &'a [String],
-    /// `-p`, when given: applied to every candidate agent.
-    permission_mode: Option<crate::permissions::PermissionMode>,
-}
-
-/// The instruction, through each usable agent in turn until one runs it.
-/// One candidate's backend, whose edit session ends when the attempt does.
-struct EndsEdits(Box<dyn AgentBackend>);
-
-impl std::ops::Deref for EndsEdits {
-    type Target = Box<dyn AgentBackend>;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl std::ops::DerefMut for EndsEdits {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-impl Drop for EndsEdits {
-    fn drop(&mut self) {
-        self.0.end_code_edits();
-    }
-}
-
-fn drive(
-    task: &Task<'_>,
-    memory: &mut crate::hooks::memory::MemoryHooks,
-    report: &mut Report,
-) -> Result<String, String> {
-    let Task {
-        workspace,
-        instruction,
-        model,
-        guards,
-        sentinel,
-        prompt,
-        system,
-        tools,
-        command_tools,
-        permission_mode,
-    } = *task;
-    // WHICH ROUTE, and the CLI requirement belongs INSIDE the choice.
-    //
-    // An API endpoint needs no installed agent, so asking for a drivable one
-    // first would refuse a perfectly good API setup on a machine with nothing
-    // installed. The CLI stays the default: an operator who has configured no
-    // endpoint sees exactly what they saw before.
-    //
-    // Both routes enforce the same guards, by different means. The CLI is told
-    // them and refuses the write itself; the toolbox behind the API route
-    // checks them before acting, because on that route these functions ARE the
-    // write and there is no other layer.
-    enum Candidate {
-        Api(crate::agent::api::Settings),
-        Cli(crate::agent::registry::DetectedAgent),
-    }
-
-    // One catalogue for both routes: the chosen agent first, then every usable
-    // local agent, then a usable API. Setting the API variables no longer
-    // replaces the installed agents — it adds one more place to send the work.
-    let chain =
-        crate::agent::catalogue::Catalogue::gather(&crate::admin::AdminConfig::load_default())
-            .usable_chain(crate::agent::registry::preferred_agent().as_deref())?;
-    let candidates: Vec<Candidate> = chain
-        .into_iter()
-        .map(
-            |agent| match crate::agent::models::settings_for(&agent.id) {
-                Some(settings) => Candidate::Api(settings),
-                None => Candidate::Cli(agent),
-            },
-        )
-        .collect();
-
-    let total_candidates = candidates.len();
-    let mut failures = Vec::new();
-
-    for (idx, candidate) in candidates.into_iter().enumerate() {
-        let agent_id = match &candidate {
-            Candidate::Api(settings) => settings.route.clone(),
-            Candidate::Cli(agent) => agent.id.clone(),
-        };
-        let (backend, route): (Box<dyn AgentBackend>, String) = match candidate {
-            Candidate::Api(settings) => {
-                let named = format!("{} over its API", settings.route);
-                (
-                    Box::new(
-                        crate::agent::api::ApiBackend::new(
-                            settings,
-                            workspace,
-                            &system.join("\n\n"),
-                            true,
-                        )
-                        // Nobody is at an unattended run: a call the engine
-                        // wants confirmed is the owner's app's to answer, or
-                        // refused.
-                        .with_engine(crate::hooks::engine::Engine::locate())
-                        .with_code_edits(crate::toolbox::CodeEdits::locate())
-                        .with_operator_hooks(crate::hooks::HookRunner::from_settings())
-                        .with_sandbox(
-                            crate::admin::AdminConfig::load_default().sandbox_policy(
-                                permission_mode
-                                    .unwrap_or(crate::permissions::PermissionMode::WorkspaceWrite),
-                            ),
-                        )
-                        .with_tool_allowlist(allowed_tools()),
-                    ),
-                    named,
-                )
-            }
-            Candidate::Cli(agent) => {
-                let named = agent.display_name.clone();
-                (
-                    crate::cli::run_backend(workspace, &agent.id, &agent.command, guards, system),
-                    named,
-                )
-            }
-        };
-        // However this candidate's attempt ends — an answer, a failure, the
-        // next candidate — the engine's edit check hears that its conversation
-        // is over: what it claimed, read and announced is let go.
-        let mut backend = EndsEdits(backend);
-        // Its calls are filed under this run's session, as its stop is.
-        backend.set_memory_session(memory.session());
-        // The run's one set of session tools, holding the external tools'
-        // servers, is every candidate's.
-        backend.share_session_tools(std::sync::Arc::clone(tools));
-        // `-p`: what the agent may do, decided by the agent's own mode on a
-        // CLI route and by the toolbox on the API route.
-        if let Some(mode) = permission_mode {
-            backend.set_permission_mode(mode.agent_mode());
-        }
-        if !command_tools.is_empty() && !backend.runs_tools_here() {
-            outln!(
-                "  · {}",
-                crate::custom_commands::not_enforced_by(&route, command_tools)
-            );
-        }
-
-        if let Some(m) = model {
-            backend.choose_model(m);
-        } else {
-            let admin = crate::admin::AdminConfig::load_default();
-            let (roles, tiers) = admin.effective_routing();
-            let plan_models = roles.get("plan").cloned().unwrap_or_default();
-            let (expanded, _) = crate::roles::expand_tiers(&plan_models, &tiers);
-            if !expanded.is_empty() {
-                backend.set_models(&expanded);
-            }
-            if backend.model().is_none() {
-                let own = backend.ladder_for("implement");
-                if !own.is_empty() {
-                    backend.set_models(&own);
-                }
-            }
-        }
-
-        outln!("Driving {route} in {}", workspace.display());
-        report.init(workspace, &agent_id, backend.model());
-        crate::trace!(
-            "agent",
-            "turn start: route={route} prompt={} chars, guards={} protected",
-            prompt.len(),
-            guards.effective().len()
-        );
-
-        let mut said = Vec::new();
-        // Which call each result belongs to; a result carries only an id.
-        let mut tool_calls: std::collections::HashMap<String, (String, Option<String>)> =
-            std::collections::HashMap::new();
-
-        // What the model said, rebuilt for the memory engine's transcript.
-        let mut heard = crate::hooks::memory::Said::default();
-        let turn_res = backend.run_turn(prompt, &mut |event: &AgentEvent| {
-            heard.hear(event);
-            report.event(event);
-            show(event, &mut said, &mut tool_calls);
-        });
-
-        let outcome = match turn_res {
-            Ok(out) => out,
-            Err(e) => {
-                let msg = format!("the agent could not run: {e}");
-                failures.push(format!("{route}: {e}"));
-                if idx + 1 < total_candidates {
-                    outln!("  · {route} failed ({e}); falling back to next agent...");
-                    crate::trace!(
-                        "agent",
-                        "{route} failed: {e}; falling back to next candidate"
-                    );
-                    continue;
-                }
-                return Err(if failures.len() == 1 {
-                    msg
-                } else {
-                    format!("all candidate agents failed:\n{}", failures.join("\n"))
-                });
-            }
-        };
-
-        report.outcome(&outcome);
-        crate::trace!(
-            "agent",
-            "turn end: stop={} error={} said={} chars served_by={:?} session={}",
-            outcome.stop_reason,
-            outcome.is_error,
-            said.iter().map(String::len).sum::<usize>(),
-            outcome.served_by,
-            outcome.session_id
-        );
-        if !outcome.session_id.is_empty() {
-            let root = crate::admin::AdminConfig::default_dir();
-            let mut record = crate::session::Record::new(&outcome.session_id, workspace, &route);
-            record.name_from(instruction);
-            for (child, title) in backend.children() {
-                record.spawned(&child, &title);
-            }
-            crate::session::save(&root, &record);
-        }
-
-        if outcome.is_error {
-            let failure_msg = outcome.failure();
-            failures.push(format!("{route}: {failure_msg}"));
-            if idx + 1 < total_candidates {
-                outln!(
-                    "  · {route} reported an error ({failure_msg}); falling back to next agent..."
-                );
-                crate::trace!(
-                    "agent",
-                    "{route} error: {failure_msg}; falling back to next candidate"
-                );
-                continue;
-            }
-            return Err(if failures.len() == 1 {
-                failure_msg
-            } else {
-                format!("all candidate agents failed:\n{}", failures.join("\n"))
-            });
-        }
-
-        // The turn is ending: the memory engine records it, and may say to
-        // carry on — sent to the same agent as its next prompt, bounded as in
-        // a session. Before the sentinel, so what a continuation writes is
-        // checked too.
-        // What its tools did, then what it said — the tool calls are what the
-        // engine's recorder learns from (`MemoryHooks::tools_ran`).
-        memory.tools_ran(&heard);
-        memory.said(crate::hooks::memory::Speaker::Agent, &heard.whole());
-        let mut last = heard.last().to_string();
-        while let Some(reason) = memory.stop(&last, None) {
-            outln!("  · memory engine: carry on — {reason}");
-            let mut more = Vec::new();
-            let mut heard = crate::hooks::memory::Said::default();
-            let ran = backend.run_turn(&reason, &mut |event: &AgentEvent| {
-                heard.hear(event);
-                report.event(event);
-                show(event, &mut more, &mut tool_calls);
-            });
-            memory.tools_ran(&heard);
-            match ran {
-                Ok(next) if !next.is_error => {
-                    report.outcome(&next);
-                    memory.said(crate::hooks::memory::Speaker::Agent, &heard.whole());
-                    last = heard.last().to_string();
-                    said.extend(more);
-                }
-                Ok(next) => {
-                    outln!("  · the continuation failed: {}", next.failure());
-                    break;
-                }
-                Err(e) => {
-                    outln!("  · the continuation could not run: {e}");
-                    break;
-                }
-            }
-        }
-
-        // Checked before the run is reported as successful. There is no ledger on
-        // this path, so the breach IS the outcome: a non-zero exit and the files
-        // named, left exactly as the agent left them for a person to look at.
-        let breaches = sentinel.breaches(workspace, guards);
-        if let Some(refusal) = crate::guards::Sentinel::refusal(&breaches) {
-            return Err(refusal);
-        }
-
-        let answer = said.join("\n");
-
-        // A DECISION NOBODY MADE MUST NOT VANISH INTO THE OUTPUT.
-        //
-        // This path is unattended by definition — one instruction, nobody at
-        // the prompt — and it never looked at what the agent said for an
-        // `<ask>` block. So an agent that reached a fork, asked, and carried
-        // on with a guess produced a run that reported plain success, with
-        // the question sitting in the middle of the prose as though it were
-        // commentary. `ask::unattended_note` was written for exactly this and
-        // had no caller.
-        //
-        // Reported, NOT failed. The agent did the work; what it could not do
-        // is get an answer. Failing here would throw away a result that is
-        // often fine, and blocking would hang a run nobody is watching —
-        // which is the thing this path exists to avoid.
-        if let Some(note) = crate::ask::unattended_note(&crate::ask::parse(&answer)) {
-            outln!("\n{note}");
-            // Returned as well as printed: the caller records this string,
-            // and a warning that exists only on a terminal nobody was
-            // watching is the same as no warning.
-            return Ok(format!("{answer}\n\n{note}"));
-        }
-
-        return Ok(answer);
-    }
-
-    Err(if failures.is_empty() {
-        "no candidate agents available to run".to_string()
-    } else {
-        format!("all candidate agents failed:\n{}", failures.join("\n"))
-    })
-}
-
-/// One agent event, printed as it happens; the model's words are kept in
-/// `said`, and each call's name in `tool_calls` for the result that follows.
-fn show(
-    event: &AgentEvent,
-    said: &mut Vec<String>,
-    tool_calls: &mut std::collections::HashMap<String, (String, Option<String>)>,
-) {
-    match event {
-        AgentEvent::Text(text) => {
-            outln!("{text}");
-            said.push(text.clone());
-        }
-        // Printed as it happens rather than summarised at the end: a long
-        // task with no output is indistinguishable from a hung one.
-        AgentEvent::ToolUse { id, name, input } => {
-            tool_calls.insert(id.clone(), (name.clone(), crate::cli::panel::target(input)));
-            outln!("  · {name}");
-        }
-        AgentEvent::SessionStarted { model, .. } => outln!("  · session on {model}"),
-        AgentEvent::Usage {
-            input_tokens,
-            output_tokens,
-            cache_creation_tokens,
-            cache_read_tokens,
-        } => {
-            outln!(
-                "  · {}",
-                usage_line(
-                    *input_tokens,
-                    *output_tokens,
-                    *cache_creation_tokens,
-                    *cache_read_tokens
-                )
-            );
-        }
-        AgentEvent::Quota { status, .. } => outln!("  · quota: {status}"),
-        AgentEvent::Notice(note) => outln!("  · {note}"),
-        AgentEvent::ToolResult {
-            id,
-            output,
-            is_error,
-        } => {
-            let (tool, on) = tool_calls
-                .get(id.as_str())
-                .cloned()
-                .unwrap_or_else(|| ("tool".to_string(), None));
-            for line in
-                crate::cli::panel::result(&tool, on.as_deref(), output, *is_error, TASK_PANEL_WIDTH)
-            {
-                outln!("{line}");
-            }
-        }
-        AgentEvent::TextDelta(_) | AgentEvent::Thinking(_) | AgentEvent::Context { .. } => {}
-    }
 }
 
 /// What a turn's tokens came to, as `158.1k in (140.2k cached) / 2.2k out`.
@@ -1123,438 +762,4 @@ pub fn build_prompt(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// **A REFUSED LINE STILL ENDS THE SESSION IT STARTED.** The operator's
-    /// `user_prompt_submit` hook refuses the instruction: the run stops with
-    /// the reason, and `session_end` runs after `session_start`, in the
-    /// workspace, so no start is left without its end.
-    #[test]
-    fn a_refused_instruction_still_runs_the_session_end_hook() {
-        let ws = tempfile::tempdir().expect("ws");
-        let (refuse, mark) = if cfg!(windows) {
-            (
-                "echo no secrets 1>&2& exit /b 2",
-                ["echo started> started.txt", "echo ended> ended.txt"],
-            )
-        } else {
-            (
-                "echo 'no secrets' >&2; exit 2",
-                ["echo started > started.txt", "echo ended > ended.txt"],
-            )
-        };
-        let hooks = crate::hooks::HookRunner::new(crate::hooks::HookConfig {
-            session_start: vec![mark[0].to_string()],
-            user_prompt_submit: vec![refuse.to_string()],
-            session_end: vec![mark[1].to_string()],
-            ..crate::hooks::HookConfig::default()
-        });
-        let ran = run_task_hooked(
-            ws.path(),
-            "fix it",
-            None,
-            &[],
-            None,
-            &mut Report::text(),
-            Some(hooks),
-        );
-        let why = ran.expect_err("exit 2 did not refuse the instruction");
-        assert!(why.contains("no secrets"), "{why}");
-        assert!(
-            ws.path().join("started.txt").exists(),
-            "session_start did not run"
-        );
-        assert!(
-            ws.path().join("ended.txt").exists(),
-            "a refused run left its session_start without a session_end"
-        );
-    }
-
-    #[test]
-    fn the_allowed_tools_are_a_comma_separated_list_or_all() {
-        assert_eq!(parse_allowed_tools(""), None);
-        assert_eq!(parse_allowed_tools(" , "), None);
-        assert_eq!(
-            parse_allowed_tools("Read, Grep,,Glob "),
-            Some(vec!["Read".into(), "Grep".into(), "Glob".into()])
-        );
-    }
-
-    /// **AN UNANSWERED DECISION MUST NOT READ AS PROSE.**
-    ///
-    /// `--task` is unattended by definition: one instruction, nobody at the
-    /// prompt. It never looked at what the agent said for an `<ask>` block,
-    /// so an agent that reached a fork, asked, and carried on with a guess
-    /// produced a run reporting plain success — with the question sitting in
-    /// the middle of the output as though it were commentary.
-    ///
-    /// `ask::unattended_note` was written for this and had no caller. This
-    /// asserts the pieces the wiring depends on: that the block is recognised
-    /// in ordinary agent text, and that the note names the question rather
-    /// than merely saying one was asked.
-    #[test]
-    fn a_question_asked_with_nobody_to_answer_it_is_named() {
-        let said = "I started on the endpoint.\n\
-                    <ask>\n\
-                    Which store should this use?\n\
-                    1. Postgres — the document implies joins\n\
-                    2. SQLite — one file, nothing to operate\n\
-                    </ask>\n\
-                    I went with Postgres for now.";
-
-        let questions = crate::ask::parse(said);
-        assert_eq!(questions.len(), 1, "the block was not recognised: {said}");
-
-        let note = crate::ask::unattended_note(&questions).expect("a question was asked");
-        assert!(
-            note.contains("Which store should this use?"),
-            "the note must carry the question, not just its existence: {note}"
-        );
-        assert!(
-            note.contains("Postgres") && note.contains("SQLite"),
-            "and the options, or the operator cannot answer it: {note}"
-        );
-    }
-
-    /// And ordinary output stays ordinary. A note on every run would train an
-    /// operator to ignore the one that matters.
-    #[test]
-    fn a_task_that_asked_nothing_gets_no_note() {
-        let plain = "I added the endpoint and its test. Both pass.";
-        assert!(crate::ask::parse(plain).is_empty());
-        assert_eq!(crate::ask::unattended_note(&crate::ask::parse(plain)), None);
-    }
-
-    /// **The instruction goes last.** Context after an instruction reads as an
-    /// afterthought, and the agent acts on what it read most recently.
-    #[test]
-    fn the_instruction_is_the_last_thing_the_agent_reads() {
-        let _guard = crate::brief::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        // Pointed at nothing, so the context blocks are all absent and the test
-        // is about ORDER rather than about what any one service returned.
-        std::env::set_var(crate::brief::MEMORY_URL_ENV, "http://127.0.0.1:1");
-        let dir = tempfile::tempdir().expect("temp dir");
-        let prompt = build_prompt(
-            dir.path(),
-            "write the PRD",
-            false,
-            None,
-            crate::spec::SpecGate::On,
-        );
-        std::env::remove_var(crate::brief::MEMORY_URL_ENV);
-
-        assert!(prompt.ends_with("write the PRD"), "got: {prompt}");
-        assert!(prompt.contains("Now do this:"), "got: {prompt}");
-    }
-
-    /// An unreachable body costs the context blocks, never the run — this door
-    /// has to work on a machine where the service is not running at all.
-    #[test]
-    fn the_task_still_runs_when_the_body_is_unreachable() {
-        let _guard = crate::brief::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        std::env::set_var(crate::brief::MEMORY_URL_ENV, "http://127.0.0.1:1");
-        let dir = tempfile::tempdir().expect("temp dir");
-        let prompt = build_prompt(
-            dir.path(),
-            "do the thing",
-            false,
-            None,
-            crate::spec::SpecGate::On,
-        );
-        std::env::remove_var(crate::brief::MEMORY_URL_ENV);
-
-        assert!(prompt.contains("do the thing"));
-    }
-
-    /// **WITH THE SPEC GATE OFF, THE PROMPT DOES NOT ASK FOR THE SPEC SET.**
-    /// The prompt is what made a one-line fix write five documents first;
-    /// relaxing only the refusal at the write would have changed nothing.
-    /// The same workspace, gated, is still told to write them.
-    #[test]
-    fn with_the_spec_gate_off_the_prompt_does_not_ask_for_the_spec_set() {
-        let _guard = crate::brief::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        std::env::set_var(crate::brief::MEMORY_URL_ENV, "http://127.0.0.1:1");
-        let dir = tempfile::tempdir().expect("temp dir");
-        let on = build_prompt(dir.path(), "fix it", false, None, crate::spec::SpecGate::On);
-        let off = build_prompt(
-            dir.path(),
-            "fix it",
-            false,
-            None,
-            crate::spec::SpecGate::Off,
-        );
-        std::env::remove_var(crate::brief::MEMORY_URL_ENV);
-
-        assert!(on.contains("spec document(s) are missing"), "{on}");
-        assert!(on.contains("WRITING SOURCE CODE IS REFUSED"), "{on}");
-        assert!(on.contains("<intake>"), "{on}");
-
-        for asked in [
-            "spec document(s) are missing",
-            "WRITING SOURCE CODE IS REFUSED",
-            "<intake>",
-        ] {
-            assert!(!off.contains(asked), "`{asked}` is still asked for: {off}");
-        }
-        assert!(off.contains(crate::spec::GATE_OFF_NOTE), "{off}");
-        assert!(off.ends_with("fix it"), "the instruction stays last: {off}");
-    }
-
-    /// **THE TOKEN LINE COUNTS WHAT THE BUDGET COUNTS.** The numbers from the
-    /// report: the line read `20 in / 2247 out` for a turn whose request
-    /// carried 157,878 input tokens, 140,221 of them served from the cache.
-    #[test]
-    fn the_token_line_counts_cached_input_as_input() {
-        let line = usage_line(20, 2_247, 17_637, 140_221);
-        assert_eq!(
-            line, "157.9k in (140.2k cached) / 2.2k out",
-            "cache writes and reads are input the turn carried"
-        );
-    }
-
-    /// A turn with nothing from the cache says nothing about it.
-    #[test]
-    fn a_turn_with_no_cache_hits_does_not_mention_the_cache() {
-        assert_eq!(usage_line(12, 3, 0, 0), "12 in / 3 out");
-        assert_eq!(usage_line(12, 3, 900, 0), "912 in / 3 out");
-    }
-
-    /// An empty instruction is refused before an agent is spawned for nothing.
-    #[test]
-    fn an_empty_instruction_is_refused_without_starting_anything() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let refused = run_task(dir.path(), "   ").expect_err("refused");
-        assert!(refused.contains("nothing to do"), "got: {refused}");
-    }
-
-    /// A turn, as the stream sees it.
-    fn a_turn(report: &mut Report) {
-        report.session = "sess-json".to_string();
-        report.init(Path::new("/ws"), "claude-code", Some("sonnet"));
-        for event in [
-            AgentEvent::SessionStarted {
-                session_id: "agent-conv".to_string(),
-                model: "sonnet".to_string(),
-            },
-            AgentEvent::Thinking("look first".to_string()),
-            AgentEvent::TextDelta("Rea".to_string()),
-            AgentEvent::ToolUse {
-                id: "incode-1".to_string(),
-                name: "Read".to_string(),
-                input: r#"{"path":"a.txt"}"#.to_string(),
-            },
-            AgentEvent::ToolResult {
-                id: "incode-1".to_string(),
-                output: "hello".to_string(),
-                is_error: false,
-            },
-            AgentEvent::Text("It says hello.".to_string()),
-            AgentEvent::Usage {
-                input_tokens: 10,
-                output_tokens: 3,
-                cache_creation_tokens: 0,
-                cache_read_tokens: 7,
-            },
-        ] {
-            report.event(&event);
-        }
-        report.outcome(&crate::agent::TurnOutcome {
-            session_id: "agent-conv".to_string(),
-            stop_reason: "end_turn".to_string(),
-            is_error: false,
-            detail: None,
-            served_by: vec!["claude-sonnet".to_string()],
-        });
-        report.finish(
-            &Ok("It says hello.".to_string()),
-            std::time::Duration::from_millis(5),
-        );
-    }
-
-    fn lines_of(path: &Path) -> Vec<Value> {
-        std::fs::read_to_string(path)
-            .expect("written")
-            .lines()
-            .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("not JSON ({e}): {l}")))
-            .collect()
-    }
-
-    /// **`stream-json` IS ONE OBJECT PER EVENT, IN ORDER, ENDING WITH THE
-    /// RESULT** — the whole blocks, never the deltas beside them.
-    #[test]
-    fn stream_json_writes_each_event_as_one_json_line() {
-        let dir = tempfile::tempdir().expect("dir");
-        let path = dir.path().join("out.jsonl");
-        let mut report = Report::text();
-        report.out = Some((std::fs::File::create(&path).expect("file"), true));
-        a_turn(&mut report);
-        let lines = lines_of(&path);
-        let kinds: Vec<&str> = lines.iter().filter_map(|l| l["type"].as_str()).collect();
-        assert_eq!(
-            kinds,
-            [
-                "init",
-                "thinking",
-                "tool_use",
-                "tool_result",
-                "text",
-                "usage",
-                "result"
-            ]
-        );
-        assert_eq!(lines[0]["agent"], "claude-code");
-        assert_eq!(lines[0]["session_id"], "sess-json");
-        assert_eq!(
-            lines[2]["input"]["path"], "a.txt",
-            "the input is JSON, not a string"
-        );
-        let result = &lines[6];
-        assert_eq!(result["is_error"], false);
-        assert_eq!(result["result"], "It says hello.");
-        assert_eq!(result["agent_session_id"], "agent-conv");
-        assert_eq!(result["stop_reason"], "end_turn");
-        assert_eq!(result["usage"]["cache_read_tokens"], 7);
-        // sonnet: 10 in at $3, 3 out at $15, 7 cache reads at $0.30, per million.
-        let cost = result["cost_usd"]
-            .as_f64()
-            .expect("a priced model has a cost");
-        assert!((cost - 77.1e-6).abs() < 1e-12, "{cost}");
-        assert_eq!(result["spec_gate"], "on", "the default, said: {result}");
-    }
-
-    /// **THE RESULT SAYS WHEN THE SPEC GATE WAS OFF**, so a caller that
-    /// relaxed it — Insi, a script — can report that it did.
-    #[test]
-    fn the_result_line_carries_the_spec_gate() {
-        let dir = tempfile::tempdir().expect("dir");
-        let path = dir.path().join("out.json");
-        let mut report = Report::text();
-        report.spec_gate = crate::spec::SpecGate::Off;
-        report.out = Some((std::fs::File::create(&path).expect("file"), false));
-        a_turn(&mut report);
-        let lines = lines_of(&path);
-        assert_eq!(lines[0]["type"], "result");
-        assert_eq!(lines[0]["spec_gate"], "off", "{:?}", lines[0]);
-    }
-
-    /// **WHAT A RUN WROTE OUTSIDE THE WORKSPACE IS IN ITS FIRST `init`.**
-    /// A first `-t` run adds definitions to the operator's home and said so on
-    /// stderr only, which a JSON consumer never reads. Present and empty when
-    /// nothing was written; absent from a fallback's `init`, which would
-    /// otherwise report the same files twice.
-    #[test]
-    fn the_first_init_names_the_files_written_outside_the_workspace() {
-        let dir = tempfile::tempdir().expect("dir");
-        let path = dir.path().join("out.jsonl");
-        let mut report = Report::text();
-        report.out = Some((std::fs::File::create(&path).expect("file"), true));
-        report.created = vec!["/home/op/.incode/agents/researcher.md".to_string()];
-        report.init(Path::new("/ws"), "claude-code", None);
-        report.init(Path::new("/ws"), "other-agent", None);
-        let lines = lines_of(&path);
-        assert_eq!(
-            lines[0]["created"],
-            json!(["/home/op/.incode/agents/researcher.md"]),
-            "the file written outside the workspace was not named"
-        );
-        assert_eq!(lines[1]["fallback_from"], "claude-code");
-        assert!(lines[1].get("created").is_none(), "{}", lines[1]);
-
-        let quiet = dir.path().join("quiet.jsonl");
-        let mut report = Report::text();
-        report.out = Some((std::fs::File::create(&quiet).expect("file"), true));
-        report.init(Path::new("/ws"), "claude-code", None);
-        assert_eq!(lines_of(&quiet)[0]["created"], json!([]));
-    }
-
-    /// `json` is the result alone, once; a failed run's says why.
-    #[test]
-    fn json_writes_only_the_result() {
-        let dir = tempfile::tempdir().expect("dir");
-        let path = dir.path().join("out.json");
-        let mut report = Report::text();
-        report.out = Some((std::fs::File::create(&path).expect("file"), false));
-        a_turn(&mut report);
-        let lines = lines_of(&path);
-        assert_eq!(lines.len(), 1, "{lines:?}");
-        assert_eq!(lines[0]["type"], "result");
-
-        let failed = dir.path().join("failed.json");
-        let mut report = Report::text();
-        report.out = Some((std::fs::File::create(&failed).expect("file"), false));
-        report.finish(&Err("no agent".to_string()), std::time::Duration::ZERO);
-        let lines = lines_of(&failed);
-        assert_eq!(lines[0]["is_error"], true);
-        assert_eq!(lines[0]["error"], "no agent");
-    }
-
-    /// Set only in the child process the purity test starts.
-    const JSON_CHILD: &str = "INCODE_TASK_JSON_CHILD";
-
-    /// The child half: stdout claimed as `run_task_as` claims it, then every
-    /// kind of stray print, then a turn reported as `stream-json`.
-    #[test]
-    fn json_output_child() {
-        if std::env::var_os(JSON_CHILD).is_none() {
-            return;
-        }
-        let claimed = crate::acp_agent::stdio::claim().expect("claim stdout");
-        println!("stray println");
-        crate::outln!("stray outln");
-        let _ = std::process::Command::new(if cfg!(windows) { "cmd" } else { "sh" })
-            .args(if cfg!(windows) {
-                ["/C", "echo stray child"]
-            } else {
-                ["-c", "echo stray child"]
-            })
-            .status();
-        let mut report = Report::text();
-        report.out = Some((claimed.output, true));
-        a_turn(&mut report);
-        std::process::exit(0);
-    }
-
-    /// **STDOUT CARRIES THE JSON AND NOTHING ELSE.** Every stray print — a
-    /// `println!`, the console, a child that inherits stdout — lands on
-    /// stderr; stdout is JSON lines only, apart from the test harness's own
-    /// banner, printed before the child's code runs.
-    #[test]
-    fn the_json_output_carries_nothing_else() {
-        let out = std::process::Command::new(std::env::current_exe().expect("test binary"))
-            .args([
-                "--exact",
-                "task_run::tests::json_output_child",
-                "--nocapture",
-                "--test-threads=1",
-                "-q",
-            ])
-            .env(JSON_CHILD, "1")
-            .stdin(std::process::Stdio::null())
-            .output()
-            .expect("run the child");
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        let mut json_lines = 0;
-        for line in stdout.lines().map(str::trim).filter(|l| !l.is_empty()) {
-            if line == "running 1 test" {
-                continue;
-            }
-            assert!(
-                serde_json::from_str::<Value>(line).is_ok(),
-                "a stray line reached stdout: {line:?}\nstdout:\n{stdout}"
-            );
-            json_lines += 1;
-        }
-        assert_eq!(json_lines, 7, "stdout:\n{stdout}\nstderr:\n{stderr}");
-        for stray in ["stray println", "stray outln", "stray child"] {
-            assert!(stderr.contains(stray), "{stray} went nowhere: {stderr}");
-        }
-    }
-}
+mod tests;
