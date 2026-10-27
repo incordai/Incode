@@ -25,8 +25,10 @@
 //!
 //! # Bridged: incode's tools instead of codex's ([`CodexTools::Incode`])
 //!
-//! Opt-in (`codex_tools: "incode"` in admin.json, or `INCODE_CODEX_TOOLS=incode`),
-//! because no turn with a REAL model has been run this way yet. When on, codex is
+//! The default since 2026-10-26, on the owner's word (`codex_tools: "own"` in
+//! admin.json, or `INCODE_CODEX_TOOLS=own`, goes back). Everything below was
+//! measured against a stand-in model; a turn with a REAL model is still owed —
+//! the account's quota ran out before one could be run. On this route codex is
 //! driven the way the Claude route is ([`crate::tool_bridge`]): its own tools are
 //! switched off by config, it is handed ONE MCP server — `incode --tool-server` —
 //! and every call the model makes comes back to this process and runs through the
@@ -84,10 +86,12 @@ use wire::Reading;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CodexTools {
     /// Codex's own (`exec_command`, `apply_patch`, …), watched afterwards by
-    /// the Sentinel. The default until a live turn has proved the other.
-    #[default]
+    /// the Sentinel: outside incode's guard, memory hooks and sandbox.
     Own,
     /// incode's, through the tool bridge: codex is a model and nothing else.
+    /// The default, as on the Claude route — the operator's built-in layer
+    /// ([`crate::admin::AdminConfig::resolve_codex_tools`]) reads it from here.
+    #[default]
     Incode,
 }
 

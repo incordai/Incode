@@ -498,13 +498,14 @@ it sets; any other `id` adds an agent.
 
 ### The codex route: whose tools
 
-By default `codex` runs its own tools (`exec_command`, `apply_patch`, …) and
-incode watches the result afterwards. With `"codex_tools": "incode"` in
-`admin.json` (or `INCODE_CODEX_TOOLS=incode`, which wins) it is driven like
-`claude`: a model only, with every tool call run by incode. `incode --admin`
-shows which is in force and where it was decided. It is opt-in until a turn with
-a real model has been run this way; everything below was measured on codex 0.163.0
-against a stand-in model endpoint, end to end through `incode -t`.
+By default `codex` is driven like `claude`: a model only, with every tool call
+run by incode, so its calls get incode's guard, memory hooks and sandbox. With
+`"codex_tools": "own"` in `admin.json` (or `INCODE_CODEX_TOOLS=own`, which wins)
+it runs its own tools (`exec_command`, `apply_patch`, …) and incode watches the
+result afterwards. `incode --admin` shows which is in force and where it was
+decided. Everything below was measured on codex 0.163.0 against a stand-in model
+endpoint, end to end through `incode -t`; a turn with a real model has not yet
+been run this way.
 
 Each turn incode opens its tool bridge and starts `codex exec --json` with:
 
@@ -1402,7 +1403,7 @@ and `--admin` prints which layer decided each value.
 | `sandbox` | `off` · `workspace-write` · `read-only`; unset follows the permission mode |
 | `sandbox_network` | `allow` (default) · `deny` — see [the OS sandbox](#the-os-sandbox) |
 | `sandbox_engine` · `sandbox_allow_hosts` · `sandbox_loopback_ports` · `sandbox_backend` | `builtin` (default) · `sbx`; under sbx, the hosts a command may reach, this machine's own ports it may reach, and, on Windows, `native` · `wsl` · `auto` — see [the OS sandbox](#the-os-sandbox) |
-| `codex_tools` | `own` (default) · `incode` — whose tools a `codex` model runs; see [the codex route](#the-codex-route-whose-tools) |
+| `codex_tools` | `incode` (default) · `own` — whose tools a `codex` model runs; see [the codex route](#the-codex-route-whose-tools) |
 | `hooks` (also `desktop_hooks`) | Your `pre_tool_use` / `post_tool_use` commands, run for every tool, and `user_prompt_submit`, run for each line you send. The event is JSON on stdin (`hook_event_name`, `session_id`, `cwd`, and `tool_name`/`tool_input` or `prompt`); exit 2 on a pre-tool command denies the call, on a prompt command refuses the line (the reason is shown and nothing is sent — not to the agent, not to the memory engine); a prompt command's stdout is added to that turn's context, and your line is never changed; bounded at 10 s. The prompt hook runs for lines typed in the REPL or sent over `--acp`, and for `-t`; for `/review` it sees the review prompt (the change included), and for `/run` each task's instruction before a worker or lane gets it — a refused task fails that attempt, and the hook's output rides that task's turn. It is taken from here and from your own plugins (`~/.incode/plugins/`), never from a project's `.incode/plugins/`, which arrives with whatever was cloned. `pre_compact` runs before `/compact` (event field `trigger`: `manual`, plus `custom_instructions`; when the agent compacts its own conversation, as a CLI agent does, it still runs and nothing is compacted by incode) and before the API route compacts on its own near the context window (`trigger`: `auto`, its output shown as incode's note during the turn); a CLI agent's own automatic compaction happens inside that agent and fires nothing, and `stop` when one of your turns has ended (`last_assistant_message`); neither can refuse anything, and their stdout is shown — with the compaction result, and with the turn's notices. `session_start` runs when a session opens (`source`: `startup`) and `session_end` when it closes (`reason`, e.g. `prompt_input_exit`, `other`), in the REPL, `--acp` and `-t`; neither can stop or keep anything, and their stdout is shown (on stderr for `-t`; a `--acp` session's end output goes to the trace, as the client has gone). They supersede a project's `.incode/lifecycle.json` (or the `lifecycle` section of `.incode.json`), whose `on_session_start`/`on_session_end` still run in the REPL — but only once you approve them as they are, since they arrive with whatever was cloned: `incode lifecycle show` lists them, `incode lifecycle approve` approves them, and any change needs approving again. `subagent_stop` runs when a sub-agent (the `Agent` tool) has finished, told `agent_type` (its definition, role, or `sub-agent`), `task`, `last_assistant_message` and `outcome` (`completed`, `failed` or `cancelled`); it cannot keep it working, and its output is traced, not shown. `notification` runs whenever incode would notify you (`notification_type`: `turn_done` or `input_needed`, plus `message`), in the background beside `notify_command`, in the REPL; its output is not shown |
 | `desktop_limits` | The desktop's limits, each optional: `max_actions_per_minute` (120), `heartbeat_deadline_secs` (30), `tree_depth` (12), `tree_max_elements` (400), `journal_max_bytes` (262144), `xvfb_start_timeout_secs` (10), `clipboard_timeout_secs` (5), `accessibility_call_timeout_ms` (1000), `paste_restore_delay_ms` (500, how long the pasted text stays on the clipboard before the old one is put back), `settle_ms` (300, the pause before a `screenshot_after`), `max_scroll_steps` (50, wheel steps in one `scroll`), `tree_max_visited` (4000, elements one tree walk may visit), and `blocked_apps` (application names, matched case-insensitively as a part of the name, added to the built-in password managers: 1Password, Bitwarden, LastPass, Dashlane, KeePass, NordPass, Proton Pass, Enpass, RoboForm, Keeper). The first two are safety limits and may only be lowered; zero and unknown keys are refused, and the desktop does not start on a malformed admin.json |
 | `desktop_display` | Linux computer use: `":N"` drives a running X display; `"xvfb"` or `"xvfb:1280x800"` starts a private Xvfb for the desktop server's lifetime (default 1920x1080). Unset refuses rather than using `$DISPLAY`. `paste_text` needs `xclip` or `xsel`; `ui_tree` needs a D-Bus session with at-spi2-core |
@@ -1552,10 +1553,10 @@ certificate error rather than going elsewhere. A coding agent CLI incode drives
 
 ## Limits
 
-- `codex` (by default) and `agy` still use their own tools; `claude` runs as a
-  model only, and so does `codex` with `codex_tools: "incode"`
-  ([opt-in](#the-codex-route-whose-tools)). On the other routes the guards are a
-  sentinel (detection), not a gate.
+- `agy`, and `codex` with `codex_tools: "own"`, still use their own tools;
+  `claude` and `codex` (by default, [the codex route](#the-codex-route-whose-tools))
+  run as a model only. On the other routes the guards are a sentinel
+  (detection), not a gate.
 - A client's MCP servers are stdio or Streamable HTTP; the older SSE transport is
   not spoken.
 - The Windows sandbox confines workspace-write only when you name it, and does

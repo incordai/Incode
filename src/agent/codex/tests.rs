@@ -459,7 +459,7 @@ fn the_setting_spells_own_and_incode() {
     assert_eq!(CodexTools::parse(" INCODE "), Some(CodexTools::Incode));
     assert_eq!(CodexTools::parse("bridge"), None);
     assert_eq!(CodexTools::parse(""), None);
-    assert_eq!(CodexTools::default(), CodexTools::Own);
+    assert_eq!(CodexTools::default(), CodexTools::Incode);
     for tools in [CodexTools::Own, CodexTools::Incode] {
         assert_eq!(CodexTools::parse(tools.as_str()), Some(tools));
     }

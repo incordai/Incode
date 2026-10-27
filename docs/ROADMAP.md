@@ -40,11 +40,13 @@ This is fully true for claude; section 0b says what is not.
 
 ### 0b. Still open
 
-- **codex and agy still use their own tools by default.** agy has no switch to
-  turn them off or add MCP per run. codex can now be bridged, opt-in
-  (`codex_tools: "incode"`): measured on 0.163.0 against a stand-in model
-  endpoint, end to end; `apply_patch` has no switch and is rejected unrun under
-  read-only + never. Left: a turn with a real model, then making it the default.
+- **agy still uses its own tools.** No flag turns them off, but a custom agent
+  (`tools: [finish]` + `mcpServers`, run with `--agent`) does, measured on 1.4.7.
+  Left: agy's own memory hooks still fire on such a run, so the engine would hear
+  each event twice (`src/agent/agy.rs`, top). codex is bridged by default (`codex_tools: "own"` opts out):
+  measured on 0.163.0 against a stand-in model endpoint, end to end;
+  `apply_patch` has no switch and is rejected unrun under read-only + never.
+  Left: a turn with a real model (the account's quota runs out until 2026-11-17).
   On the unbridged routes the guards are the Sentinel (detection), not a gate
   (`ARCHITECTURE.md` §5a).
 - **Driving ACP agents (opencode, gemini).** Built in `fcfa2d9`, reverted in

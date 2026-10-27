@@ -994,8 +994,9 @@ feature flag or config key (only the model catalogue's `apply_patch_tool_type`);
 to switch them off was found. Until both are proved, codex keeps its own tools, the
 Sentinel remains detection-only there, and its edit events still feed the diff.
 
-**codex 0.163.0 — bridged, OPT-IN (`codex_tools: "incode"` / `INCODE_CODEX_TOOLS`).**
-The default stays `own` until a turn with a real model has run this way. The tool list
+**codex 0.163.0 — bridged, THE DEFAULT (`codex_tools: "own"` / `INCODE_CODEX_TOOLS=own` opts out).**
+Made the default on 2026-10-26 by the owner, before a turn with a real model had run
+this way (the account's quota ran out); that turn is still owed. The tool list
 was observed by pointing codex at a stand-in Responses endpoint
 (`-c model_providers.<n>.base_url=…`) that recorded each request — no login needed:
 
