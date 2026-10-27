@@ -464,6 +464,43 @@ pub(crate) fn stand_in_cli(dir: &std::path::Path, waits: bool) -> PathBuf {
 // Pinned behaviour: what a whole turn through `run_turn` reports.
 // ---------------------------------------------------------------------------
 
+/// **A PROMPT TOO LONG FOR THE COMMAND LINE GOES ON STDIN, NOT INTO A FILE.**
+/// It used to be written to `.incode/context/task-*.md` and the model told to
+/// read that first — measured: a two-line request arrived as a 16 KB file with
+/// the person's words on its last line. Now the turn runs, whole, and no such
+/// file is made.
+#[test]
+fn a_prompt_too_long_for_the_command_line_is_sent_on_stdin_not_spilled() {
+    let dir = tempfile::tempdir().expect("scratch");
+    let fake = stand_in_cli(dir.path(), false);
+    let mut backend =
+        ClaudeCodeBackend::new(dir.path().to_path_buf()).with_binary(fake.to_string_lossy());
+    let long = format!(
+        "{}\nthe question itself",
+        "context ".repeat(crate::agent::MAX_CMDLINE_PAYLOAD_LEN / 8 + 100)
+    );
+    assert!(
+        !crate::agent::fits_command_line(&long, &[]),
+        "the prompt must be over the cap"
+    );
+    backend
+        .run_turn(&long, &mut |_| {})
+        .expect("a long prompt still gets its turn");
+    let spilled: Vec<_> = std::fs::read_dir(dir.path().join(crate::hooks::memory::CONTEXT))
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().starts_with("task-"))
+                .map(|e| e.file_name())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        spilled.is_empty(),
+        "the prompt was spilled to a file: {spilled:?}"
+    );
+}
+
 /// **A WHOLE TURN THROUGH `run_turn`**: the events in order, the outcome,
 /// and the session kept for the next turn.
 #[test]

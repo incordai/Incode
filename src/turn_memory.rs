@@ -78,6 +78,13 @@ fn pack(query: &str, cwd: &Path, session: &str, budget: u32, timeout: Duration) 
     if query.is_empty() {
         return None;
     }
+    // A test asks only an engine it named. The default address is the real
+    // engine on the machine running the tests, and a pack asked with a session
+    // id is noted against that session there — state a test must not leave.
+    #[cfg(test)]
+    if std::env::var(crate::brief::MEMORY_URL_ENV).is_err() {
+        return None;
+    }
     let began = std::time::Instant::now();
     let url = format!(
         "{}{CONTEXT_PATH}",

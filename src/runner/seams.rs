@@ -76,6 +76,16 @@ pub trait TaskWorker {
     /// Defaulted to ignoring it, for a worker with no agent turn to add it to.
     fn operator_context(&mut self, _blocks: &[String]) {}
 
+    /// The last `work`'s tool calls and what each returned, taken — for the
+    /// memory engine's transcript, whose recorder learns from them
+    /// (`MemoryHooks::tools_ran`). Read by `cli::run_memory::Remembered` after
+    /// each `work`, whether or not it succeeded.
+    ///
+    /// Defaulted to none, for a worker that runs no tools.
+    fn take_steps(&mut self) -> crate::hooks::memory::Said {
+        crate::hooks::memory::Said::default()
+    }
+
     /// Who did the last attempt, and what they actually ran on.
     ///
     /// Defaulted to the harness itself: a worker that does not delegate is still

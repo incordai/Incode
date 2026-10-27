@@ -105,6 +105,9 @@ pub struct AgentBackendWorker<B: AgentBackend> {
     pending: TokenUsage,
     /// What the agent said, collected across the turn.
     said: Vec<String>,
+    /// The task's tool calls and results, every attempt's, for the memory
+    /// engine's transcript (`TaskWorker::take_steps`).
+    steps: crate::hooks::memory::Said,
     /// Guard rules the agent in hand will NOT apply, collected per task.
     ///
     /// Kept so the gap reaches the operator's record and not only the trace: a
@@ -269,6 +272,7 @@ impl<B: AgentBackend> AgentBackendWorker<B> {
             roles: crate::roles::RoleTable::default(),
             pending: TokenUsage::default(),
             said: Vec::new(),
+            steps: crate::hooks::memory::Said::default(),
             unenforced: Vec::new(),
             handovers: Vec::new(),
             instance: crate::identity::Attribution::new_instance_id(),
@@ -384,6 +388,7 @@ impl<B: AgentBackend> AgentBackendWorker<B> {
         self.said.clear();
 
         let said = &mut self.said;
+        let steps = &mut self.steps;
         let pending = &mut self.pending;
         // Every event, not just the two this closure acts on. Tool calls and
         // their results used to fall into the `_` arm below and vanish, which
@@ -397,6 +402,7 @@ impl<B: AgentBackend> AgentBackendWorker<B> {
             if let Some(open) = transcript.as_mut() {
                 open.record(event);
             }
+            steps.hear(event);
             if let Some(tap) = tap.as_mut() {
                 tap.event(event);
             }
@@ -701,6 +707,10 @@ impl<B: AgentBackend> TaskWorker for AgentBackendWorker<B> {
         self.operator_context = blocks.to_vec();
     }
 
+    fn take_steps(&mut self) -> crate::hooks::memory::Said {
+        std::mem::take(&mut self.steps)
+    }
+
     fn release(&mut self) {
         self.heard_up_to = None;
         // The run is over: its claims and reads go now, not at their TTL.
@@ -725,6 +735,7 @@ impl<B: AgentBackend> TaskWorker for AgentBackendWorker<B> {
         }
 
         self.said.clear();
+        self.steps = crate::hooks::memory::Said::default();
         self.served_by.clear();
         self.unenforced.clear();
         self.handovers.clear();

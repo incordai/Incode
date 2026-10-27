@@ -575,6 +575,70 @@ fn a_blocked_write_is_not_made_and_the_model_is_told_why() {
     );
 }
 
+/// **A SERVED RESULT IS THE CALL'S RESULT.** The recorder answering a read
+/// arrives shaped like a refusal — exit 2, on stderr — and was handed to the
+/// model as a failed call. It is the answer, and comes back as one.
+#[test]
+fn a_served_read_is_a_result_not_a_refusal() {
+    let (ws, engine) = (
+        tempfile::tempdir().expect("ws"),
+        tempfile::tempdir().expect("engine"),
+    );
+    std::fs::write(ws.path().join("a.txt"), "on disk").expect("seed");
+    let served = "## WATCHMAN HAS ALREADY RUN THIS CALL - recorded output below\nRECORDED: hi";
+    let toolbox = guarded(
+        ws.path(),
+        engine.path(),
+        &[("pre-tool", Reply::exit(2).stderr(served))],
+        30,
+    );
+    let said = toolbox
+        .run(READ, &json!({"path": "a.txt"}))
+        .expect("a served read is not an error");
+    assert!(said.contains("RECORDED: hi"), "{said}");
+}
+
+/// …and only ever for a call that does not write: a "served" answer to a
+/// write would read as a write that landed when none was made. A plain
+/// refusal stays a refusal.
+#[test]
+fn a_write_is_never_served_and_a_refusal_stays_one() {
+    let (ws, engine) = (
+        tempfile::tempdir().expect("ws"),
+        tempfile::tempdir().expect("engine"),
+    );
+    let served = "## WATCHMAN HAS ALREADY RUN THIS CALL - recorded output below\nok";
+    let toolbox = guarded(
+        ws.path(),
+        engine.path(),
+        &[("pre-tool", Reply::exit(2).stderr(served))],
+        30,
+    );
+    toolbox
+        .run(WRITE, &json!({"path": "b.txt", "content": "x"}))
+        .expect_err("a write is never taken as served");
+    assert!(!ws.path().join("b.txt").exists(), "and nothing was written");
+
+    let (ws, engine) = (
+        tempfile::tempdir().expect("ws"),
+        tempfile::tempdir().expect("engine"),
+    );
+    std::fs::write(ws.path().join("a.txt"), "on disk").expect("seed");
+    let toolbox = guarded(
+        ws.path(),
+        engine.path(),
+        &[(
+            "pre-tool",
+            Reply::exit(2).stderr("BLOCKED by Rule 4: a secret path"),
+        )],
+        30,
+    );
+    let refused = toolbox
+        .run(READ, &json!({"path": "a.txt"}))
+        .expect_err("a refusal is still an error");
+    assert!(refused.contains("BLOCKED by Rule 4"), "{refused}");
+}
+
 /// §3 test 2. **SILENCE IS AN ALLOW.**
 #[test]
 fn an_engine_that_says_nothing_lets_the_tool_run() {

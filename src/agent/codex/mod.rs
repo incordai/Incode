@@ -25,8 +25,10 @@
 //!
 //! # Bridged: incode's tools instead of codex's ([`CodexTools::Incode`])
 //!
-//! Opt-in (`codex_tools: "incode"` in admin.json, or `INCODE_CODEX_TOOLS=incode`),
-//! because no turn with a REAL model has been run this way yet. When on, codex is
+//! The default since 2026-10-26, on the owner's word (`codex_tools: "own"` in
+//! admin.json, or `INCODE_CODEX_TOOLS=own`, goes back). Everything below was
+//! measured against a stand-in model; a turn with a REAL model is still owed —
+//! the account's quota ran out before one could be run. On this route codex is
 //! driven the way the Claude route is ([`crate::tool_bridge`]): its own tools are
 //! switched off by config, it is handed ONE MCP server — `incode --tool-server` —
 //! and every call the model makes comes back to this process and runs through the
@@ -84,10 +86,12 @@ use wire::Reading;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CodexTools {
     /// Codex's own (`exec_command`, `apply_patch`, …), watched afterwards by
-    /// the Sentinel. The default until a live turn has proved the other.
-    #[default]
+    /// the Sentinel: outside incode's guard, memory hooks and sandbox.
     Own,
     /// incode's, through the tool bridge: codex is a model and nothing else.
+    /// The default, as on the Claude route — the operator's built-in layer
+    /// ([`crate::admin::AdminConfig::resolve_codex_tools`]) reads it from here.
+    #[default]
     Incode,
 }
 
@@ -331,16 +335,51 @@ impl CodexBackend {
         KNOWN_FAMILIES.iter().any(|f| id.starts_with(f))
     }
 
-    /// The prompt actually sent: the harness's context, then the task, budgeted for OS limits.
-    fn full_prompt(&self, prompt: &str) -> Result<String, AgentError> {
+    /// The prompt actually sent — the harness's context, then the task — and
+    /// whether it goes on stdin.
+    ///
+    /// Within one command line it is an argument, as before. Too long for one,
+    /// it goes WHOLE on stdin (`codex exec -`: "If not provided as an argument
+    /// (or if `-` is used), instructions are read from stdin", 0.163.0) rather
+    /// than into a file the model is told to read first — measured: a two-line
+    /// request arrived as a 16 KB file with the person's words last.
+    fn full_prompt(&self, prompt: &str) -> Result<(String, bool), AgentError> {
+        if !crate::agent::fits_command_line(prompt, &self.system_context) {
+            let context = self.system_context.join("\n\n");
+            return Ok((
+                if context.trim().is_empty() {
+                    prompt.to_string()
+                } else {
+                    format!("{context}\n\n{prompt}")
+                },
+                true,
+            ));
+        }
         let (budgeted_prompt, budgeted_context) =
             crate::agent::budget_for_spawn(prompt, &self.system_context, &self.workspace)?;
-        Ok(if budgeted_context.is_empty() {
-            budgeted_prompt
-        } else {
-            format!("{budgeted_context}\n\n{budgeted_prompt}")
-        })
+        Ok((
+            if budgeted_context.is_empty() {
+                budgeted_prompt
+            } else {
+                format!("{budgeted_context}\n\n{budgeted_prompt}")
+            },
+            false,
+        ))
     }
+}
+
+/// Write `text` to `child`'s stdin and close it, on a thread of its own: the
+/// prompt can be large, and a pipe codex is not reading yet must not stall the
+/// turn. Nothing to do without `text`. Called by both routes' spawns.
+pub(super) fn feed_stdin(child: &mut std::process::Child, text: Option<String>) {
+    let (Some(text), Some(mut stdin)) = (text, child.stdin.take()) else {
+        return;
+    };
+    std::thread::spawn(move || {
+        use std::io::Write as _;
+        let _ = stdin.write_all(text.as_bytes());
+        // Dropped here: codex reads to EOF.
+    });
 }
 
 impl AgentBackend for CodexBackend {
@@ -555,7 +594,10 @@ impl AgentBackend for CodexBackend {
         prompt: &str,
         on_event: &mut dyn FnMut(&AgentEvent),
     ) -> Result<TurnOutcome, AgentError> {
-        let sent = self.full_prompt(prompt)?;
+        let (sent, on_stdin) = self.full_prompt(prompt)?;
+        // `-` makes codex read the instructions from stdin.
+        let arg = if on_stdin { "-" } else { sent.as_str() };
+        let stdin_text = on_stdin.then(|| sent.clone());
         // Held to the end of the turn, then removed.
         let pictures =
             ImageFiles::write(&std::mem::take(&mut self.images)).map_err(AgentError::new)?;
@@ -571,18 +613,22 @@ impl AgentBackend for CodexBackend {
                 }
             };
             let exe = self.tool_server.clone().unwrap_or_else(|| turn.exe.clone());
-            let command = self.bridged_command(&sent, &exe);
+            let command = self.bridged_command(arg, &exe);
             self.image_files.clear();
-            return self.run_bridged(command, turn, on_event);
+            return self.run_bridged(command, stdin_text, turn, on_event);
         }
-        let mut command = self.command(&sent);
+        let mut command = self.command(arg);
         self.image_files.clear();
         crate::agent::process_tree::prepare(&mut command);
+        if stdin_text.is_some() {
+            command.stdin(Stdio::piped());
+        }
         let mut child = command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| AgentError::new(format!("could not start `{}`: {e}", self.binary)))?;
+        feed_stdin(&mut child, stdin_text);
         let tree = crate::agent::process_tree::Tree::adopt(&child);
 
         let stdout = child

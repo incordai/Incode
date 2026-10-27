@@ -119,8 +119,20 @@ impl ClaudeCodeBackend {
         images: Vec<crate::toolbox::Image>,
         on_event: &mut dyn FnMut(&AgentEvent),
     ) -> Result<TurnOutcome, AgentError> {
-        let (budgeted_prompt, budgeted_context) =
-            crate::agent::budget_for_spawn(prompt, &self.system_context, &self.workspace)?;
+        // A prompt too long for the command line goes on stdin, WHOLE, as one
+        // stream-json message — the road a turn with pictures already takes —
+        // rather than into a file the model is told to read first. Then the
+        // command line is the system context's alone, budgeted to fit.
+        let on_stdin =
+            !images.is_empty() || !crate::agent::fits_command_line(prompt, &self.system_context);
+        let (budgeted_prompt, budgeted_context) = if on_stdin {
+            (
+                prompt.to_string(),
+                crate::agent::budget_context(&self.system_context),
+            )
+        } else {
+            crate::agent::budget_for_spawn(prompt, &self.system_context, &self.workspace)?
+        };
 
         // THE TOOLS ARE incode's. The CLI's own are switched off below and the
         // model is handed incode's toolbox through the bridge, which this
@@ -136,7 +148,7 @@ impl ClaudeCodeBackend {
         let (servers, allowed) = servers_for(&exe);
 
         let mut cmd = self.command(
-            images.is_empty().then_some(budgeted_prompt.as_str()),
+            (!on_stdin).then_some(budgeted_prompt.as_str()),
             &budgeted_context,
             &servers,
             &allowed,
@@ -149,7 +161,7 @@ impl ClaudeCodeBackend {
         self.trace_spawn(&cmd);
         self.dump_argv(&cmd);
 
-        let (mut child, tree) = self.spawn(&mut cmd, &budgeted_prompt, &images)?;
+        let (mut child, tree) = self.spawn(&mut cmd, on_stdin, &budgeted_prompt, &images)?;
         let stdout = child
             .stdout
             .take()
@@ -236,26 +248,27 @@ impl ClaudeCodeBackend {
     }
 
     /// The CLI started in the workspace with its output piped and everything
-    /// it starts taken in; a turn with pictures has its one message written to
-    /// stdin.
+    /// it starts taken in; a turn `on_stdin` — one with pictures, or a prompt
+    /// too long for the command line — has its one message written to stdin.
     ///
     /// Called by [`Self::run_once`].
     fn spawn(
         &self,
         cmd: &mut Command,
+        on_stdin: bool,
         prompt: &str,
         images: &[crate::toolbox::Image],
     ) -> Result<(Child, Tree), AgentError> {
         // stdin must be closed explicitly, or the CLI waits ~3s for piped input
-        // on every invocation. A turn with pictures writes its one message
-        // there instead, and closes it.
+        // on every invocation. A turn on stdin writes its one message there
+        // instead, and closes it.
         crate::agent::process_tree::prepare(cmd);
         let mut child = cmd
             .current_dir(&self.workspace)
-            .stdin(if images.is_empty() {
-                Stdio::null()
-            } else {
+            .stdin(if on_stdin {
                 Stdio::piped()
+            } else {
+                Stdio::null()
             })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

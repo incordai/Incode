@@ -2154,20 +2154,23 @@ mod tests {
         assert_eq!(backend.mcp_config(), None);
     }
 
-    /// Codex takes the same registration in its own spelling.
+    /// Codex on its own tools takes the same registration in its own spelling.
+    /// (Bridged — the default — the desktop is the toolbox's instead:
+    /// `the_codex_setting_picks_whose_tools_codex_runs`.)
     ///
-    /// Drop the `.with_mcp_overrides(..)` from [`run_backend_with_desktop`] and
+    /// Drop the `.with_mcp_overrides(..)` from [`codex_backend`]'s own arm and
     /// this fails on the `expect`.
     #[test]
     fn codex_gets_the_desktop_as_toml_overrides_when_it_is_on() {
-        let on = run_backend_with_desktop(
+        use crate::agent::codex::CodexTools;
+        use crate::agent::AgentBackend as _;
+        let on = codex_backend(
             Path::new("."),
-            crate::agent::registry::CODEX,
             "codex",
-            &crate::guards::Guards::default(),
             &[],
             true,
             ORDINARY,
+            CodexTools::Own,
         );
         // TOML, not JSON — the difference that makes it codex's dialect.
         let config = on
@@ -2182,14 +2185,13 @@ mod tests {
             "the desktop overrides swallowed the team server: {config}"
         );
 
-        let off = run_backend_with_desktop(
+        let off = codex_backend(
             Path::new("."),
-            crate::agent::registry::CODEX,
             "codex",
-            &crate::guards::Guards::default(),
             &[],
             false,
             ORDINARY,
+            CodexTools::Own,
         );
         let quiet = off.mcp_config().expect("the team channel is not optional");
         assert!(
@@ -2305,10 +2307,15 @@ mod tests {
         assert_eq!(claude.id(), "claude-code");
         assert_eq!(agy.id(), "agy", "the backend reports the BINARY it drives");
         assert_eq!(codex.id(), "codex");
-        // And they do NOT claim the same enforcement, which is the whole point
-        // of asking each backend rather than assuming one answer.
+        // And each is asked for its enforcement rather than assumed one: agy
+        // runs its own tools, so it cannot claim what claude does — while codex,
+        // on incode's tools by default, claims exactly that.
         assert_ne!(claude.enforces(), agy.enforces());
-        assert_ne!(claude.enforces(), codex.enforces());
+        assert!(
+            codex.runs_tools_here(),
+            "codex runs on incode's tools by default"
+        );
+        assert_eq!(claude.enforces(), codex.enforces());
     }
 
     /// **An agent admin.json adds is driven by the backend for the protocol
@@ -2337,8 +2344,15 @@ mod tests {
         );
         let added = build(Some(crate::agent::Protocol::CodexJson));
         assert_eq!(added.enforces(), codex.enforces(), "the codex backend");
+        // Told apart by what only codex speaks — its TOML registration of the
+        // bridge — since bridged codex now enforces what claude does.
+        let codex_dialect = |b: &dyn crate::agent::AgentBackend| {
+            b.mcp_config()
+                .is_some_and(|c| c.contains("mcp_servers.incode."))
+        };
+        assert!(codex_dialect(added.as_ref()), "the codex backend");
         let fallback = build(None);
-        assert_ne!(fallback.enforces(), codex.enforces(), "not the codex one");
+        assert!(!codex_dialect(fallback.as_ref()), "not the codex one");
     }
 
     /// An empty session context is not an error — a project with no brief, no
