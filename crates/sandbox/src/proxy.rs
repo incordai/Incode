@@ -384,8 +384,14 @@ fn serve(
     upstream: Option<&Upstream>,
 ) -> Option<Decision> {
     let _ = client.set_read_timeout(Some(IO_TIMEOUT));
-    let mut reader = BufReader::new(client.try_clone().ok()?);
-    let mut writer = client;
+    // READ AND WRITTEN THROUGH BORROWS, NEVER A CLONE. On Windows a cloned
+    // socket (`try_clone`) is created inheritable, so any process this one
+    // starts while it is open (the sandboxed command, an `icacls`) takes a
+    // copy of the connection: closing ours then sends nothing, and the
+    // child's exit resets it — measured as a refusal the client never read
+    // (os error 10054) whenever a child was started beside it.
+    let mut reader = BufReader::new(&client);
+    let mut writer = &client;
     let head = match read_head(&mut reader) {
         Ok(h) => h,
         Err(e) => {
@@ -442,7 +448,7 @@ fn serve(
     if !buffered.is_empty() && server.write_all(&buffered).is_err() {
         return None;
     }
-    pipe(writer, server);
+    pipe(client, server);
     Some(Decision {
         target,
         allowed: true,
@@ -457,7 +463,7 @@ fn serve(
 /// The request head: its lines ([`head_lines`]), then a `CONNECT` target
 /// ([`connect_head`]) or a plain-HTTP request rewritten for the origin
 /// ([`forward_head`]).
-fn read_head(reader: &mut BufReader<TcpStream>) -> Result<Head, String> {
+fn read_head(reader: &mut BufReader<&TcpStream>) -> Result<Head, String> {
     let lines = head_lines(reader)?;
     let first = lines.first().ok_or("empty request")?;
     let mut parts = first.split_whitespace();
@@ -473,7 +479,7 @@ fn read_head(reader: &mut BufReader<TcpStream>) -> Result<Head, String> {
 
 /// The head's lines, without their endings, up to the blank line; at most
 /// [`HEAD_LIMIT`] bytes.
-fn head_lines(reader: &mut BufReader<TcpStream>) -> Result<Vec<String>, String> {
+fn head_lines(reader: &mut BufReader<&TcpStream>) -> Result<Vec<String>, String> {
     let mut lines = Vec::new();
     let mut total = 0;
     loop {
@@ -643,7 +649,7 @@ fn connect_via(up: &Upstream, host: &str, port: u16) -> Result<TcpStream, String
     Ok(stream)
 }
 
-fn respond(writer: &mut TcpStream, code: u16, message: &str) -> io::Result<()> {
+fn respond(writer: &mut impl Write, code: u16, message: &str) -> io::Result<()> {
     let reason = match code {
         400 => "Bad Request",
         403 => "Forbidden",
@@ -657,22 +663,23 @@ fn respond(writer: &mut TcpStream, code: u16, message: &str) -> io::Result<()> {
     )
 }
 
-/// Copy both ways until either side closes.
+/// Copy both ways until either side closes; both are closed when it
+/// returns.
+///
+/// Each direction borrows the two sockets rather than cloning them: a
+/// clone is inheritable on Windows, and one taken by a process started
+/// meanwhile would hold the connection open past this end (see [`serve`]).
 fn pipe(client: TcpStream, server: TcpStream) {
     let _ = client.set_read_timeout(None);
     let _ = server.set_read_timeout(None);
-    let (Ok(mut c2), Ok(mut s2)) = (client.try_clone(), server.try_clone()) else {
-        return;
-    };
-    let up = thread::spawn(move || {
-        let mut client = client;
-        let mut server = server;
-        let _ = io::copy(&mut client, &mut server);
-        let _ = server.shutdown(Shutdown::Write);
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            let _ = io::copy(&mut &client, &mut &server);
+            let _ = server.shutdown(Shutdown::Write);
+        });
+        let _ = io::copy(&mut &server, &mut &client);
+        let _ = client.shutdown(Shutdown::Write);
     });
-    let _ = io::copy(&mut s2, &mut c2);
-    let _ = c2.shutdown(Shutdown::Write);
-    let _ = up.join();
 }
 
 fn base64(input: &[u8]) -> String {
@@ -791,6 +798,58 @@ mod tests {
         ] {
             assert_eq!(base64(input.as_bytes()), want);
         }
+    }
+
+    /// **A REFUSAL REACHES THE CLIENT WHILE PROCESSES ARE STARTED BESIDE
+    /// THE PROXY.** sbx starts the sandboxed command (and `icacls`) from the
+    /// process the proxy runs in. A socket the proxy cloned was inheritable
+    /// on Windows, so a process started while a connection was open took a
+    /// copy of it, and its exit reset the connection before the client had
+    /// read its 403 (os error 10054). Children are started in a loop here,
+    /// with their output piped so handles are inherited, while every request
+    /// is refused; each refusal must be read whole.
+    #[test]
+    fn a_refusal_reaches_the_client_while_processes_are_started_beside_it() {
+        // Measured with the clone put back: 1 or 2 of 60 lost on every run.
+        const TRIES: usize = 200;
+        let proxy = Proxy::start(list(&["allowed.example"]), None).expect("starts");
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let spawner = {
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let child = if cfg!(windows) {
+                        std::process::Command::new("cmd")
+                            .args(["/c", "exit"])
+                            .stdout(std::process::Stdio::piped())
+                            .output()
+                    } else {
+                        std::process::Command::new("true")
+                            .stdout(std::process::Stdio::piped())
+                            .output()
+                    };
+                    child.expect("a child starts");
+                }
+            })
+        };
+        let mut failed = Vec::new();
+        for _ in 0..TRIES {
+            let mut s = TcpStream::connect(("127.0.0.1", proxy.port())).expect("connects");
+            s.write_all(b"CONNECT denied.example:443 HTTP/1.1\r\nHost: denied.example:443\r\n\r\n")
+                .expect("writes");
+            let mut reply = String::new();
+            match s.read_to_string(&mut reply) {
+                Ok(_) if reply.starts_with("HTTP/1.1 403") => {}
+                other => failed.push(format!("{other:?}: {reply:?}")),
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        spawner.join().expect("spawner");
+        assert!(
+            failed.is_empty(),
+            "{} of {TRIES} refusals lost: {failed:?}",
+            failed.len()
+        );
     }
 
     /// A refused host gets a 403 that names it, and the decision is kept.
