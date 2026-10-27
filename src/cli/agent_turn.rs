@@ -403,12 +403,18 @@ impl AgentSession {
     /// Extend the session — and its snapshot — to more directories.
     #[must_use]
     pub fn with_extra_dirs(mut self, dirs: Vec<PathBuf>) -> Self {
+        self.set_extra_dirs(dirs);
+        self
+    }
+
+    /// [`Self::with_extra_dirs`] for a session already in use: the REPL's
+    /// `/add-dir`, which holds the session in place rather than by value.
+    pub fn set_extra_dirs(&mut self, dirs: Vec<PathBuf>) {
         self.backend.set_extra_dirs(dirs.clone());
         for s in &mut self.standby {
             s.set_extra_dirs(dirs.clone());
         }
         self.extra_dirs = dirs;
-        self
     }
 
     /// Take what should be shown to the person after the turn.
