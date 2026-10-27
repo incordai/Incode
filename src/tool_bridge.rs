@@ -250,7 +250,12 @@ fn answer_connection<M>(
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(REQUEST_BOUND))?;
     let mut line = String::new();
-    BufReader::new(stream.try_clone()?.take(MAX_REQUEST_BYTES)).read_line(&mut line)?;
+    // Through a borrow, never a clone: on Windows a cloned socket is
+    // inheritable, and a shell command the toolbox starts meanwhile (a
+    // background job included) would take a copy of this connection and
+    // hold it open past its answer — see `incord-sandbox`'s proxy, where it
+    // reset refusals the client had not yet read.
+    BufReader::new((&stream).take(MAX_REQUEST_BYTES)).read_line(&mut line)?;
     if !line.ends_with('\n') {
         return refuse(stream, "the request was too large or was cut off");
     }
