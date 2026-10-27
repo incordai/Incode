@@ -1032,7 +1032,7 @@ read_resource`. A custom AGENT does both jobs instead (measured on 1.4.7):
 
 | Need | How | Evidence |
 |---|---|---|
-| None of agy's own tools | agent file `~/.gemini/config/agents/incode.md`, `tools: [finish]`, run with `--agent incode` (`agent/agy/agent_file.rs`) | the model had only `finish, call_mcp_tool, list_resources, read_resource, manage_task`; a shell request was refused for want of a tool. `call_mcp_tool` under `tools:` is refused at startup (not in the registry). The `init` event lists the whole registry either way. |
+| None of agy's own tools | agent file `~/.gemini/config/agents/incode-<hash>.md` (one per incode binary, by a hash of its path), `tools: [finish]`, run with `--agent incode-<hash>` (`agent/agy/agent_file.rs`) | the model had only `finish, call_mcp_tool, list_resources, read_resource, manage_task`; a shell request was refused for want of a tool. `call_mcp_tool` under `tools:` is refused at startup (not in the registry). The `init` event lists the whole registry either way. |
 | incode's server, reachable | the agent's one `mcpServers` entry, `incode --tool-server`; the bridge's address and token in agy's environment | agy starts the server with its own environment (a variable set on agy reached it); the file carries the binary's path only, written by rename and only when it differs. |
 | Calls not refused by agy | `--dangerously-skip-permissions` | headless MCP calls are denied unasked without it; safe only because agy has no tool of its own left that writes or runs. |
 | agy's memory hooks quiet | `INCORD_HOOKS_BY=incode` in agy's environment | the engine's `--agy` hooks stand down on it; an engine without the switch records the run twice. |

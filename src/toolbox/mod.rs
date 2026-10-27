@@ -575,6 +575,9 @@ pub struct Toolbox {
     /// Directories beyond the workspace the session may work in. A file tool
     /// given an absolute path inside one acts there, under the same guards.
     extra_dirs: Vec<PathBuf>,
+    /// Folders `Read` alone may open beyond those ([`Self::allow_reading`]);
+    /// no other tool acts in them.
+    read_only_dirs: Vec<PathBuf>,
     /// Who can be asked when the engine wants a person — the terminal, or the
     /// ACP client. `None` when nobody is there.
     prompter: Option<Arc<dyn crate::hooks::engine::Prompter>>,
@@ -665,6 +668,7 @@ impl Toolbox {
             session: String::new(),
             session_pinned: false,
             extra_dirs: Vec::new(),
+            read_only_dirs: Vec::new(),
             prompter: None,
             owner: None,
             allowed_into: None,
@@ -1029,6 +1033,39 @@ impl Toolbox {
     /// operator's guards apply inside them as in the workspace.
     pub fn set_extra_dirs(&mut self, dirs: Vec<PathBuf>) {
         self.extra_dirs = dirs;
+    }
+
+    /// Let `Read`, and no other tool, open files under `dir`: where an agent
+    /// CLI keeps this toolbox's own results outside the workspace — agy saves
+    /// a large one under its conversation's folder and tells the model to
+    /// read it there (`agent/agy/bridged.rs`). Nothing is written, listed or
+    /// searched there; the file's content is what this toolbox returned.
+    pub fn allow_reading(&mut self, dir: PathBuf) {
+        if !self.read_only_dirs.contains(&dir) {
+            self.read_only_dirs.push(dir);
+        }
+    }
+
+    /// The root a `Read` acts under: [`Self::root_for`]'s, or a folder
+    /// [`Self::allow_reading`] named when the path is absolute and inside
+    /// one, by the same containment check the file tools apply.
+    fn read_root_for(&self, input: &Value) -> &Path {
+        let root = self.root_for(input);
+        let Some(path) = input.get("path").and_then(Value::as_str) else {
+            return root;
+        };
+        if root != self.workspace.as_path() || !Path::new(path).is_absolute() {
+            return root;
+        }
+        let probe = json!({ "path": path }).to_string();
+        let inside = |dir: &Path| crate::tools::file_ops::target_path(dir, &probe).is_ok();
+        if inside(&self.workspace) {
+            return root;
+        }
+        self.read_only_dirs
+            .iter()
+            .find(|dir| inside(dir))
+            .map_or(root, PathBuf::as_path)
     }
 
     /// The root a file tool call acts under — see [`Self::root_for_path`].
@@ -2517,10 +2554,13 @@ impl Toolbox {
         // the interface they were written to; re-serialising here keeps that
         // contract rather than rewriting six working implementations.
         let raw = input.to_string();
-        // The workspace, or the added directory the call names a path in.
-        let ws = if matches!(
+        // The workspace, or the added directory the call names a path in —
+        // and for `Read` alone, a folder only it may open.
+        let ws = if name == READ {
+            self.read_root_for(input)
+        } else if matches!(
             name,
-            READ | WRITE | EDIT | GLOB | GREP | MULTI_EDIT | NOTEBOOK_EDIT | LS | OUTLINE
+            WRITE | EDIT | GLOB | GREP | MULTI_EDIT | NOTEBOOK_EDIT | LS | OUTLINE
         ) {
             self.root_for(input)
         } else {
