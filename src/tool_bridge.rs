@@ -494,7 +494,8 @@ impl Turn {
 /// stdio, so Claude Code starts no MCP server at all (#68).
 ///
 /// Called by the Claude Code route (`agent/claude_code/turn.rs` `run_once`)
-/// once its turn produced a result. Not by the codex route
+/// and the bridged agy route (`agent/agy/bridged.rs` `run_bridged`) once
+/// their turn produced a result. Not by the codex route
 /// (`agent/codex/bridged.rs`): whether codex always lists its servers' tools
 /// before the model runs is not yet measured (#19).
 ///

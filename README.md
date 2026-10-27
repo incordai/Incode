@@ -16,8 +16,8 @@ before it calls it done.
 in to — `claude`, `codex` and `agy` — are used only as models, run headless on
 your own subscriptions. The loop's tools, the permission checks, the undo
 history, the memory hooks and the record of what happened are incode's own.
-(Today that is fully true for `claude`, and for `codex` when you opt in; `codex`
-by default and `agy` still run their own tools — see [Limits](#limits).)
+(That is true for `claude`, and by default for `codex` and `agy`; set to `own`,
+either still runs its own tools — see [Limits](#limits).)
 
 ---
 
@@ -543,9 +543,42 @@ and the [OS sandbox](#the-os-sandbox) apply to it before it runs, and the
 - Older codex: 0.145 has no `view_image` switch and lists incode's tools behind
   its tool search; 0.153 has every switch above.
 
-`agy` cannot be driven this way: it has no flag to switch its tools off, and
-takes MCP servers only through a persistent `agy mcp add`, which would edit your
-machine rather than one run.
+### The agy route: whose tools
+
+`agy` (Antigravity) is driven the same way by default: a model only, every tool
+call run by incode. With `"agy_tools": "own"` in `admin.json` (or
+`INCODE_AGY_TOOLS=own`, which wins) it runs its own tools and incode watches the
+result afterwards; `incode --admin` shows which is in force.
+
+agy has no flag to switch its tools off or to hand it an MCP server for one run,
+but a custom agent does both (measured on agy 1.4.7). Before each turn incode
+writes `~/.gemini/config/agents/incode.md` — only when its content changed, and
+whole, by rename — whose only tool of agy's own is `finish` and whose one MCP
+server is `incode --tool-server`; the file names the incode binary and nothing
+else. The turn starts `agy --print … --output-format stream-json --agent incode
+--dangerously-skip-permissions` (plus the model, mode, added roots and
+conversation as before). The bridge's address and token, and
+`INCORD_HOOKS_BY=incode` — on which the memory engine's own agy hooks stand
+down — are in agy's environment, which the server inherits, never on its argv
+or in the file. Skipping agy's permission prompts is safe only because agy has
+no tool of its own left that writes or runs anything: whether each call runs is
+decided by incode.
+
+What the model has there: `finish`, `call_mcp_tool` (incode's server), the MCP
+resource readers and agy's task list. Every file, shell, web, team, desktop and
+sub-agent call is incode's, with the same guards, rules, hooks and sandbox as on
+the codex route. agy hands the model no schema it can open for an MCP tool, so
+each turn's prompt opens with an `<incode-tools>` block naming every tool's
+inputs. A turn whose tool server never asked incode for its tools is refused
+rather than reported as done; a failure agy reports itself (an unknown model,
+say) keeps its own reason.
+
+Run live on agy 1.4.7 with `gemini-3.8-flash-high` through `incode -t`
+(2026-10-27): agy started `incode --tool-server`, every call — `Write`, `Read`,
+`Bash`, the memory tools — ran in incode's toolbox (trace `tool Write (change)`,
+`Write ok`), the file was written and read back, and asked to reach past
+incode, the model found only `finish`, `call_mcp_tool`, `list_resources`,
+`read_resource` and `manage_task`, and agy refused its calls to other servers.
 
 ### The API providers contract
 
@@ -704,9 +737,9 @@ rule (`Bash(npm test:*)`, `Read`, `Edit(src/**)` — the grammar of
 refused, with the list named to the model. A compound shell line is covered
 only when every part is. Only that turn: the next one is unrestricted. It only
 narrows — deny and ask rules, guards, the mode and hooks still apply. It binds
-where incode runs the tools (the API route, Claude Code, and Codex with
-`codex_tools: "incode"`); on Codex's own tools and Antigravity, the turn says it
-was not enforced.
+where incode runs the tools (the API route, Claude Code, Codex with
+`codex_tools: "incode"` and Antigravity with `agy_tools: "incode"`, both the
+default); on either one's own tools, the turn says it was not enforced.
 
 A **plugin** is a folder in `~/.incode/plugins/<name>/` or
 `.incode/plugins/<name>/` with a `plugin.toml` (`name`, `version`,
@@ -1094,7 +1127,7 @@ In the order a call meets them:
    target or the argument of a writing command (`rm`, `tee`, `sed -i`,
    `git checkout`, a quoted path in `python -c`, ...) is protected — a command
    that only mentions one, like a heredoc writing docs, is not. For an agent
-   that still runs its own tools (`codex`, `agy`),
+   that still runs its own tools (`codex` or `agy` set to `own`),
    a sentinel fingerprints the protected files before and after the turn —
    detection, not prevention.
 3. **Permission mode** (`-p`):
@@ -1262,8 +1295,8 @@ project setting can undo one. `[mcp] allow` (when present) and `deny` apply to
 every server a session would start — `.mcp.json`, `~/.incode/mcp.json`,
 external tools and an ACP client's. An unknown key or invalid file refuses
 every tool call and every server until it is fixed. These rules apply to the
-tools incode runs itself; `codex` and `agy` still run their own (see
-[Limits](#limits)).
+tools incode runs itself, which by default includes every call `codex` and `agy`
+make; set to `own`, they run their own (see [Limits](#limits)).
 
 ## Incord Memory integration
 
@@ -1404,6 +1437,7 @@ and `--admin` prints which layer decided each value.
 | `sandbox_network` | `allow` (default) · `deny` — see [the OS sandbox](#the-os-sandbox) |
 | `sandbox_engine` · `sandbox_allow_hosts` · `sandbox_loopback_ports` · `sandbox_backend` | `builtin` (default) · `sbx`; under sbx, the hosts a command may reach, this machine's own ports it may reach, and, on Windows, `native` · `wsl` · `auto` — see [the OS sandbox](#the-os-sandbox) |
 | `codex_tools` | `incode` (default) · `own` — whose tools a `codex` model runs; see [the codex route](#the-codex-route-whose-tools) |
+| `agy_tools` | `incode` (default) · `own` — whose tools an `agy` model runs; see [the agy route](#the-agy-route-whose-tools) |
 | `hooks` (also `desktop_hooks`) | Your `pre_tool_use` / `post_tool_use` commands, run for every tool, and `user_prompt_submit`, run for each line you send. The event is JSON on stdin (`hook_event_name`, `session_id`, `cwd`, and `tool_name`/`tool_input` or `prompt`); exit 2 on a pre-tool command denies the call, on a prompt command refuses the line (the reason is shown and nothing is sent — not to the agent, not to the memory engine); a prompt command's stdout is added to that turn's context, and your line is never changed; bounded at 10 s. The prompt hook runs for lines typed in the REPL or sent over `--acp`, and for `-t`; for `/review` it sees the review prompt (the change included), and for `/run` each task's instruction before a worker or lane gets it — a refused task fails that attempt, and the hook's output rides that task's turn. It is taken from here and from your own plugins (`~/.incode/plugins/`), never from a project's `.incode/plugins/`, which arrives with whatever was cloned. `pre_compact` runs before `/compact` (event field `trigger`: `manual`, plus `custom_instructions`; when the agent compacts its own conversation, as a CLI agent does, it still runs and nothing is compacted by incode) and before the API route compacts on its own near the context window (`trigger`: `auto`, its output shown as incode's note during the turn); a CLI agent's own automatic compaction happens inside that agent and fires nothing, and `stop` when one of your turns has ended (`last_assistant_message`); neither can refuse anything, and their stdout is shown — with the compaction result, and with the turn's notices. `session_start` runs when a session opens (`source`: `startup`) and `session_end` when it closes (`reason`, e.g. `prompt_input_exit`, `other`), in the REPL, `--acp` and `-t`; neither can stop or keep anything, and their stdout is shown (on stderr for `-t`; a `--acp` session's end output goes to the trace, as the client has gone). They supersede a project's `.incode/lifecycle.json` (or the `lifecycle` section of `.incode.json`), whose `on_session_start`/`on_session_end` still run in the REPL — but only once you approve them as they are, since they arrive with whatever was cloned: `incode lifecycle show` lists them, `incode lifecycle approve` approves them, and any change needs approving again. `subagent_stop` runs when a sub-agent (the `Agent` tool) has finished, told `agent_type` (its definition, role, or `sub-agent`), `task`, `last_assistant_message` and `outcome` (`completed`, `failed` or `cancelled`); it cannot keep it working, and its output is traced, not shown. `notification` runs whenever incode would notify you (`notification_type`: `turn_done` or `input_needed`, plus `message`), in the background beside `notify_command`, in the REPL; its output is not shown |
 | `desktop_limits` | The desktop's limits, each optional: `max_actions_per_minute` (120), `heartbeat_deadline_secs` (30), `tree_depth` (12), `tree_max_elements` (400), `journal_max_bytes` (262144), `xvfb_start_timeout_secs` (10), `clipboard_timeout_secs` (5), `accessibility_call_timeout_ms` (1000), `paste_restore_delay_ms` (500, how long the pasted text stays on the clipboard before the old one is put back), `settle_ms` (300, the pause before a `screenshot_after`), `max_scroll_steps` (50, wheel steps in one `scroll`), `tree_max_visited` (4000, elements one tree walk may visit), and `blocked_apps` (application names, matched case-insensitively as a part of the name, added to the built-in password managers: 1Password, Bitwarden, LastPass, Dashlane, KeePass, NordPass, Proton Pass, Enpass, RoboForm, Keeper). The first two are safety limits and may only be lowered; zero and unknown keys are refused, and the desktop does not start on a malformed admin.json |
 | `desktop_display` | Linux computer use: `":N"` drives a running X display; `"xvfb"` or `"xvfb:1280x800"` starts a private Xvfb for the desktop server's lifetime (default 1920x1080). Unset refuses rather than using `$DISPLAY`. `paste_text` needs `xclip` or `xsel`; `ui_tree` needs a D-Bus session with at-spi2-core |
@@ -1424,6 +1458,7 @@ Environment variables:
 | `INCODE_SANDBOX` · `INCODE_SANDBOX_NETWORK` | The sandbox mode · the network switch |
 | `INCODE_DESKTOP` | `1` offers the [computer use](#computer-use) tools |
 | `INCODE_CODEX_TOOLS` | `own` · `incode`, over `admin.json` `codex_tools` |
+| `INCODE_AGY_TOOLS` | `own` · `incode`, over `admin.json` `agy_tools` |
 | The variable each `key_env` names | That entry's key — the only part of an API route read from the environment |
 | `INCORD_MEMORY_URL` · `INCORD_ENGINE_BIN` | The memory service · its engine binary |
 | `INCODE_BROWSER` · `INCODE_PDF_BROWSER` · `INCODE_SOFFICE` | The headless browser · the PDF printer · LibreOffice |
@@ -1553,10 +1588,20 @@ certificate error rather than going elsewhere. A coding agent CLI incode drives
 
 ## Limits
 
-- `agy`, and `codex` with `codex_tools: "own"`, still use their own tools;
-  `claude` and `codex` (by default, [the codex route](#the-codex-route-whose-tools))
-  run as a model only. On the other routes the guards are a sentinel
+- `codex` with `codex_tools: "own"` and `agy` with `agy_tools: "own"` still use
+  their own tools; `claude`, `codex` and `agy` (by default — [the codex
+  route](#the-codex-route-whose-tools), [the agy route](#the-agy-route-whose-tools))
+  run as a model only. On the own-tools routes the guards are a sentinel
   (detection), not a gate.
+- On the agy route, agy keeps a large tool result in a file of its own under
+  `~/.gemini/antigravity-cli/`, outside the workspace, where incode's `Read`
+  refuses it; the model then has to ask again in smaller pieces. A call agy
+  makes outside incode's server is named on the trace (`agy ran its own tool
+  …`, `agy called MCP server …`); in a live probe agy itself refused other
+  servers ("server filesystem is not allowed in this context"), but the server
+  registered with `agy mcp add` (here `memory`) was not tried. The agent file is
+  shared by every incode on the machine, so two incode binaries running at once
+  rewrite it in turn.
 - A client's MCP servers are stdio or Streamable HTTP; the older SSE transport is
   not spoken.
 - The Windows sandbox confines workspace-write only when you name it, and does

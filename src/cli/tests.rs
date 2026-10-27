@@ -176,26 +176,40 @@ fn the_run_backend_hands_the_desktop_to_the_agent_when_it_is_on() {
     assert_eq!(off.mcp_config(), None);
 }
 
-/// agy has NO per-invocation MCP flag, so it must never be handed one.
+/// agy has NO per-invocation MCP flag, so on its own tools it must never be
+/// handed a server: measured from `agy --help`, it offers only `mcp
+/// add/remove/list`, which edits the operator's persistent configuration.
+/// Registering a desktop there would be a lasting change to their machine.
 ///
-/// Measured from `agy --help`: it offers only `mcp add/remove/list`, which
-/// edits the operator's persistent configuration. Registering a desktop
-/// there would be a lasting change to their machine, not a spawn argument,
-/// and that is a decision for them.
+/// **`agy_tools: "incode"` (the default) makes agy a model on incode's
+/// toolbox**: its calls run here, it enforces both halves, the desktop is the
+/// toolbox's, and the one server it is handed is the bridge, through the
+/// `incode` agent — no desktop server beside it.
 #[test]
-fn agy_is_not_handed_a_flag_it_does_not_have() {
-    let backend = run_backend_with_desktop(
-        Path::new("."),
-        crate::agent::registry::ANTIGRAVITY,
-        "agy",
-        &crate::guards::Guards::default(),
-        &[],
-        // Switched ON, which is the case that matters: the point is that
-        // agy stays empty-handed even then.
-        true,
-        ORDINARY,
+fn agy_is_handed_no_server_but_the_bridge() {
+    use crate::agent::agy::AgyTools;
+    use crate::agent::AgentBackend as _;
+    // The desktop switched ON throughout, which is the case that matters.
+    let own = agy_backend(Path::new("."), "agy", &[], true, ORDINARY, AgyTools::Own);
+    assert_eq!(own.mcp_config(), None);
+    assert!(!own.runs_tools_here());
+    assert_eq!(own.enforces(), crate::guards::Enforcement::NOTHING);
+    assert!(own.offered_tools().is_empty());
+
+    let bridged = agy_backend(Path::new("."), "agy", &[], true, ORDINARY, AgyTools::Incode);
+    assert!(bridged.runs_tools_here());
+    assert_eq!(bridged.enforces(), crate::guards::Enforcement::EVERYTHING);
+    let tools = bridged.offered_tools();
+    for tool in ["Read", "Write", "Bash", "screenshot"] {
+        assert!(tools.iter().any(|t| t == tool), "{tool}: {tools:?}");
+    }
+    let config = bridged.mcp_config().expect("the bridge is handed over");
+    assert!(config.contains("args: ['--tool-server']"), "{config}");
+    assert_eq!(
+        config.matches("  - name: ").count(),
+        1,
+        "a server beside the bridge: {config}"
     );
-    assert_eq!(backend.mcp_config(), None);
 }
 
 /// Codex on its own tools takes the same registration in its own spelling.
@@ -351,10 +365,15 @@ fn the_configured_agent_selects_the_backend_that_drives_it() {
     assert_eq!(claude.id(), "claude-code");
     assert_eq!(agy.id(), "agy", "the backend reports the BINARY it drives");
     assert_eq!(codex.id(), "codex");
-    // And each is asked for its enforcement rather than assumed one: agy
-    // runs its own tools, so it cannot claim what claude does — while codex,
-    // on incode's tools by default, claims exactly that.
-    assert_ne!(claude.enforces(), agy.enforces());
+    // And each is asked for its enforcement rather than assumed one: agy and
+    // codex, on incode's tools by default, claim exactly what claude does.
+    // (On their own tools they claim nothing: `agy_is_handed_no_server_but_the_bridge`,
+    // `the_codex_setting_picks_whose_tools_codex_runs`.)
+    assert!(
+        agy.runs_tools_here(),
+        "agy runs on incode's tools by default"
+    );
+    assert_eq!(claude.enforces(), agy.enforces());
     assert!(
         codex.runs_tools_here(),
         "codex runs on incode's tools by default"

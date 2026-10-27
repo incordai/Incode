@@ -374,16 +374,16 @@ fn backend_for_protocol(
     mode: crate::permissions::PermissionMode,
 ) -> Box<dyn crate::agent::AgentBackend> {
     match protocol {
-        Some(crate::agent::Protocol::AgyStreamJson) => Box::new(
-            crate::agent::agy::AgyBackend::new(workspace.to_path_buf())
-                .with_binary(binary.to_string())
-                // No guards argument: this agent has no flag to enforce them.
-                // The policy still applies — the sentinel checks it, and the
-                // worker reports the gap on every task — but claiming it here
-                // by handing over rules nothing would render is the pretence
-                // this whole split exists to prevent.
-                .with_system_context(system_prompt.to_vec()),
-        ),
+        Some(crate::agent::Protocol::AgyStreamJson) => Box::new(agy_backend(
+            workspace,
+            binary,
+            system_prompt,
+            desktop,
+            mode,
+            crate::admin::AdminConfig::load_default()
+                .resolve_agy_tools()
+                .value,
+        )),
         Some(crate::agent::Protocol::CodexJson) => Box::new(codex_backend(
             workspace,
             binary,
@@ -470,6 +470,51 @@ fn codex_backend(
                 backend.with_mcp_overrides(overrides)
             }
         }
+    }
+}
+
+/// The agy backend, on its own tools or on incode's ([`crate::agent::agy::AgyTools`]).
+///
+/// The choice is an argument for the reason [`codex_backend`]'s is: a test
+/// can then build both routes in one process and reach the lines of each.
+fn agy_backend(
+    workspace: &Path,
+    binary: &str,
+    system_prompt: &[String],
+    desktop: bool,
+    mode: crate::permissions::PermissionMode,
+    tools: crate::agent::agy::AgyTools,
+) -> crate::agent::agy::AgyBackend {
+    // No guards argument on either route. On agy's own tools it has no flag
+    // to enforce them: the policy still applies — the sentinel checks it,
+    // and the worker reports the gap on every task — but claiming it here by
+    // handing over rules nothing would render is the pretence this whole
+    // split exists to prevent. Bridged, incode's toolbox checks them itself.
+    let backend = crate::agent::agy::AgyBackend::new(workspace.to_path_buf())
+        .with_binary(binary.to_string())
+        .with_system_context(system_prompt.to_vec());
+    match tools {
+        // agy as a model only. The toolbox gets what codex's bridged one
+        // does — the engine's guard before each call, the code-edit marks,
+        // the operator's own commands around each, the OS sandbox on its
+        // shell — and the desktop is toolbox tools reached through the bridge.
+        crate::agent::agy::AgyTools::Incode => {
+            let mut backend = backend
+                .with_tools(tools)
+                .with_engine(crate::hooks::engine::Engine::locate())
+                .with_code_edits(crate::toolbox::CodeEdits::locate())
+                .with_operator_hooks(crate::hooks::HookRunner::from_settings())
+                .with_sandbox(sandbox_for(mode));
+            if let Some(setup) = desktop_setup_for(desktop, std::env::current_exe().ok(), workspace)
+            {
+                backend = backend.with_desktop(setup);
+            }
+            backend
+        }
+        // agy's own tools: no per-run MCP flag exists, so it is handed
+        // nothing — registering a desktop in its persistent configuration
+        // would be a lasting change to the operator's machine.
+        crate::agent::agy::AgyTools::Own => backend,
     }
 }
 
