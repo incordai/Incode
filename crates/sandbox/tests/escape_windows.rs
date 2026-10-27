@@ -812,21 +812,41 @@ fn a_second_network_deny_run_writes_what_the_first_created() {
         "{}",
         String::from_utf8_lossy(&set.stdout)
     );
+    // None of the user's own: an elevated process (a CI runner) gives a new
+    // folder an explicit full-control ACE for its user, which
+    // `/inheritance:r` does not take off and which would hide the case.
+    let me = Command::new("whoami").output().expect("whoami");
+    let me = String::from_utf8_lossy(&me.stdout).trim().to_string();
+    let removed = Command::new("icacls")
+        .arg(&d.ws)
+        .args(["/remove:g", &me])
+        .output()
+        .expect("icacls");
+    assert!(
+        removed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&removed.stdout)
+    );
     let flags = ["--net", "deny", "-w", "."];
     let file = d.ws.join(r"cache\f.txt");
     let first = cmd(&d.ws, &flags, r"mkdir cache & echo one> cache\f.txt");
     let read = || std::fs::read_to_string(&file).unwrap_or_default();
     assert_eq!(read().trim(), "one", "{}", text(&first));
     // The case that failed: the file is the account's, not the user's.
+    // Windows PowerShell started from a PowerShell 7 shell (a CI step)
+    // inherits 7's module path, cannot load `Get-Acl`'s module and prints
+    // nothing; without the variable it uses its own.
     let owner = Command::new("powershell")
+        .env_remove("PSModulePath")
         .args(["-NoProfile", "-NonInteractive", "-Command"])
         .arg(format!("(Get-Acl -LiteralPath '{}').Owner", file.display()))
         .output()
         .expect("powershell");
     assert!(
         String::from_utf8_lossy(&owner.stdout).contains(OFFLINE),
-        "the first run's file should be the offline account's: {}",
-        String::from_utf8_lossy(&owner.stdout)
+        "the first run's file should be the offline account's: {} {}",
+        String::from_utf8_lossy(&owner.stdout),
+        String::from_utf8_lossy(&owner.stderr)
     );
 
     let second = cmd(&d.ws, &flags, r"echo two> cache\f.txt");

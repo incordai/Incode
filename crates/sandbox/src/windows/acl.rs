@@ -1052,11 +1052,21 @@ mod tests {
     /// message: what a test's precondition actually found, so a run on
     /// another machine (an elevated CI runner) says why it differs.
     fn acl_of(path: &Path) -> String {
+        // Without `PSModulePath`: Windows PowerShell started from a
+        // PowerShell 7 shell (a CI step) inherits 7's module path, cannot
+        // load `Get-Acl`'s module and prints nothing.
         let run = |program: &str, args: &[&std::ffi::OsStr]| {
             std::process::Command::new(program)
+                .env_remove("PSModulePath")
                 .args(args)
                 .output()
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .map(|o| {
+                    format!(
+                        "{} {}",
+                        String::from_utf8_lossy(&o.stdout).trim(),
+                        String::from_utf8_lossy(&o.stderr).trim()
+                    )
+                })
                 .unwrap_or_else(|e| format!("{program}: {e}"))
         };
         let owner = run(
