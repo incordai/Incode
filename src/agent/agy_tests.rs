@@ -262,12 +262,28 @@ fn a_foreign_model_id_is_dropped_rather_than_sent() {
 /// from `agy models`, and a cheap role must not draw the strong model.
 #[test]
 fn each_role_draws_a_model_this_agent_actually_has() {
+    // What `agy models` listed on 1.4.7 (2026-10-27). A family prefix alone
+    // let `gemini-3.1-pro-high` through after agy stopped serving it, and
+    // every role-routed turn failed "model … is not recognized"; re-measure
+    // this list when agy changes.
+    const SERVED: [&str; 6] = [
+        "gemini-3.8-flash-high",
+        "gemini-3.8-flash-medium",
+        "gemini-3.8-flash-low",
+        "claude-sonnet-4-6",
+        "claude-opus-4-6-thinking",
+        "gpt-oss-120b-medium",
+    ];
     let backend = AgyBackend::new(PathBuf::from("."));
     for role in crate::roles::KNOWN_ROLES {
         for id in backend.ladder_for(role) {
             assert!(
                 backend.serves(&id),
                 "role {role} was given `{id}`, which this agent cannot serve"
+            );
+            assert!(
+                SERVED.contains(&id.as_str()),
+                "role {role} was given `{id}`, which `agy models` does not list"
             );
         }
     }

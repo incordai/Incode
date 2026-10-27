@@ -229,6 +229,12 @@ pub struct AdminConfig {
     /// [`crate::agent::codex::CodexTools`]. `INCODE_CODEX_TOOLS` wins over it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_tools: Option<String>,
+    /// Whose tools an agy (Antigravity) model runs: `incode` (the default —
+    /// incode's toolbox through the tool bridge, agy's own switched off by a
+    /// custom agent) or `own` (agy's, watched afterwards by the Sentinel) —
+    /// see [`crate::agent::agy::AgyTools`]. `INCODE_AGY_TOOLS` wins over it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agy_tools: Option<String>,
     /// The capability ladder, named by the operator.
     ///
     /// A tier is a list of models that can do the same JOB — `"top"` might hold
@@ -793,6 +799,33 @@ impl AdminConfig {
         }
     }
 
+    /// Whose tools an agy model runs, and where that was decided — resolved
+    /// as [`Self::resolve_codex_tools`] is: the environment, then the
+    /// settings, then `incode` ([`AgyTools`]'s default).
+    ///
+    /// [`AgyTools`]: crate::agent::agy::AgyTools
+    #[must_use]
+    pub fn resolve_agy_tools(&self) -> Resolved<crate::agent::agy::AgyTools> {
+        self.resolve_agy_tools_with(
+            std::env::var(crate::agent::agy::AGY_TOOLS_ENV)
+                .ok()
+                .as_deref(),
+        )
+    }
+
+    /// [`Self::resolve_agy_tools`] with the environment's value passed in,
+    /// for the reason [`Self::resolve_codex_tools_with`] takes it.
+    fn resolve_agy_tools_with(&self, env: Option<&str>) -> Resolved<crate::agent::agy::AgyTools> {
+        use crate::agent::agy::AgyTools;
+        if let Some(tools) = env.and_then(AgyTools::parse) {
+            return Resolved::new(tools, Source::Environment);
+        }
+        match self.agy_tools.as_deref().and_then(AgyTools::parse) {
+            Some(tools) => Resolved::new(tools, Source::AdminFile),
+            None => Resolved::new(AgyTools::default(), Source::BuiltIn),
+        }
+    }
+
     /// The check that decides whether work is finished, and where it came from.
     #[must_use]
     pub fn resolve_verify(&self, workspace: &Path) -> Option<Resolved<Vec<String>>> {
@@ -835,6 +868,12 @@ impl AdminConfig {
             "  codex tools    {}  <- {}\n",
             codex_tools.value.as_str(),
             codex_tools.source.as_str()
+        ));
+        let agy_tools = self.resolve_agy_tools();
+        out.push_str(&format!(
+            "  agy tools      {}  <- {}\n",
+            agy_tools.value.as_str(),
+            agy_tools.source.as_str()
         ));
         out.push_str(&format!(
             "  telemetry      {}\n",

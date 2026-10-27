@@ -77,7 +77,7 @@ There are **three** processes and they are not peers.
 
 | | The harness (`incode`) | The model (an installed CLI, headless) | The body (memory service) |
 |---|---|---|---|
-| **Owns** | the plan, the check, the guards, the ledger, the budget, the terminal, and every tool call (the `Toolbox`, §5a–§5b) | the model's reasoning and its conversation; codex and agy also still run their own tools (§5a) | recall, rules, the proxy, the auditor, the recorder, the owner queue |
+| **Owns** | the plan, the check, the guards, the ledger, the budget, the terminal, and every tool call (the `Toolbox`, §5a–§5b) | the model's reasoning and its conversation; codex and agy set to `own` also run their own tools (§5a) | recall, rules, the proxy, the auditor, the recorder, the owner queue |
 | **State** | one workspace | one conversation, which it stores itself | every project, every agent on the machine |
 | **Reached by** | the person, at a prompt, or an ACP client | spawned as a child process | HTTP on `127.0.0.1`, default port in `brief.rs`; the engine binary's hooks |
 | **Lifetime** | a session | a turn | a machine |
@@ -423,9 +423,10 @@ and the walk to the nearest existing ancestor ended at nothing.
 
 `hooks::engine` runs the memory engine's lifecycle hooks at the moment incode's own
 Toolbox is about to act. Only calls that go through the Toolbox are covered: the API
-route (`agent::api`) and the bridged claude route (§5a), with their sub-agents. codex
-and Antigravity still run their own tools inside their own processes, so no call they
-make passes this gate.
+route (`agent::api`) and the bridged claude, codex and Antigravity routes (§5a), with
+their sub-agents. codex with `codex_tools: "own"` and Antigravity with `agy_tools:
+"own"` run their own tools inside their own processes, so no call they make there
+passes this gate.
 
 - **Binary:** `INCORD_ENGINE_BIN`, then `engine_bin` in `admin.json`, then the engine's
   install location — `%LOCALAPPDATA%\Watchman\incord-memory-service.exe`, where it ships
@@ -509,7 +510,7 @@ engine who changed which definition, not any CLI's edit events.
   Unanswered — no engine, a folder that is not one of its projects, a file its index does
   not cover — the call runs unchecked, as before; the `pre-tool` gate has already refused
   every change when the engine cannot decide. Not covered: shell commands (the engine has
-  no command window yet), and codex and agy, which write with their own tools.
+  no command window yet), and codex and agy set to `own`, which write with their own tools.
 
 ### The engine's session lifecycle, fired by incode
 
@@ -681,7 +682,7 @@ That is why the fallback is traced rather than silent.
 | `wiring.rs` | **A capability nothing calls is not a capability.** Counts production mentions of every `pub fn`; a declaration mentioned only once is dead. Ratcheted, so the number can fall and never rise. See `CONVENTIONS.md` §13. |
 | `permissions.rs` | **What the session may do reaches every place that does it.** A mode governs every tool call *and* the desktop: `-p read-only` means the agent may look at the screen and not touch it. The policy applies in `Toolbox::run_call` for every tool (§5b), and again at `desktop::mcp::call_tool` in the desktop's executor. |
 | `hooks.rs` | **The operator can put their own command in front of an action.** Pre-tool hooks run before every Toolbox tool (the desktop's in its executor) and refuse with exit code 2; post-tool hooks run only for calls that happened and cannot deny. Bounded at 10s, because a hook runs between the agent asking and the screen moving. `hooks/engine.rs` is the other half: the memory engine's own hooks, run before each Toolbox call with a piped stdin and the engine's 600 s bounds — see §2, "The engine's hooks". |
-| `spec.rs` | **No source for a project nobody has specified.** Five documents, each with a named consumer, and a document is written only when it carries what it must: `ARCHITECTURE.md` its `## Layout` and its `## Language` — each term, its definition, `_Avoid_:` its synonyms — (checked by `spec::has_section`, the same check the PRD's `## Non-goals` goes through), and on a project with no code, `VERIFICATION.md` a runnable check for the scaffold. Until then `Write`/`Edit` of source is refused, naming the gap. **One exception, per run:** `incode -t … --spec-gate=off` (or `INCODE_SPEC_GATE=off`), for a task its caller already scoped (Insi's one-line fixes paid 130–170k tokens writing five guessed documents first). `task_run::run_task_as` fixes `spec::SpecGate` for that process (`spec::set_for_this_run`, a `OnceLock`, not an environment variable a nested `incode` would inherit); every `Toolbox` built in it takes it (`spec::for_this_run`) and skips only `refuse_source_write` — after the guards, so a protected path is still refused, and the sentinel and the verify law are untouched. The prompt drops the intake it would otherwise carry (the brief, the unvetted dependencies, the spec note) for `spec::GATE_OFF_NOTE`, since the prompt, not the refusal, is what made a fix write the set. The tool server needs nothing: it runs no tool, and the write is decided by the parent's toolbox. The result line carries `spec_gate`. Only `-t` honours it: the REPL, `/run` (`cli::run_ledger` still refuses to start) and `--acp` never set it and name the variable on stderr when it is set, and `admin.json` has no field for it — a standing setting would turn the law off for every future run without anyone saying so. `codex` and `agy` bring their own write tools, so on those routes the gate was only ever the prompt, and off removes that. |
+| `spec.rs` | **No source for a project nobody has specified.** Five documents, each with a named consumer, and a document is written only when it carries what it must: `ARCHITECTURE.md` its `## Layout` and its `## Language` — each term, its definition, `_Avoid_:` its synonyms — (checked by `spec::has_section`, the same check the PRD's `## Non-goals` goes through), and on a project with no code, `VERIFICATION.md` a runnable check for the scaffold. Until then `Write`/`Edit` of source is refused, naming the gap. **One exception, per run:** `incode -t … --spec-gate=off` (or `INCODE_SPEC_GATE=off`), for a task its caller already scoped (Insi's one-line fixes paid 130–170k tokens writing five guessed documents first). `task_run::run_task_as` fixes `spec::SpecGate` for that process (`spec::set_for_this_run`, a `OnceLock`, not an environment variable a nested `incode` would inherit); every `Toolbox` built in it takes it (`spec::for_this_run`) and skips only `refuse_source_write` — after the guards, so a protected path is still refused, and the sentinel and the verify law are untouched. The prompt drops the intake it would otherwise carry (the brief, the unvetted dependencies, the spec note) for `spec::GATE_OFF_NOTE`, since the prompt, not the refusal, is what made a fix write the set. The tool server needs nothing: it runs no tool, and the write is decided by the parent's toolbox. The result line carries `spec_gate`. Only `-t` honours it: the REPL, `/run` (`cli::run_ledger` still refuses to start) and `--acp` never set it and name the variable on stderr when it is set, and `admin.json` has no field for it — a standing setting would turn the law off for every future run without anyone saying so. `codex` and `agy` set to `own` bring their own write tools, so on those routes the gate was only ever the prompt, and off removes that. |
 | `scaffold.rs` | **A new project's layout is roadmap item one, and a command proves it.** On a project with no code, `s1 Create the layout` is put first in the roadmap — derived (`brief::from_docs`) or saved (`save_brief`) — and is traceable to `## Layout` rather than to a PRD section. Its goal check is the stack's build or test command. No templates: the stack's own generator, optionally pinned by the owner (`scaffold` in `admin.json`), passed to the model as a preference. |
 | `plan.rs` | **The expensive model decides the shape once.** At most twelve steps, `role: what to do`, `[after N]` for what must wait. Each step a thin vertical slice its check can prove; prefactoring first; a wide refactor as expand → migrate in batches → contract; and for a behaviour change the test as its own first step, written pending so the check stays green, with the change `[after]` it turning the test on. Test paths stay guarded and both steps need the owner: an agent that brings its own tools is put to the owner (`agent::worker::settle_breach`); on incode's own toolbox the write is put to a person (`Toolbox::ask_protected`) — the one at the session (terminal, or the ACP client's `session/request_permission`), else during `/run` the owner's channel (`owner::OwnerPrompter`, under the sentinel's own card title `guards::breach_title`, so one answer covers both) — and refused when nobody can be asked or the session is read-only, unless `.incode/guards.json` allows the path (`allow_writes_to`). An allow passes the protected path only: the intake gate still applies. |
 | `ask.rs` | **A question arrives with an answer to agree to.** An option line ending `(recommended)` — or `recommended: true` in `AskUserQuestion` — is the default: shown as recommended, taken by an empty answer (Enter, `cli/prompt.rs`), at most one per question. The intake asks at most seven, in one batch, each with its recommendation; unanswered, they stand as recorded assumptions. Decisions live in `ASSUMPTIONS.md` and memory, never ADR files. |
@@ -1021,14 +1022,33 @@ written. On a code-mode model (`gpt-5.6-terra`) the tools are nested under codex
 `exec` (JavaScript, no file system or network), and each call still lands in the
 toolbox. NOT run: a turn with a real model.
 
-**agy 1.2.11 (antigravity) — NOT bridged; cannot be.** `agy --help` has no flag to
-remove or restrict its built-in tools, no per-run MCP configuration (only a persistent
-`agy mcp add`, which edits the operator's machine), and no way to skip its settings. A
-live run listed its tools as `view_file, run_command, manage_task, send_message,
-schedule, invoke_subagent, define_subagent, manage_subagents, write_to_file,
-replace_file_content, generate_image, read_url_content, search_web, ask_question,
-call_mcp_tool, list_resources, read_resource`. It stays on its own harness, with the
-Sentinel as detection.
+**agy 1.4.7 (antigravity) — bridged, THE DEFAULT (`agy_tools: "own"` /
+`INCODE_AGY_TOOLS=own` opts out).** On 1.2.11 `agy --help` showed no flag to remove its
+built-in tools and no per-run MCP configuration, and a live run listed `view_file,
+run_command, manage_task, send_message, schedule, invoke_subagent, define_subagent,
+manage_subagents, write_to_file, replace_file_content, generate_image,
+read_url_content, search_web, ask_question, call_mcp_tool, list_resources,
+read_resource`. A custom AGENT does both jobs instead (measured on 1.4.7):
+
+| Need | How | Evidence |
+|---|---|---|
+| None of agy's own tools | agent file `~/.gemini/config/agents/incode.md`, `tools: [finish]`, run with `--agent incode` (`agent/agy/agent_file.rs`) | the model had only `finish, call_mcp_tool, list_resources, read_resource, manage_task`; a shell request was refused for want of a tool. `call_mcp_tool` under `tools:` is refused at startup (not in the registry). The `init` event lists the whole registry either way. |
+| incode's server, reachable | the agent's one `mcpServers` entry, `incode --tool-server`; the bridge's address and token in agy's environment | agy starts the server with its own environment (a variable set on agy reached it); the file carries the binary's path only, written by rename and only when it differs. |
+| Calls not refused by agy | `--dangerously-skip-permissions` | headless MCP calls are denied unasked without it; safe only because agy has no tool of its own left that writes or runs. |
+| agy's memory hooks quiet | `INCORD_HOOKS_BY=incode` in agy's environment | the engine's `--agy` hooks stand down on it; an engine without the switch records the run twice. |
+| The model knows each tool's inputs | an `<incode-tools>` block opening the prompt (`agent/agy/bridged.rs` `tool_inputs`) | agy writes MCP schemas to `~/.gemini/antigravity-cli/mcp/<server>/<Tool>.json` for its own `view_file`, which is gone here; without the block the model asked `Read` for that file (refused) and sent `{}`. |
+
+Live with a real model through `incode -t` (2026-10-27, `gemini-3.8-flash-high`): agy
+started `incode --tool-server` (`the tool server asked for the tools: 42 offered`), the
+calls ran in the toolbox — engine pre-tool hook, schema checks, the workspace boundary
+(`tool Write (change) <- {"content":"agy via incode","path":"hello.txt"}`, `Write ok`) —
+and the file was written and read back. Asked to act without incode, the model named
+only the five tools above; `list_resources` on another server and `call_mcp_tool` to
+`system` were refused by agy, and the trace named both (`agy ran its own tool
+list_resources`, `agy called MCP server system — not incode's tool server`). Left: a
+large tool result agy keeps in `~/.gemini/antigravity-cli/brain/…/output.txt` is
+outside the workspace and refused by `Read`; the server registered with `agy mcp add`
+was not probed.
 
 ### Known limitations on the bridged route
 

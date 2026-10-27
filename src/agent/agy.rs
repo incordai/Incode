@@ -15,28 +15,48 @@
 //! renders it; a rule that only one agent can express would have shown up here
 //! as something impossible to translate.
 //!
-//! It showed up as something worse, and more useful: **this agent cannot
-//! express the policy at all.** See [`AgyBackend::enforces`].
+//! It showed up as something worse, and more useful: on its own tools **this
+//! agent cannot express the policy at all.** See [`AgyBackend::enforces`].
 //!
-//! # Why it is not driven over the tool bridge — yet
+//! # Bridged: incode's tools instead of agy's ([`AgyTools::Incode`])
 //!
-//! The Claude route and codex (by default) run every tool call in incode's
-//! toolbox ([`crate::tool_bridge`]). That needs two things of the CLI for ONE
-//! run: a way to switch its own tools off, and a way to hand it an MCP server.
-//! No FLAG does either, but a custom AGENT does both. Measured on 1.4.7
-//! (2026-10-26): an agent file (`.agents/agents/<name>.md` or
-//! `~/.gemini/config/agents/<name>.md`) with frontmatter `tools: [finish]`,
-//! `mcpServers: [{name, command, args}]` and `mainAgent: true`, run as
-//! `agy -p --agent <name> --dangerously-skip-permissions`, gives the model only
-//! `finish`, `call_mcp_tool`, `list_resources`, `read_resource` and
-//! `manage_task`. The shell never ran, and the server inherited agy's
-//! environment, as the bridge's address and token need. The `init` event lists
-//! the whole registry either way, so it is not evidence of the restriction.
+//! The default, as on the Claude route and codex (`agy_tools: "own"` in
+//! admin.json, or `INCODE_AGY_TOOLS=own`, goes back). On this route agy is a
+//! model and nothing else: every tool call runs in incode's toolbox
+//! ([`crate::tool_bridge`]), under the guards, the memory engine's pre-tool
+//! check, the code-edit marks, the sandbox and the operator's hooks.
 //!
-//! Not built, because one thing is unresolved: agy's own memory hooks
-//! (`~/.gemini/*/hooks.json`) still fire on such a run, beside the ones the
-//! toolbox fires, so the engine would hear every event twice. Until that is
-//! settled agy keeps its own tools, and the Sentinel stays its check.
+//! No FLAG switches agy's tools off or hands it an MCP server, but a custom
+//! AGENT does both. Measured on 1.4.7 (2026-10-26/27, real headless turns):
+//! an agent file with `tools: [finish]` and one `mcpServers` entry
+//! (`agy/agent_file.rs`), run as `agy --print … --agent incode
+//! --dangerously-skip-permissions`, gives the model only `finish`,
+//! `call_mcp_tool`, `list_resources`, `read_resource` and `manage_task`; the
+//! shell never ran, and the server inherited agy's environment, which is how
+//! the bridge's address and token reach it. The `init` event lists the whole
+//! registry either way, so it is not evidence of the restriction.
+//!
+//! agy's own memory hooks (`~/.gemini/*/hooks.json`) would fire on such a run
+//! beside the ones the toolbox fires, so the spawn carries
+//! `INCORD_HOOKS_BY=incode` ([`HOOKS_BY_ENV`]), on which the engine's `--agy`
+//! hooks stand down. An engine without that switch only records the run twice.
+//!
+//! Run live with a real model (1.4.7, `gemini-3.8-flash-high`, `incode -t`,
+//! 2026-10-27): agy started `incode --tool-server`, every call ran in the
+//! toolbox (trace `tool Write (change)`), the file was written and read back,
+//! and asked to reach past incode the model found no tool of agy's that writes
+//! or runs — agy refused its calls to other servers. agy gives the model no
+//! MCP schema it can open on this route, so the prompt names each tool's
+//! inputs (`agy/bridged.rs` `tool_inputs`).
+//!
+//! # Layout
+//!
+//! This file holds the backend, its settings and the reading of agy's stream.
+//! The agent file is written in `agy/agent_file.rs`, and a bridged turn is
+//! run in `agy/bridged.rs`.
+
+mod agent_file;
+mod bridged;
 
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
@@ -45,6 +65,48 @@ use std::process::{Command, Stdio};
 use serde::Deserialize;
 
 use super::{AgentBackend, AgentError, AgentEvent, TurnOutcome};
+
+/// Whose tools an agy model runs, from admin.json's `agy_tools` or
+/// [`AGY_TOOLS_ENV`] — see [`crate::admin::AdminConfig::resolve_agy_tools`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AgyTools {
+    /// agy's own (`run_command`, the write tools, its sub-agents), watched
+    /// afterwards by the Sentinel: outside incode's guard, memory hooks and
+    /// sandbox.
+    Own,
+    /// incode's, through the tool bridge: agy is a model and nothing else.
+    /// The default, as for codex — the operator's built-in layer
+    /// ([`crate::admin::AdminConfig::resolve_agy_tools`]) reads it from here.
+    #[default]
+    Incode,
+}
+
+impl AgyTools {
+    /// `own` or `incode`, ignoring case; anything else is no answer.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "own" => Some(Self::Own),
+            "incode" => Some(Self::Incode),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Own => "own",
+            Self::Incode => "incode",
+        }
+    }
+}
+
+/// The variable that wins over admin.json's `agy_tools`.
+pub const AGY_TOOLS_ENV: &str = "INCODE_AGY_TOOLS";
+
+/// Set to `incode` on a bridged agy: the memory engine's own `--agy` hooks
+/// read it and stand down, because incode's toolbox reports every call.
+pub const HOOKS_BY_ENV: &str = "INCORD_HOOKS_BY";
 
 /// How long one turn may take before this CLI abandons it.
 ///
@@ -110,6 +172,12 @@ struct StepUpdate {
     /// once mistaken for the whole text of a finished step ([`StepText`]).
     #[serde(default)]
     text_delta: String,
+    /// The tool a `tool` step ran: `call_mcp_tool` for every call that goes
+    /// to an MCP server, with the server in `tool_info.parameters.ServerName`.
+    #[serde(default)]
+    tool_name: String,
+    #[serde(default)]
+    tool_info: Option<serde_json::Value>,
     #[serde(default)]
     usage: Option<WireUsage>,
 }
@@ -178,6 +246,19 @@ pub struct AgyBackend {
     /// instruction — and weaker is the honest trade against not sending it.
     system_context: Vec<String>,
     cancel: Option<crate::runtime::cancel::CancelToken>,
+    /// Every tool the model has, run HERE — on the bridged route only
+    /// ([`AgyTools::Incode`]). `None` is agy running its own tools, and then
+    /// nothing below this line is used.
+    tools: Option<crate::toolbox::Toolbox>,
+    /// How many calls the toolbox has run for this backend, so each gets an
+    /// id no earlier turn used.
+    calls: u64,
+    /// The binary agy is told to start as the tool server, when not this
+    /// one — a test's stand-in. `None` is this process's own binary.
+    tool_server: Option<PathBuf>,
+    /// Where the agent file is written, when not agy's own agents folder —
+    /// a test's. `None` is `~/.gemini/config/agents`.
+    agents_dir: Option<PathBuf>,
 }
 
 impl AgyBackend {
@@ -203,7 +284,87 @@ impl AgyBackend {
             mode: Some("accept-edits".to_string()),
             system_context: Vec::new(),
             cancel: None,
+            tools: None,
+            calls: 0,
+            tool_server: None,
+            agents_dir: None,
         }
+    }
+
+    /// Run this model's tool calls in incode's toolbox, through the bridge,
+    /// with agy's own tools switched off by the `incode` agent — or not, for
+    /// [`AgyTools::Own`].
+    ///
+    /// Set before the toolbox builders below, which do nothing without it:
+    /// agy's own tools are not incode's to configure.
+    #[must_use]
+    pub fn with_tools(mut self, tools: AgyTools) -> Self {
+        self.tools = match tools {
+            // The filtered environment for the shell tool, as on the other
+            // bridged routes: a command the model chose must not inherit this
+            // process's credentials.
+            AgyTools::Incode => Some(crate::toolbox::Toolbox::new(&self.workspace, true)),
+            AgyTools::Own => None,
+        };
+        self
+    }
+
+    /// The toolbox, when this model's tools are incode's.
+    fn toolbox(&mut self) -> Option<&mut crate::toolbox::Toolbox> {
+        self.tools.as_mut()
+    }
+
+    /// Ask the memory engine before every tool call this model makes — on the
+    /// bridged route, where incode runs them.
+    #[must_use]
+    pub fn with_engine(mut self, engine: Option<crate::hooks::engine::Engine>) -> Self {
+        self.tools = self.tools.map(|t| t.with_engine(engine));
+        self
+    }
+
+    /// Announce each file write to the engine's edit check — bridged only.
+    #[must_use]
+    pub fn with_code_edits(mut self, edits: Option<crate::toolbox::CodeEdits>) -> Self {
+        self.tools = self.tools.map(|t| t.with_code_edits(edits));
+        self
+    }
+
+    /// Run the operator's own pre- and post-tool commands around every call —
+    /// bridged only. See [`crate::hooks`].
+    #[must_use]
+    pub fn with_operator_hooks(mut self, hooks: Option<crate::hooks::HookRunner>) -> Self {
+        self.tools = self.tools.map(|t| t.with_operator_hooks(hooks));
+        self
+    }
+
+    /// Confine this model's shell commands to `policy` — bridged only: agy
+    /// has no shell of its own there, and incode's runs under incode's
+    /// sandbox.
+    #[must_use]
+    pub fn with_sandbox(mut self, policy: crate::sandbox::SandboxPolicy) -> Self {
+        self.tools = self.tools.map(|t| t.with_sandbox(policy));
+        self
+    }
+
+    /// Offer the model the desktop tools, run through incode's toolbox —
+    /// bridged only. agy's own route has no way to be handed a desktop for
+    /// one run (`cli/tests.rs` `agy_is_handed_no_server_but_the_bridge`).
+    #[must_use]
+    pub fn with_desktop(mut self, setup: crate::toolbox::DesktopSetup) -> Self {
+        if let Some(tools) = self.toolbox() {
+            tools.enable_desktop(setup);
+        }
+        self
+    }
+
+    /// Have agy start `exe` as the tool server instead of this binary, and
+    /// write the agent file into `agents` instead of agy's own folder.
+    /// Called by the bridged-turn tests' stand-ins (`agy/bridged_tests.rs`).
+    #[cfg(test)]
+    fn with_stand_ins(mut self, exe: PathBuf, agents: PathBuf) -> Self {
+        self.tool_server = Some(exe);
+        self.agents_dir = Some(agents);
+        self
     }
 
     /// Carry the harness's context on every turn.
@@ -235,9 +396,19 @@ impl AgyBackend {
     }
 
     /// The prompt actually sent: the harness's context, then the task, budgeted for OS limits.
+    ///
+    /// Bridged, the context opens with the inputs of incode's tools
+    /// (`agy/bridged.rs` `tool_inputs`): agy gives the model no schema it can
+    /// open on that route.
     fn full_prompt(&self, prompt: &str) -> Result<String, AgentError> {
+        let context: Vec<String> = match &self.tools {
+            Some(tools) => std::iter::once(bridged::tool_inputs(tools))
+                .chain(self.system_context.iter().cloned())
+                .collect(),
+            None => self.system_context.clone(),
+        };
         let (budgeted_prompt, budgeted_context) =
-            crate::agent::budget_for_spawn(prompt, &self.system_context, &self.workspace)?;
+            crate::agent::budget_for_spawn(prompt, &context, &self.workspace)?;
         Ok(if budgeted_context.is_empty() {
             budgeted_prompt
         } else {
@@ -289,8 +460,8 @@ impl AgentBackend for AgyBackend {
         "agy"
     }
 
-    /// **Neither half.** Measured, and this is the finding that made
-    /// [`crate::guards::Enforcement`] necessary.
+    /// **On its own tools, neither half.** Measured, and this is the finding
+    /// that made [`crate::guards::Enforcement`] necessary.
     ///
     /// `agy --help` offers no per-tool deny list — nothing equivalent to the
     /// other CLI's `--disallowedTools` — and no way to append to the system
@@ -303,8 +474,102 @@ impl AgentBackend for AgyBackend {
     /// detects a write after the fact and needs no cooperation. The no-subagent
     /// rule has no enforcement path here at all, and the worker reports that
     /// gap on every task rather than letting it pass unsaid.
+    ///
+    /// **Bridged, both** — by incode's toolbox, as on the Claude route: the
+    /// `incode` agent leaves agy no tool that writes, runs or delegates
+    /// (`finish`, the MCP caller and readers, its task list — measured), so
+    /// every write is a toolbox call refused before it runs, and the only
+    /// sub-agent tool is incode's, which stops at its depth limit.
     fn enforces(&self) -> crate::guards::Enforcement {
+        if self.tools.is_some() {
+            return crate::guards::Enforcement::EVERYTHING;
+        }
         crate::guards::Enforcement::NOTHING
+    }
+
+    /// Bridged, the one server agy is handed: the agent file the next turn
+    /// writes, which names incode's tool server and nothing else. On agy's
+    /// own tools, nothing — it has no per-run registration.
+    fn mcp_config(&self) -> Option<String> {
+        self.tools
+            .as_ref()
+            .map(|_| agent_file::content(&self.server_exe()))
+    }
+
+    // What follows reaches the toolbox, and so means something only on the
+    // bridged route. On agy's own tools each is the trait's default: there is
+    // no call of incode's to ask about, record or watch.
+
+    /// Bridged: agy's own tools are switched off and every call comes back
+    /// through the bridge to this backend's toolbox.
+    fn runs_tools_here(&self) -> bool {
+        self.tools.is_some()
+    }
+
+    fn set_team_identity(&mut self, role: &str) {
+        if let Some(tools) = self.toolbox() {
+            tools.set_team_identity(role);
+        }
+    }
+
+    fn set_prompter(&mut self, prompter: std::sync::Arc<dyn crate::hooks::engine::Prompter>) {
+        if let Some(tools) = self.toolbox() {
+            tools.set_prompter(prompter);
+        }
+    }
+
+    fn set_owner(&mut self, owner: std::sync::Arc<dyn crate::hooks::engine::Prompter>) {
+        if let Some(tools) = self.toolbox() {
+            tools.set_owner(owner);
+        }
+    }
+
+    fn share_allowed_writes(&mut self, record: std::sync::Arc<crate::toolbox::AllowedWrites>) {
+        if let Some(tools) = self.toolbox() {
+            tools.share_allowed_writes(record);
+        }
+    }
+
+    fn share_session_tools(&mut self, state: std::sync::Arc<crate::toolbox::SessionTools>) {
+        if let Some(tools) = self.toolbox() {
+            tools.share_session(state);
+        }
+    }
+
+    fn set_watch(&mut self, watch: std::sync::Arc<dyn crate::watch::Watch>) {
+        if let Some(tools) = self.toolbox() {
+            tools.set_watch(watch);
+        }
+    }
+
+    /// The engine hears incode's session id with every call, not agy's
+    /// conversation id: incode's is the one its session events carry too.
+    fn set_memory_session(&mut self, session: &str) {
+        if let Some(tools) = self.toolbox() {
+            tools.pin_session(session);
+        }
+    }
+
+    fn end_code_edits(&mut self) {
+        if let Some(tools) = self.toolbox() {
+            tools.end_code_edits();
+        }
+    }
+
+    fn children(&self) -> Vec<(String, String)> {
+        self.tools.as_ref().map_or_else(Vec::new, |tools| {
+            tools
+                .children()
+                .into_iter()
+                .map(|c| (c.session, c.title))
+                .collect()
+        })
+    }
+
+    fn offered_tools(&self) -> Vec<String> {
+        self.tools
+            .as_ref()
+            .map_or_else(Vec::new, crate::toolbox::Toolbox::names)
     }
 
     /// `status: ERROR` is this agent's OWN channel, never a verdict on the work.
@@ -340,10 +605,15 @@ impl AgentBackend for AgyBackend {
 
     /// This agent's own ladder, in ITS namespace.
     ///
-    /// The ids are taken from `agy models` on v1.1.23, not guessed. The shape
-    /// mirrors the harness's own tiering — cheap models for reading, strong
-    /// ones for deciding and writing — so a role means the same thing here as
-    /// it does on any other agent even though the names share nothing.
+    /// The ids are taken from `agy models` on 1.4.7 (2026-10-27), not guessed:
+    /// `gemini-3.8-flash-{high,medium,low}`, `claude-sonnet-4-6`,
+    /// `claude-opus-4-6-thinking`, `gpt-oss-120b-medium`. The ladder named
+    /// `gemini-3.1-pro-high` before, which agy no longer serves — every
+    /// role-routed turn then failed "model … is not recognized" unless `-m`
+    /// named one it does. The shape mirrors the harness's own tiering — cheap
+    /// models for reading, strong ones for deciding and writing — so a role
+    /// means the same thing here as it does on any other agent even though
+    /// the names share nothing.
     ///
     /// Two candidates per role wherever there are two: this CLI has no fallback
     /// flag, so only the first is ever sent, but the list documents the
@@ -352,10 +622,10 @@ impl AgentBackend for AgyBackend {
         let ids: &[&str] = match role {
             // Reading and locating: the cheapest model that can follow a file.
             "explore" | "grunt" => &["gemini-3.8-flash-low", "gemini-3.8-flash-medium"],
-            // Judgement about code that already exists.
-            "diagnose" | "review" | "plan" => &["gemini-3.1-pro-high", "gemini-3.8-flash-high"],
+            // Judgement about code that already exists: the strongest it has.
+            "diagnose" | "review" | "plan" => &["claude-opus-4-6-thinking", "claude-sonnet-4-6"],
             // Writing code, where being wrong is most expensive.
-            "implement" | "frontend" => &["gemini-3.1-pro-high", "gemini-3.8-flash-high"],
+            "implement" | "frontend" => &["claude-sonnet-4-6", "gemini-3.8-flash-high"],
             // An unknown role gets nothing rather than a guess — the agent's
             // own default then stands, which is the documented behaviour.
             _ => &[],
@@ -402,11 +672,22 @@ impl AgentBackend for AgyBackend {
         self.model = candidates.iter().find(|c| self.serves(c)).cloned();
     }
 
+    /// Bridged, incode's toolbox does the writing, so it is the toolbox that
+    /// must reach the added roots — under the same guards. agy is told too,
+    /// as on its own route: with no tools of its own the roots only widen
+    /// what it may name.
     fn set_extra_dirs(&mut self, dirs: Vec<PathBuf>) {
+        if let Some(tools) = self.toolbox() {
+            tools.set_extra_dirs(dirs.clone());
+        }
         self.extra_dirs = dirs;
     }
 
     fn set_permission_mode(&mut self, mode: &str) {
+        // Bridged, the toolbox decides what a call may do in this mode.
+        if let Some(tools) = self.toolbox() {
+            tools.set_permission_mode(crate::permissions::PermissionMode::from_agent_mode(mode));
+        }
         // Only two values exist on this CLI. An unrecognised mode leaves the
         // agent's own default standing rather than passing a word it will
         // reject and failing the whole turn over a setting.
@@ -418,6 +699,9 @@ impl AgentBackend for AgyBackend {
     }
 
     fn set_cancel(&mut self, token: crate::runtime::cancel::CancelToken) {
+        if let Some(tools) = self.toolbox() {
+            tools.set_cancel(token.clone());
+        }
         self.cancel = Some(token);
     }
 
@@ -427,13 +711,16 @@ impl AgentBackend for AgyBackend {
         on_event: &mut dyn FnMut(&AgentEvent),
     ) -> Result<TurnOutcome, AgentError> {
         let sent = self.full_prompt(prompt)?;
+        if self.tools.is_some() {
+            return self.run_bridged(&sent, on_event);
+        }
         let Running {
             mut child,
             tree,
             stdout,
             stderr,
-        } = self.spawn(&sent)?;
-        let mut turn = TurnSoFar::default();
+        } = self.spawn(self.command(&sent))?;
+        let mut reading = Reading::new(&mut self.conversation_id, self.model.clone(), false);
 
         for line in BufReader::new(stdout).lines() {
             if self.cancel.as_ref().is_some_and(|t| t.is_cancelled()) {
@@ -441,28 +728,15 @@ impl AgentBackend for AgyBackend {
                 return Err(AgentError::new("the turn was cancelled"));
             }
             let Ok(line) = line else { break };
-            // A line this module does not understand is SKIPPED, never fatal:
-            // the CLI is free to add events, and a turn that died because of an
-            // unrecognised one would be a self-inflicted outage on upgrade.
-            let Ok(wire) = serde_json::from_str::<Wire>(&line) else {
-                continue;
-            };
-            self.read(wire, &mut turn, on_event);
+            reading.line(&line, on_event);
         }
-        turn.reply.finish(on_event);
-
-        on_event(&AgentEvent::Usage {
-            input_tokens: turn.usage.input_tokens,
-            output_tokens: turn.usage.output_tokens,
-            cache_creation_tokens: turn.usage.cache_creation_input_tokens,
-            cache_read_tokens: turn.usage.cache_read_input_tokens,
-        });
+        let outcome = reading.finish(on_event);
 
         let status = child
             .wait()
             .map_err(|e| AgentError::new(format!("the agent did not exit cleanly: {e}")))?;
 
-        turn.outcome.ok_or_else(|| no_result_line(status, stderr))
+        outcome.ok_or_else(|| no_result_line(status, stderr))
     }
 }
 
@@ -474,21 +748,13 @@ struct Running {
     stderr: crate::agent::stderr_tail::StderrTail,
 }
 
-/// What a turn has gathered from the stream so far.
-#[derive(Default)]
-struct TurnSoFar {
-    outcome: Option<TurnOutcome>,
-    usage: crate::runtime::usage::TokenUsage,
-    reply: StepText,
-}
-
 impl AgyBackend {
-    /// The CLI started on `prompt` with its output piped, everything it starts
-    /// taken in, and its stderr drained from the start.
+    /// `command` started with its output piped, everything it starts taken
+    /// in, and its stderr drained from the start.
     ///
-    /// Called by `run_turn`, once per turn.
-    fn spawn(&self, prompt: &str) -> Result<Running, AgentError> {
-        let mut command = self.command(prompt);
+    /// Called once per turn, by `run_turn` on agy's own tools and by
+    /// `bridged.rs` `run_bridged` on incode's.
+    fn spawn(&self, mut command: Command) -> Result<Running, AgentError> {
         crate::agent::process_tree::prepare(&mut command);
         let mut child = command
             .stdout(Stdio::piped())
@@ -510,26 +776,117 @@ impl AgyBackend {
             stderr,
         })
     }
+}
 
-    /// One understood line of the stream, folded into `turn`.
+/// One turn's reading of agy's stream, on either route: the conversation it
+/// runs in (kept on the backend as soon as it is named, so a turn that fails
+/// partway can still be resumed), the reply, the usage and the outcome.
+struct Reading<'a> {
+    conversation_id: &'a mut Option<String>,
+    /// The model that was asked for — the only answer this CLI gives.
+    model: Option<String>,
+    /// Whether the tools are incode's: then agy's `init` list is not what the
+    /// model has, and a tool step of agy's own is worth a trace line.
+    bridged: bool,
+    outcome: Option<TurnOutcome>,
+    usage: crate::runtime::usage::TokenUsage,
+    reply: StepText,
+    /// The last tool step traced, so a step's several updates trace once.
+    traced_step: Option<u64>,
+}
+
+impl<'a> Reading<'a> {
+    fn new(conversation_id: &'a mut Option<String>, model: Option<String>, bridged: bool) -> Self {
+        Self {
+            conversation_id,
+            model,
+            bridged,
+            outcome: None,
+            usage: crate::runtime::usage::TokenUsage::default(),
+            reply: StepText::default(),
+            traced_step: None,
+        }
+    }
+
+    /// One line of the stream, its events handed to `on_event`.
     ///
-    /// Called by `run_turn` for every line that parses.
-    fn read(&mut self, wire: Wire, turn: &mut TurnSoFar, on_event: &mut dyn FnMut(&AgentEvent)) {
+    /// A line this module does not understand is SKIPPED, never fatal: the
+    /// CLI is free to add events, and a turn that died because of an
+    /// unrecognised one would be a self-inflicted outage on upgrade.
+    fn line(&mut self, line: &str, on_event: &mut dyn FnMut(&AgentEvent)) {
+        if let Ok(wire) = serde_json::from_str::<Wire>(line) {
+            self.read(wire, on_event);
+        }
+    }
+
+    /// The stream is over: the last step's text said, the usage reported,
+    /// and the outcome, when a result line gave one.
+    fn finish(mut self, on_event: &mut dyn FnMut(&AgentEvent)) -> Option<TurnOutcome> {
+        self.reply.finish(on_event);
+        on_event(&AgentEvent::Usage {
+            input_tokens: self.usage.input_tokens,
+            output_tokens: self.usage.output_tokens,
+            cache_creation_tokens: self.usage.cache_creation_input_tokens,
+            cache_read_tokens: self.usage.cache_read_input_tokens,
+        });
+        self.outcome
+    }
+
+    /// One understood line of the stream, folded in.
+    ///
+    /// Called by [`Self::line`] for every line that parses.
+    fn read(&mut self, wire: Wire, on_event: &mut dyn FnMut(&AgentEvent)) {
         match wire {
             Wire::Init(init) => self.started(init, on_event),
             Wire::StepUpdate { step_update } => {
-                turn.reply.feed(&step_update, on_event);
+                self.reply.feed(&step_update, on_event);
+                self.trace_tool_step(&step_update);
                 if let Some(u) = step_update.usage {
-                    turn.usage = to_usage(&u);
+                    self.usage = to_usage(&u);
                 }
             }
             Wire::Result { result } => {
                 if let Some(u) = &result.usage {
-                    turn.usage = to_usage(u);
+                    self.usage = to_usage(u);
                 }
-                turn.outcome = Some(self.finished(&result));
+                self.outcome = Some(self.finished(&result));
             }
             Wire::Other => {}
+        }
+    }
+
+    /// On the bridged route, which tool a `tool` step ran, on the trace: a
+    /// call to incode's server is what the route expects, and anything else —
+    /// a tool of agy's own, or another MCP server — is named, so a run shows
+    /// whether agy reached past incode's toolbox.
+    ///
+    /// Called by [`Self::read`] on every step update.
+    fn trace_tool_step(&mut self, step: &StepUpdate) {
+        if !self.bridged || step.step_type != "tool" || step.tool_name.is_empty() {
+            return;
+        }
+        if self.traced_step == Some(step.step_index) {
+            return;
+        }
+        self.traced_step = Some(step.step_index);
+        let server = step
+            .tool_info
+            .as_ref()
+            .and_then(|info| info.get("parameters"))
+            .and_then(|p| p.get("ServerName"))
+            .and_then(serde_json::Value::as_str);
+        match (step.tool_name.as_str(), server) {
+            ("call_mcp_tool", Some(crate::tool_bridge::CLIENT_KEY)) => {
+                crate::trace!("agent", "agy forwarded a call to incode's tool server");
+            }
+            ("call_mcp_tool", server) => crate::trace!(
+                "guards",
+                "agy called MCP server {} — not incode's tool server",
+                server.unwrap_or("(unnamed)")
+            ),
+            // Ends the turn; nothing to report.
+            ("finish", _) => {}
+            (name, _) => crate::trace!("agent", "agy ran its own tool {name}"),
         }
     }
 
@@ -538,14 +895,19 @@ impl AgyBackend {
     ///
     /// Called by [`Self::read`] on the `init` line.
     fn started(&mut self, init: InitEvent, on_event: &mut dyn FnMut(&AgentEvent)) {
-        self.conversation_id = Some(init.conversation_id.clone());
+        *self.conversation_id = Some(init.conversation_id.clone());
         on_event(&AgentEvent::SessionStarted {
             session_id: init.conversation_id,
             model: self.model.clone().unwrap_or_default(),
         });
-        // Reported rather than acted on: the harness cannot remove
-        // a tool from this agent, so the honest thing is to record
-        // that the sub-agent tools were on offer.
+        // Reported rather than acted on: on its own tools the harness cannot
+        // remove a tool from this agent, so the honest thing is to record
+        // that the sub-agent tools were on offer. Bridged, the list is agy's
+        // whole registry whatever the agent allows (measured), so it says
+        // nothing about what the model has.
+        if self.bridged {
+            return;
+        }
         if init.init.tools.iter().any(|t| t.contains("subagent")) {
             crate::trace!(
                 "guards",
@@ -567,7 +929,7 @@ impl AgyBackend {
     /// Called by [`Self::read`] on the `result` line.
     fn finished(&mut self, result: &ResultEvent) -> TurnOutcome {
         let is_error = !result.status.eq_ignore_ascii_case("SUCCESS");
-        self.conversation_id = Some(result.conversation_id.clone());
+        *self.conversation_id = Some(result.conversation_id.clone());
         TurnOutcome {
             session_id: result.conversation_id.clone(),
             stop_reason: result.status.clone(),

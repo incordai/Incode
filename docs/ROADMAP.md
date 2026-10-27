@@ -40,10 +40,19 @@ This is fully true for claude; section 0b says what is not.
 
 ### 0b. Still open
 
-- **agy still uses its own tools.** No flag turns them off, but a custom agent
-  (`tools: [finish]` + `mcpServers`, run with `--agent`) does, measured on 1.4.7.
-  Left: agy's own memory hooks still fire on such a run, so the engine would hear
-  each event twice (`src/agent/agy.rs`, top). codex is bridged by default (`codex_tools: "own"` opts out):
+- **agy is bridged by default** (`agy_tools: "own"` opts out): a custom agent
+  (`tools: [finish]` + incode's server, run with `--agent incode`), written by
+  incode (`src/agent/agy/agent_file.rs`), leaves it no tool of its own that
+  writes or runs. The spawn carries `INCORD_HOOKS_BY=incode` so the engine's own
+  agy hooks stand down; until an engine build with that switch ships, the
+  engine hears such a run twice. Run live with a real model (agy 1.4.7,
+  `gemini-3.8-flash-high`, `incode -t`, 2026-10-27): every call ran in the
+  toolbox and the model found no tool of agy's that writes or runs. Left: agy
+  keeps a large tool result in a file under `~/.gemini/antigravity-cli/`,
+  outside the workspace, which incode's `Read` refuses. (incode's own ladder for
+  agy named `gemini-3.1-pro-high`, which agy no longer serves; it now names the
+  models `agy models` lists on 1.4.7, and its test pins that list.)
+  codex is bridged by default (`codex_tools: "own"` opts out):
   measured on 0.163.0 against a stand-in model endpoint, end to end;
   `apply_patch` has no switch and is rejected unrun under read-only + never.
   Left: a turn with a real model (the account's quota runs out until 2026-11-17).

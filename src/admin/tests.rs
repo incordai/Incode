@@ -19,6 +19,7 @@ fn clear_env() {
     std::env::remove_var(crate::budget::BUDGET_ENV);
     std::env::remove_var(crate::verify::VERIFY_COMMAND_ENV);
     std::env::remove_var(crate::agent::codex::CODEX_TOOLS_ENV);
+    std::env::remove_var(crate::agent::agy::AGY_TOOLS_ENV);
     for role in crate::roles::KNOWN_ROLES {
         std::env::remove_var(format!(
             "{}{}",
@@ -436,6 +437,7 @@ fn settings_round_trip_through_the_file() {
         // The Bash tool's shell, which the owner may pin on Windows.
         shell: Some("C:/Program Files/Git/bin/bash.exe".to_string()),
         codex_tools: Some("incode".to_string()),
+        agy_tools: Some("own".to_string()),
         // The ladder has to survive the file too — a tier an operator
         // writes and cannot read back is a setting that does not exist.
         tiers: BTreeMap::from([(
@@ -588,6 +590,85 @@ fn the_report_says_whose_tools_codex_runs() {
     assert!(
         report.contains("codex tools    incode  <- admin file"),
         "{report}"
+    );
+    clear_env();
+}
+
+/// **AGY RUNS ON incode's TOOLS UNLESS SOMEONE SAID OTHERWISE**, resolved
+/// layer for layer as `codex_tools` is: unset is `incode`; the settings
+/// switch it to `own`; the environment wins over the settings; a word nobody
+/// uses is `incode` from the built-in layer.
+#[test]
+fn agy_tools_resolve_like_codex_tools() {
+    use crate::agent::agy::AgyTools;
+    let unset = AdminConfig::default();
+    assert_eq!(
+        unset.resolve_agy_tools_with(None),
+        Resolved::new(AgyTools::Incode, Source::BuiltIn)
+    );
+
+    let admin = AdminConfig {
+        agy_tools: Some("own".to_string()),
+        ..Default::default()
+    };
+    assert_eq!(
+        admin.resolve_agy_tools_with(None),
+        Resolved::new(AgyTools::Own, Source::AdminFile)
+    );
+    let parsed: AdminConfig = serde_json::from_str(r#"{"agy_tools":"own"}"#).expect("admin.json");
+    assert_eq!(parsed, admin, "the admin.json spelling");
+    // The two settings are separate: codex's says nothing about agy's.
+    let codex_only = AdminConfig {
+        codex_tools: Some("own".to_string()),
+        ..Default::default()
+    };
+    assert_eq!(
+        codex_only.resolve_agy_tools_with(None),
+        Resolved::new(AgyTools::Incode, Source::BuiltIn)
+    );
+
+    let typo = AdminConfig {
+        agy_tools: Some("bridged".to_string()),
+        ..Default::default()
+    };
+    assert_eq!(
+        typo.resolve_agy_tools_with(None),
+        Resolved::new(AgyTools::Incode, Source::BuiltIn)
+    );
+
+    assert_eq!(
+        admin.resolve_agy_tools_with(Some("incode")),
+        Resolved::new(AgyTools::Incode, Source::Environment)
+    );
+    assert_eq!(
+        unset.resolve_agy_tools_with(Some(" Own ")),
+        Resolved::new(AgyTools::Own, Source::Environment)
+    );
+    assert_eq!(
+        admin.resolve_agy_tools_with(Some("")).source,
+        Source::AdminFile
+    );
+}
+
+/// The report names agy's choice and who made it, and the variable is the
+/// one [`crate::agent::agy::AGY_TOOLS_ENV`] names.
+#[test]
+fn the_report_says_whose_tools_agy_runs() {
+    let _guard = lock();
+    clear_env();
+    let admin = AdminConfig {
+        agy_tools: Some("own".to_string()),
+        ..Default::default()
+    };
+    let report = admin.report(Path::new("."), None);
+    assert!(
+        report.contains("agy tools      own  <- admin file"),
+        "{report}"
+    );
+    std::env::set_var(crate::agent::agy::AGY_TOOLS_ENV, "incode");
+    assert_eq!(
+        admin.resolve_agy_tools(),
+        Resolved::new(crate::agent::agy::AgyTools::Incode, Source::Environment)
     );
     clear_env();
 }
