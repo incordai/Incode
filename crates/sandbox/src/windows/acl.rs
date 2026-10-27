@@ -1048,6 +1048,28 @@ impl Drop for AclLock {
 mod tests {
     use super::*;
 
+    /// `path`'s owner and ACL, as Windows reports them, for a failure
+    /// message: what a test's precondition actually found, so a run on
+    /// another machine (an elevated CI runner) says why it differs.
+    fn acl_of(path: &Path) -> String {
+        let run = |program: &str, args: &[&std::ffi::OsStr]| {
+            std::process::Command::new(program)
+                .args(args)
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_else(|e| format!("{program}: {e}"))
+        };
+        let owner = run(
+            "powershell",
+            &[
+                "-NoProfile".as_ref(),
+                "-Command".as_ref(),
+                format!("(Get-Acl -LiteralPath '{}').Owner", path.display()).as_ref(),
+            ],
+        );
+        format!("owner: {owner}\n{}", run("icacls", &[path.as_os_str()]))
+    }
+
     /// A folder with the ACL a data drive gives (`D:\Projects\...`): the
     /// user reaches it through `Authenticated Users`' `Modify`, with no ACE
     /// of the user's own passing anything down. The profile's folders (the
@@ -1084,7 +1106,9 @@ mod tests {
         let user = current_user_sid().expect("the user's SID");
         assert!(
             !passes_down(dir.path(), &user, ACL_RIGHTS).expect("reads the ACL"),
-            "a data-drive folder starts without it"
+            "a data-drive folder starts without it (user {user}, elevated: {}):\n{}",
+            super::super::token::is_elevated(),
+            acl_of(dir.path())
         );
 
         assert!(keep_acl_rights(dir.path()).expect("kept"), "added");
@@ -1144,8 +1168,14 @@ mod tests {
             String::from_utf8_lossy(&set.stdout)
         );
 
-        let err = Lease::acquire(&[granted.clone(), locked.clone()], None)
-            .expect_err("the locked root refuses its grant");
+        let err = match Lease::acquire(&[granted.clone(), locked.clone()], None) {
+            Err(err) => err,
+            Ok(_) => panic!(
+                "the locked root refused nothing (elevated: {}):\n{}",
+                super::super::token::is_elevated(),
+                acl_of(&locked)
+            ),
+        };
         assert!(
             err.starts_with(&format!(
                 "workspace-write could not grant {}:",
