@@ -71,6 +71,7 @@ mod config;
 mod history;
 mod permission;
 mod present;
+mod prompt;
 mod run;
 // Shared with `incode -t --output-format stream-json|json`, whose stdout is
 // its JSON and nothing else, for the same reason.
@@ -91,11 +92,12 @@ use agent_client_protocol_schema::ProtocolVersion;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use crate::agent::{AgentBackend, AgentEvent, DetectedAgent};
-use crate::cli::agent_turn::{AgentSession, TurnStart};
+use crate::agent::{AgentBackend, DetectedAgent};
+use crate::cli::agent_turn::AgentSession;
 use crate::config::IncordCodeConfig;
 use crate::permissions::PermissionMode;
 use crate::runtime::cancel::CancelToken;
+use prompt::run_prompt;
 use run::LedgerRuns;
 use transport::{Incoming, Line, Outbox};
 
@@ -956,6 +958,12 @@ fn connecting_note(connecting: &[String]) -> Option<String> {
 
 /// One session's thread: build it, answer `session/new` or `session/load`,
 /// then run prompts until the reader lets go.
+///
+/// Called by [`Server::start_session`], on the thread it starts. The session
+/// is built by [`build_session`] and made ready by [`hold`];
+/// [`answer_opened`] answers the request that opened it,
+/// [`ask_about_servers`] puts the project's unapproved servers to the
+/// client, and [`serve_prompts`] runs its work until [`end_session`].
 fn drive<F: SessionFactory>(
     factory: &F,
     outbox: &Arc<Outbox>,
@@ -972,27 +980,7 @@ fn drive<F: SessionFactory>(
         subagents,
     } = start;
     let session_id = &session_id;
-    // A panic is caught here and at each prompt below, never let through: the
-    // request that was running is owed an answer, and an unwound thread would
-    // leave the client waiting for it forever.
-    let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        factory.open(
-            &workspace,
-            shared.cancel.clone(),
-            &session_id.0,
-            history.is_some(),
-        )
-    }))
-    .unwrap_or_else(|_| Err("building it panicked".to_string()));
-    let Opened {
-        mut session,
-        mode,
-        settings,
-        workspace,
-        roles,
-        build,
-        runs,
-    } = match opened {
+    let opened = match build_session(factory, &workspace, shared, session_id, history.is_some()) {
         Ok(opened) => opened,
         Err(why) => {
             return outbox.respond::<Value>(
@@ -1001,6 +989,81 @@ fn drive<F: SessionFactory>(
             );
         }
     };
+    let (mut held, opening) = hold(
+        factory, opened, outbox, session_id, shared, &servers, subagents,
+    );
+    answer_opened(&mut held, outbox, opened_by, session_id, history.as_deref());
+    // After the answer too: the client is asked about the session it knows.
+    // Not waited for — each one allowed connects in the background.
+    ask_about_servers(
+        factory,
+        &held,
+        outbox,
+        session_id,
+        opening.unapproved,
+        opening.on_connected,
+    );
+    say_lines(outbox, session_id, &opening.connected);
+    if serve_prompts(&mut held, outbox, session_id, shared, work, &opening.later) {
+        end_session(&mut held.session);
+    }
+}
+
+/// The session `factory` builds for this thread, for `session/new` or, when
+/// `loading`, `session/load`.
+///
+/// A panic is caught here and at each prompt ([`serve_prompts`]), never let
+/// through: the request that was running is owed an answer, and an unwound
+/// thread would leave the client waiting for it forever.
+fn build_session<F: SessionFactory>(
+    factory: &F,
+    workspace: &Path,
+    shared: &Shared,
+    session_id: &acp::SessionId,
+    loading: bool,
+) -> Result<Opened, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        factory.open(workspace, shared.cancel.clone(), &session_id.0, loading)
+    }))
+    .unwrap_or_else(|_| Err("building it panicked".to_string()))
+}
+
+/// What opening a session leaves for after its answer.
+struct Opening {
+    /// What became of the MCP servers that connected or were dropped at once.
+    connected: Vec<String>,
+    /// The project's servers nobody has approved yet.
+    unapproved: Vec<crate::mcp_config::Configured>,
+    /// Where what became of each server that connects later goes.
+    on_connected: crate::toolbox::OnConnected,
+    /// What such a server said while the client could not be told at once.
+    later: Arc<Mutex<Later>>,
+}
+
+/// The session as built, made ready for the client and held: its mode one
+/// the client is offered, its confirmations and its steps put to the client,
+/// its MCP servers connecting ([`connect_servers`]), the operator's commands
+/// loaded and the pickers opened.
+///
+/// Called by [`drive`], before anything is answered.
+fn hold<F: SessionFactory>(
+    factory: &F,
+    opened: Opened,
+    outbox: &Arc<Outbox>,
+    session_id: &acp::SessionId,
+    shared: &Arc<Shared>,
+    servers: &[acp::McpServer],
+    subagents: bool,
+) -> (Held, Opening) {
+    let Opened {
+        mut session,
+        mode,
+        settings,
+        workspace,
+        roles,
+        build,
+        runs,
+    } = opened;
     // A mode that is not offered cannot be shown as current. It fails CLOSED,
     // like `PermissionMode::from_str_lossy`.
     let applied = if MODES.contains(&mode) {
@@ -1019,34 +1082,10 @@ fn drive<F: SessionFactory>(
     // workers they start — shown to the client as they happen.
     let watch = workers::SessionWatch::opened(outbox, session_id, subagents);
     session.set_watch(Arc::new(watch.clone()));
-    // The client's MCP servers, started here as incode's own tools — every
-    // call to them goes through the toolbox's gate. In the background:
-    // `session/new` is answered without waiting for them (a slow server once
-    // held it for 42 s), and each one's tools are offered from the first turn
-    // after it has connected. Bounded; one that does not start costs its own
-    // tools and nothing else.
-    let (mut specs, mut connected) = server_specs(&servers);
-    // The owner's installed external tools join the same way, in the same
-    // call: a session's servers are connected once.
-    let (tools, about_tools) = factory.tool_servers();
-    specs.extend(tools);
-    connected.extend(about_tools);
-    // `.mcp.json` and `~/.incode/mcp.json`. A project's server nobody has
-    // approved yet is asked about once the session is answered, below.
-    let (from_files, about_files, unapproved) =
-        crate::mcp_config::session_servers_asking_later(&workspace, &factory.data_dir(), None);
-    specs.extend(from_files);
-    connected.extend(about_files);
     let later: Arc<Mutex<Later>> = Arc::default();
     let on_connected = connected_later(outbox, session_id, shared, &later);
-    connected.extend(session.session_tools().connect_client_servers(
-        specs,
-        &workspace,
-        &on_connected,
-    ));
-    for line in &connected {
-        eprintln!("incode acp: {line}");
-    }
+    let (connected, unapproved) =
+        connect_servers(factory, &session, &workspace, servers, &on_connected);
     // The operator's own slash commands — the project's, the user's and the
     // plugins' — offered beside the built-ins. What was wrong with a file is
     // said where the servers' troubles are.
@@ -1056,7 +1095,7 @@ fn drive<F: SessionFactory>(
     }
     let choices = config::opening(&settings, &roles, session.model());
     *shared.choices() = Some(choices.clone());
-    let mut held = Held {
+    let held = Held {
         session,
         applied,
         settings,
@@ -1071,96 +1110,163 @@ fn drive<F: SessionFactory>(
         watch,
         custom,
     };
-    let say = |update: acp::SessionUpdate| {
-        outbox.notify(
-            acp::CLIENT_METHOD_NAMES.session_update,
-            acp::SessionNotification::new(session_id.clone(), update),
-        );
+    let opening = Opening {
+        connected,
+        unapproved,
+        on_connected,
+        later,
     };
-    match &history {
-        // The history first, then the answer, as `session/load` requires.
+    (held, opening)
+}
+
+/// The session's MCP servers, started as incode's own tools: what became of
+/// those that connected or were dropped at once, each also logged, and the
+/// project's servers nobody has approved yet.
+///
+/// Called by [`hold`]. The client's servers, the owner's external tools and
+/// the configured ones are all connected in this one call.
+fn connect_servers<F: SessionFactory>(
+    factory: &F,
+    session: &AgentSession,
+    workspace: &Path,
+    servers: &[acp::McpServer],
+    on_connected: &crate::toolbox::OnConnected,
+) -> (Vec<String>, Vec<crate::mcp_config::Configured>) {
+    // The client's MCP servers, started here as incode's own tools — every
+    // call to them goes through the toolbox's gate. In the background:
+    // `session/new` is answered without waiting for them (a slow server once
+    // held it for 42 s), and each one's tools are offered from the first turn
+    // after it has connected. Bounded; one that does not start costs its own
+    // tools and nothing else.
+    let (mut specs, mut connected) = server_specs(servers);
+    // The owner's installed external tools join the same way, in the same
+    // call: a session's servers are connected once.
+    let (tools, about_tools) = factory.tool_servers();
+    specs.extend(tools);
+    connected.extend(about_tools);
+    // `.mcp.json` and `~/.incode/mcp.json`. A project's server nobody has
+    // approved yet is asked about once the session is answered
+    // ([`ask_about_servers`]).
+    let (from_files, about_files, unapproved) =
+        crate::mcp_config::session_servers_asking_later(workspace, &factory.data_dir(), None);
+    specs.extend(from_files);
+    connected.extend(about_files);
+    connected.extend(session.session_tools().connect_client_servers(
+        specs,
+        workspace,
+        on_connected,
+    ));
+    for line in &connected {
+        eprintln!("incode acp: {line}");
+    }
+    (connected, unapproved)
+}
+
+/// The answer to the `session/new` or `session/load` that opened the
+/// session — a loaded one's `conversation` taken up and replayed first —
+/// then the slash commands it offers.
+///
+/// Called by [`drive`], once the session is held.
+fn answer_opened(
+    held: &mut Held,
+    outbox: &Arc<Outbox>,
+    opened_by: acp::RequestId,
+    session_id: &acp::SessionId,
+    conversation: Option<&[history::Said]>,
+) {
+    // The history first, then the answer, as `session/load` requires.
+    match conversation {
         Some(conversation) => {
-            history::resume_or_carry(&mut held, session_id, conversation);
+            history::resume_or_carry(held, session_id, conversation);
             for update in history::replay(conversation) {
-                say(update);
+                say(outbox, session_id, update);
             }
             outbox.respond(
                 opened_by,
                 Ok(acp::LoadSessionResponse::new()
-                    .modes(mode_state(applied))
+                    .modes(mode_state(held.applied))
                     .config_options(held.shown.clone())),
             );
         }
         None => outbox.respond(
             opened_by,
             Ok(acp::NewSessionResponse::new(session_id.clone())
-                .modes(mode_state(applied))
+                .modes(mode_state(held.applied))
                 .config_options(held.shown.clone())),
         ),
     }
     // After the answer, so the client knows the session the list belongs to.
-    say(acp::SessionUpdate::AvailableCommandsUpdate(
-        acp::AvailableCommandsUpdate::new(commands::available(&held.custom)),
-    ));
-    // After the answer too: the client is asked about the session it knows.
-    // Not waited for — each one allowed connects in the background.
+    say(
+        outbox,
+        session_id,
+        acp::SessionUpdate::AvailableCommandsUpdate(acp::AvailableCommandsUpdate::new(
+            commands::available(&held.custom),
+        )),
+    );
+}
+
+/// The project's servers nobody has approved yet, put to the client one by
+/// one, from a thread of their own; what became of each one allowed is said
+/// through `said`.
+///
+/// Called by [`drive`], after the answer, so the client is asked about a
+/// session it knows.
+fn ask_about_servers<F: SessionFactory>(
+    factory: &F,
+    held: &Held,
+    outbox: &Arc<Outbox>,
+    session_id: &acp::SessionId,
+    unapproved: Vec<crate::mcp_config::Configured>,
+    said: crate::toolbox::OnConnected,
+) {
     permission::ServerApprovals {
         outbox: Arc::clone(outbox),
         session: session_id.clone(),
         workspace: held.workspace.clone(),
         data_dir: factory.data_dir(),
         late: held.session.session_tools().late_servers(),
-        said: on_connected,
+        said,
     }
     .ask_in_background(unapproved);
-    if !connected.is_empty() {
-        say(acp::SessionUpdate::AgentMessageChunk(
-            acp::ContentChunk::new(acp::ContentBlock::from(format!(
-                "{}\n",
-                connected.join("\n")
-            ))),
-        ));
-    }
+}
 
-    // What a server that finished connecting before the answer, or during a
-    // turn, had to say — said here, between turns, and never inside the
-    // model's own text. The first call opens the session to being told at
-    // once.
-    let say_later = || {
-        let mut held = later
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        held.open = true;
-        if !held.lines.is_empty() {
-            say(acp::SessionUpdate::AgentMessageChunk(
-                acp::ContentChunk::new(acp::ContentBlock::from(format!(
-                    "{}\n",
-                    held.lines.join("\n")
-                ))),
-            ));
-            held.lines.clear();
-        }
-    };
-    say_later();
+/// The session's work, until the reader lets go: each prompt run by
+/// [`run_prompt`] and answered, each change of the pickers applied while the
+/// session is idle, and what a server said meanwhile told between them
+/// ([`say_later`]).
+///
+/// Called by [`drive`], once the session is answered. `false` when a panic
+/// ended it first: the session's state is unknown then, so it is offered
+/// nothing more — later prompts to it are refused as a session that ended —
+/// and it is not ended either.
+fn serve_prompts(
+    held: &mut Held,
+    outbox: &Arc<Outbox>,
+    session_id: &acp::SessionId,
+    shared: &Shared,
+    work: &Receiver<Work>,
+    later: &Mutex<Later>,
+) -> bool {
+    say_later(outbox, session_id, later);
     while let Ok(next) = work.recv() {
-        say_later();
+        say_later(outbox, session_id, later);
         let prompt = match next {
             Work::Prompt(prompt) => prompt,
             Work::Apply => {
                 let applied = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    config::apply(&mut held, shared, outbox, session_id);
+                    config::apply(held, shared, outbox, session_id);
                 }));
                 if applied.is_err() {
                     // As after a panicked turn: the session's state is unknown,
                     // so it ends, and later prompts are refused as ended.
                     eprintln!("incode acp: applying the client's choices panicked");
-                    return;
+                    return false;
                 }
                 continue;
             }
         };
         let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_prompt(&mut held, outbox, session_id, shared, &prompt.blocks)
+            run_prompt(held, outbox, session_id, shared, &prompt.blocks)
         }));
         let Ok(answer) = answer else {
             shared.finish();
@@ -1173,23 +1279,65 @@ fn drive<F: SessionFactory>(
                     "the turn panicked; this session has ended".to_string(),
                 )),
             );
-            return;
+            return false;
         };
         // Released BEFORE the answer goes out, so a client that sends its next
         // prompt the moment it reads this one's reply is not refused as busy.
         shared.finish();
         outbox.respond(prompt.id, answer);
-        say_later();
+        say_later(outbox, session_id, later);
     }
-    // The reader let go: `session/close`, or the client went away. Either way
-    // the session is over, and the memory engine is told — on this thread,
-    // which owns the session, bounded by the engine runner.
-    held.session.end_memory("other");
+    true
+}
+
+/// The reader let go: `session/close`, or the client went away. Either way
+/// the session is over, and the memory engine is told — on this thread,
+/// which owns the session, bounded by the engine runner.
+///
+/// Called by [`drive`] when [`serve_prompts`] returns with the session whole.
+fn end_session(session: &mut AgentSession) {
+    session.end_memory("other");
     // The operator's `session_end` commands. Nowhere to show their output
     // once the client has closed the session: it is traced.
-    for said in held.session.operator_session_end("other") {
+    for said in session.operator_session_end("other") {
         crate::trace!("hooks", "session_end hook: {said}");
     }
+}
+
+/// What a server that finished connecting before the answer, or during a
+/// turn, had to say — said here, between turns, and never inside the
+/// model's own text. The first call opens the session to being told at
+/// once.
+///
+/// Called by [`serve_prompts`], before and after each piece of work.
+fn say_later(outbox: &Outbox, session_id: &acp::SessionId, later: &Mutex<Later>) {
+    let mut held = later
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    held.open = true;
+    say_lines(outbox, session_id, &held.lines);
+    held.lines.clear();
+}
+
+/// Lines for the person, as one agent message; nothing when there are none.
+fn say_lines(outbox: &Outbox, session_id: &acp::SessionId, lines: &[String]) {
+    if !lines.is_empty() {
+        say(
+            outbox,
+            session_id,
+            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(acp::ContentBlock::from(
+                format!("{}\n", lines.join("\n")),
+            ))),
+        );
+    }
+}
+
+/// One `session/update` to the client, for this session.
+fn say(outbox: &Outbox, session_id: &acp::SessionId, update: acp::SessionUpdate) {
+    outbox.notify(
+        acp::CLIENT_METHOD_NAMES.session_update,
+        acp::SessionNotification::new(session_id.clone(), update),
+    );
 }
 
 /// One open session, as its thread holds it.
@@ -1219,225 +1367,6 @@ struct Held {
     watch: workers::SessionWatch,
     /// The operator's own slash commands, as the session opened.
     custom: crate::custom_commands::Registry,
-}
-
-/// One prompt: the same turn an interactive line runs, streamed as updates —
-/// or, when the prompt is a slash command, that command.
-fn run_prompt(
-    held: &mut Held,
-    outbox: &Arc<Outbox>,
-    session_id: &acp::SessionId,
-    shared: &Shared,
-    blocks: &[acp::ContentBlock],
-) -> Result<acp::PromptResponse, acp::Error> {
-    let workspace = held.workspace.clone();
-    let workspace = workspace.as_path();
-    let present::Prompted { text, images } =
-        present::prompt_parts(blocks, workspace).map_err(invalid_params)?;
-    if text.trim().is_empty() {
-        return Err(invalid_params("the prompt has no text"));
-    }
-    // The operator's own command becomes the prompt, as it does in the REPL:
-    // before anything asks whether the prompt is a slash command, so it is
-    // never answered as one that is not offered. Its `allowed-tools` hold
-    // the turn it starts.
-    let typed = text.clone();
-    let (text, allowed_tools, expanded) = match held.custom.expand_line(&text, workspace) {
-        Some(expanded) => (
-            expanded.prompt.clone(),
-            expanded.allowed_tools.clone(),
-            Some(crate::custom_commands::note(&expanded)),
-        ),
-        None => (text, Vec::new(), None),
-    };
-    // Pictures go to the model with a question; a command runs here and has
-    // nowhere to put them.
-    if !images.is_empty() && crate::cli::slash_commands::SlashCommand::parse(text.trim()).is_some()
-    {
-        return Err(invalid_params(
-            "pictures go with a prompt to the model, not with a slash command",
-        ));
-    }
-
-    // The mode the client chose, sent to the thing that does the writing —
-    // as `-p` is at startup. Before the turn, because a running agent's mode
-    // was fixed when it was started.
-    let wanted = shared.state().mode;
-    if let Some(wanted) = wanted {
-        if wanted != held.applied {
-            held.session.set_permission_mode(wanted.agent_mode());
-            held.applied = wanted;
-        }
-    }
-    // And the agent and role the client picked, for the same reason.
-    config::apply(held, shared, outbox, session_id);
-
-    if shared.cancelled() {
-        return Ok(acp::PromptResponse::new(acp::StopReason::Cancelled));
-    }
-
-    // `/run` works the ledger for as long as it takes, streaming, with the
-    // ledger as the plan, and its lanes as sub-agents.
-    if matches!(
-        crate::cli::slash_commands::SlashCommand::parse(text.trim()),
-        Some(crate::cli::slash_commands::SlashCommand::Run)
-    ) {
-        return Ok(acp::PromptResponse::new(run::run(
-            held.runs.as_mut(),
-            workspace,
-            held.applied,
-            outbox,
-            session_id,
-            shared,
-            &held.watch,
-        )));
-    }
-    let session = &mut held.session;
-
-    let say = |update: acp::SessionUpdate| {
-        outbox.notify(
-            acp::CLIENT_METHOD_NAMES.session_update,
-            acp::SessionNotification::new(session_id.clone(), update),
-        );
-    };
-    let say_text = |text: &str| {
-        if !text.is_empty() {
-            say(acp::SessionUpdate::AgentMessageChunk(
-                acp::ContentChunk::new(acp::ContentBlock::from(text)),
-            ));
-        }
-    };
-
-    if let Some(note) = &expanded {
-        say_text(&format!("{note}\n\n"));
-    }
-
-    // A slash command is run here, as the REPL runs it, and never reaches the
-    // agent. It runs to the end: a cancel that lands meanwhile decides the
-    // answer, as it does for a turn.
-    if let Some(ran) = commands::run(&text, session, workspace, &held.settings) {
-        say_text(&ran.said);
-        if let Some(mode) = ran.mode {
-            // The command switched the mode; the client's picker, and the
-            // mode the next prompt asks for, follow it.
-            held.applied = mode;
-            shared.state().mode = Some(mode);
-            say(acp::SessionUpdate::CurrentModeUpdate(
-                acp::CurrentModeUpdate::new(mode.as_str()),
-            ));
-        }
-        return Ok(acp::PromptResponse::new(if shared.cancelled() {
-            acp::StopReason::Cancelled
-        } else {
-            acp::StopReason::EndTurn
-        }));
-    }
-
-    // The pictures go to the agent that leads now, before anything else is
-    // done with the prompt: an agent that cannot take them refuses the
-    // prompt whole, before the engine or the transcript have heard it.
-    let pictures = !images.is_empty();
-    if pictures {
-        session.attach_images(images).map_err(invalid_params)?;
-    }
-    let (instruction, mut context) = match crate::cli::plan_turn(session, workspace, &text, &text) {
-        crate::cli::TurnPlan::NextQuestion(reply) | crate::cli::TurnPlan::Greeting(reply) => {
-            if pictures {
-                // No turn runs: the pictures must not ride the next one.
-                let _ = session.attach_images(Vec::new());
-            }
-            say_text(&reply);
-            return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
-        }
-        crate::cli::TurnPlan::Refused(why) => {
-            if pictures {
-                let _ = session.attach_images(Vec::new());
-            }
-            say_text(&format!(
-                "Not sent: the operator's user_prompt_submit hook refused it. {why}"
-            ));
-            return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
-        }
-        crate::cli::TurnPlan::Agent {
-            instruction,
-            context,
-        } => (instruction, context),
-    };
-    // A loaded session whose model could not resume its own conversation is
-    // given it here, once, ahead of everything else the turn carries.
-    if let Some(earlier) = held.replay.take() {
-        context.insert(0, earlier);
-    }
-    // A turn does not wait for the client's MCP servers still connecting: it
-    // runs without their tools, and the model is told so, by name.
-    if let Some(note) = connecting_note(&session.session_tools().client_servers_connecting()) {
-        context.push(note);
-    }
-
-    // Looked at again AFTER the plan, which can wait on the memory service:
-    // a cancel that landed during that wait is honoured here, before an agent
-    // is started, rather than being cleared when the turn resets its token.
-    if shared.cancelled() {
-        if pictures {
-            let _ = session.attach_images(Vec::new());
-        }
-        return Ok(acp::PromptResponse::new(acp::StopReason::Cancelled));
-    }
-
-    // Who serves this turn, for every step's `_meta` and the answer's.
-    let who = workers::Who {
-        role: Some(held.role.clone()),
-        agent: Some(held.lead.clone()),
-        model: session.model().map(str::to_string),
-        lane: None,
-    };
-    held.watch.serve_as(who.clone());
-    let mut presenter = held.watch.presenter(workspace);
-    // Set here, after every way out above that runs no turn, so it is taken
-    // by this turn and no other.
-    session.restrict_next_turn(allowed_tools);
-    let outcome = session.turn_observed(
-        workspace,
-        &instruction,
-        &context,
-        &mut |fragment: &str| {
-            shared.hold_cancel();
-            say_text(fragment);
-        },
-        &mut |_status| {},
-        Some(&mut |event: &AgentEvent, start: &TurnStart<'_>| {
-            shared.hold_cancel();
-            for update in presenter.updates(event, &|path| start.before(path)) {
-                say(update);
-            }
-        }),
-    );
-
-    // What the session holds for the person once the turn is over — a
-    // question the agent asked, a guard the sentinel caught. The REPL prints
-    // these after the status line stops; here they follow the reply.
-    for notice in session.take_notices() {
-        say_text(&format!("\n{notice}\n"));
-    }
-    // Which conversation the model holds now, so the session can be loaded
-    // and resumed; and the pickers, when the turn changed what serves the
-    // session (a standby took over) or what model it asks for.
-    history::remember(held, session_id, &typed);
-    config::report(held, shared, outbox, session_id);
-
-    // A cancel decides the answer whatever the turn did with it: ACP requires
-    // `cancelled` once the client has asked, even if stopping surfaced as an
-    // error underneath.
-    if shared.cancelled() {
-        return Ok(acp::PromptResponse::new(acp::StopReason::Cancelled));
-    }
-    match outcome {
-        Ok(outcome) => Ok(
-            acp::PromptResponse::new(present::stop_reason(&outcome.stop_reason))
-                .meta(workers::prompt_meta(&who)),
-        ),
-        Err(why) => Err(internal(why)),
-    }
 }
 
 fn initialize() -> acp::InitializeResponse {
@@ -1533,7 +1462,7 @@ mod worker_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::{AgentBackend, AgentError, TurnOutcome};
+    use crate::agent::{AgentBackend, AgentError, AgentEvent, TurnOutcome};
     use serde_json::json;
     use std::io::BufRead;
 
