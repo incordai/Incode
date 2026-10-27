@@ -86,8 +86,9 @@ impl AgyBackend {
             })
     }
 
-    /// The command for one bridged turn: agy running the `incode` agent,
-    /// whose only tools are `finish` and incode's tool server. `bridge_env`
+    /// The command for one bridged turn: agy running `agent` (this binary's
+    /// own, `agent_file::agent_name`), whose only tools are `finish` and
+    /// incode's tool server. `bridge_env`
     /// is the bridge's address and token, set in agy's environment — which
     /// the server agy starts inherits (measured) — never on its argv.
     ///
@@ -101,14 +102,19 @@ impl AgyBackend {
     /// incode's toolbox, which is told the mode and the roots itself.
     ///
     /// Called by [`Self::run_bridged`].
-    pub(super) fn bridged_command(&self, prompt: &str, bridge_env: &[(&str, String)]) -> Command {
+    pub(super) fn bridged_command(
+        &self,
+        prompt: &str,
+        agent: &str,
+        bridge_env: &[(&str, String)],
+    ) -> Command {
         let mut cmd = Command::new(&self.binary);
         crate::agent::parent_session::detach_from_parent_session(&mut cmd);
         cmd.current_dir(&self.workspace);
         cmd.arg("--print").arg(prompt);
         cmd.arg("--output-format").arg("stream-json");
         cmd.arg("--print-timeout").arg(PRINT_TIMEOUT);
-        cmd.arg("--agent").arg(agent_file::AGENT_NAME);
+        cmd.arg("--agent").arg(agent);
         // Acceptable ONLY because agy has no tools of its own on this route:
         // the agent gives it `finish` and incode's server, nothing that runs
         // or writes. Without it every headless MCP call is denied unasked
@@ -158,12 +164,15 @@ impl AgyBackend {
         } = crate::tool_bridge::Turn::open(self.cancel.clone())?;
         let exe = self.tool_server.clone().unwrap_or(exe);
         agent_file::ensure(&self.agents_dir()?, &exe).map_err(AgentError::new)?;
-        let command = self.bridged_command(prompt, &bridge.env());
+        // The name of the file just written, from the same exe: this
+        // binary's own agent (`agent_file::agent_name`).
+        let agent = agent_file::agent_name(&exe);
+        let command = self.bridged_command(prompt, &agent, &bridge.env());
         crate::trace!(
             "agent",
             "spawning {} bridged: agent={} model={:?} resume={:?}",
             self.binary,
-            agent_file::AGENT_NAME,
+            agent,
             self.model,
             self.conversation_id
         );
@@ -200,6 +209,12 @@ impl AgyBackend {
                     if let AgentEvent::SessionStarted { session_id, .. } = event {
                         // The engine files its cards under the conversation.
                         tools.set_session(session_id);
+                        // A result too large for the model is kept by agy in
+                        // this conversation's folder, and the model is told to
+                        // read it there: `Read`, alone, may.
+                        if let Some(dir) = agent_file::results_dir(session_id) {
+                            tools.allow_reading(dir);
+                        }
                     }
                 }
                 Ok(events)

@@ -45,10 +45,11 @@ fn the_agent_file_names_incodes_server_and_nothing_else() {
         .strip_prefix("---\n")
         .and_then(|t| t.split_once("\n---\n"))
         .expect("YAML frontmatter, then the body");
+    let name = format!("name: {}", agent_file::agent_name(exe));
     assert_eq!(
         front.lines().collect::<Vec<_>>(),
         [
-            "name: incode",
+            name.as_str(),
             "description: incode's model-only agent; every tool is incode's, through its tool bridge.",
             "tools:",
             "  - finish",
@@ -91,8 +92,8 @@ fn the_agent_file_carries_no_secret() {
 fn the_agent_file_is_rewritten_only_when_it_differs() {
     let dir = tempfile::tempdir().expect("scratch");
     let agents = dir.path().join("config").join("agents");
-    let path = agents.join("incode.md");
     let one = Path::new("/opt/incode/bin/incode");
+    let path = agents.join(format!("{}.md", agent_file::agent_name(one)));
 
     assert_eq!(agent_file::ensure(&agents, one), Ok(true), "first write");
     assert_eq!(
@@ -112,30 +113,92 @@ fn the_agent_file_is_rewritten_only_when_it_differs() {
         "an unchanged file was rewritten"
     );
 
-    let two = Path::new("/usr/local/bin/incode");
-    assert_eq!(agent_file::ensure(&agents, two), Ok(true), "moved binary");
-    assert_eq!(
-        std::fs::read_to_string(&path).expect("rewritten"),
-        agent_file::content(two)
-    );
-
     std::fs::write(&path, "---\nname: incode\ntools:\n  - run_command\n---\n").expect("edit");
     assert_eq!(
-        agent_file::ensure(&agents, two),
+        agent_file::ensure(&agents, one),
         Ok(true),
         "hand edit undone"
     );
     assert_eq!(
         std::fs::read_to_string(&path).expect("rewritten"),
-        agent_file::content(two)
+        agent_file::content(one)
     );
 
-    let left: Vec<_> = std::fs::read_dir(&agents)
+    let mut left: Vec<_> = std::fs::read_dir(&agents)
         .expect("listed")
         .filter_map(Result::ok)
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
-    assert_eq!(left, ["incode.md"], "a temporary file was left behind");
+    left.sort();
+    assert_eq!(
+        left,
+        [format!("{}.md", agent_file::agent_name(one))],
+        "a temporary file was left behind"
+    );
+}
+
+/// **EACH incode BINARY HAS AN AGENT OF ITS OWN.** The agents folder is
+/// machine-wide: with one shared file, two incode binaries running at once
+/// rewrote it in turn and pointed each other's next turn at the wrong tool
+/// server. Two binaries now write two files and leave each other's alone;
+/// the same binary always gets the same name (on Windows whatever the case
+/// of its path), so its file is still written once.
+#[test]
+fn each_incode_binary_has_an_agent_of_its_own() {
+    let dir = tempfile::tempdir().expect("scratch");
+    let agents = dir.path().join("agents");
+    let one = Path::new("/opt/incode/bin/incode");
+    let two = Path::new("/usr/local/bin/incode");
+    let (name_one, name_two) = (agent_file::agent_name(one), agent_file::agent_name(two));
+    assert_ne!(name_one, name_two, "two binaries, two agents");
+    assert_eq!(
+        name_one,
+        agent_file::agent_name(one),
+        "stable for one binary"
+    );
+    assert!(name_one.starts_with("incode-") && name_one.len() == "incode-".len() + 8);
+    #[cfg(windows)]
+    assert_eq!(
+        agent_file::agent_name(Path::new(r"C:\Tools\incode.exe")),
+        agent_file::agent_name(Path::new(r"c:\tools\INCODE.EXE")),
+        "a Windows path's case names the same binary"
+    );
+
+    assert_eq!(agent_file::ensure(&agents, one), Ok(true));
+    assert_eq!(agent_file::ensure(&agents, two), Ok(true));
+    assert_eq!(
+        agent_file::ensure(&agents, one),
+        Ok(false),
+        "one's file left alone by two"
+    );
+    for (exe, name) in [(one, &name_one), (two, &name_two)] {
+        let file = std::fs::read_to_string(agents.join(format!("{name}.md"))).expect("its file");
+        assert_eq!(file, agent_file::content(exe));
+        assert!(file.contains(&format!("name: {name}\n")), "{file}");
+    }
+}
+
+/// **agy's saved results folder is named only for a plain conversation id**:
+/// the id arrives on agy's output, and one holding `..` or a separator would
+/// widen the folder incode's `Read` is allowed into.
+#[test]
+fn the_results_folder_is_named_only_for_a_plain_conversation_id() {
+    let dir = agent_file::results_dir("643db012-39c5-419d-8868-3d41fc5f669b")
+        .expect("a conversation id names a folder");
+    assert!(
+        dir.ends_with(
+            Path::new("antigravity-cli")
+                .join("brain")
+                .join("643db012-39c5-419d-8868-3d41fc5f669b")
+                .join(".system_generated")
+                .join("steps")
+        ),
+        "{}",
+        dir.display()
+    );
+    for bad in ["", "..", "../..", "a/b", r"a\b", "x y", "C:"] {
+        assert_eq!(agent_file::results_dir(bad), None, "{bad:?}");
+    }
 }
 
 /// agy's agents folder is under ITS home: `USERPROFILE` on Windows.
@@ -166,7 +229,7 @@ fn a_bridged_turn_is_started_as_the_incode_agent_with_the_bridge_in_its_environm
     let mut backend = AgyBackend::new(PathBuf::from("ws"))
         .with_binary("/opt/agy")
         .with_tools(AgyTools::Incode);
-    let cmd = backend.bridged_command("p", &env);
+    let cmd = backend.bridged_command("p", "incode-0a1b2c3d", &env);
     assert_eq!(cmd.get_program(), "/opt/agy");
     assert_eq!(cmd.get_current_dir(), Some(Path::new("ws")));
     assert_eq!(
@@ -179,7 +242,7 @@ fn a_bridged_turn_is_started_as_the_incode_agent_with_the_bridge_in_its_environm
             "--print-timeout",
             "30m",
             "--agent",
-            "incode",
+            "incode-0a1b2c3d",
             "--dangerously-skip-permissions",
             "--mode",
             "accept-edits",
@@ -206,10 +269,10 @@ fn a_bridged_turn_is_started_as_the_incode_agent_with_the_bridge_in_its_environm
     backend.set_extra_dirs(vec![PathBuf::from("a")]);
     backend.set_session_id("c-1");
     assert_eq!(
-        args_of(&backend.bridged_command("p", &env))[6..].to_vec(),
+        args_of(&backend.bridged_command("p", "incode-0a1b2c3d", &env))[6..].to_vec(),
         strings(&[
             "--agent",
-            "incode",
+            "incode-0a1b2c3d",
             "--dangerously-skip-permissions",
             "--model",
             "gemini-3.1-pro-high",
@@ -400,7 +463,14 @@ fn fake_agy_child() {
         say(result);
         std::process::exit(0);
     }
-    let file = std::fs::read_to_string(dir.join("agents").join("incode.md")).expect("agent file");
+    // The one agent file in the folder it was pointed at: this binary's.
+    let agent = std::fs::read_dir(dir.join("agents"))
+        .expect("agents folder")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|x| x == "md"))
+        .expect("an agent file");
+    let file = std::fs::read_to_string(agent).expect("agent file");
     let (command, args) = server_in(&file);
     let mut server = std::process::Command::new(&command)
         .args(&args)
@@ -671,9 +741,11 @@ fn run_turn_on_incodes_tools_takes_the_bridged_route() {
         .run_turn("hi", &mut |_| {})
         .expect_err("nothing to start");
     assert!(err.to_string().starts_with("could not start"), "{err}");
+    let exe = Path::new("/opt/incode/bin/incode");
     assert_eq!(
-        std::fs::read_to_string(agents.join("incode.md")).expect("the agent file"),
-        agent_file::content(Path::new("/opt/incode/bin/incode"))
+        std::fs::read_to_string(agents.join(format!("{}.md", agent_file::agent_name(exe))))
+            .expect("the agent file"),
+        agent_file::content(exe)
     );
 
     let mut own = AgyBackend::new(ws.path().to_path_buf()).with_binary(missing.to_string_lossy());

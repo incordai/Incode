@@ -552,10 +552,11 @@ result afterwards; `incode --admin` shows which is in force.
 
 agy has no flag to switch its tools off or to hand it an MCP server for one run,
 but a custom agent does both (measured on agy 1.4.7). Before each turn incode
-writes `~/.gemini/config/agents/incode.md` — only when its content changed, and
-whole, by rename — whose only tool of agy's own is `finish` and whose one MCP
-server is `incode --tool-server`; the file names the incode binary and nothing
-else. The turn starts `agy --print … --output-format stream-json --agent incode
+writes `~/.gemini/config/agents/incode-<hash>.md` — one per incode binary, named
+by a hash of its path; only when its content changed, and whole, by rename —
+whose only tool of agy's own is `finish` and whose one MCP server is
+`incode --tool-server`; the file names the incode binary and nothing else. The
+turn starts `agy --print … --output-format stream-json --agent incode-<hash>
 --dangerously-skip-permissions` (plus the model, mode, added roots and
 conversation as before). The bridge's address and token, and
 `INCORD_HOOKS_BY=incode` — on which the memory engine's own agy hooks stand
@@ -1593,15 +1594,15 @@ certificate error rather than going elsewhere. A coding agent CLI incode drives
   route](#the-codex-route-whose-tools), [the agy route](#the-agy-route-whose-tools))
   run as a model only. On the own-tools routes the guards are a sentinel
   (detection), not a gate.
-- On the agy route, agy keeps a large tool result in a file of its own under
-  `~/.gemini/antigravity-cli/`, outside the workspace, where incode's `Read`
-  refuses it; the model then has to ask again in smaller pieces. A call agy
+- On the agy route, agy keeps a large tool result in a file of its own, under
+  `~/.gemini/antigravity-cli/brain/<conversation>/.system_generated/steps/`,
+  and tells the model to read it there. incode's `Read` — and no other tool —
+  may open that one folder of the running conversation; what it holds is
+  incode's own result. A call agy
   makes outside incode's server is named on the trace (`agy ran its own tool
   …`, `agy called MCP server …`); in a live probe agy itself refused other
   servers ("server filesystem is not allowed in this context"), but the server
-  registered with `agy mcp add` (here `memory`) was not tried. The agent file is
-  shared by every incode on the machine, so two incode binaries running at once
-  rewrite it in turn.
+  registered with `agy mcp add` (here `memory`) was not tried.
 - A client's MCP servers are stdio or Streamable HTTP; the older SSE transport is
   not spoken.
 - The Windows sandbox confines workspace-write only when you name it, and does

@@ -1337,6 +1337,71 @@ fn an_extra_directory_is_writable_under_the_same_guards() {
     assert!(!outside.exists());
 }
 
+/// **A FOLDER ONLY `Read` MAY OPEN.** Where an agent CLI keeps this
+/// toolbox's own results (agy's saved large results): `Read` opens a file
+/// there, and nothing else acts there — no write, edit, listing or search —
+/// while a folder nobody allowed stays refused to `Read` as well.
+#[test]
+fn a_read_only_folder_is_open_to_read_and_to_nothing_else() {
+    let (ws, kept, elsewhere) = (
+        tempfile::tempdir().expect("ws"),
+        tempfile::tempdir().expect("kept"),
+        tempfile::tempdir().expect("elsewhere"),
+    );
+    let result = kept.path().join("1").join("output.txt");
+    std::fs::create_dir_all(result.parent().expect("a parent")).expect("mkdir");
+    std::fs::write(&result, "the whole result").expect("write");
+    let other = elsewhere.path().join("x.txt");
+    std::fs::write(&other, "not allowed").expect("write");
+
+    let mut tools = toolbox(ws.path());
+    let at = |p: &std::path::Path| json!({"path": p.to_string_lossy()});
+    assert!(
+        tools.run(READ, &at(&result)).is_err(),
+        "refused before it is allowed"
+    );
+    tools.allow_reading(kept.path().to_path_buf());
+
+    let read = tools.run(READ, &at(&result)).expect("Read opens it");
+    assert!(read.contains("the whole result"), "{read}");
+    let target = kept.path().join("new.txt");
+    assert!(tools
+        .run(
+            WRITE,
+            &json!({"path": target.to_string_lossy(), "content": "no"})
+        )
+        .is_err());
+    assert!(!target.exists(), "nothing is written there");
+    assert!(tools
+        .run(
+            EDIT,
+            &json!({"path": result.to_string_lossy(), "old_string": "whole", "new_string": "half"})
+        )
+        .is_err());
+    assert_eq!(
+        std::fs::read_to_string(&result).expect("read"),
+        "the whole result",
+        "nothing is edited there"
+    );
+    assert!(
+        tools.run(LS, &at(kept.path())).is_err(),
+        "nothing is listed there"
+    );
+    assert!(
+        tools
+            .run(
+                GREP,
+                &json!({"pattern": "whole", "path": kept.path().to_string_lossy()})
+            )
+            .is_err(),
+        "nothing is searched there"
+    );
+    assert!(
+        tools.run(READ, &at(&other)).is_err(),
+        "only the folder allowed"
+    );
+}
+
 // -----------------------------------------------------------------------
 // A protected write is a question, not a wall (the owner's decision,
 // 2026-09-27). Each test below fails if `run_call` stops asking — remove the
