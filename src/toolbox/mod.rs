@@ -72,7 +72,9 @@ mod todo;
 mod validate;
 
 pub(crate) use client_servers::{OnConnected, ServerSpec, Transport};
-pub use code_edits::{CodeEdits, EditLedger, EngineLedger, LedgerError, Route as EditRoute};
+pub use code_edits::{
+    CodeEdits, EditLedger, EngineLedger, LedgerError, Route as EditRoute, ROOT_AGENT,
+};
 pub use desktop::DesktopSetup;
 pub use image::{Image, ImageFormat, ToolOutput, MAX_IMAGES_PER_RESULT, MAX_IMAGE_EDGE};
 pub(crate) use todo::{parse_todos, Priority, TodoStatus};
@@ -184,11 +186,17 @@ pub fn reach_of(name: &str) -> Option<Reach> {
     Some(match name {
         READ | GLOB | GREP | LS | OUTLINE | BASH_OUTPUT | SKILL => Reach::Observe,
         crate::web::FETCH_TOOL | crate::web::SEARCH_TOOL => Reach::Observe,
-        crate::recall::INDEX_TOOL | crate::recall::GET_TOOL => Reach::Observe,
+        crate::recall::INDEX_TOOL | crate::recall::GET_TOOL | crate::recall::TIMELINE_TOOL => {
+            Reach::Observe
+        }
         SEARCH_TOOL | SYMBOL_TOOL | SKELETON_TOOL | BLAST_RADIUS_TOOL => Reach::Observe,
         crate::recorder::LOOKUP_TOOL | crate::team_mcp::READ_TOOL => Reach::Observe,
+        crate::brief_read::READ_TOOL | crate::verify::PLAN_TOOL => Reach::Observe,
         TODO_WRITE | ASK_USER_QUESTION => Reach::Session,
         REMEMBER_TOOL | FORGET_TOOL | crate::brief::SAVE_TOOL => Reach::Record,
+        crate::session_record::NOTE_TOOL
+        | crate::session_record::RESOLVE_TOOL
+        | crate::session_record::FACT_TOOL => Reach::Record,
         crate::team_mcp::ASK_TOOL | crate::team_mcp::TELL_TOOL | crate::team_mcp::ANSWER_TOOL => {
             Reach::Record
         }
@@ -462,6 +470,12 @@ enum Gate {
     /// A question the owner already answered in their app: the answer IS the
     /// result, and it is not an error.
     Answered(String),
+    /// The recorder already ran this exact call and served its recorded
+    /// output ([`crate::hooks::engine::is_served`]): that output IS the
+    /// result. It arrives shaped like a refusal, and handed back as one it
+    /// read as a failed call — so the model retried, or worked around a tool
+    /// that had in fact answered.
+    Served(String),
 }
 
 /// The most of the engine's reason a decision carries to a watch, in
@@ -727,8 +741,23 @@ impl Toolbox {
     /// Called by `agent::api::ApiBackend::compact_if_near_window`, before the
     /// route compacts on its own (`trigger` `auto`); a `/compact` by hand
     /// fires them in `cli::agent_turn::AgentSession::compact` instead.
+    ///
+    /// The memory engine is told too, so it records the turns before they are
+    /// summarised away ([`crate::hooks::engine::Engine::pre_compact`]); it is
+    /// not waited for.
     #[must_use]
     pub fn operator_pre_compact(&self, trigger: &str) -> Vec<String> {
+        if let Some(engine) = &self.engine {
+            let transcript = crate::hooks::memory::transcript_for(&self.workspace, &self.session);
+            engine.pre_compact(
+                crate::hooks::engine::Conversation {
+                    session: &self.session,
+                    cwd: &self.workspace,
+                    transcript: transcript.is_file().then_some(transcript.as_path()),
+                },
+                trigger,
+            );
+        }
         self.hooks.as_ref().map_or_else(Vec::new, |hooks| {
             hooks
                 .pre_compact(trigger, "", &self.session, Some(&self.workspace))
@@ -1635,15 +1664,19 @@ fn catalogue() -> Vec<Value> {
                 }
             }),
             crate::verify::tool_definition(),
+            crate::verify::plan_tool_definition(),
             crate::recall::index_tool_definition(),
             crate::recall::get_tool_definition(),
+            crate::recall::timeline_tool_definition(),
             crate::recorder::lookup_tool_definition(),
             // The intake gate TELLS the model to call this. Offering the gate
             // without the tool is an instruction that cannot be followed, and
             // the loop stalls on a brief that can never be saved.
             crate::brief::save_tool_definition(),
+            crate::brief_read::tool_definition(),
         ]);
     all.extend(crate::knowledge::tool_definitions());
+    all.extend(crate::session_record::tool_definitions());
     all.extend(crate::web::tool_definitions());
     all.push(browser::definition());
     all.push(pdf::definition());
@@ -1854,6 +1887,10 @@ impl Toolbox {
             Gate::Answered(said) => {
                 crate::trace!("tool", "{name} answered in the owner's app");
                 return Ok(ToolOutput::from(said));
+            }
+            Gate::Served(recorded) => {
+                crate::trace!("tool", "{name} served from the recorder");
+                return Ok(ToolOutput::from(recorded));
             }
         };
         // The edit check, last: every gate above refuses a call for reasons
@@ -2222,9 +2259,9 @@ impl Toolbox {
             let (allowed, reason) = match &gate {
                 Gate::Run { .. } => (true, None),
                 Gate::Refused(why) => (false, Some(why.clone())),
-                // The owner answered a question in the app: nothing was
-                // refused, and the answer is the result.
-                Gate::Answered(_) => (true, None),
+                // The owner answered a question in the app, or the recorder
+                // served the call: nothing was refused, and that is the result.
+                Gate::Answered(_) | Gate::Served(_) => (true, None),
             };
             self.tell_decided(
                 call_id,
@@ -2253,6 +2290,15 @@ impl Toolbox {
             // Exit 2 on a question is the owner's ANSWER, given in the app.
             crate::hooks::engine::PreTool::Block(said) if name == ASK_USER_QUESTION => {
                 Gate::Answered(said)
+            }
+            // Never for a write: the engine serves only reads (`Read`, recall,
+            // and a one-file `cat`/`head`/`tail`/`sed -n` through the shell),
+            // and a "served" answer to a write would read as a write that
+            // landed when none was made.
+            crate::hooks::engine::PreTool::Block(recorded)
+                if reach != Reach::Change && crate::hooks::engine::is_served(&recorded) =>
+            {
+                Gate::Served(recorded)
             }
             crate::hooks::engine::PreTool::Block(reason) => Gate::Refused(reason),
             crate::hooks::engine::PreTool::Ask { reason, context } => {
@@ -2507,14 +2553,24 @@ impl Toolbox {
                 None => Err("LibreOffice was not found".to_string()),
             },
             BASH if background => shell::start(&self.state, ws, input, &self.sandbox()?),
-            BASH => self.run_shell(call_id, ws, &raw),
+            BASH => {
+                // A write through the shell is credited to this agent: the
+                // engine's window around the command (`shell_window`).
+                let command = input.get("command").and_then(Value::as_str).unwrap_or("");
+                self.shell_window("begin", command, call_id);
+                let ran = self.run_shell(call_id, ws, &raw);
+                self.shell_window("end", command, call_id);
+                ran
+            }
             BASH_OUTPUT => shell::output(&self.state, input),
             KILL_SHELL => shell::kill(&self.state, input),
             TODO_WRITE => todo::write(&mut self.state.todos(), input),
             DIAGNOSTICS => checks::diagnostics(ws, input, &|path| self.resolve(path)),
             crate::verify::VERIFY_TOOL => crate::verify::run_tool(ws),
-            crate::recall::INDEX_TOOL => crate::recall::run_index_tool(&raw),
+            crate::verify::PLAN_TOOL => Ok(crate::verify::run_plan_tool(ws)),
+            crate::recall::INDEX_TOOL => crate::recall::run_index_tool(&raw, ws),
             crate::recall::GET_TOOL => crate::recall::run_get_tool(&raw),
+            crate::recall::TIMELINE_TOOL => crate::recall::run_timeline_tool(&raw),
             crate::recorder::LOOKUP_TOOL => {
                 crate::recorder::run_lookup_tool(ws, input).map(|found| {
                     if let Some(watch) = &self.watch {
@@ -2527,14 +2583,26 @@ impl Toolbox {
             AGENT => self.run_subagent(input),
             ASK_USER_QUESTION => self.ask_here(input),
             crate::brief::SAVE_TOOL => self.save_brief(&raw),
+            crate::brief_read::READ_TOOL => crate::brief_read::run(ws),
             other => crate::knowledge::handle_tool(
                 other,
                 input,
                 &crate::knowledge::CodeContext {
                     cwd: &self.workspace,
+                    session: &self.session,
                     resolve: &|path| self.resolve(path),
                 },
             )
+            .or_else(|| {
+                crate::session_record::handle_tool(
+                    other,
+                    input,
+                    &crate::session_record::Record {
+                        session: &self.session,
+                        workspace: &self.workspace,
+                    },
+                )
+            })
             .or_else(|| crate::web::handle_tool(other, input, render))
             .or_else(|| self.team.handle(other, input))
             .unwrap_or_else(|| Err(format!("there is no tool called `{other}`"))),

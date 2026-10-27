@@ -45,7 +45,8 @@ pub use backend::AgentBackend;
 pub use handover::{is_limit_failure, looks_like_auth_failure, moves_the_work};
 pub use registry::{discover, DetectedAgent, Protocol};
 pub use spawn_budget::{
-    budget_for_spawn, MAX_CMDLINE_PAYLOAD_LEN, MAX_PROMPT_BUDGET, MIN_CONTEXT_BUDGET,
+    budget_context, budget_for_spawn, fits_command_line, MAX_CMDLINE_PAYLOAD_LEN,
+    MAX_PROMPT_BUDGET, MIN_CONTEXT_BUDGET,
 };
 
 /// An event produced by an agent backend while running one turn.

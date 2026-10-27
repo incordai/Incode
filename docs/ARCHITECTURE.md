@@ -428,8 +428,9 @@ and Antigravity still run their own tools inside their own processes, so no call
 make passes this gate.
 
 - **Binary:** `INCORD_ENGINE_BIN`, then `engine_bin` in `admin.json`, then the engine's
-  install location — `%LOCALAPPDATA%\Incord Memory\incord-memory-service.exe`, which is
-  what the engine's installer writes into Claude's and Codex's hooks, then the spaceless
+  install location — `%LOCALAPPDATA%\Watchman\incord-memory-service.exe`, where it ships
+  inside Watchman, then `%LOCALAPPDATA%\Incord Memory\incord-memory-service.exe`, which is
+  what the engine's older installer writes into Claude's and Codex's hooks, then the spaceless
   copy at `%USERPROFILE%\.incord\` it makes for Antigravity. No default elsewhere. A
   NAMED path that is missing is a spawn failure (the failure policy below); nothing
   named and nothing installed skips the hooks.
@@ -993,8 +994,9 @@ feature flag or config key (only the model catalogue's `apply_patch_tool_type`);
 to switch them off was found. Until both are proved, codex keeps its own tools, the
 Sentinel remains detection-only there, and its edit events still feed the diff.
 
-**codex 0.163.0 — bridged, OPT-IN (`codex_tools: "incode"` / `INCODE_CODEX_TOOLS`).**
-The default stays `own` until a turn with a real model has run this way. The tool list
+**codex 0.163.0 — bridged, THE DEFAULT (`codex_tools: "own"` / `INCODE_CODEX_TOOLS=own` opts out).**
+Made the default on 2026-10-26 by the owner, before a turn with a real model had run
+this way (the account's quota ran out); that turn is still owed. The tool list
 was observed by pointing codex at a stand-in Responses endpoint
 (`-c model_providers.<n>.base_url=…`) that recorded each request — no login needed:
 

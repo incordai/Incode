@@ -92,12 +92,53 @@ pub struct Said {
     /// The last block is still being streamed into.
     open: bool,
     streamed: bool,
+    /// The run's tool calls and what each returned, in order — written to the
+    /// transcript by [`MemoryHooks::tools_ran`].
+    steps: Vec<Step>,
+}
+
+/// One tool call of a run, or what it returned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Step {
+    Called {
+        id: String,
+        name: String,
+        input: String,
+    },
+    Returned {
+        id: String,
+        output: String,
+        is_error: bool,
+    },
 }
 
 impl Said {
+    /// The run's tool calls and results, in the order they happened.
+    #[must_use]
+    pub fn steps(&self) -> &[Step] {
+        &self.steps
+    }
+
     /// Take one event of the run into account.
     pub fn hear(&mut self, event: &crate::agent::AgentEvent) {
         use crate::agent::AgentEvent;
+        match event {
+            AgentEvent::ToolUse { id, name, input } => self.steps.push(Step::Called {
+                id: id.clone(),
+                name: name.clone(),
+                input: input.clone(),
+            }),
+            AgentEvent::ToolResult {
+                id,
+                output,
+                is_error,
+            } => self.steps.push(Step::Returned {
+                id: id.clone(),
+                output: output.clone(),
+                is_error: *is_error,
+            }),
+            _ => {}
+        }
         match event {
             AgentEvent::TextDelta(fragment) => {
                 if !self.streamed {
@@ -207,6 +248,13 @@ impl MemoryHooks {
         &self.session
     }
 
+    /// Whether this session has the engine — the condition every memory
+    /// request it makes is gated on (`crate::turn_memory`).
+    #[must_use]
+    pub fn has_engine(&self) -> bool {
+        self.engine.is_some()
+    }
+
     /// The workspace this session works in.
     #[must_use]
     pub fn cwd(&self) -> &Path {
@@ -227,6 +275,7 @@ impl MemoryHooks {
     /// engine's context for it, bounded, or `None`.
     pub fn start(&mut self, source: &str) -> Option<String> {
         let engine = self.engine.as_ref()?;
+        self.ensure_transcript();
         start_block(engine, self.at(), source)
     }
 
@@ -239,6 +288,7 @@ impl MemoryHooks {
     #[must_use]
     pub fn start_in_background(&self, source: &str) -> Option<PendingStart> {
         let engine = self.engine.clone()?;
+        self.ensure_transcript();
         let session = self.session.clone();
         let cwd = self.cwd.clone();
         let transcript = self.transcript.clone();
@@ -286,9 +336,6 @@ impl MemoryHooks {
 
     /// Write one line of the conversation to the transcript.
     pub fn said(&mut self, speaker: Speaker, text: &str) {
-        let Some(path) = self.transcript.as_deref() else {
-            return;
-        };
         if text.trim().is_empty() {
             return;
         }
@@ -297,6 +344,98 @@ impl MemoryHooks {
             // As an array of text blocks: the engine reads an assistant line
             // only in that shape.
             Speaker::Agent => ("assistant", json!([{ "type": "text", "text": text }])),
+        };
+        self.write_line(kind, content);
+    }
+
+    /// Write a run's tool calls and results to the transcript, as the
+    /// `tool_use` / `tool_result` blocks of a Claude Code transcript.
+    ///
+    /// # Why
+    ///
+    /// The engine's recorder (Watchman) learns what a session RAN from these
+    /// blocks — it pairs each `tool_use` with the `tool_result` naming its id
+    /// (`watchman_capture.rs` in the engine) — and the transcript had none:
+    /// only the person's lines and the model's words. So nothing an incode
+    /// agent ran was ever recorded, and no later call of the same kind could
+    /// be served. The engine's turn capture keeps text blocks only, so these
+    /// lines add nothing to the conversation it stores.
+    ///
+    /// Called for every run, whether or not its turn succeeded: a tool that
+    /// ran, ran. Called by `cli::agent_turn` and `task_run` beside
+    /// [`Self::said`].
+    pub fn tools_ran(&mut self, said: &Said) {
+        for step in said.steps() {
+            let (kind, content) = match step {
+                Step::Called { id, name, input } => (
+                    "assistant",
+                    json!([{
+                        "type": "tool_use",
+                        "id": id,
+                        "name": name,
+                        // The arguments as the model gave them: JSON when they
+                        // are, kept as text when not.
+                        "input": serde_json::from_str::<serde_json::Value>(input)
+                            .unwrap_or_else(|_| json!({ "raw": input })),
+                    }]),
+                ),
+                Step::Returned {
+                    id,
+                    output,
+                    is_error,
+                } => (
+                    "user",
+                    json!([{
+                        "type": "tool_result",
+                        "tool_use_id": id,
+                        "content": bounded(output),
+                        "is_error": is_error,
+                    }]),
+                ),
+            };
+            self.write_line(kind, content);
+        }
+    }
+
+    /// The conversation is about to be compacted by hand (`/compact`): the
+    /// engine records the turns first. Not waited for. The route compacting on
+    /// its own tells the engine from `Toolbox::operator_pre_compact`.
+    pub fn pre_compact(&self, trigger: &str) {
+        if let Some(engine) = &self.engine {
+            engine.pre_compact(self.at(), trigger);
+        }
+    }
+
+    /// The transcript file, made now if it is not there yet, so the first
+    /// event names it: [`Self::at`] names only a file that exists, and the
+    /// session-start ran before anything was said — so the engine's first
+    /// look at a session never had the path to it.
+    fn ensure_transcript(&self) {
+        let Some(path) = self.transcript.as_deref() else {
+            return;
+        };
+        if path.exists() {
+            return;
+        }
+        let made = path
+            .parent()
+            .map_or(Ok(()), crate::folders::create_dir_all)
+            .and_then(|()| {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .map(|_| ())
+            });
+        if let Err(e) = made {
+            crate::trace!("memory", "transcript {} not made: {e}", path.display());
+        }
+    }
+
+    /// One line of the transcript: `kind` is `user` or `assistant`.
+    fn write_line(&mut self, kind: &str, content: serde_json::Value) {
+        let Some(path) = self.transcript.as_deref() else {
+            return;
         };
         let line = json!({
             "type": kind,
@@ -510,6 +649,23 @@ fn safe_name(id: &str) -> String {
     out
 }
 
+/// The most of one tool's output the transcript keeps, in bytes. The engine's
+/// recorder digests anything larger than a few kilobytes anyway; a whole build
+/// log per call would only grow the file.
+const MAX_RESULT_BYTES: usize = 32_000;
+
+/// `output` within [`MAX_RESULT_BYTES`], saying so when it was cut.
+fn bounded(output: &str) -> String {
+    let head = crate::text::head_bytes(output, MAX_RESULT_BYTES);
+    if head.len() == output.len() {
+        return output.to_string();
+    }
+    format!(
+        "{head}\n[… {} more bytes of this result were not kept]",
+        output.len() - head.len()
+    )
+}
+
 fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
     use std::io::Write;
     let fresh = !path.exists();
@@ -620,6 +776,127 @@ mod tests {
         assert_eq!(end["hook_event_name"], "SessionEnd");
         assert_eq!(end["reason"], "prompt_input_exit");
         assert_eq!(end["transcript_path"], transcript.as_str());
+
+        // The FIRST event names the transcript too: it is made before the
+        // session-start, which ran before anything was said and so never had
+        // the path.
+        assert_eq!(start["transcript_path"], transcript.as_str(), "{start}");
+    }
+
+    /// **WHAT A RUN'S TOOLS DID REACHES THE TRANSCRIPT** as the `tool_use` and
+    /// `tool_result` blocks the engine's recorder pairs by id — and nothing
+    /// else changes: the person's line and the model's words are where they
+    /// were.
+    #[test]
+    fn a_runs_tool_calls_are_written_as_the_blocks_the_recorder_pairs() {
+        use crate::agent::AgentEvent;
+        let dir = tempfile::tempdir().expect("scratch");
+        let mut memory = hooks(dir.path(), &[("user-prompt", Reply::exit(0))]);
+        let _ = memory.prompt("what is in a.txt");
+        let mut said = Said::default();
+        said.hear(&AgentEvent::ToolUse {
+            id: "t-1".to_string(),
+            name: "Read".to_string(),
+            input: r#"{"path":"a.txt"}"#.to_string(),
+        });
+        said.hear(&AgentEvent::ToolResult {
+            id: "t-1".to_string(),
+            output: "hi".to_string(),
+            is_error: false,
+        });
+        said.hear(&AgentEvent::Text("It says hi.".to_string()));
+        memory.tools_ran(&said);
+        memory.said(Speaker::Agent, &said.whole());
+
+        let text = std::fs::read_to_string(transcript_for(dir.path(), "sess-1")).expect("written");
+        let lines: Vec<serde_json::Value> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("JSON"))
+            .collect();
+        assert_eq!(lines.len(), 4, "person, call, result, words: {text}");
+        let call = &lines[1];
+        assert_eq!(call["type"], "assistant");
+        assert_eq!(call["message"]["content"][0]["type"], "tool_use");
+        assert_eq!(call["message"]["content"][0]["id"], "t-1");
+        assert_eq!(call["message"]["content"][0]["name"], "Read");
+        assert_eq!(call["message"]["content"][0]["input"]["path"], "a.txt");
+        let result = &lines[2];
+        assert_eq!(result["type"], "user");
+        assert_eq!(result["message"]["content"][0]["type"], "tool_result");
+        assert_eq!(result["message"]["content"][0]["tool_use_id"], "t-1");
+        assert_eq!(result["message"]["content"][0]["content"], "hi");
+        assert_eq!(result["message"]["content"][0]["is_error"], false);
+        for line in &lines {
+            assert!(
+                line["uuid"].as_str().is_some_and(|u| !u.is_empty()),
+                "{line}"
+            );
+        }
+        assert_eq!(lines[3]["message"]["content"][0]["text"], "It says hi.");
+    }
+
+    /// A tool's output is kept within a bound, and says when it was cut;
+    /// arguments that are not JSON are kept as text rather than dropped.
+    #[test]
+    fn a_huge_result_is_bounded_and_odd_arguments_are_kept() {
+        use crate::agent::AgentEvent;
+        let dir = tempfile::tempdir().expect("scratch");
+        let mut memory = hooks(dir.path(), &[]);
+        memory.ensure_transcript();
+        let mut said = Said::default();
+        said.hear(&AgentEvent::ToolUse {
+            id: "t-2".to_string(),
+            name: "Bash".to_string(),
+            input: "not json".to_string(),
+        });
+        said.hear(&AgentEvent::ToolResult {
+            id: "t-2".to_string(),
+            output: "y".repeat(MAX_RESULT_BYTES + 10),
+            is_error: true,
+        });
+        memory.tools_ran(&said);
+        let text = std::fs::read_to_string(transcript_for(dir.path(), "sess-1")).expect("written");
+        let lines: Vec<serde_json::Value> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("JSON"))
+            .collect();
+        assert_eq!(
+            lines[0]["message"]["content"][0]["input"]["raw"],
+            "not json"
+        );
+        let kept = lines[1]["message"]["content"][0]["content"]
+            .as_str()
+            .expect("text");
+        assert!(kept.len() < MAX_RESULT_BYTES + 100, "bounded");
+        assert!(kept.contains("10 more bytes"), "and says so");
+        assert_eq!(lines[1]["message"]["content"][0]["is_error"], true);
+    }
+
+    /// **A COMPACTION IS TOLD TO THE ENGINE**, with what it reads: the
+    /// trigger and the transcript the turns are captured from. Not waited
+    /// for, so the test waits for it.
+    #[test]
+    fn a_compaction_is_told_to_the_engine() {
+        let dir = tempfile::tempdir().expect("scratch");
+        let memory = hooks(dir.path(), &[("pre-compact", Reply::exit(0))]);
+        memory.ensure_transcript();
+        memory.pre_compact("manual");
+        let waited = std::time::Instant::now();
+        while fake::events(dir.path(), "pre-compact").is_empty()
+            && waited.elapsed() < Duration::from_secs(20)
+        {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let told = &fake::events(dir.path(), "pre-compact")[0];
+        assert_eq!(told["hook_event_name"], "PreCompact");
+        assert_eq!(told["trigger"], "manual");
+        assert_eq!(told["session_id"], "sess-1");
+        assert_eq!(
+            told["transcript_path"],
+            transcript_for(dir.path(), "sess-1")
+                .to_string_lossy()
+                .as_ref()
+        );
     }
 
     /// **THE TRANSCRIPT IS IN THE SHAPE THE ENGINE CAPTURES FROM.** Its

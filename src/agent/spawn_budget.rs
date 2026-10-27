@@ -89,6 +89,43 @@ pub fn budget_for_spawn(
     Ok((budgeted_prompt, kept.blocks.join("\n\n")))
 }
 
+/// Whether `prompt` and `system_context` together fit on one command line.
+///
+/// A backend that can take the prompt on stdin asks this first, and sends a
+/// prompt that does not fit THERE rather than spilling it to a file the model
+/// must be told to read (`spill`) — measured: with the memory engine's context
+/// riding the turn, a two-line request arrived as a 16 KB file with the
+/// person's words on its last line. Called by `claude_code/turn.rs`
+/// `run_once`.
+#[must_use]
+pub fn fits_command_line(prompt: &str, system_context: &[String]) -> bool {
+    prompt.len() + system_context.join("\n\n").len() <= MAX_CMDLINE_PAYLOAD_LEN
+}
+
+/// The system context alone, kept within one command line — for a turn whose
+/// prompt goes on stdin, so the whole command line is the context's. Blocks
+/// are kept by the same priority [`budget_for_spawn`] uses.
+#[must_use]
+pub fn budget_context(system_context: &[String]) -> String {
+    let joined = system_context.join("\n\n");
+    if joined.len() <= MAX_CMDLINE_PAYLOAD_LEN {
+        return joined;
+    }
+    let (high_priority, low_priority) = by_priority(system_context);
+    let mut kept = Kept::default();
+    kept.take(
+        &high_priority,
+        MAX_CMDLINE_PAYLOAD_LEN,
+        HIGH_PRIORITY_CUT_FLOOR,
+    );
+    kept.take(
+        &low_priority,
+        MAX_CMDLINE_PAYLOAD_LEN,
+        LOW_PRIORITY_CUT_FLOOR,
+    );
+    kept.blocks.join("\n\n")
+}
+
 /// The context's non-blank blocks, trimmed, split by priority in their
 /// order:
 /// high-priority: guards, standing rules, intake task, question prompt, roles;

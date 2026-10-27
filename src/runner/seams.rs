@@ -76,6 +76,16 @@ pub trait TaskWorker {
     /// Defaulted to ignoring it, for a worker with no agent turn to add it to.
     fn operator_context(&mut self, _blocks: &[String]) {}
 
+    /// The last `work`'s tool calls and what each returned, taken — for the
+    /// memory engine's transcript, whose recorder learns from them
+    /// (`MemoryHooks::tools_ran`). Read by `cli::run_memory::Remembered` after
+    /// each `work`, whether or not it succeeded.
+    ///
+    /// Defaulted to none, for a worker that runs no tools.
+    fn take_steps(&mut self) -> crate::hooks::memory::Said {
+        crate::hooks::memory::Said::default()
+    }
+
     /// Who did the last attempt, and what they actually ran on.
     ///
     /// Defaulted to the harness itself: a worker that does not delegate is still
@@ -312,6 +322,14 @@ impl WorkJournal for MemoryJournal {
     ) -> Result<(), String> {
         let (text, subject) =
             crate::knowledge::work_note(attribution, &task.id, &task.title, evidence);
-        crate::knowledge::remember(&text, "fact", &subject).map(|_| ())
+        // The folder the run works in, which `work_note`'s subject is named
+        // from too: the engine files a lesson by the project its `cwd` is in.
+        let cwd = std::env::current_dir()
+            .map_err(|e| format!("the run's folder could not be read: {e}"))?;
+        crate::knowledge::remember(&crate::knowledge::Lesson {
+            subject: &subject,
+            ..crate::knowledge::Lesson::new("fact", &text, &cwd)
+        })
+        .map(|_| ())
     }
 }

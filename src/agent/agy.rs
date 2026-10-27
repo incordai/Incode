@@ -18,17 +18,25 @@
 //! It showed up as something worse, and more useful: **this agent cannot
 //! express the policy at all.** See [`AgyBackend::enforces`].
 //!
-//! # Why it is not driven over the tool bridge
+//! # Why it is not driven over the tool bridge — yet
 //!
-//! The Claude route, and codex with `codex_tools: "incode"`, run every tool call
-//! in incode's toolbox ([`crate::tool_bridge`]). That needs two things of the CLI
-//! for ONE run: a way to switch its own tools off, and a way to hand it an MCP
-//! server. `agy --help` (1.2.11) has neither — no flag removes or restricts a
-//! built-in tool, and MCP servers are added only by `agy mcp add`, which writes
-//! the operator's persistent configuration rather than this spawn's. Without the
-//! first, the bridge would be one more tool beside `run_command` and
-//! `write_to_file`, refusing nothing. So agy keeps its own tools, and the
-//! Sentinel stays its check.
+//! The Claude route and codex (by default) run every tool call in incode's
+//! toolbox ([`crate::tool_bridge`]). That needs two things of the CLI for ONE
+//! run: a way to switch its own tools off, and a way to hand it an MCP server.
+//! No FLAG does either, but a custom AGENT does both. Measured on 1.4.7
+//! (2026-10-26): an agent file (`.agents/agents/<name>.md` or
+//! `~/.gemini/config/agents/<name>.md`) with frontmatter `tools: [finish]`,
+//! `mcpServers: [{name, command, args}]` and `mainAgent: true`, run as
+//! `agy -p --agent <name> --dangerously-skip-permissions`, gives the model only
+//! `finish`, `call_mcp_tool`, `list_resources`, `read_resource` and
+//! `manage_task`. The shell never ran, and the server inherited agy's
+//! environment, as the bridge's address and token need. The `init` event lists
+//! the whole registry either way, so it is not evidence of the restriction.
+//!
+//! Not built, because one thing is unresolved: agy's own memory hooks
+//! (`~/.gemini/*/hooks.json`) still fire on such a run, beside the ones the
+//! toolbox fires, so the engine would hear every event twice. Until that is
+//! settled agy keeps its own tools, and the Sentinel stays its check.
 
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;

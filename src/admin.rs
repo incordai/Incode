@@ -762,9 +762,11 @@ impl AdminConfig {
     }
 
     /// Whose tools a codex model runs, and where that was decided: the
-    /// environment, then the settings, then `own`. A word nobody uses is
-    /// `own` from the built-in layer — the route that has run live — and is
-    /// reported as such rather than guessed at.
+    /// environment, then the settings, then `incode` ([`CodexTools`]'s
+    /// default, so the two cannot disagree). A word nobody uses is the
+    /// built-in default and is reported as such rather than guessed at.
+    ///
+    /// [`CodexTools`]: crate::agent::codex::CodexTools
     #[must_use]
     pub fn resolve_codex_tools(&self) -> Resolved<crate::agent::codex::CodexTools> {
         self.resolve_codex_tools_with(
@@ -787,7 +789,7 @@ impl AdminConfig {
         }
         match self.codex_tools.as_deref().and_then(CodexTools::parse) {
             Some(tools) => Resolved::new(tools, Source::AdminFile),
-            None => Resolved::new(CodexTools::Own, Source::BuiltIn),
+            None => Resolved::new(CodexTools::default(), Source::BuiltIn),
         }
     }
 

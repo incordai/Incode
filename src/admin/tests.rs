@@ -527,29 +527,28 @@ fn the_sandbox_policy_says_whether_the_mode_was_named_and_resolves_the_network()
     clear_env();
 }
 
-/// **CODEX KEEPS ITS OWN TOOLS UNLESS SOMEONE SAID OTHERWISE.** Unset is
-/// `own`; the settings switch it to `incode`; the environment wins over
-/// the settings; a word nobody uses is `own` from the built-in layer,
-/// never a guess at what was meant.
+/// **CODEX RUNS ON incode's TOOLS UNLESS SOMEONE SAID OTHERWISE.** Unset
+/// is `incode`; the settings switch it to `own`; the environment wins
+/// over the settings; a word nobody uses is `incode` from the built-in
+/// layer, never a guess at what was meant.
 #[test]
 fn codex_tools_resolve_like_the_other_settings() {
     use crate::agent::codex::CodexTools;
     let unset = AdminConfig::default();
     assert_eq!(
         unset.resolve_codex_tools_with(None),
-        Resolved::new(CodexTools::Own, Source::BuiltIn)
+        Resolved::new(CodexTools::Incode, Source::BuiltIn)
     );
 
     let admin = AdminConfig {
-        codex_tools: Some("incode".to_string()),
+        codex_tools: Some("own".to_string()),
         ..Default::default()
     };
     assert_eq!(
         admin.resolve_codex_tools_with(None),
-        Resolved::new(CodexTools::Incode, Source::AdminFile)
+        Resolved::new(CodexTools::Own, Source::AdminFile)
     );
-    let parsed: AdminConfig =
-        serde_json::from_str(r#"{"codex_tools":"incode"}"#).expect("admin.json");
+    let parsed: AdminConfig = serde_json::from_str(r#"{"codex_tools":"own"}"#).expect("admin.json");
     assert_eq!(parsed, admin, "the admin.json spelling");
 
     let typo = AdminConfig {
@@ -558,16 +557,16 @@ fn codex_tools_resolve_like_the_other_settings() {
     };
     assert_eq!(
         typo.resolve_codex_tools_with(None),
-        Resolved::new(CodexTools::Own, Source::BuiltIn)
+        Resolved::new(CodexTools::Incode, Source::BuiltIn)
     );
 
     assert_eq!(
-        admin.resolve_codex_tools_with(Some("own")),
-        Resolved::new(CodexTools::Own, Source::Environment)
+        admin.resolve_codex_tools_with(Some("incode")),
+        Resolved::new(CodexTools::Incode, Source::Environment)
     );
     assert_eq!(
-        unset.resolve_codex_tools_with(Some(" Incode ")),
-        Resolved::new(CodexTools::Incode, Source::Environment)
+        unset.resolve_codex_tools_with(Some(" Own ")),
+        Resolved::new(CodexTools::Own, Source::Environment)
     );
     // An unusable value in the environment is no answer: the settings speak.
     assert_eq!(

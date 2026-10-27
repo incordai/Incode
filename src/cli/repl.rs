@@ -291,15 +291,10 @@ impl Repl {
         // Returns nothing when the store is unreachable: retrieval enriches a
         // turn, so losing it costs context, not the turn.
         //
-        // The rules ride the same turn, and are fetched for the same line: the
-        // service returns the always-on rules unioned with the ones that match
-        // what is being asked, so which rules apply depends on the question.
-        // Rules go FIRST — they are the only retrieved block the model is meant
-        // to obey, and they govern how it treats the rest.
-        let mut turn_context = Vec::new();
-        if let Some(rules) = crate::rules::context_for_turn(line) {
-            turn_context.push(rules);
-        }
+        // The rules ride the same turn, fetched for the same line — by
+        // `plan_turn`, inside `run_one_turn`. They were ALSO fetched here,
+        // into a list nothing read: a second rules request per turn, paid
+        // in the operator's wait and thrown away.
         // Per-turn recall is gone. Measured against the live service it
         // takes 6-8 SECONDS while the turn budget is 1.2 — so it timed out
         // every time, contributing nothing and costing 1.2s of the

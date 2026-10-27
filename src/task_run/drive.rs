@@ -342,7 +342,9 @@ fn attempt(
     // The turn is ending: the memory engine records it, and may say to
     // carry on — sent to the same agent as its next prompt, bounded as in
     // a session. Before the sentinel, so what a continuation writes is
-    // checked too.
+    // checked too. What its tools did, then what it said — the tool calls
+    // are what the engine's recorder learns from (`MemoryHooks::tools_ran`).
+    memory.tools_ran(&heard);
     memory.said(crate::hooks::memory::Speaker::Agent, &heard.whole());
     carry_on(
         backend,
@@ -399,11 +401,13 @@ fn carry_on(
         outln!("  · memory engine: carry on — {reason}");
         let mut more = Vec::new();
         let mut heard = crate::hooks::memory::Said::default();
-        match backend.run_turn(&reason, &mut |event: &AgentEvent| {
+        let ran = backend.run_turn(&reason, &mut |event: &AgentEvent| {
             heard.hear(event);
             report.event(event);
             show(event, &mut more, tool_calls);
-        }) {
+        });
+        memory.tools_ran(&heard);
+        match ran {
             Ok(next) if !next.is_error => {
                 report.outcome(&next);
                 memory.said(crate::hooks::memory::Speaker::Agent, &heard.whole());

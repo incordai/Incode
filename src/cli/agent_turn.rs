@@ -114,6 +114,9 @@ pub struct AgentSession {
     native_context: Vec<String>,
     /// What the engine's session-start handed this session, when it answered.
     start_block: Option<String>,
+    /// Which per-turn rules this conversation has been given in full
+    /// ([`Self::turn_rules`]).
+    turn_rules: crate::rules::TurnRules,
     /// The session-start still being answered, on a thread of its own: the
     /// session opens without waiting for it, and the first turn does.
     pending_start: Option<crate::hooks::memory::PendingStart>,
@@ -235,6 +238,7 @@ impl AgentSession {
             base_context: system_context,
             native_context: Vec::new(),
             start_block: None,
+            turn_rules: crate::rules::TurnRules::default(),
             pending_start: None,
             workspace: workspace_for_self,
             checkpoints: CheckpointStore::new(),
@@ -526,7 +530,14 @@ impl AgentSession {
                 .to_vec(),
             None => Vec::new(),
         };
-        match self.backend.compact(instructions) {
+        let compacted = self.backend.compact(instructions);
+        // The memory engine records the turns that were summarised away. Told
+        // only when a compaction happened, and safely after it: the engine
+        // reads the turns from the transcript, which compaction never shortens.
+        if matches!(compacted, Some(Ok(_))) {
+            self.memory.pre_compact("manual");
+        }
+        match compacted {
             Some(Ok(done)) if !said.is_empty() => {
                 let lines: Vec<String> = said
                     .iter()
@@ -633,6 +644,45 @@ impl AgentSession {
     pub fn memory_prompt(&mut self, line: &str) -> Option<String> {
         self.settle_memory_start();
         self.memory.prompt(line)
+    }
+
+    /// incode's own rules for `line`, for a turn the engine gave no context
+    /// for: the rules this conversation has not been given yet in full, the
+    /// ones it has by title, and the always-on ones not at all while the
+    /// standing context carries them ([`crate::rules::TurnRules`]).
+    ///
+    /// Called by `cli::plan_turn` after [`Self::memory_prompt`], which settles
+    /// the session-start this reads.
+    pub fn turn_rules(&mut self, line: &str) -> Option<String> {
+        let ruleset = crate::rules::ruleset_for_turn(line)?;
+        let always_in_prefix = self.always_rules_in_prefix();
+        let conversation = self.backend.session_id().map(str::to_string);
+        self.turn_rules
+            .block(&ruleset, conversation.as_deref(), always_in_prefix)
+    }
+
+    /// What the shared memory holds for `line` — past work and the code it is
+    /// about — for a turn the engine's prompt hook gave nothing
+    /// ([`crate::turn_memory::for_turn`]). Its rules are not in it:
+    /// [`Self::turn_rules`] gives those.
+    ///
+    /// Called by `cli::plan_turn` beside [`Self::turn_rules`].
+    pub fn turn_memory(&self, line: &str) -> Option<String> {
+        if !self.memory.has_engine() {
+            return None;
+        }
+        crate::turn_memory::for_turn(line, &self.workspace, self.memory.session())
+    }
+
+    /// Whether the standing context handed to the backend carries the
+    /// always-on rules: incode's own block does until the engine's
+    /// session-start replaces it ([`Self::carry_context`]).
+    fn always_rules_in_prefix(&self) -> bool {
+        self.start_block.is_none()
+            && self
+                .native_context
+                .iter()
+                .any(|block| crate::rules::is_always_block(block))
     }
 
     /// The operator's `session_start` commands (`crate::hooks`): what they
@@ -1205,6 +1255,9 @@ impl AgentSession {
         }
 
         let mut outcome = attempt;
+        // What the tools did, whether or not the turn then succeeded: a tool
+        // that ran, ran, and the engine's recorder learns from it.
+        self.memory.tools_ran(&said);
         if outcome.is_ok() {
             self.memory
                 .said(crate::hooks::memory::Speaker::Agent, &said.whole());
@@ -1248,6 +1301,7 @@ impl AgentSession {
                             _ => {}
                         }
                     });
+                self.memory.tools_ran(&replied);
                 if !replied.last().is_empty() {
                     self.memory
                         .said(crate::hooks::memory::Speaker::Agent, &replied.whole());
@@ -1295,6 +1349,7 @@ impl AgentSession {
                 &mut observer,
             );
             outcome = judged(self.backend.as_ref(), next).0;
+            self.memory.tools_ran(&said);
             if outcome.is_ok() {
                 self.memory
                     .said(crate::hooks::memory::Speaker::Agent, &said.whole());

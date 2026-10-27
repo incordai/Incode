@@ -1160,12 +1160,44 @@ pub fn tool_definition() -> serde_json::Value {
             your own reading of the code is a claim, and a passing check is \
             evidence. Call it after making a change, and believe the exit code \
             over your expectations. You cannot choose what is run: the check \
-            belongs to the project, so that passing cannot be arranged.",
+            belongs to the project, so that passing cannot be arranged. To see \
+            what it would run before running it, use verify_plan.",
         "input_schema": { "type": "object", "properties": {} }
     })
 }
 
+/// The tool that says what `verify` would check, running nothing.
+///
+/// A tool of its OWN, not an argument to `verify`: `verify` takes no input at
+/// all, so its answer can only ever mean a check ran (pinned by
+/// `the_model_cannot_choose_what_counts_as_passing`). A `verify` that could
+/// also answer without running would be one whose success no longer proves
+/// anything by itself.
+pub const PLAN_TOOL: &str = "verify_plan";
+
+/// `verify_plan` as advertised to the model.
+#[must_use]
+pub fn plan_tool_definition() -> serde_json::Value {
+    serde_json::json!({
+        "name": PLAN_TOOL,
+        "description": "Say what `verify` would check here, WITHOUT running \
+            anything: the command it runs, and what the project's frozen contracts \
+            (.incode/contracts.json) declare — or why that file cannot be read, \
+            which would fail every verify. Use it to plan the work against the \
+            check before starting. It proves nothing; only verify does.",
+        "input_schema": { "type": "object", "properties": {} }
+    })
+}
+
+/// Run `verify_plan`. Called by the toolbox's dispatch.
+#[must_use]
+pub fn run_plan_tool(workspace: &Path) -> String {
+    plan(workspace, command_for(workspace).as_deref())
+}
+
 /// Run the project's check on the model's request and render the outcome.
+///
+/// Called by the toolbox's dispatch (`toolbox/mod.rs` `run_tool`).
 pub fn run_tool(workspace: &Path) -> Result<String, String> {
     let Some(argv) = command_for(workspace) else {
         return Err(format!(
@@ -1187,6 +1219,45 @@ pub fn run_tool(workspace: &Path) -> Result<String, String> {
         return Err(format!("{}\n\n{breaches}", evidence.summary()));
     }
     Ok(format!("{}\nThe check passed.", evidence.summary()))
+}
+
+/// What `verify` would check in `workspace`, without running any of it.
+///
+/// The same two halves a real run checks, from the same sources: the command
+/// [`command_for`] picks, and the contracts [`contract_breaches`] loads. A
+/// contracts file that cannot be read is said here — before the first run,
+/// rather than as the reason a finished task fails.
+#[must_use]
+pub fn plan(workspace: &Path, argv: Option<&[String]>) -> String {
+    let command = match argv {
+        Some(argv) => format!(
+            "`verify` would run `{}` in {}.",
+            argv.join(" "),
+            workspace.display()
+        ),
+        None => format!(
+            "No check is configured for this project, so `verify` cannot prove anything. \
+             Set {VERIFY_COMMAND_ENV} to the command that decides whether the work is correct."
+        ),
+    };
+    let contracts = match crate::contracts::Contracts::load(workspace) {
+        Ok(c) if c.is_empty() => format!(
+            "No frozen contracts ({} is absent or empty), so only the command decides.",
+            crate::contracts::CONTRACTS_FILE
+        ),
+        Ok(c) => format!(
+            "It then holds the code to {}: {} schema(s) ({}) and {} endpoint(s).",
+            crate::contracts::CONTRACTS_FILE,
+            c.schemas.len(),
+            c.schemas.keys().cloned().collect::<Vec<_>>().join(", "),
+            c.endpoints.len()
+        ),
+        Err(e) => format!(
+            "The contracts file could not be read, so `verify` will FAIL until it is \
+             fixed: {e}"
+        ),
+    };
+    format!("{command}\n{contracts}\nNothing was run.")
 }
 
 /// Run a check and return proof, or the reason there is none.
@@ -1523,6 +1594,57 @@ mod tests {
 
         let error = outcome.expect_err("a failing check must not read as success");
         assert!(error.contains("failed"), "got: {error}");
+    }
+
+    /// `verify_plan` names the command `verify` would run — the same
+    /// [`command_for`] — and says it ran nothing.
+    #[test]
+    fn a_plan_names_the_command_and_runs_nothing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _guard = crate::brief::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var(VERIFY_COMMAND_ENV, "cargo --definitely-not-a-real-flag");
+        let said = run_plan_tool(dir.path());
+        std::env::remove_var(VERIFY_COMMAND_ENV);
+
+        assert!(
+            said.contains("`cargo --definitely-not-a-real-flag`"),
+            "{said}"
+        );
+        assert!(said.contains("Nothing was run"), "{said}");
+        assert!(said.contains("No frozen contracts"), "{said}");
+    }
+
+    /// A contracts file that cannot be read is said in the PLAN, before the
+    /// work, rather than as the reason the finished task fails.
+    #[test]
+    fn a_plan_says_a_broken_contracts_file_will_fail_the_check() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::create_dir_all(dir.path().join(".incode")).expect("dir");
+        std::fs::write(
+            dir.path().join(crate::contracts::CONTRACTS_FILE),
+            r#"{"interfaces":{"User":{}}}"#,
+        )
+        .expect("write");
+        let broken = plan(dir.path(), Some(&["make".to_string(), "check".to_string()]));
+        assert!(broken.contains("will FAIL"), "{broken}");
+        assert!(
+            broken.contains("`interfaces`"),
+            "the unread key is named: {broken}"
+        );
+
+        std::fs::write(
+            dir.path().join(crate::contracts::CONTRACTS_FILE),
+            r#"{"schemas":{"User":{"fields":{"id":"uuid"}}},"endpoints":[{"path":"GET /u"}]}"#,
+        )
+        .expect("write");
+        let frozen = plan(dir.path(), None);
+        assert!(
+            frozen.contains("1 schema(s) (User) and 1 endpoint(s)"),
+            "{frozen}"
+        );
+        assert!(frozen.contains("No check is configured"), "{frozen}");
     }
 
     #[test]

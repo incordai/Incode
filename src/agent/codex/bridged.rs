@@ -19,9 +19,12 @@ impl CodexBackend {
     /// over codex's lines.
     ///
     /// Called by the backend's `run_turn` once the turn's channel is open.
+    /// `stdin_text` is the prompt when it was too long for the command line:
+    /// the command then says `-`, and the text is written to codex's stdin.
     pub(super) fn run_bridged(
         &mut self,
         mut command: Command,
+        stdin_text: Option<String>,
         turn: crate::tool_bridge::Turn,
         on_event: &mut dyn FnMut(&AgentEvent),
     ) -> Result<TurnOutcome, AgentError> {
@@ -35,11 +38,15 @@ impl CodexBackend {
             command.env(key, value);
         }
         crate::agent::process_tree::prepare(&mut command);
+        if stdin_text.is_some() {
+            command.stdin(Stdio::piped());
+        }
         let mut child = command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| AgentError::new(format!("could not start `{}`: {e}", self.binary)))?;
+        super::feed_stdin(&mut child, stdin_text);
         let tree = crate::agent::process_tree::Tree::adopt(&child);
         let stdout = child
             .stdout

@@ -604,10 +604,12 @@ pub(crate) fn plan_turn(
     crate::telemetry::user_prompt(line);
     match session.memory_prompt(line) {
         Some(block) => context.push(block),
+        // The engine's hook said nothing: the rules this conversation has not
+        // been given, then what memory holds for the line and the code it is
+        // about — not the rules alone, which is all such a turn used to carry.
         None => {
-            if let Some(rules) = crate::rules::context_for_turn(line) {
-                context.push(rules);
-            }
+            context.extend(session.turn_rules(line));
+            context.extend(session.turn_memory(line));
         }
     }
 
