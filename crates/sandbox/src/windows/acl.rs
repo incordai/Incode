@@ -124,6 +124,61 @@ pub(crate) struct OfflineGrant {
     pub parents: Vec<PathBuf>,
 }
 
+impl OfflineGrant {
+    /// The share a run may give the account, for [`Lease::acquire`]: a read
+    /// folder that would reach far past a workspace refuses the run, and a
+    /// read path or parent this process may not re-ACL is left out.
+    fn grantable(self, profile: Option<&str>) -> Result<Self, String> {
+        for read in self.reads.iter().filter(|r| r.is_dir()) {
+            refuse_broad(&read.to_string_lossy(), profile).map_err(|e| {
+                format!(
+                    "network deny runs the command as the offline account, which must \
+                     be granted the current folder; {e} (run from a project folder)"
+                )
+            })?;
+        }
+        // Only what this process may re-ACL: anything else (an sbx.exe under
+        // Program Files) is the system's, readable by `Users` already or not
+        // this run's to open up. If it is not readable, starting the command
+        // says so.
+        let reads = self
+            .reads
+            .into_iter()
+            .filter(|r| may_change_acl(r))
+            .collect();
+        // The same for a parent: one this process may not re-ACL is not the
+        // user's (a folder of the system's), and is listable by `Users`
+        // already or not this run's to open up.
+        let parents = self
+            .parents
+            .into_iter()
+            .filter(|p| p.is_dir() && may_change_acl(p))
+            .collect();
+        Ok(Self {
+            user: self.user,
+            reads,
+            parents,
+        })
+    }
+}
+
+/// Refuse the run when a root may not be granted, for [`Lease::acquire`]: it
+/// would reach far past a workspace ([`refuse_broad`]), or it is not a
+/// folder. Checked for every root before anything is granted.
+fn refuse_ungrantable(roots: &[PathBuf], profile: Option<&str>) -> Result<(), String> {
+    for root in roots {
+        refuse_broad(&root.to_string_lossy(), profile)
+            .map_err(|e| format!("workspace-write {e}"))?;
+        if !root.is_dir() {
+            return Err(format!(
+                "workspace-write cannot grant {}: not a directory",
+                root.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// One run's grant on its roots. Dropping it revokes them.
 pub(crate) struct Lease {
     record: GrantRecord,
@@ -153,47 +208,26 @@ impl Lease {
     /// # Errors
     /// When a root may not or could not be granted. Nothing this call granted
     /// is left behind on failure.
+    ///
+    /// The steps: the roots are checked ([`refuse_ungrantable`]) and folded,
+    /// the account's share narrowed ([`OfflineGrant::grantable`]), the sweep
+    /// run and the grant written down, then the roots granted
+    /// ([`Lease::grant_roots`]), the account's read paths
+    /// ([`Lease::grant_reads`]) and its parents ([`Lease::grant_parents`]).
+    /// A step that fails returns with the lease, which drops and so takes
+    /// back what the steps before it listed.
     pub(crate) fn acquire(
         roots: &[PathBuf],
         offline: Option<OfflineGrant>,
     ) -> Result<Self, String> {
         let profile = std::env::var("USERPROFILE").ok();
-        for root in roots {
-            refuse_broad(&root.to_string_lossy(), profile.as_deref())
-                .map_err(|e| format!("workspace-write {e}"))?;
-            if !root.is_dir() {
-                return Err(format!(
-                    "workspace-write cannot grant {}: not a directory",
-                    root.display()
-                ));
-            }
-        }
+        refuse_ungrantable(roots, profile.as_deref())?;
         let roots = fold_nested(roots);
+        let offline = offline
+            .map(|o| o.grantable(profile.as_deref()))
+            .transpose()?;
         let (user, reads, parents) = match offline {
-            Some(o) => {
-                for read in o.reads.iter().filter(|r| r.is_dir()) {
-                    refuse_broad(&read.to_string_lossy(), profile.as_deref()).map_err(|e| {
-                        format!(
-                            "network deny runs the command as the offline account, which must \
-                             be granted the current folder; {e} (run from a project folder)"
-                        )
-                    })?;
-                }
-                // Only what this process may re-ACL: anything else (an
-                // sbx.exe under Program Files) is the system's, readable by
-                // `Users` already or not this run's to open up. If it is not
-                // readable, starting the command says so.
-                let reads = o.reads.into_iter().filter(|r| may_change_acl(r)).collect();
-                // The same for a parent: one this process may not re-ACL is
-                // not the user's (a folder of the system's), and is listable
-                // by `Users` already or not this run's to open up.
-                let parents = o
-                    .parents
-                    .into_iter()
-                    .filter(|p| p.is_dir() && may_change_acl(p))
-                    .collect();
-                (Some(o.user), reads, parents)
-            }
+            Some(o) => (Some(o.user), o.reads, o.parents),
             None => (None, Vec::new(), Vec::new()),
         };
         let dir = records_dir();
@@ -219,51 +253,58 @@ impl Lease {
         // after this is swept.
         std::fs::write(&lease.path, lease.record.to_text())
             .map_err(|e| format!("{}: {e}", lease.path.display()))?;
-        for root in &roots {
+        lease.grant_roots(&roots)?;
+        if let Some(user) = lease.record.user.clone() {
+            lease.grant_reads(&reads, &user)?;
+            lease.grant_parents(&parents, &user);
+        }
+        Ok(lease)
+    }
+
+    /// Grant each root in turn ([`grant_root`]), for [`Lease::acquire`],
+    /// stopping at the first that fails.
+    fn grant_roots(&mut self, roots: &[PathBuf]) -> Result<(), String> {
+        for root in roots {
             // Listed first: a propagation can fail part-way (a file the user
             // may not re-ACL), and dropping the lease takes back whatever
             // landed.
-            lease.roots.push(root.clone());
-            let granted =
-                change(root, &lease.record.sid, Change::Grant(MODIFY)).and_then(|()| match &lease
-                    .record
-                    .user
-                {
-                    Some(user) => grant_account(root, user, MODIFY)
-                        .and_then(|()| keep_acl_rights(root).map(|_| ())),
-                    None => Ok(()),
-                });
-            if let Err(e) = granted {
-                return Err(format!(
-                    "workspace-write could not grant {}: {e}",
-                    root.display()
-                ));
+            self.roots.push(root.clone());
+            grant_root(root, &self.record.sid, self.record.user.as_deref())
+                .map_err(|e| format!("workspace-write could not grant {}: {e}", root.display()))?;
+        }
+        Ok(())
+    }
+
+    /// Let the offline account `user` read each of `reads`, for
+    /// [`Lease::acquire`], stopping at the first that fails.
+    fn grant_reads(&mut self, reads: &[PathBuf], user: &str) -> Result<(), String> {
+        for read in reads {
+            self.reads.push(read.clone());
+            grant_account(read, user, READ_EXECUTE).map_err(|e| {
+                format!(
+                    "could not let the offline account read {}: {e}",
+                    read.display()
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Let the offline account `user` list each of `parents`, for
+    /// [`Lease::acquire`]. Not a confinement matter: without it the run goes
+    /// on, and only PowerShell's starting location suffers, so a failure is
+    /// said and the next parent tried.
+    fn grant_parents(&mut self, parents: &[PathBuf], user: &str) {
+        for parent in parents {
+            self.parents.push(parent.clone());
+            if let Err(e) = set_list(parent, user, true) {
+                eprintln!(
+                    "sbx: could not let the offline account list {} ({e}); PowerShell \
+                     may start at the drive root instead of the current folder",
+                    parent.display()
+                );
             }
         }
-        if let Some(user) = lease.record.user.clone() {
-            for read in &reads {
-                lease.reads.push(read.clone());
-                grant_account(read, &user, READ_EXECUTE).map_err(|e| {
-                    format!(
-                        "could not let the offline account read {}: {e}",
-                        read.display()
-                    )
-                })?;
-            }
-            // Not a confinement matter: without it the run goes on, and
-            // only PowerShell's starting location suffers, so say so.
-            for parent in &parents {
-                lease.parents.push(parent.clone());
-                if let Err(e) = set_list(parent, &user, true) {
-                    eprintln!(
-                        "sbx: could not let the offline account list {} ({e}); PowerShell \
-                         may start at the drive root instead of the current folder",
-                        parent.display()
-                    );
-                }
-            }
-        }
-        Ok(lease)
     }
 
     /// The SID the command's token is restricted to.
@@ -362,6 +403,19 @@ fn release_list(parent: &Path, user: &str, others: &Others) -> Result<(), String
         return Ok(());
     }
     set_list(parent, user, false).map(|_| ())
+}
+
+/// Grant one root, for [`Lease::grant_roots`]: `Modify` to the run's SID
+/// and, with the offline account `user`, to the account as well, with the
+/// user's own ACL rights kept beneath it ([`keep_acl_rights`]). Stops at the
+/// first that fails.
+fn grant_root(root: &Path, sid_text: &str, user: Option<&str>) -> Result<(), String> {
+    change(root, sid_text, Change::Grant(MODIFY))?;
+    if let Some(user) = user {
+        grant_account(root, user, MODIFY)?;
+        keep_acl_rights(root)?;
+    }
+    Ok(())
 }
 
 /// Grant the account `rights` on `path`, inherited beneath a folder. A
@@ -1055,5 +1109,80 @@ mod tests {
             !keep_acl_rights(dir.path()).expect("kept"),
             "a root that already passes it down is left alone"
         );
+    }
+
+    /// **A GRANT THAT FAILS PART-WAY TAKES BACK WHAT IT ALREADY GRANTED**:
+    /// the first root is granted, the second refuses (its ACL may be read but
+    /// not changed: an `OWNER RIGHTS` ACE takes the owner's implicit
+    /// `WRITE_DAC` away), and the lease the failure drops revokes the first
+    /// root and what propagated beneath it. The second root's revoke fails as
+    /// its grant did, so the record is kept for the next sweep, naming that
+    /// root alone.
+    #[test]
+    fn a_grant_that_fails_part_way_takes_back_what_it_granted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Folded in this order: `a-` before `b-`.
+        let granted = dir.path().join("a-granted");
+        let locked = dir.path().join("b-locked");
+        std::fs::create_dir(&granted).expect("granted root");
+        std::fs::create_dir(&locked).expect("locked root");
+        let beneath = granted.join("made-before.txt");
+        std::fs::write(&beneath, "x").expect("write");
+        let set = std::process::Command::new("icacls")
+            .arg(&locked)
+            .args([
+                "/inheritance:r",
+                "/grant:r",
+                "*S-1-3-4:(OI)(CI)R",
+                "*S-1-5-11:(OI)(CI)M",
+            ])
+            .output()
+            .expect("icacls");
+        assert!(
+            set.status.success(),
+            "{}",
+            String::from_utf8_lossy(&set.stdout)
+        );
+
+        let err = Lease::acquire(&[granted.clone(), locked.clone()], None)
+            .expect_err("the locked root refuses its grant");
+        assert!(
+            err.starts_with(&format!(
+                "workspace-write could not grant {}:",
+                locked.display()
+            )),
+            "{err}"
+        );
+
+        let kept: Vec<(PathBuf, GrantRecord)> = std::fs::read_dir(records_dir())
+            .expect("records")
+            .flatten()
+            .map(|e| e.path())
+            .filter_map(|p| {
+                let record = GrantRecord::parse(&std::fs::read_to_string(&p).ok()?)?;
+                Some((p, record))
+            })
+            .filter(|(_, r)| r.roots.contains(&locked) || r.roots.contains(&granted))
+            .collect();
+        for (path, _) in &kept {
+            // This test's own record: the locked root goes with the tempdir.
+            let _ = std::fs::remove_file(path);
+        }
+        assert_eq!(kept.len(), 1, "one record kept for the next sweep");
+        let record = &kept[0].1;
+        assert_eq!(
+            record.roots,
+            vec![locked.clone()],
+            "the granted root was revoked"
+        );
+
+        for path in [&granted, &beneath] {
+            let acl = std::process::Command::new("icacls")
+                .arg(path)
+                .output()
+                .expect("icacls");
+            let acl = String::from_utf8_lossy(&acl.stdout);
+            assert!(!acl.contains(&record.sid), "{}: {acl}", path.display());
+        }
     }
 }
