@@ -1094,7 +1094,28 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&set.stdout)
         );
+        // None of the user's own: an elevated process (a CI runner) gives a
+        // new folder an explicit ACE for its user, which `/inheritance:r`
+        // does not take off and which would pass the user everything.
+        remove_grants(dir.path(), &[&current_user_sid().expect("the user's SID")]);
         dir
+    }
+
+    /// Take every allow ACE for each of `sids` off `path`, explicit ones
+    /// included — what `/grant:r` of other SIDs leaves in place.
+    fn remove_grants(path: &Path, sids: &[&str]) {
+        for sid in sids {
+            let removed = std::process::Command::new("icacls")
+                .arg(path)
+                .args(["/remove:g", &format!("*{sid}")])
+                .output()
+                .expect("icacls");
+            assert!(
+                removed.status.success(),
+                "{}",
+                String::from_utf8_lossy(&removed.stdout)
+            );
+        }
     }
 
     /// **THE USER KEEPS READING AND CHANGING THE ACL OF WHAT IS CREATED
@@ -1152,6 +1173,12 @@ mod tests {
         std::fs::create_dir(&locked).expect("locked root");
         let beneath = granted.join("made-before.txt");
         std::fs::write(&beneath, "x").expect("write");
+        // An elevated process (a CI runner) leaves explicit full-control ACEs
+        // for its user and for Administrators on a new folder; either one
+        // would let it re-ACL the root, which is what must fail here. Taken
+        // off BEFORE the lock below: after it, nobody here may change the ACL.
+        let user = current_user_sid().expect("the user's SID");
+        remove_grants(&locked, &[&user, "S-1-5-32-544"]);
         let set = std::process::Command::new("icacls")
             .arg(&locked)
             .args([
