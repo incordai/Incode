@@ -19,8 +19,9 @@
 //! # Wired to
 //!
 //! - [`usable`] is the one gate: `plugins::session_hooks`,
-//!   `plugins::session_servers`, `plugins::session_skills` and
-//!   `custom_commands::Registry::load` take their plugins through it.
+//!   `plugins::session_servers`, `plugins::session_skills`,
+//!   `plugins::session_agents` and `custom_commands::Registry::load` take
+//!   their plugins through it.
 //! - `incode plugin approve <name>` (`plugins::cli`) calls [`approve`];
 //!   `incode plugin list` shows [`state`].
 

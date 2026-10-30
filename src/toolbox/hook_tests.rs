@@ -40,8 +40,8 @@ fn logging_hook(dir: &Path) -> (String, PathBuf) {
 fn hooked(ws: &Path, pre: String, post: Vec<String>) -> Toolbox {
     Toolbox::new(ws, true).with_operator_hooks(Some(crate::hooks::HookRunner::new(
         crate::hooks::HookConfig {
-            pre_tool_use: vec![pre],
-            post_tool_use: post,
+            pre_tool_use: vec![pre.into()],
+            post_tool_use: post.into_iter().map(Into::into).collect(),
             user_prompt_submit: Vec::new(),
             pre_compact: Vec::new(),
             stop: Vec::new(),

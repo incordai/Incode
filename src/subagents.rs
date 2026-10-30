@@ -3,7 +3,9 @@
 //! # Where they come from
 //!
 //! - `.incode/agents/*.md` in the workspace — the project's own;
-//! - `~/.incode/agents/*.md` — the operator's, for every project.
+//! - `~/.incode/agents/*.md` — the operator's, for every project;
+//! - a usable plugin's `agents/*.md` (`plugins::session_agents`), named
+//!   `<plugin>:<agent>`.
 //!
 //! A project's definition wins over the operator's of the same name.
 //!
@@ -22,7 +24,8 @@
 //!
 //! `name`, `description` and a non-empty body are required. `role` is one of
 //! [`crate::roles::KNOWN_ROLES`] and routes the model the way the `Agent`
-//! tool's own `role` does; `model` names one outright. `tools` is an
+//! tool's own `role` does; `model` names one outright (`inherit` is the
+//! same as none: the parent's). `tools` is an
 //! allow-list of toolbox tool names, written `[A, B]`, `A, B` or as a list of
 //! `- A` lines: the sub-agent is offered only those, and a call to any other
 //! is refused by the toolbox's own gate.
@@ -65,6 +68,8 @@ pub enum Scope {
     Harness,
     /// The operator's `~/.incode/agents`.
     User,
+    /// A plugin's `agents/`.
+    Plugin,
 }
 
 impl Scope {
@@ -73,6 +78,7 @@ impl Scope {
             Self::Project => "project",
             Self::Harness => "harness",
             Self::User => "user",
+            Self::Plugin => "plugin",
         }
     }
 }
@@ -168,7 +174,8 @@ impl Loaded {
 
 /// Every sub-agent defined for `workspace`: the project's, then the run's
 /// harness's, then the operator's — each only where an earlier one does not
-/// already define the name.
+/// already define the name — then each usable plugin's, as
+/// `<plugin>:<agent>`.
 #[must_use]
 pub fn load(workspace: &Path) -> Loaded {
     let project = workspace.join(PROJECT_DIR);
@@ -179,7 +186,27 @@ pub fn load(workspace: &Path) -> Loaded {
         dirs.push((h.as_path(), Scope::Harness));
     }
     dirs.push((user.as_path(), Scope::User));
-    load_dirs(&dirs)
+    let mut loaded = load_dirs(&dirs);
+    add_plugin_agents(&mut loaded, &crate::plugins::session_agents(workspace));
+    loaded
+}
+
+/// The definitions in each plugin's `agents/` folder, each named
+/// `<plugin>:<agent>` so none can stand in for the operator's own.
+fn add_plugin_agents(loaded: &mut Loaded, plugins: &[(String, PathBuf)]) {
+    for (plugin, dir) in plugins {
+        let mut problems = Vec::new();
+        for mut found in read_dir(dir, Scope::Plugin, &mut problems) {
+            found.name = format!("{plugin}:{}", found.name);
+            if loaded.find(&found.name).is_none() {
+                loaded.agents.push(found);
+            }
+        }
+        for problem in &problems {
+            crate::trace!("agents", "left out: {problem}");
+        }
+        loaded.problems.extend(problems);
+    }
 }
 
 /// [`load`], from a project and an operator directory.
@@ -442,7 +469,7 @@ fn parse(text: &str, path: &Path, scope: Scope) -> Result<AgentDef, String> {
     };
     let model = match get("model") {
         None => None,
-        Some(Field::One(m)) if m.is_empty() => None,
+        Some(Field::One(m)) if m.is_empty() || m == "inherit" => None,
         Some(Field::One(m)) => Some(m),
         Some(Field::Many(_)) => return Err("`model` takes one value".to_string()),
     };
@@ -575,6 +602,44 @@ mod tests {
     const REVIEWER: &str = "---\nname: reviewer\ndescription: Reads a change and reports \
         problems.\nrole: review\nmodel: opus\ntools: [Read, Grep, \"Glob\"]\n---\nYou review \
         changes.\n";
+
+    /// **A plugin's agents arrive named for the plugin**, beside the
+    /// operator's own of the same bare name, and `model: inherit` (the other
+    /// layout's word for the parent's model) names none.
+    #[test]
+    fn a_plugins_agents_are_named_for_it_and_inherit_the_model() {
+        let dir = tempfile::tempdir().expect("dir");
+        let user = dir.path().join("u");
+        write(&user, "reviewer.md", REVIEWER);
+        let agents = dir.path().join("plugin").join("agents");
+        write(
+            &agents,
+            "reviewer.md",
+            "---\nname: reviewer\ndescription: The plugin's reviewer.\nmodel: inherit\n\
+             tools: Read, Grep\ncolor: blue\n---\nReview it.\n",
+        );
+        write(&agents, "broken.md", "no front matter\n");
+
+        let mut loaded = load_from(&dir.path().join("p"), &user);
+        add_plugin_agents(&mut loaded, &[("web".to_string(), agents.clone())]);
+
+        let own = loaded.find("reviewer").expect("the operator's own");
+        assert_eq!(own.scope, Scope::User);
+        assert_eq!(own.model.as_deref(), Some("opus"));
+        let theirs = loaded.find("web:reviewer").expect("the plugin's");
+        assert_eq!(theirs.scope, Scope::Plugin);
+        assert_eq!(theirs.model, None, "`inherit` is the parent's model");
+        assert_eq!(
+            theirs.tools.as_deref(),
+            Some(&["Read".to_string(), "Grep".to_string()][..])
+        );
+        assert_eq!(theirs.description, "The plugin's reviewer.");
+        assert!(
+            loaded.problems.iter().any(|p| p.contains("broken.md")),
+            "{:?}",
+            loaded.problems
+        );
+    }
 
     /// **The shipped reviewers load, review, and can only look.** Seeded
     /// into an empty folder, both parse with the real loader, carry the
