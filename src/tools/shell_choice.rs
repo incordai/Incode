@@ -314,6 +314,19 @@ pub(crate) fn for_sandbox(sandbox: &crate::sandbox::Sandbox) -> Result<Shell, St
     shell.map_err(|why| format!("no shell to run the command in: {why}"))
 }
 
+/// The process's shell when it is a POSIX one (`sh`, or Git Bash on Windows),
+/// unconfined — for a hook command written for one (`hooks::HookCommand`
+/// `posix`), which runs outside the sandbox as every hook does.
+#[must_use]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn posix() -> Option<Shell> {
+    chosen()
+        .as_ref()
+        .ok()
+        .filter(|shell| shell.flavor == Flavor::Posix)
+        .cloned()
+}
+
 /// The sentence the `Bash` tool's description carries about its shell, for a
 /// session whose commands run under `sandbox` — so the model writes the syntax
 /// that shell reads.

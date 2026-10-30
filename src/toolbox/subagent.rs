@@ -613,7 +613,7 @@ mod tests {
         };
         let mut parent = Toolbox::new(ws.path(), true).with_operator_hooks(Some(
             crate::hooks::HookRunner::new(crate::hooks::HookConfig {
-                subagent_stop: vec![save_event.to_string()],
+                subagent_stop: vec![save_event.to_string().into()],
                 ..crate::hooks::HookConfig::default()
             }),
         ));

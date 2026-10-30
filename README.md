@@ -749,7 +749,19 @@ A **plugin** is a folder in `~/.incode/plugins/<name>/` or
 `hooks.json` (`{"pre_tool_use": [...], "post_tool_use": [...]}`, added to
 `admin.json`'s hooks) and `.mcp.json` (`{"mcpServers": {"db": {"command",
 "args", "env"}}}`, or `{"type": "http", "url", "headers"}`, started with the
-session). `${INCODE_PLUGIN_ROOT}` in a hook or server is the plugin's folder.
+session), and `agents/*.md` (sub-agents, as `<plugin>:<agent>`).
+`${INCODE_PLUGIN_ROOT}` in a hook or server is the plugin's folder. A hook may
+be `{"command": "...", "matcher": "Edit|Write"}` to run only for the tools the
+regular expression names (the whole name, as in `admin.json`).
+
+**Claude Code plugins install as they are.** A folder with
+`.claude-plugin/plugin.json` and no `plugin.toml` is read in that layout:
+the same `commands/`, `skills/` and `agents/`, its `hooks/hooks.json`
+(events, `matcher`s and `command` hooks; the commands run in Git Bash on
+Windows), its `.mcp.json` servers, and `${CLAUDE_PLUGIN_ROOT}`. Once installed
+it is an incode plugin, used by every agent incode drives. `incode plugin
+list` notes what it brings that incode does not run: `prompt` hooks, events
+incode has no point for, and `plugin.json` keys it does not read.
 
 ```sh
 incode plugin list

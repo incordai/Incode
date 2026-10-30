@@ -1972,7 +1972,7 @@ mod tests {
         let echo_stdin = if cfg!(windows) { "more" } else { "cat" };
         let mut agent = backend(dir.path()).with_operator_hooks(Some(
             crate::hooks::HookRunner::new(crate::hooks::HookConfig {
-                pre_compact: vec![echo_stdin.to_string()],
+                pre_compact: vec![echo_stdin.into()],
                 ..crate::hooks::HookConfig::default()
             }),
         ));
