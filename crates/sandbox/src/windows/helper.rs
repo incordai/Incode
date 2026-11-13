@@ -24,6 +24,12 @@
 //! spec and the command travel in an environment variable, not on its
 //! command line: `CreateProcessWithLogonW` takes at most 1024 characters
 //! there.
+//!
+//! An `msys` run (`spec.msys`, [`super::offline`]) is the same, with the
+//! second helper logged on as the msys account and its token trusting that
+//! account's own SID. The first helper checks the spec's SID against the
+//! setup record's ([`launch_offline`]); the second against its own token
+//! ([`super::token::restricted`]).
 
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStrExt;
@@ -54,7 +60,7 @@ use windows_sys::Win32::System::Threading::{
 };
 
 use super::job_flags;
-use super::offline::HELPER_PROCESS_SDDL;
+use super::offline::{is_sid, HELPER_PROCESS_SDDL};
 use super::token::{dacl_of, last_error, restricted, security_descriptor, wide, OwnedHandle};
 use super::{
     batch_command_line, command_line, is_batch, is_root_sid, is_session_sid, resolve_program,
@@ -235,7 +241,18 @@ fn launch_offline(
         .offline_record
         .as_ref()
         .ok_or_else(|| sandbox("the helper was started without the offline account's record"))?;
-    let (account, password) = super::setup::password(record).map_err(sandbox)?;
+    // An msys run logs on as the msys account, and its token trusts that
+    // account's SID: the spec's SID must be the record's, so a spec cannot
+    // name any other SID for the token to trust.
+    let (account, account_sid, password) =
+        super::setup::password(record, spec.msys.is_some()).map_err(sandbox)?;
+    if let Some(asked) = &spec.msys {
+        if *asked != account_sid {
+            return Err(sandbox(format!(
+                "{asked} is not the msys account's SID in the setup record; the command was not run"
+            )));
+        }
+    }
     let text = |s: &OsString| {
         s.to_str()
             .map(str::to_string)
@@ -403,7 +420,15 @@ fn confining_token(spec: &EnterSpec) -> Result<OwnedHandle, String> {
     if let Some(bad) = spec.root_sids.iter().find(|s| !is_root_sid(s)) {
         return Err(format!("{bad} is not an insbx root SID"));
     }
-    restricted(sid, &spec.root_sids)
+    // The msys account's SID, trusted by the token: only in the second
+    // helper, which runs as that account (`restricted` checks it is the
+    // token's own user), never in a run as the caller.
+    if let Some(msys) = &spec.msys {
+        if !is_sid(msys) || spec.offline != Offline::Inner {
+            return Err(format!("{msys} cannot be trusted by this token"));
+        }
+    }
+    restricted(sid, &spec.root_sids, spec.msys.as_deref())
 }
 
 /// A job that kills everything in it when its last handle closes, with the

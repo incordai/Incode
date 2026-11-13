@@ -1229,3 +1229,213 @@ fn proxy_lets_only_the_allowlist_through_natively() {
         "{out}"
     );
 }
+
+// ---- `--msys`: Git Bash as the account insbx-msys (#38). ----
+
+/// Git for Windows' bash, where its installer puts it.
+const GIT_BASH: &str = r"C:\Program Files\Git\bin\bash.exe";
+/// The msys account (`incord_sandbox::windows::offline::MSYS_ACCOUNT`).
+const MSYS: &str = "insbx-msys";
+
+/// The `--msys` tests' gate: the layer-2 setup, the msys account that
+/// `insbx setup-windows` makes beside the offline one, and Git Bash. Else
+/// says it skipped. (Run `insbx setup-windows` as administrator again on a
+/// machine set up before `--msys` existed.)
+fn needs_msys(test: &str) -> bool {
+    if !needs_offline(test) {
+        return false;
+    }
+    let account = Command::new("net")
+        .args(["user", MSYS])
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !account {
+        eprintln!("SKIPPED {test}: the account {MSYS} does not exist; run `insbx setup-windows`");
+        return false;
+    }
+    if !Path::new(GIT_BASH).is_file() {
+        eprintln!("SKIPPED {test}: Git for Windows is not at {GIT_BASH}");
+        return false;
+    }
+    true
+}
+
+/// `insbx run --msys --net deny -w <roots> -- bash -c <script>`.
+fn bash_msys(cwd: &Path, extra: &[&str], script: &str) -> Output {
+    let mut args = vec!["run", "--msys", "--net", "deny", "-w", "."];
+    args.extend_from_slice(extra);
+    args.extend_from_slice(&["--", GIT_BASH, "-c", script]);
+    insbx(&args, cwd)
+}
+
+/// A path as Git Bash takes it: forward slashes.
+fn msys_path(p: &Path) -> String {
+    p.to_string_lossy().replace('\\', "/")
+}
+
+#[test]
+fn git_bash_runs_under_msys_and_not_without_it() {
+    if !needs_msys("git_bash_runs_under_msys") {
+        return;
+    }
+    let d = dirs();
+    let o = bash_msys(&d.ws, &[], "echo ok > x && cat x && whoami");
+    let out = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{out}");
+    assert!(out.contains("ok"), "{out}");
+    assert!(d.ws.join("x").exists(), "{out}");
+    // (msys's own `whoami` prints the bare name.)
+    assert!(
+        out.to_ascii_lowercase().contains(MSYS),
+        "runs as the msys account: {out}"
+    );
+    // The control: without `--msys` the same command dies where msys builds
+    // its pipes (measured: "couldn't create signal pipe, Win32 error 5").
+    let o = insbx(
+        &[
+            "run",
+            "--net",
+            "deny",
+            "-w",
+            ".",
+            "--",
+            GIT_BASH,
+            "-c",
+            "echo ok > y",
+        ],
+        &d.ws,
+    );
+    assert!(
+        !o.status.success() && !d.ws.join("y").exists(),
+        "bash without --msys: {}",
+        text(&o)
+    );
+    let o = insbx(&["revoke", "."], &d.ws);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+}
+
+/// The reason for a second account: the offline account's grant on a folder
+/// is KEPT, so trusting its SID would let a run write into every folder an
+/// earlier deny run used (measured). An msys run must not.
+#[test]
+fn an_msys_run_cannot_write_where_another_run_kept_a_grant() {
+    if !needs_msys("an_msys_run_cannot_write_where_another_run_kept_a_grant") {
+        return;
+    }
+    let d = dirs();
+    // B: an earlier deny run leaves insbx-offline's kept grant on `out`.
+    let o = cmd(&d.out, &["--net", "deny", "-w", "."], "echo a> f");
+    assert!(d.out.join("f").exists(), "{}", text(&o));
+    assert!(icacls(&d.out).contains(OFFLINE), "{}", icacls(&d.out));
+
+    // A msys run in `ws` writes in `ws` and not in `out`.
+    let target = d.out.join("from-msys");
+    let o = bash_msys(
+        &d.ws,
+        &[],
+        &format!(
+            "echo ok > here; echo bad > '{}'; echo bad2 > '{}/g'; true",
+            msys_path(&target),
+            msys_path(&d.out)
+        ),
+    );
+    let out = text(&o);
+    assert!(d.ws.join("here").exists(), "the run's own root: {out}");
+    assert!(
+        !target.exists(),
+        "an msys run wrote into a kept grant: {out}"
+    );
+    assert!(!d.out.join("g").exists(), "{out}");
+    for dir in [&d.ws, &d.out] {
+        let o = insbx(&["revoke", dir.to_str().expect("utf8")], &d.ws);
+        assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    }
+}
+
+/// The msys account's ACEs are the run's alone: gone from the root and what
+/// is beneath it afterwards, while the root's own SID and the OWNER RIGHTS
+/// entry stay.
+#[test]
+fn an_msys_runs_account_is_gone_from_the_root_afterwards() {
+    if !needs_msys("an_msys_runs_account_is_gone_from_the_root_afterwards") {
+        return;
+    }
+    let d = dirs();
+    let o = bash_msys(&d.ws, &[], "icacls . && echo ok > made");
+    let during = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{during}");
+    assert!(
+        during.contains(MSYS),
+        "the account's ACE during the run: {during}"
+    );
+    assert!(d.ws.join("made").exists(), "{during}");
+    for path in [d.ws.clone(), d.ws.join("made")] {
+        let after = icacls(&path);
+        assert!(!after.contains(MSYS), "{}: {after}", path.display());
+        assert!(!after.contains(SID_MARK), "{}: {after}", path.display());
+    }
+    let after = icacls(&d.ws);
+    assert!(
+        after.contains(KEEP_MARK),
+        "the root's own SID is kept: {after}"
+    );
+    assert!(
+        after.contains("OWNER RIGHTS"),
+        "and the OWNER RIGHTS entry: {after}"
+    );
+    // Nothing of the offline account either: this run was not its.
+    assert!(!after.contains(OFFLINE), "{after}");
+    let o = insbx(&["revoke", "."], &d.ws);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+}
+
+/// One msys run at a time: the second waits for the first to end.
+#[test]
+fn two_msys_runs_serialize() {
+    if !needs_msys("two_msys_runs_serialize") {
+        return;
+    }
+    let d = dirs();
+    let first = base(&d.ws)
+        .args([
+            "run",
+            "--msys",
+            "--net",
+            "deny",
+            "-w",
+            ".",
+            "--",
+            GIT_BASH,
+            "-c",
+            "echo go > a-start; sleep 4; echo done > a-end",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("insbx");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !d.ws.join("a-start").exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(d.ws.join("a-start").exists(), "the first run never started");
+    let second = bash_msys(&d.ws, &[], "echo go > b-start");
+    let second_out = text(&second);
+    let first = first.wait_with_output().expect("first run");
+    assert_eq!(first.status.code(), Some(0), "{}", text(&first));
+    assert_eq!(second.status.code(), Some(0), "{second_out}");
+    let modified = |name: &str| {
+        std::fs::metadata(d.ws.join(name))
+            .and_then(|m| m.modified())
+            .unwrap_or_else(|e| panic!("{name}: {e}"))
+    };
+    assert!(
+        modified("b-start") >= modified("a-end"),
+        "the second run started before the first ended: {second_out}"
+    );
+    assert!(
+        second_out.contains("another msys run"),
+        "the second says it waited: {second_out}"
+    );
+    let o = insbx(&["revoke", "."], &d.ws);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+}

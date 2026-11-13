@@ -118,15 +118,23 @@ pub struct EnterSpec {
     /// reads the account's password.
     #[serde(default)]
     pub offline_record: Option<PathBuf>,
+    /// Windows, `fs.msys`: the SID of the msys account
+    /// ([`windows::offline::MSYS_ACCOUNT`]). The command runs as that account
+    /// instead of the offline one, and its token trusts that SID. The helper
+    /// accepts it only when it is the setup record's.
+    #[serde(default)]
+    pub msys: Option<String>,
 }
 
 /// Who a run's command runs as, for its [`EnterSpec`]: the run's private SID
-/// and, under network deny or proxy on Windows, the offline account.
+/// and, under network deny or proxy on Windows, the offline account (or, for
+/// an `msys` run, the msys account).
 struct RunIdentity {
     sid: Option<String>,
     root_sids: Vec<String>,
     offline: Offline,
     offline_record: Option<PathBuf>,
+    msys: Option<String>,
 }
 
 impl RunIdentity {
@@ -138,13 +146,19 @@ impl RunIdentity {
             root_sids: Vec::new(),
             offline: Offline::No,
             offline_record: None,
+            msys: None,
         }
     }
 
     /// Windows: the lease's SID when there is one, and the offline account
-    /// when the setup is ready for this run.
+    /// when the setup is ready for this run (the msys account instead, with
+    /// `msys`).
     #[cfg(windows)]
-    fn of(lease: Option<&windows::acl::Lease>, offline: Option<&windows::offline::Ready>) -> Self {
+    fn of(
+        lease: Option<&windows::acl::Lease>,
+        offline: Option<&windows::offline::Ready>,
+        msys: bool,
+    ) -> Self {
         Self {
             sid: lease.map(|l| l.sid().to_string()),
             root_sids: lease.map(|l| l.root_sids().to_vec()).unwrap_or_default(),
@@ -154,6 +168,7 @@ impl RunIdentity {
                 Offline::No
             },
             offline_record: offline.map(|r| r.record.clone()),
+            msys: offline.filter(|_| msys).map(|ready| ready.msys_sid.clone()),
         }
     }
 }
@@ -398,7 +413,7 @@ impl Sandbox {
         let environment = self.environment(&temp, proxy.as_ref(), block_interop);
         // Windows: who the command runs as. Elsewhere the caller, always.
         #[cfg(windows)]
-        let identity = RunIdentity::of(lease.as_ref(), offline.as_ref());
+        let identity = RunIdentity::of(lease.as_ref(), offline.as_ref(), self.policy.fs.msys);
         #[cfg(not(windows))]
         let identity = RunIdentity::caller();
 
@@ -421,6 +436,7 @@ impl Sandbox {
             parent_pid: Some(std::process::id()),
             offline: identity.offline,
             offline_record: identity.offline_record,
+            msys: identity.msys,
         };
         let spec_json = serde_json::to_string(&spec).map_err(|e| e.to_string())?;
 
@@ -479,7 +495,9 @@ impl Sandbox {
     /// Windows: grant the writable roots and the temp directory to a private
     /// SID for this run, before the helper restricts the command's token to
     /// it; under network deny to the offline account as well, with the
-    /// current folder and the helper program to read. A grant that fails
+    /// current folder and the helper program to read (an `msys` run: to the
+    /// msys account instead, all of it for this run alone, and holding the
+    /// one-at-a-time lock of `Global\insbx-msys`). A grant that fails
     /// refuses the run in strict mode; best effort runs it with the writes
     /// unconfined and the network open (`offline` is cleared), and says so.
     #[cfg(windows)]
@@ -513,17 +531,30 @@ impl Sandbox {
                 &real(helper),
                 program.map(real).as_deref(),
             );
+            // An msys run uses the msys account, granted for this run alone
+            // (`per_run`), and needs no parent listed: Git Bash does not
+            // look the current folder up in its parent.
+            let msys = self.policy.fs.msys;
             windows::acl::OfflineGrant {
-                user: ready.sid.clone(),
+                user: if msys {
+                    ready.msys_sid.clone()
+                } else {
+                    ready.sid.clone()
+                },
                 // PowerShell lists the current folder's parent to start in
                 // it at all.
-                parents: windows::offline_parents(
-                    &granted,
-                    &reads,
-                    &real(cwd),
-                    windows::profiles_dir().as_deref(),
-                ),
+                parents: if msys {
+                    Vec::new()
+                } else {
+                    windows::offline_parents(
+                        &granted,
+                        &reads,
+                        &real(cwd),
+                        windows::profiles_dir().as_deref(),
+                    )
+                },
                 reads,
+                per_run: msys,
             }
         });
         match windows::acl::Lease::acquire(&grant, &temp.path, account) {
@@ -956,6 +987,7 @@ mod tests {
             parent_pid: Some(7),
             offline: Offline::Launch,
             offline_record: Some(PathBuf::from(r"C:\ProgramData\insbx\offline.conf")),
+            msys: None,
         }
     }
 
@@ -966,9 +998,21 @@ mod tests {
         let map = json.as_object_mut().expect("object");
         map.remove("offline");
         map.remove("offline_record");
+        map.remove("msys");
         let back: EnterSpec = serde_json::from_value(json).expect("parses");
         assert_eq!(back.offline, Offline::No);
         assert_eq!(back.offline_record, None);
+        assert_eq!(back.msys, None);
+    }
+
+    /// The msys account's SID travels in the spec, to the second helper too.
+    #[test]
+    fn an_msys_spec_carries_the_accounts_sid() {
+        let mut msys = spec();
+        msys.msys = Some("S-1-5-21-1-2-3-1010".into());
+        let json = serde_json::to_string(&msys).expect("json");
+        let back: EnterSpec = serde_json::from_str(&json).expect("parses");
+        assert_eq!(back.msys.as_deref(), Some("S-1-5-21-1-2-3-1010"));
     }
 
     #[test]

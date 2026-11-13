@@ -81,11 +81,43 @@
 //! account's other ACEs: removed (that exact ACE, nothing else) when no
 //! other live run lists the same parent.
 //!
+//! # `msys`: the msys account's share is per run, never kept
+//!
+//! A run that asks for `msys` ([`super::offline`]) runs as the account
+//! `insbx-msys`, and its token trusts that account's own SID, so the SID
+//! passes the restricted check wherever the account is granted. The offline
+//! account's ACEs are kept across runs (above), so trusting THAT SID would
+//! open every folder an earlier deny run used (measured). The msys account
+//! therefore has no kept ACE anywhere:
+//!
+//! - `Modify` on each writable root, and `RX` on the read paths (the current
+//!   folder, the helper, the program), are granted at [`Lease::acquire`] by
+//!   walking the trees and taken back when the lease drops
+//!   ([`Lease::grant_msys_roots`], [`release_account`]). The record lists the
+//!   roots under `modify` and the sweep takes them back after a crash, like
+//!   every other per-run ACE.
+//! - The roots' own SIDs stay kept as ever ([`keep_root`]); without the token
+//!   carrying them they let nothing through.
+//! - One msys run at a time: the named mutex `Global\insbx-msys`
+//!   ([`MsysLock`]) is held for the lease's whole life, since the account is
+//!   one account for every run that holds it.
+//! - Each msys root also carries one inheritable OWNER RIGHTS ACE
+//!   (`S-1-3-4`) granting only `READ_CONTROL` ([`keep_owner_rights`]), kept
+//!   like [`keep_acl_rights`]'s. Without an OWNER RIGHTS ACE the owner of an
+//!   object holds `READ_CONTROL | WRITE_DAC` implicitly, so a file the msys
+//!   account creates (it owns it) would let it rewrite that file's ACL in a
+//!   later run, whoever was granted what. With the entry it holds
+//!   `READ_CONTROL` and nothing more. The user's own `READ_CONTROL |
+//!   WRITE_DAC` entry ([`keep_acl_rights`], added to msys roots too, before
+//!   the OWNER RIGHTS one) is a separate ACE for the user's SID, so the user,
+//!   who owns the files the user creates, can still re-ACL everything.
+//!   `insbx revoke` leaves both entries, as it leaves the user's.
+//!
 //! # A crash leaves the ACE behind: the sweep
 //!
 //! Every grant is written down before it is made, in
 //! `%LOCALAPPDATA%\insbx\grants\<rid>.grant` (the SID and each root, and the
-//! account's SID and read paths), and the process holds a named mutex
+//! account's SID and read paths, and an msys run's `modify` roots), and the process holds a named mutex
 //! `Global\insbx-grant-<rid>` while the lease lives. Every new lease first
 //! sweeps: a record whose mutex no longer exists belongs to a process that
 //! died, so its ACEs are revoked and the record deleted. A record whose
@@ -95,13 +127,14 @@
 //!
 //! The sweep only ever revokes SIDs with this crate's prefix
 //! ([`super::SID_PREFIX`]), and an account ACE only when the record's
-//! account SID is the real offline account's, so a forged record can do no
-//! more than remove another dead run's ACE.
+//! account SID is the real offline account's or the real msys account's, so a
+//! forged record can do no more than remove another dead run's ACE.
 
 use std::path::{Path, PathBuf};
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_FILE_NOT_FOUND, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
     GetNamedSecurityInfoW, GetSecurityInfo, SetEntriesInAclW, SetNamedSecurityInfoW,
@@ -142,17 +175,34 @@ const LIST_ONLY: u32 = 0x0010_00A1;
 /// The rights the user keeps beneath a root the offline account writes to:
 /// what owning a file gives, reading and changing its ACL.
 const ACL_RIGHTS: u32 = READ_CONTROL | WRITE_DAC;
+/// OWNER RIGHTS, `S-1-3-4`: the ACE for it replaces the rights an owner holds
+/// implicitly (`READ_CONTROL | WRITE_DAC`) with the ACE's own.
+const OWNER_RIGHTS: &str = "S-1-3-4";
+/// What an msys root's OWNER RIGHTS ACE grants: reading the ACL, nothing else.
+const OWNER_RIGHTS_ALLOWED: u32 = READ_CONTROL;
 
 /// How long a grant or revoke waits for another process changing an ACL at
 /// the same moment. Propagation over a very large tree takes tens of
 /// seconds; past this the run is refused rather than left hanging.
 const LOCK_WAIT_MS: u32 = 120_000;
 
-/// The offline account's part in a run's grant.
+/// The named mutex that keeps `msys` runs one at a time ([`MsysLock`]).
+const MSYS_LOCK_NAME: &str = "Global\\insbx-msys";
+
+/// How long an msys run waits for the msys run holding `Global\insbx-msys`
+/// (half an hour: a build can take a while) before it is refused.
+const MSYS_WAIT_MS: u32 = 30 * 60 * 1000;
+
+/// The offline account's part in a run's grant, or with `per_run` the msys
+/// account's.
 #[derive(Debug, Clone)]
 pub(crate) struct OfflineGrant {
-    /// The account's SID.
+    /// The account's SID: the offline account's, or the msys account's.
     pub user: String,
+    /// The msys account, whose ACEs are all granted for this run alone (see
+    /// the module docs): its roots and reads are granted at acquire and
+    /// revoked at drop, none kept, and the run holds the msys lock.
+    pub per_run: bool,
     /// Paths it is granted for reading only (the current folder when it is
     /// not inside a root, the helper program).
     pub reads: Vec<PathBuf>,
@@ -193,6 +243,7 @@ impl OfflineGrant {
             .collect();
         Ok(Self {
             user: self.user,
+            per_run: self.per_run,
             reads,
             parents,
         })
@@ -233,8 +284,17 @@ pub(crate) struct Lease {
     /// The roots whose grant this lease had to make (walking their trees);
     /// a root granted before is only read, and is not here.
     walked: Vec<PathBuf>,
+    /// An msys run: the writable roots the msys account was granted `Modify`
+    /// on, so far, which dropping the lease takes back.
+    account_roots: Vec<PathBuf>,
+    /// An msys run: the account's ACEs are this run's alone, none kept.
+    msys: bool,
     /// The named mutex that tells a later sweep this run is alive.
     _alive: OwnedHandle,
+    /// An msys run: the lock that keeps msys runs one at a time, held to the
+    /// end of the lease (after [`Drop`] has taken the grants back, being
+    /// declared last).
+    _msys: Option<MsysLock>,
 }
 
 impl std::fmt::Debug for Lease {
@@ -267,6 +327,13 @@ impl Lease {
     /// A step that fails returns with the lease, which drops and so takes
     /// back what the steps before it listed.
     ///
+    /// An msys run (`offline.per_run`, see the module docs) first takes
+    /// [`MsysLock`], then differs in three steps: its reads are all this
+    /// run's, none kept; the roots' kept grants carry no account ACE but add
+    /// the user's ACL rights and the OWNER RIGHTS entry ([`keep_root`]); and
+    /// the account's `Modify` on each root is granted for this run
+    /// ([`Lease::grant_msys_roots`]).
+    ///
     /// Called by `crate::Sandbox::windows_lease` (lib.rs), once per run.
     pub(crate) fn acquire(
         roots: &[PathBuf],
@@ -280,12 +347,21 @@ impl Lease {
         let offline = offline
             .map(|o| o.grantable(profile.as_deref()))
             .transpose()?;
+        let msys = offline.as_ref().is_some_and(|o| o.per_run);
         let (user, reads, parents) = match offline {
             Some(o) => (Some(o.user), o.reads, o.parents),
             None => (None, Vec::new(), Vec::new()),
         };
-        let (kept_reads, reads): (Vec<PathBuf>, Vec<PathBuf>) =
-            reads.into_iter().partition(|r| r.is_dir());
+        // The offline account keeps its ACE on a read FOLDER; the msys
+        // account keeps none, so all its reads are this run's.
+        let (kept_reads, reads): (Vec<PathBuf>, Vec<PathBuf>) = if msys {
+            (Vec::new(), reads)
+        } else {
+            reads.into_iter().partition(|r| r.is_dir())
+        };
+        // One msys run at a time, from before the sweep to the lease's end;
+        // waits (and says so) while another holds it.
+        let msys_lock = msys.then(MsysLock::take).transpose()?;
         let dir = records_dir();
         std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         sweep(&dir);
@@ -299,6 +375,7 @@ impl Lease {
                 user,
                 reads: reads.clone(),
                 parents: parents.clone(),
+                modify: if msys { roots.clone() } else { Vec::new() },
             },
             path: dir.join(format!("{rid}.grant")),
             roots: Vec::new(),
@@ -306,7 +383,10 @@ impl Lease {
             parents: Vec::new(),
             root_sids: Vec::new(),
             walked: Vec::new(),
+            account_roots: Vec::new(),
+            msys,
             _alive: alive,
+            _msys: msys_lock,
         };
         // Written down BEFORE anything is granted, so a crash at any point
         // after this is swept.
@@ -314,6 +394,9 @@ impl Lease {
             .map_err(|e| format!("{}: {e}", lease.path.display()))?;
         lease.grant_roots(&temp)?;
         lease.keep_roots(&roots)?;
+        if msys {
+            lease.grant_msys_roots(&roots)?;
+        }
         if let Some(user) = lease.record.user.clone() {
             for read in &kept_reads {
                 keep_read(read, &user).map_err(|e| {
@@ -333,8 +416,15 @@ impl Lease {
     /// [`Lease::acquire`], collecting the SIDs the command's token carries.
     /// Stops at the first that fails.
     fn keep_roots(&mut self, roots: &[PathBuf]) -> Result<(), String> {
+        // The offline account's ACE on a root is kept; the msys account's is
+        // not ([`Lease::grant_msys_roots`]).
+        let kept_user = if self.msys {
+            None
+        } else {
+            self.record.user.as_deref()
+        };
         for root in roots {
-            let (sid, walked) = keep_root(root, self.record.user.as_deref())
+            let (sid, walked) = keep_root(root, kept_user, self.msys)
                 .map_err(|e| format!("workspace-write could not grant {}: {e}", root.display()))?;
             self.root_sids.push(sid);
             if walked {
@@ -360,6 +450,26 @@ impl Lease {
             self.roots.push(root.clone());
             grant_root(root, &self.record.sid, self.record.user.as_deref())
                 .map_err(|e| format!("workspace-write could not grant {}: {e}", root.display()))?;
+        }
+        Ok(())
+    }
+
+    /// An msys run: grant the msys account `Modify` on each of `roots`, for
+    /// this run alone ([`Lease::acquire`]), stopping at the first that fails.
+    /// Listed first, as in [`Lease::grant_roots`]: a propagation can fail
+    /// part-way, and dropping the lease takes back whatever landed.
+    fn grant_msys_roots(&mut self, roots: &[PathBuf]) -> Result<(), String> {
+        let Some(user) = self.record.user.clone() else {
+            return Ok(());
+        };
+        for root in roots {
+            self.account_roots.push(root.clone());
+            grant_account(root, &user, MODIFY).map_err(|e| {
+                format!(
+                    "workspace-write could not grant {} to the msys account: {e}",
+                    root.display()
+                )
+            })?;
         }
         Ok(())
     }
@@ -431,7 +541,7 @@ impl Drop for Lease {
             }
         }
         if let Some(user) = &self.record.user {
-            let others = live_account_grants(&self.path);
+            let others = live_account_grants(&self.path, user);
             for (path, was_root) in self
                 .roots
                 .iter()
@@ -441,7 +551,7 @@ impl Drop for Lease {
             {
                 if let Err(e) = release_account(path, user, &others) {
                     eprintln!(
-                        "insbx: could not revoke the offline account's access to {} ({e}); the \
+                        "insbx: could not revoke the account's access to {} ({e}); the \
                          next run sweeps it",
                         path.display()
                     );
@@ -450,6 +560,18 @@ impl Drop for Lease {
                     } else {
                         stuck.reads.push(path.clone());
                     }
+                }
+            }
+            // An msys run's writable roots: the account's ACE was this run's
+            // alone.
+            for path in self.account_roots.iter().filter(|p| p.exists()) {
+                if let Err(e) = release_account(path, user, &others) {
+                    eprintln!(
+                        "insbx: could not revoke the msys account's access to {} ({e}); the \
+                         next run sweeps it",
+                        path.display()
+                    );
+                    stuck.modify.push(path.clone());
                 }
             }
             for parent in self.parents.iter().filter(|p| p.exists()) {
@@ -463,7 +585,11 @@ impl Drop for Lease {
                 }
             }
         }
-        if stuck.roots.is_empty() && stuck.reads.is_empty() && stuck.parents.is_empty() {
+        if stuck.roots.is_empty()
+            && stuck.reads.is_empty()
+            && stuck.parents.is_empty()
+            && stuck.modify.is_empty()
+        {
             let _ = std::fs::remove_file(&self.path);
         } else {
             let _ = std::fs::write(&self.path, stuck.to_text());
@@ -556,7 +682,13 @@ pub(crate) fn root_sid(root: &Path) -> Result<String, String> {
 /// again instead of finding the ACE on the folder and trusting a tree only
 /// part granted. Under the ACL lock throughout, so two runs granting the
 /// same new folder do not both walk it.
-fn keep_root(root: &Path, user: Option<&str>) -> Result<(String, bool), String> {
+///
+/// With `msys` (the run is an msys run, `user` is `None`: that account keeps
+/// no ACE) the root also carries the user's ACL rights ([`keep_acl_rights`])
+/// and then the OWNER RIGHTS entry ([`keep_owner_rights`], in that order: the
+/// entry takes the owner's implicit `WRITE_DAC` away, so the user's explicit
+/// one must be there first).
+fn keep_root(root: &Path, user: Option<&str>, msys: bool) -> Result<(String, bool), String> {
     let sid = root_sid(root)?;
     let _lock = AclLock::take()?;
     let mut walked = false;
@@ -576,6 +708,10 @@ fn keep_root(root: &Path, user: Option<&str>) -> Result<(String, bool), String> 
             }
         }
         walked |= keep_acl_rights(root)?;
+    }
+    if msys {
+        walked |= keep_acl_rights(root)?;
+        walked |= keep_owner_rights(root)?;
     }
     remember_kept(root);
     Ok((sid, walked))
@@ -745,6 +881,24 @@ fn keep_acl_rights(root: &Path) -> Result<bool, String> {
     change(root, &user, Change::Grant(ACL_RIGHTS)).map(|()| true)
 }
 
+/// Make sure everything created beneath the msys root `root` leaves its
+/// owner only `READ_CONTROL`: one inheritable allow ACE for OWNER RIGHTS
+/// ([`OWNER_RIGHTS_ALLOWED`]), added once like [`keep_acl_rights`]'s and kept
+/// (see the module docs). Call it AFTER [`keep_acl_rights`] on the same root.
+/// Whether it was added. An ACE that fails part-way is taken off again, so
+/// the next run walks and reports it again instead of trusting a tree only
+/// part done.
+fn keep_owner_rights(root: &Path) -> Result<bool, String> {
+    if passes_down(root, OWNER_RIGHTS, OWNER_RIGHTS_ALLOWED)? {
+        return Ok(false);
+    }
+    if let Err(e) = change(root, OWNER_RIGHTS, Change::Grant(OWNER_RIGHTS_ALLOWED)) {
+        let _ = change(root, OWNER_RIGHTS, Change::Revoke);
+        return Err(e);
+    }
+    Ok(true)
+}
+
 /// Whether `path`'s DACL allows `sid_text` all of `rights` on everything
 /// created beneath it: an allow ACE inherited by both files and folders.
 fn passes_down(path: &Path, sid_text: &str, rights: u32) -> Result<bool, String> {
@@ -819,8 +973,10 @@ struct Others {
     parents: Vec<PathBuf>,
 }
 
-/// What every other live run granted the offline account.
-fn live_account_grants(own: &Path) -> Others {
+/// What every other live run granted the account `user` (the offline account
+/// or the msys one: a run's grants are the other account's business, never
+/// this one's).
+fn live_account_grants(own: &Path, user: &str) -> Others {
     let mut others = Others::default();
     let Ok(entries) = std::fs::read_dir(records_dir()) else {
         return others;
@@ -832,9 +988,11 @@ fn live_account_grants(own: &Path) -> Others {
         .filter_map(|p| Some((record_rid(&p)?, p)))
         .filter(|(rid, _)| is_alive(*rid))
         .filter_map(|(_, p)| GrantRecord::parse(&std::fs::read_to_string(p).ok()?))
-        .filter(|r| r.user.is_some())
+        .filter(|r| r.user.as_deref() == Some(user))
     {
-        others.grants.push((record.roots, record.reads));
+        let mut roots = record.roots;
+        roots.extend(record.modify);
+        others.grants.push((roots, record.reads));
         others.parents.extend(record.parents);
     }
     others
@@ -963,9 +1121,9 @@ fn sweep(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
-    // The real offline account's SID, looked up once and only if a dead
-    // record names an account.
-    let mut account: Option<Option<String>> = None;
+    // The real accounts' SIDs (offline, msys), looked up once and only if a
+    // dead record names an account.
+    let mut accounts: Option<Vec<String>> = None;
     for entry in entries.flatten() {
         let path = entry.path();
         let Some(rid) = record_rid(&path) else {
@@ -993,16 +1151,17 @@ fn sweep(dir: &Path) {
             }
         }
         if let Some(user) = &record.user {
-            let real = account.get_or_insert_with(super::setup::account_sid);
-            // Only the real account's ACEs; a record naming anyone else is
+            let real = accounts.get_or_insert_with(super::setup::account_sids);
+            // Only a real account's ACEs; a record naming anyone else is
             // not acted on (and an account since removed left only ACEs for
             // a SID nothing can carry any more).
-            if real.as_deref() == Some(user.as_str()) {
-                let others = live_account_grants(&path);
+            if real.iter().any(|sid| sid == user) {
+                let others = live_account_grants(&path, user);
                 for p in record
                     .roots
                     .iter()
                     .chain(&record.reads)
+                    .chain(&record.modify)
                     .filter(|p| p.exists())
                 {
                     if release_account(p, user, &others).is_err() {
@@ -1305,6 +1464,65 @@ fn set_list(path: &Path, sid_text: &str, add: bool) -> Result<bool, String> {
         drop(descriptor);
     }
     Ok(true)
+}
+
+/// The lock that keeps `msys` runs one at a time: the named mutex
+/// `Global\insbx-msys`, taken by [`Lease::acquire`] and held for the lease's
+/// whole life, released on drop. Same style as [`AclLock`], but it waits long
+/// (a run is as long as its command) and says so first. A mutex abandoned by a
+/// process that died counts as taken, so a crash frees it. Like any Windows
+/// mutex it belongs to the thread that took it: a lease is made and dropped
+/// on one thread.
+struct MsysLock(HANDLE);
+
+impl MsysLock {
+    /// Take it, waiting up to [`MSYS_WAIT_MS`] for the msys run that holds it.
+    fn take() -> Result<Self, String> {
+        Self::take_within(MSYS_WAIT_MS, true)
+    }
+
+    /// Take it, waiting up to `wait_ms` (`say`: print a line when it has to
+    /// wait).
+    fn take_within(wait_ms: u32, say: bool) -> Result<Self, String> {
+        // SAFETY: a NUL-terminated name; no security attributes, so the
+        // handle is not inherited by the command; the handle is owned by
+        // the guard, or closed on the error paths.
+        unsafe {
+            let handle = CreateMutexW(std::ptr::null(), 0, wide(MSYS_LOCK_NAME).as_ptr());
+            if handle.is_null() {
+                return Err(last_error("CreateMutexW"));
+            }
+            let mut waited = WaitForSingleObject(handle, 0);
+            if waited == WAIT_TIMEOUT {
+                if say {
+                    eprintln!(
+                        "insbx: another msys run is in progress; waiting for it to end \
+                         (msys runs go one at a time)"
+                    );
+                }
+                waited = WaitForSingleObject(handle, wait_ms);
+            }
+            if waited != WAIT_OBJECT_0 && waited != WAIT_ABANDONED {
+                CloseHandle(handle);
+                return Err(format!(
+                    "another msys run held {MSYS_LOCK_NAME} for {} seconds; not waiting longer \
+                     (msys runs go one at a time)",
+                    wait_ms.div_ceil(1000)
+                ));
+            }
+            Ok(Self(handle))
+        }
+    }
+}
+
+impl Drop for MsysLock {
+    fn drop(&mut self) {
+        // SAFETY: owned, held, released and closed once.
+        unsafe {
+            ReleaseMutex(self.0);
+            CloseHandle(self.0);
+        }
+    }
 }
 
 /// The cross-process lock around an ACL change, released on drop. A
@@ -1638,6 +1856,116 @@ mod tests {
         );
         assert!(acl_of(&moved).contains(&sid), "reset: {}", acl_of(&moved));
         revoke_kept(&root, None).expect("cleanup");
+    }
+
+    /// **AN MSYS ROOT LEAVES AN OWNER ONLY `READ_CONTROL`, AND THE USER KEEPS
+    /// HIS ACL RIGHTS**: the OWNER RIGHTS entry is added once, after the
+    /// user's own `READ_CONTROL | WRITE_DAC`, and what is created beneath
+    /// inherits both; the user can still re-ACL a file he owns.
+    #[test]
+    fn the_owner_rights_entry_is_added_once_and_the_user_can_still_re_acl() {
+        let dir = data_drive_folder();
+        assert!(!passes_down(dir.path(), OWNER_RIGHTS, READ_CONTROL).expect("reads the ACL"));
+        assert!(keep_acl_rights(dir.path()).expect("user rights"));
+        assert!(keep_owner_rights(dir.path()).expect("added"));
+        assert!(
+            !keep_owner_rights(dir.path()).expect("checked"),
+            "a root that has it is left alone"
+        );
+        assert!(passes_down(dir.path(), OWNER_RIGHTS, READ_CONTROL).expect("reads the ACL"));
+        assert!(
+            !passes_down(dir.path(), OWNER_RIGHTS, WRITE_DAC).expect("reads the ACL"),
+            "READ_CONTROL and nothing else"
+        );
+
+        let file = dir.path().join("made-later.txt");
+        std::fs::write(&file, "x").expect("write");
+        let file_acl = acl_of(&file);
+        assert!(file_acl.contains("OWNER RIGHTS"), "{file_acl}");
+        // Re-ACLing what the user made still works: his own explicit entry.
+        change(&file, "S-1-5-4", Change::Grant(READ_EXECUTE)).expect("the user re-ACLs");
+        change(&file, "S-1-5-4", Change::Revoke).expect("and takes it back");
+    }
+
+    /// **AN MSYS LEASE GRANTS ITS ACCOUNT FOR THE RUN AND TAKES IT BACK**, the
+    /// roots' own SIDs and the OWNER RIGHTS entry staying. The account is a
+    /// made-up SID (ACEs name any SID), so no setup is needed. Its record
+    /// lists the roots under `modify` while the run lives.
+    #[test]
+    fn an_msys_lease_grants_the_account_per_run_and_takes_it_back() {
+        let dir = data_drive_folder();
+        let root = dir.path().join("root");
+        let temp = dir.path().join("t");
+        std::fs::create_dir(&root).expect("root");
+        std::fs::create_dir(&temp).expect("temp");
+        let beneath = root.join("before.txt");
+        std::fs::write(&beneath, "x").expect("write");
+        let account = "S-1-5-21-7777777-7777777-7777777-4242";
+        let sid = root_sid(&root).expect("sid");
+
+        let lease = Lease::acquire(
+            std::slice::from_ref(&root),
+            &temp,
+            Some(OfflineGrant {
+                user: account.to_string(),
+                per_run: true,
+                reads: Vec::new(),
+                parents: Vec::new(),
+            }),
+        )
+        .expect("an msys lease");
+        assert_eq!(lease.root_sids(), std::slice::from_ref(&sid));
+        for path in [&root, &beneath, &temp] {
+            let acl = acl_of(path);
+            assert!(acl.contains(account), "granted: {}: {acl}", path.display());
+        }
+        assert!(acl_of(&root).contains("OWNER RIGHTS"), "{}", acl_of(&root));
+        let listed = std::fs::read_dir(records_dir())
+            .expect("records")
+            .flatten()
+            .filter_map(|e| GrantRecord::parse(&std::fs::read_to_string(e.path()).ok()?))
+            .any(|r| r.modify.contains(&root) && r.user.as_deref() == Some(account));
+        assert!(listed, "the record lists the msys root");
+        drop(lease);
+
+        for path in [&root, &beneath, &temp] {
+            let acl = acl_of(path);
+            assert!(
+                !acl.contains(account),
+                "taken back: {}: {acl}",
+                path.display()
+            );
+        }
+        let acl = acl_of(&root);
+        assert!(acl.contains(&sid), "the root's own SID is kept: {acl}");
+        assert!(acl.contains("OWNER RIGHTS"), "and the entry: {acl}");
+        let left = std::fs::read_dir(records_dir())
+            .expect("records")
+            .flatten()
+            .filter_map(|e| GrantRecord::parse(&std::fs::read_to_string(e.path()).ok()?))
+            .any(|r| r.modify.contains(&root));
+        assert!(!left, "the record was removed");
+        revoke_kept(&root, None).expect("cleanup");
+    }
+
+    /// **MSYS RUNS GO ONE AT A TIME**: a second, on another thread (a
+    /// mutex is recursive for its own), cannot take the lock while the first
+    /// holds it, and can once it is let go.
+    #[test]
+    fn msys_runs_go_one_at_a_time() {
+        let first = MsysLock::take_within(120_000, false).expect("first");
+        let blocked = std::thread::spawn(|| MsysLock::take_within(200, false).map(|_| ()))
+            .join()
+            .expect("thread");
+        assert!(
+            blocked.is_err_and(|e| e.contains("one at a time")),
+            "the second waited and gave up"
+        );
+        drop(first);
+        std::thread::spawn(|| MsysLock::take_within(120_000, false).map(|_| ()))
+            .join()
+            .expect("thread")
+            .expect("free again");
     }
 
     /// **A ROOT HOLDING INSBX'S OWN RECORDS IS REFUSED**: a command that

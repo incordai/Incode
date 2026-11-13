@@ -12,15 +12,17 @@
 //! 1. creates a local account, [`ACCOUNT`], member of `Users` only (it needs
 //!    `Users` to log on locally and to read `C:\Windows` and `Program Files`;
 //!    Codex adds its accounts to `Users` too), with a random password nobody
-//!    is shown, hidden from the sign-in screen;
-//! 2. stores that password DPAPI-protected (machine scope) in a record under
+//!    is shown, hidden from the sign-in screen; and a second one the same
+//!    way, [`MSYS_ACCOUNT`], for the runs that ask for `msys` (below);
+//! 2. stores both passwords DPAPI-protected (machine scope) in a record under
 //!    `%ProgramData%\insbx`, readable by SYSTEM, Administrators and the user who
 //!    ran the setup only ([`state_dir_sddl`]);
 //! 3. adds persistent WFP filters ([`FILTERS`]) that block every connection
-//!    the account makes or accepts, TCP, UDP and ICMP, loopback included, and
-//!    permit one thing: TCP to `127.0.0.1` on a small fixed range of ports
+//!    either account makes or accepts, TCP, UDP and ICMP, loopback included,
+//!    and permit one thing: TCP to `127.0.0.1` on a small fixed range of ports
 //!    ([`DEFAULT_PROXY_PORTS`]), where a `proxy` run's allowlisting proxy
-//!    listens.
+//!    listens. The one filter set names both accounts
+//!    ([`user_condition_sddl`]), so the two can never differ.
 //!
 //! At run time, unelevated, the helper starts a second helper as that account
 //! with `CreateProcessWithLogonW` (the one way an unprivileged process can
@@ -48,6 +50,33 @@
 //!   run shares and could leave things in for the next. The command gets the
 //!   run's computed environment instead.
 //!
+//! # `msys`: a second account, for Git Bash
+//!
+//! Git Bash and every msys program build their pipes and sections with a DACL
+//! that grants only the token's USER (msys2-runtime `sec_acl`), and a
+//! write-restricted token passes a write only where a restricting SID is
+//! granted ([`super`], "Known limit: Git Bash"). Adding the token's own user
+//! SID to the restricting SIDs makes them work (measured: `bash -c "echo ok >
+//! x && cat x"` under `insbx run --net deny -w .`). But the offline account's
+//! ACEs on writable roots and current folders are KEPT across runs
+//! ([`super::acl`]), so trusting that account's SID would let the command
+//! write into every folder an earlier deny run used (measured: it did). So an
+//! `msys` run (`[fs] msys = true`, `--msys`) runs as [`MSYS_ACCOUNT`] instead,
+//! an account with no kept ACE anywhere:
+//!
+//! - its ACEs are granted per run, and taken back when the run ends or, after
+//!   a crash, by the next run's sweep ([`super::acl`]);
+//! - one msys run at a time, a named mutex `Global\insbx-msys`, because the
+//!   account is shared by every run;
+//! - its token trusts its own SID (the helper accepts it only when it equals
+//!   the account's SID in the record, and the token's own user SID);
+//! - the roots carry an OWNER RIGHTS entry that leaves an owner only
+//!   `READ_CONTROL`, so a file the account creates (it owns it) never gives it
+//!   `WRITE_DAC` in a later run.
+//!
+//! It has the same firewall filters as the offline account, and
+//! `insbx setup-windows --read` grants both.
+//!
 //! Not stopped by the filters (said in the README): name lookups through the
 //! DNS Client service, which resolves on the command's behalf as
 //! `NetworkService` (as on Linux with `systemd-resolved`), and SMB/WebDAV
@@ -70,6 +99,14 @@ pub const ACCOUNT: &str = "insbx-offline";
 pub const ACCOUNT_COMMENT: &str =
     "insbx: runs sandboxed commands with no network (made by insbx setup-windows)";
 
+/// The local account `msys` runs use instead of [`ACCOUNT`] (see the module
+/// docs): made and cut off from the network the same way.
+pub const MSYS_ACCOUNT: &str = "insbx-msys";
+
+/// [`MSYS_ACCOUNT`]'s description, shown in Computer Management.
+pub const MSYS_ACCOUNT_COMMENT: &str =
+    "insbx: runs Git Bash (msys) commands with no network, one run at a time (made by insbx setup-windows)";
+
 /// The loopback ports a `proxy` run's proxy may listen on, one per
 /// concurrent run. Below Windows' dynamic range (49152-65535), so the system
 /// never hands one out as an ephemeral port.
@@ -86,7 +123,19 @@ pub const RECORD_FILE: &str = "offline.conf";
 pub const DPAPI_ENTROPY: &[u8] = b"insbx-offline-v1";
 
 const RECORD_MAGIC: &str = "insbx-offline-record";
-const RECORD_VERSION: u32 = 1;
+const RECORD_VERSION: u32 = 2;
+
+/// The `msys` account's part of the record ([`MSYS_ACCOUNT`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MsysAccount {
+    /// The account name ([`MSYS_ACCOUNT`]).
+    pub account: String,
+    /// The account's SID, to check it is still the same account, and what an
+    /// msys run's token is allowed to trust.
+    pub sid: String,
+    /// The password, DPAPI-protected like [`Record::password`].
+    pub password: Vec<u8>,
+}
 
 /// What `insbx setup-windows` wrote down.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,10 +149,12 @@ pub struct Record {
     pub owner: String,
     /// The loopback port range the proxy filter permits.
     pub proxy_ports: (u16, u16),
-    /// Folders granted to the account for reading at setup (`--read`).
+    /// Folders granted to both accounts for reading at setup (`--read`).
     pub reads: Vec<PathBuf>,
     /// The password, DPAPI-protected (machine scope, [`DPAPI_ENTROPY`]).
     pub password: Vec<u8>,
+    /// The second account, for `msys` runs.
+    pub msys: MsysAccount,
 }
 
 impl Record {
@@ -122,6 +173,9 @@ impl Record {
             text.push_str(&format!("read {}\n", r.display()));
         }
         text.push_str(&format!("password {}\n", hex(&self.password)));
+        text.push_str(&format!("msys-account {}\n", self.msys.account));
+        text.push_str(&format!("msys-sid {}\n", self.msys.sid));
+        text.push_str(&format!("msys-password {}\n", hex(&self.msys.password)));
         text
     }
 
@@ -144,6 +198,7 @@ impl Record {
         }
         let (mut account, mut sid, mut owner, mut ports, mut password) =
             (None, None, None, None, None);
+        let (mut msys_account, mut msys_sid, mut msys_password) = (None, None, None);
         let mut reads = Vec::new();
         for line in lines {
             let Some((key, value)) = line.split_once(' ') else {
@@ -157,6 +212,12 @@ impl Record {
                 "read" => reads.push(PathBuf::from(value)),
                 "password" => {
                     password = Some(unhex(value).ok_or("the record's password is not hex")?);
+                }
+                "msys-account" => msys_account = Some(value.to_string()),
+                "msys-sid" => msys_sid = Some(value.to_string()),
+                "msys-password" => {
+                    msys_password =
+                        Some(unhex(value).ok_or("the record's msys account password is not hex")?);
                 }
                 _ => {}
             }
@@ -176,6 +237,17 @@ impl Record {
             password: password
                 .filter(|p| !p.is_empty())
                 .ok_or("the record has no password")?,
+            msys: MsysAccount {
+                account: msys_account
+                    .filter(|a| !a.is_empty())
+                    .ok_or("the record has no msys account")?,
+                sid: msys_sid
+                    .filter(|s| is_sid(s))
+                    .ok_or("the record has no msys account SID")?,
+                password: msys_password
+                    .filter(|p| !p.is_empty())
+                    .ok_or("the record has no msys account password")?,
+            },
         })
     }
 }
@@ -269,12 +341,17 @@ pub fn meets_complexity(pw: &str) -> bool {
 // ---- Security descriptors. ----
 
 /// The WFP user condition: a security descriptor granting
-/// `FWP_ACTRL_MATCH_FILTER` (`CC`, 0x1) to the account, so a filter matches
-/// every socket a process of that account opens (Codex's
-/// `LocalUserAuthorizedList` uses the same SDDL).
+/// `FWP_ACTRL_MATCH_FILTER` (`CC`, 0x1) to each of the accounts (the offline
+/// account and the `msys` one), so a filter matches every socket a process of
+/// either opens (Codex's `LocalUserAuthorizedList` uses the same SDDL). One
+/// descriptor for both, so no filter can cover one account and not the other.
 #[must_use]
-pub fn user_condition_sddl(account_sid: &str) -> String {
-    format!("O:LSD:(A;;CC;;;{account_sid})")
+pub fn user_condition_sddl(account_sids: &[&str]) -> String {
+    let aces: String = account_sids
+        .iter()
+        .map(|sid| format!("(A;;CC;;;{sid})"))
+        .collect();
+    format!("O:LSD:{aces}")
 }
 
 /// The state folder and the record in it: SYSTEM and Administrators full
@@ -315,7 +392,8 @@ pub enum Layer {
 /// One condition of a filter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cond {
-    /// The socket's user is the offline account ([`user_condition_sddl`]).
+    /// The socket's user is the offline account or the msys one
+    /// ([`user_condition_sddl`]).
     User,
     /// `FWPM_CONDITION_IP_PROTOCOL`.
     Protocol(u8),
@@ -483,6 +561,8 @@ pub fn parse_setup_args(args: &[String]) -> Result<SetupArgs, String> {
 pub struct Ready {
     /// The account's SID.
     pub sid: String,
+    /// The `msys` account's SID ([`MSYS_ACCOUNT`]).
+    pub msys_sid: String,
     /// The loopback ports the proxy may listen on.
     pub proxy_ports: (u16, u16),
     /// Where the record is, for the helper to read the password from.
@@ -491,7 +571,7 @@ pub struct Ready {
 
 /// How to get layer 2, for messages.
 pub const SETUP_HINT: &str = "run `insbx setup-windows` as administrator once (it creates the \
-     offline account insbx-offline and its firewall filters), or use WSL2 (INSBX_BACKEND=wsl, or auto)";
+     accounts insbx-offline and insbx-msys and their firewall filters), or use WSL2 (INSBX_BACKEND=wsl, or auto)";
 
 /// What native Windows enforces of the network policy, given whether the
 /// setup is in place (`Err` says why not).
@@ -564,17 +644,28 @@ mod tests {
                 PathBuf::from(r"D:\tools x"),
             ],
             password: vec![0, 1, 0xab, 0xff],
+            msys: MsysAccount {
+                account: MSYS_ACCOUNT.into(),
+                sid: "S-1-5-21-1-2-3-1010".into(),
+                password: vec![0xde, 0xad, 0xbe, 0xef],
+            },
         }
     }
 
     #[test]
-    fn a_record_round_trips() {
+    fn a_record_round_trips_with_both_accounts() {
         let r = record();
         let text = r.to_text();
-        assert!(text.starts_with("insbx-offline-record 1\n"), "{text}");
-        assert!(text.contains("password 0001abff\n"), "{text}");
+        assert!(text.starts_with("insbx-offline-record 2\n"), "{text}");
+        assert!(text.contains("\npassword 0001abff\n"), "{text}");
+        assert!(text.contains("msys-account insbx-msys\n"), "{text}");
+        assert!(text.contains("msys-sid S-1-5-21-1-2-3-1010\n"), "{text}");
+        assert!(text.contains("msys-password deadbeef\n"), "{text}");
         assert!(text.contains("proxy-ports 47600-47615\n"), "{text}");
-        assert_eq!(Record::parse(&text), Ok(r));
+        let back = Record::parse(&text).expect("parses");
+        assert_eq!(back.msys, r.msys);
+        assert_ne!(back.sid, back.msys.sid, "two accounts, two SIDs");
+        assert_eq!(back, r);
         // CRLF, as a file edited on Windows may come back.
         assert_eq!(
             Record::parse(&record().to_text().replace('\n', "\r\n")),
@@ -586,9 +677,15 @@ mod tests {
     fn a_bad_record_is_refused_and_says_why() {
         assert!(Record::parse("").is_err());
         assert!(Record::parse("something else\n").is_err());
-        let v2 = record().to_text().replace("record 1", "record 2");
-        assert!(Record::parse(&v2).is_err_and(|e| e.contains("version 2")));
+        // A record from before the msys account (version 1) is refused:
+        // setup makes a new one.
+        let v1 = record().to_text().replace("record 2", "record 1");
+        assert!(Record::parse(&v1).is_err_and(|e| e.contains("version 1")));
         for (from, to) in [
+            ("msys-sid S-1-5-21-1-2-3-1010", "msys-sid nobody"),
+            ("msys-account insbx-msys", "msys-account "),
+            ("msys-password deadbeef", "msys-password xyz"),
+            ("msys-password deadbeef", "msys-password "),
             ("sid S-1-5-21-1-2-3-1009", "sid nobody"),
             ("owner S-1-5-21-1-2-3-1001", "owner "),
             ("password 0001abff", "password xyz"),
@@ -599,6 +696,14 @@ mod tests {
             let bad = record().to_text().replace(from, to);
             assert!(Record::parse(&bad).is_err(), "{to}");
         }
+    }
+
+    #[test]
+    fn the_two_accounts_are_named_apart_and_alike() {
+        assert_eq!(ACCOUNT, "insbx-offline");
+        assert_eq!(MSYS_ACCOUNT, "insbx-msys");
+        assert_ne!(ACCOUNT, MSYS_ACCOUNT);
+        assert!(SETUP_HINT.contains(ACCOUNT) && SETUP_HINT.contains(MSYS_ACCOUNT));
     }
 
     #[test]
@@ -642,8 +747,14 @@ mod tests {
     #[test]
     fn security_descriptors_name_who_they_should() {
         assert_eq!(
-            user_condition_sddl("S-1-5-21-9-1009"),
+            user_condition_sddl(&["S-1-5-21-9-1009"]),
             "O:LSD:(A;;CC;;;S-1-5-21-9-1009)"
+        );
+        // The filters' condition names BOTH accounts: no filter covers one
+        // and not the other.
+        assert_eq!(
+            user_condition_sddl(&["S-1-5-21-9-1009", "S-1-5-21-9-1010"]),
+            "O:LSD:(A;;CC;;;S-1-5-21-9-1009)(A;;CC;;;S-1-5-21-9-1010)"
         );
         let dir = state_dir_sddl("S-1-5-21-9-1001");
         assert!(dir.starts_with("O:BAD:P("), "protected: {dir}");
@@ -727,6 +838,7 @@ mod tests {
     fn the_status_says_what_is_enforced_and_how_to_get_it() {
         let ready = Ok(Ready {
             sid: "S-1-5-21-1-1009".into(),
+            msys_sid: "S-1-5-21-1-1010".into(),
             proxy_ports: (5000, 5003),
             record: PathBuf::from(r"C:\ProgramData\insbx\offline.conf"),
         });

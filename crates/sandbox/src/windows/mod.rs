@@ -79,13 +79,37 @@
 //! `cpu_secs` its user-mode time limit per process. `file_size_mb` and
 //! `open_files` have no Windows equivalent and are reported not enforced.
 //!
-//! # Known limit: Git Bash
+//! # Git Bash: `msys`, a second account ([`offline`])
 //!
 //! Git Bash and every msys program fail to start under the write-restricted
-//! token: the msys runtime maps a per-user shared section the token may not
-//! map writable, and dies with `CreateFileMapping ..., Win32 error 5`
-//! (incode measured). Use `cmd` or PowerShell, or `INSBX_BACKEND=wsl` for a
-//! POSIX shell.
+//! token: the msys runtime builds its pipes and sections with a DACL that
+//! grants only the token's user (msys2-runtime `sec_acl`), a write passes the
+//! restricted check only where a restricting SID is granted, and none is
+//! (`couldn't create signal pipe, Win32 error 5`, `CreateFileMapping ...,
+//! Win32 error 5`; measured). Adding the token's own user SID to the
+//! restricting SIDs fixes it (measured), but the offline account's ACEs are
+//! kept across runs ([`acl`]), so trusting its SID would open every folder an
+//! earlier deny run used (measured: a write into another folder succeeded).
+//!
+//! So a policy that asks (`[fs] msys = true`, `--msys`) runs as a third kind of
+//! identity: the account `insbx-msys`, made by `insbx setup-windows` beside
+//! `insbx-offline` with the same firewall filters, whose SID the token trusts
+//! ([`token::restricted`]) and which has NO kept ACE anywhere:
+//!
+//! - its `Modify` on each writable root and `RX` on the reads are granted per
+//!   run, by walking the trees, and taken back when the run ends or, after a
+//!   crash, by the next run's sweep ([`acl::Lease`]);
+//! - one msys run at a time (the mutex `Global\insbx-msys`), since the account
+//!   is shared by every run that holds the mutex;
+//! - each root carries an inheritable OWNER RIGHTS entry of `READ_CONTROL`
+//!   only (kept), so a file the account creates, which it owns, never gives it
+//!   `WRITE_DAC` in a later run; the user's own `READ_CONTROL | WRITE_DAC`
+//!   entry ([`acl`]) still lets the user re-ACL it.
+//!
+//! It only means something here, with network `deny` or `proxy` (a run uses an
+//! account only then, [`msys_gap`]); on Linux and macOS `msys` is ignored.
+//! Without `msys`, use `cmd` or PowerShell, or `INSBX_BACKEND=wsl` for a POSIX
+//! shell.
 
 // The pure parts below are compiled on every platform so their tests run in
 // Linux CI; only the Windows build calls them.
@@ -242,6 +266,25 @@ pub const DENY_READ_NOT_ENFORCED: &str =
     "a write-restricted token consults its restricting SIDs only for writes, so no ACE can hide \
      a path from the sandbox alone; use WSL2 (INSBX_BACKEND=wsl, or auto), where Landlock does";
 
+/// Why a policy's `msys = true` cannot be honoured natively with network
+/// `allow`, or `None` when it can (or is not asked for). `msys` runs as the
+/// `insbx-msys` account, and a run uses an account only under network deny or
+/// proxy ([`offline`]); with `allow` the command would run as the caller, where
+/// Git Bash does not start (see "Known limit: Git Bash" above). Called by
+/// `status::enforcement` on Windows, where it makes the filesystem a gap, so
+/// strict mode refuses the run and `--best-effort` runs without `msys`.
+#[must_use]
+pub fn msys_gap(fs: &Fs, net: NetMode) -> Option<Status> {
+    (fs.msys && net == NetMode::Allow).then(|| {
+        Status::NotEnforced(
+            "msys = true needs network deny or proxy: Git Bash runs as the account insbx-msys, \
+             and a run uses an account only when the network is denied (with `allow` it runs as \
+             you, where Git Bash does not start); use --net deny or --net proxy"
+                .to_string(),
+        )
+    })
+}
+
 /// What native Windows enforces of the filesystem policy.
 #[must_use]
 pub fn fs_status(fs: &Fs) -> Status {
@@ -258,10 +301,16 @@ pub fn fs_status(fs: &Fs) -> Status {
         FsMode::ReadOnly => "writes only to the run's private temp directory",
         _ => "writes only beneath the writable roots and the run's private temp directory",
     };
+    let msys = if fs.msys {
+        "; msys: the command runs as insbx-msys, granted per run (roots and reads walked and \
+         taken back), one such run at a time, Git Bash works"
+    } else {
+        ""
+    };
     Status::Enforced(format!(
         "write-restricted token: reads anywhere, {writes} (each root granted to its own SID, \
          kept for later runs until `insbx revoke`; the temp directory to a per-run SID, revoked \
-         after the run), the null device, and anywhere Everyone may write"
+         after the run), the null device, and anywhere Everyone may write{msys}"
     ))
 }
 
@@ -292,12 +341,17 @@ pub struct GrantRecord {
     /// itself and nothing beneath it: the current folder's parent
     /// ([`offline_parents`]). Records written before this field have none.
     pub parents: Vec<PathBuf>,
+    /// An `msys` run ([`offline`]): the writable roots the `msys` account
+    /// (`user`) is granted `Modify` on for this run alone, taken back when it
+    /// ends or by the sweep. The offline account's own ACE on a root is kept,
+    /// so it is not listed here; the msys account has none to keep.
+    pub modify: Vec<PathBuf>,
 }
 
 impl GrantRecord {
     /// The record's text: `sid`, a `root` per root, then `user`, a `read`
-    /// per read path and a `parent` per listed folder when the offline
-    /// account takes part.
+    /// per read path, a `parent` per listed folder and a `modify` per
+    /// per-run writable root when an account takes part.
     #[must_use]
     pub fn to_text(&self) -> String {
         let mut text = format!("sid {}\n", self.sid);
@@ -312,6 +366,9 @@ impl GrantRecord {
         }
         for parent in &self.parents {
             text.push_str(&format!("parent {}\n", parent.display()));
+        }
+        for path in &self.modify {
+            text.push_str(&format!("modify {}\n", path.display()));
         }
         text
     }
@@ -330,6 +387,7 @@ impl GrantRecord {
                 Some(("user", v)) if offline::is_sid(v) => record.user = Some(v.to_string()),
                 Some(("read", v)) => record.reads.push(PathBuf::from(v)),
                 Some(("parent", v)) => record.parents.push(PathBuf::from(v)),
+                Some(("modify", v)) => record.modify.push(PathBuf::from(v)),
                 _ => {}
             }
         }
@@ -949,9 +1007,25 @@ mod tests {
                 PathBuf::from(r"C:\bin\insbx.exe"),
             ],
             parents: vec![PathBuf::from(r"C:\Users\me\src")],
+            modify: Vec::new(),
         };
         assert!(offline.to_text().ends_with("parent C:\\Users\\me\\src\n"));
         assert_eq!(GrantRecord::parse(&offline.to_text()), Some(offline));
+        // An msys run lists the roots its account holds for this run alone.
+        let msys = GrantRecord {
+            sid: session_sid(10),
+            roots: vec![PathBuf::from(r"C:\tmp\run")],
+            user: Some("S-1-5-21-1-2-3-1010".into()),
+            reads: vec![PathBuf::from(r"C:\proj")],
+            modify: vec![PathBuf::from(r"C:\w\a"), PathBuf::from(r"D:\b c")],
+            ..GrantRecord::default()
+        };
+        assert!(
+            msys.to_text().ends_with("modify D:\\b c\n"),
+            "{}",
+            msys.to_text()
+        );
+        assert_eq!(GrantRecord::parse(&msys.to_text()), Some(msys));
         assert!(GrantRecord::parse("sid S-1-1-0\nroot C:\\w\n").is_none());
         assert!(GrantRecord::parse(&format!("sid {SID_PREFIX}\n")).is_none());
         assert!(GrantRecord::parse("root C:\\w\n").is_none());
@@ -1230,6 +1304,29 @@ mod tests {
         assert_eq!(huge.process_user_time, i64::MAX);
     }
 
+    /// `msys` with network `allow` is a gap (the command would run as the
+    /// caller, not an account); with deny or proxy, or not asked for, it is
+    /// not, and the filesystem line says an msys run is in force.
+    #[test]
+    fn msys_needs_an_account_so_a_network_mode_that_uses_one() {
+        let mut fs = Fs::default();
+        assert!(msys_gap(&fs, NetMode::Allow).is_none(), "not asked for");
+        fs.msys = true;
+        for net in [NetMode::Deny, NetMode::Proxy] {
+            assert!(msys_gap(&fs, net).is_none(), "{net:?}");
+        }
+        let gap = msys_gap(&fs, NetMode::Allow).expect("a gap");
+        assert!(
+            matches!(&gap, Status::NotEnforced(s) if s.contains("--net deny") && s.contains("insbx-msys")),
+            "{gap:?}"
+        );
+        assert!(gap.is_gap());
+        fs.mode = FsMode::WorkspaceWrite;
+        assert!(matches!(fs_status(&fs), Status::Enforced(s) if s.contains("insbx-msys")));
+        fs.msys = false;
+        assert!(matches!(fs_status(&fs), Status::Enforced(s) if !s.contains("msys")));
+    }
+
     #[test]
     fn statuses_say_what_windows_enforces() {
         let mut fs = Fs::default();
@@ -1244,6 +1341,7 @@ mod tests {
         assert!(net_status(NetMode::Proxy, &missing).is_gap());
         let ready = Ok(offline::Ready {
             sid: "S-1-5-21-1-1009".into(),
+            msys_sid: "S-1-5-21-1-1010".into(),
             proxy_ports: offline::DEFAULT_PROXY_PORTS,
             record: PathBuf::from(r"C:\ProgramData\insbx\offline.conf"),
         });

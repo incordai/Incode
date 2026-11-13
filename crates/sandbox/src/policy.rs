@@ -7,6 +7,7 @@
 //! deny_read = ["../private"]      # hidden: not even readable
 //! protect_git = true              # .git/hooks and .git/config kept as they were (default)
 //! block_wsl_interop = true        # inside WSL2: no starting Windows programs (default)
+//! msys = false                    # Windows, network deny/proxy: let Git Bash run
 //!
 //! [network]
 //! mode = "proxy"                  # allow | deny | proxy
@@ -73,6 +74,15 @@ pub struct Fs {
     /// run outside the sandbox altogether (see [`crate::wsl`]). On by
     /// default; only applies when the filesystem is confined.
     pub block_wsl_interop: bool,
+    /// Native Windows, with network `deny` or `proxy`: run the command as the
+    /// account `insbx-msys` instead of `insbx-offline`, with its own SID
+    /// trusted by the write-restricted token, so Git Bash and other msys
+    /// programs start. It costs per-run grants (each writable root and read
+    /// path is walked, then taken back) and allows one such run at a time
+    /// (see [`crate::windows`], "Git Bash"). With network `allow` it cannot be
+    /// honoured natively (strict mode refuses the run). Ignored on Linux and
+    /// macOS, whose sandboxes have no such limit. Off by default.
+    pub msys: bool,
 }
 
 impl Default for Fs {
@@ -83,6 +93,7 @@ impl Default for Fs {
             deny_read: Vec::new(),
             protect_git: true,
             block_wsl_interop: true,
+            msys: false,
         }
     }
 }
@@ -248,6 +259,7 @@ impl Policy {
                 deny_read: Vec::new(),
                 protect_git: true,
                 block_wsl_interop: true,
+                msys: false,
             },
             ..Self::default()
         }
@@ -426,6 +438,23 @@ mod tests {
         let err = Policy::from_toml("[fs]\nmode = \"read-only\"\nwirte = [\"x\"]\n")
             .expect_err("unknown keys are errors");
         assert!(err.contains("wirte"), "{err}");
+    }
+
+    /// `msys` is a key of `[fs]`, off unless asked for; a misspelling of it
+    /// and a `[windows]` table (not a thing) are refused like any unknown key.
+    #[test]
+    fn msys_is_an_fs_key_and_off_by_default() {
+        assert!(!Policy::default().fs.msys);
+        assert!(!Policy::workspace("w").fs.msys);
+        let p = Policy::from_toml("[fs]\nmode = \"workspace-write\"\nmsys = true\n").expect("ok");
+        assert!(p.fs.msys);
+        let p = Policy::from_toml("[fs]\nmsys = false\n").expect("ok");
+        assert!(!p.fs.msys);
+        for bad in ["[fs]\nmsyss = true\n", "[windows]\nmsys = true\n"] {
+            let err = Policy::from_toml(bad).expect_err("unknown keys are errors");
+            assert!(err.contains("msys") || err.contains("windows"), "{err}");
+        }
+        assert!(Policy::from_toml("[fs]\nmsys = \"yes\"\n").is_err());
     }
 
     #[test]

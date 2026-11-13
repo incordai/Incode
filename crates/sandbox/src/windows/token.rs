@@ -77,7 +77,18 @@ pub(crate) fn sid(s: &str) -> Result<LocalPtr, String> {
 /// where one of them is granted. Its default DACL lets the command open its
 /// own process. Called by `helper::confining_token`, which has checked every
 /// SID's shape.
-pub(crate) fn restricted(run_sid: &str, root_sids: &[String]) -> Result<OwnedHandle, String> {
+///
+/// With `trusted_user` (an `msys` run, see [`super::offline`]) the token's own
+/// user SID is a restricting SID too, so the DACLs msys programs build for
+/// that user pass the restricted check. Only that SID is accepted: it must be
+/// this token's own user, so a spec cannot name any other SID, and the helper
+/// that starts this one (`helper::launch_offline`) has checked it against the
+/// setup record's msys account.
+pub(crate) fn restricted(
+    run_sid: &str,
+    root_sids: &[String],
+    trusted_user: Option<&str>,
+) -> Result<OwnedHandle, String> {
     // SAFETY: Win32 handle work; each call is checked and every handle this
     // owns is closed. The SIDs and the array outlive the calls that read
     // them.
@@ -87,6 +98,12 @@ pub(crate) fn restricted(run_sid: &str, root_sids: &[String]) -> Result<OwnedHan
             return Err(last_error("OpenProcessToken"));
         }
         let base = OwnedHandle(base);
+        let user = token_user_sid(base.0)?;
+        let trusted = match trusted_user {
+            Some(t) if t == user => Some(sid(t)?),
+            Some(t) => return Err(format!("{t} is not the SID this token runs as")),
+            None => None,
+        };
         let private = sid(run_sid)?;
         let roots = root_sids
             .iter()
@@ -96,6 +113,7 @@ pub(crate) fn restricted(run_sid: &str, root_sids: &[String]) -> Result<OwnedHan
         let logon = logon_sid(base.0)?;
         let restricting: Vec<SID_AND_ATTRIBUTES> = std::iter::once(&private)
             .chain(&roots)
+            .chain(&trusted)
             .chain([&everyone, &logon])
             .map(|s| SID_AND_ATTRIBUTES {
                 Sid: s.0,
@@ -119,8 +137,7 @@ pub(crate) fn restricted(run_sid: &str, root_sids: &[String]) -> Result<OwnedHan
         }
         let token = OwnedHandle(token);
         drop(restricting);
-        drop((private, roots, everyone, logon));
-        let user = token_user_sid(base.0)?;
+        drop((private, roots, trusted, everyone, logon));
         set_default_dacl(token.0, &super::default_dacl_sddl(&user, run_sid))?;
         Ok(token)
     }

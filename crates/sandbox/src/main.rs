@@ -57,6 +57,10 @@ POLICY (a file, then flags on top of it):
         --fs <MODE>          off | read-only | workspace-write
     -w, --write <DIR>        writable root (implies --fs workspace-write; repeatable)
         --deny-read <PATH>   hide this path entirely, reads included (repeatable)
+        --msys               Windows, with --net deny or proxy: run as the account insbx-msys
+                             so Git Bash (msys) works. Costs per-run grants (each root is
+                             walked, then taken back) and one such run at a time. Refused
+                             with --net allow; ignored on Linux and macOS
         --net <MODE>         allow | deny | proxy
         --allow-host <HOST>  host the proxy lets through (implies --net proxy; repeatable)
         --allow-private      an allowed host may resolve to a private address
@@ -235,9 +239,10 @@ mod windows_backend {
         }
         match incord_sandbox::windows::offline_setup() {
             Ok(r) => println!(
-                "  [ok  ] offline user   {} and its firewall filters are set up (insbx setup-windows): \
-                 network deny and proxy run natively (proxy ports {}-{})",
+                "  [ok  ] offline user   {} and {} (--msys) and their firewall filters are set up \
+                 (insbx setup-windows): network deny and proxy run natively (proxy ports {}-{})",
                 incord_sandbox::windows::offline::ACCOUNT,
+                incord_sandbox::windows::offline::MSYS_ACCOUNT,
                 r.proxy_ports.0,
                 r.proxy_ports.1
             ),
@@ -669,8 +674,8 @@ fn apply_flag(policy: &mut Policy, flag: &str, v: String) -> Result<(), String> 
     }
 }
 
-/// `--fs`, `-w`/`--write`, `--deny-read`, `--no-protect-git`; `Ok(false)` for
-/// any other flag.
+/// `--fs`, `-w`/`--write`, `--deny-read`, `--no-protect-git`, `--msys`;
+/// `Ok(false)` for any other flag.
 fn apply_fs_flag(policy: &mut Policy, flag: &str, v: &str) -> Result<bool, String> {
     match flag {
         "--fs" => {
@@ -687,6 +692,7 @@ fn apply_fs_flag(policy: &mut Policy, flag: &str, v: &str) -> Result<bool, Strin
             policy.fs.deny_read.push(PathBuf::from(v));
         }
         "--no-protect-git" => policy.fs.protect_git = false,
+        "--msys" => policy.fs.msys = true,
         _ => return Ok(false),
     }
     Ok(true)
@@ -839,6 +845,7 @@ mod tests {
             "--deny-read",
             "/secret",
             "--no-protect-git",
+            "--msys",
             "--allow-host",
             "crates.io",
             "--allow-private",
@@ -861,6 +868,7 @@ mod tests {
         assert_eq!(p.fs.write, [PathBuf::from("/w")]);
         assert_eq!(p.fs.deny_read, [PathBuf::from("/secret")]);
         assert!(!p.fs.protect_git);
+        assert!(p.fs.msys);
         assert_eq!(p.network.mode, NetMode::Proxy);
         assert_eq!(p.network.allow, ["crates.io"]);
         assert!(p.network.allow_private);
