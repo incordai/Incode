@@ -263,8 +263,9 @@ Windows. This crate's port is checked by its tests
   `insbx mcp` scripts default to PowerShell on Windows.
 - **Grants are visible, and kept.** Every object under a root that a run
   has used carries the root's ACE until `insbx revoke`. A file moved into a
-  root from elsewhere keeps the ACL it had, so the command cannot write it
-  until `insbx revoke <ROOT>` and the next run grants the tree again.
+  root from elsewhere keeps the ACL it had (no grant re-ACLs it, kept or
+  per run), so the command cannot write it until `icacls <FILE> /reset`
+  gives it its folder's ACL.
 
 ### Network natively: `insbx setup-windows`
 

@@ -24,10 +24,10 @@
 //! folder never granted. `insbx revoke <PATH>|--all` takes kept grants back
 //! ([`revoke_kept`]); `insbx grants` lists them ([`kept_folders`]).
 //!
-//! What it costs: a file moved INTO a root from elsewhere keeps the ACL it
-//! had and lacks the root's inherited ACE until the root is granted again,
-//! so the command cannot write it (it fails closed); `insbx revoke <ROOT>`
-//! and the next run re-grants the whole tree.
+//! A file moved INTO a root from elsewhere keeps the ACL it had: no grant's
+//! walk re-ACLs it (measured, and so it was with the per-run grant too), so
+//! the command cannot write it (it fails closed). `icacls <FILE> /reset`
+//! gives it its folder's ACL, the root's ACE included.
 //!
 //! # The temp directory: one SID per run
 //!
@@ -230,6 +230,9 @@ pub(crate) struct Lease {
     /// The kept SIDs of this run's writable roots ([`root_sid`]), for the
     /// command's token.
     root_sids: Vec<String>,
+    /// The roots whose grant this lease had to make (walking their trees);
+    /// a root granted before is only read, and is not here.
+    walked: Vec<PathBuf>,
     /// The named mutex that tells a later sweep this run is alive.
     _alive: OwnedHandle,
 }
@@ -302,6 +305,7 @@ impl Lease {
             reads: Vec::new(),
             parents: Vec::new(),
             root_sids: Vec::new(),
+            walked: Vec::new(),
             _alive: alive,
         };
         // Written down BEFORE anything is granted, so a crash at any point
@@ -330,11 +334,20 @@ impl Lease {
     /// Stops at the first that fails.
     fn keep_roots(&mut self, roots: &[PathBuf]) -> Result<(), String> {
         for root in roots {
-            let sid = keep_root(root, self.record.user.as_deref())
+            let (sid, walked) = keep_root(root, self.record.user.as_deref())
                 .map_err(|e| format!("workspace-write could not grant {}: {e}", root.display()))?;
             self.root_sids.push(sid);
+            if walked {
+                self.walked.push(root.clone());
+            }
         }
         Ok(())
+    }
+
+    /// The roots whose grant this lease made, walking their trees.
+    #[cfg(test)]
+    fn walked(&self) -> &[PathBuf] {
+        &self.walked
     }
 
     /// Grant each root in turn ([`grant_root`]), for [`Lease::acquire`],
@@ -536,17 +549,19 @@ pub(crate) fn root_sid(root: &Path) -> Result<String, String> {
 /// to the account and the user's own ACL rights beneath ([`keep_acl_rights`]).
 /// Each is read off the folder's own ACL first ([`passes_down`]) and made
 /// only when missing, so a root granted before costs one ACL read, not a
-/// walk of its tree. The SID.
+/// walk of its tree. The SID, and whether a grant had to be made (a walk).
 ///
 /// A grant that fails part-way (a file beneath the user may not re-ACL) has
 /// the root's ACE taken off again, so the next run walks and reports it
 /// again instead of finding the ACE on the folder and trusting a tree only
 /// part granted. Under the ACL lock throughout, so two runs granting the
 /// same new folder do not both walk it.
-fn keep_root(root: &Path, user: Option<&str>) -> Result<String, String> {
+fn keep_root(root: &Path, user: Option<&str>) -> Result<(String, bool), String> {
     let sid = root_sid(root)?;
     let _lock = AclLock::take()?;
+    let mut walked = false;
     if !passes_down(root, &sid, MODIFY)? {
+        walked = true;
         if let Err(e) = change(root, &sid, Change::Grant(MODIFY)) {
             let _ = change(root, &sid, Change::Revoke);
             return Err(e);
@@ -554,15 +569,16 @@ fn keep_root(root: &Path, user: Option<&str>) -> Result<String, String> {
     }
     if let Some(user) = user {
         if !passes_down(root, user, MODIFY)? {
+            walked = true;
             if let Err(e) = grant_account(root, user, MODIFY) {
                 let _ = change(root, user, Change::Revoke);
                 return Err(e);
             }
         }
-        keep_acl_rights(root)?;
+        walked |= keep_acl_rights(root)?;
     }
     remember_kept(root);
-    Ok(sid)
+    Ok((sid, walked))
 }
 
 /// Make sure the offline account `user` may read the folder `dir` (the
@@ -676,8 +692,8 @@ pub fn kept_folders() -> Result<Vec<KeptFolder>, String> {
 /// account `user`, the account's ACEs on it; then drop it from the kept
 /// list. The user's own ACL rights stay ([`keep_acl_rights`] says why). A
 /// run that is using the folder right now loses its writes there. The next
-/// run with it as a root grants the whole tree again, which also reaches
-/// files moved in since.
+/// run with it as a root grants the whole tree again (files moved in keep
+/// their own ACL even then; `icacls <FILE> /reset` fixes one).
 ///
 /// # Errors
 /// When an ACE cannot be removed; the folder stays listed then.
@@ -1536,11 +1552,11 @@ mod tests {
 
     /// **A KEPT GRANT IS MADE ONCE, THEN ONLY READ; REVOKE TAKES IT BACK**:
     /// the first lease walks the root (a file beneath gets the root's ACE);
-    /// a file then MOVED in keeps the ACL it had, and the second lease leaves
-    /// it so, which shows the second lease did not walk the tree (a walk
-    /// would have given it the ACE). `revoke_kept` takes the ACE off the root
-    /// and its files and drops the root from the kept list; the next lease
-    /// walks again, and the moved file gets the ACE.
+    /// the second only reads the root's ACL and walks nothing. `revoke_kept`
+    /// takes the ACE off the root and its files and drops the root from the
+    /// kept list; the next lease walks again. A file MOVED in keeps the ACL
+    /// it had through all of it (no walk re-ACLs it, kept grant or not), and
+    /// `icacls /reset` gives it the folder's.
     #[test]
     fn a_kept_grant_is_made_once_then_only_read_and_revoke_takes_it_back() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1559,6 +1575,11 @@ mod tests {
 
         let first = Lease::acquire(std::slice::from_ref(&root), &temp("t1"), None).expect("first");
         assert_eq!(first.root_sids(), std::slice::from_ref(&sid));
+        assert_eq!(
+            first.walked(),
+            std::slice::from_ref(&root),
+            "the first walks"
+        );
         drop(first);
         assert!(acl_of(&root).contains(&sid), "kept on the root");
         assert!(acl_of(&beneath).contains(&sid), "and beneath it");
@@ -1576,12 +1597,9 @@ mod tests {
         let second =
             Lease::acquire(std::slice::from_ref(&root), &temp("t2"), None).expect("second");
         assert_eq!(second.root_sids(), std::slice::from_ref(&sid));
+        assert!(second.walked().is_empty(), "the second only reads the ACL");
         drop(second);
-        assert!(
-            !acl_of(&moved).contains(&sid),
-            "the second lease walked the tree: {}",
-            acl_of(&moved)
-        );
+        assert!(!acl_of(&moved).contains(&sid), "{}", acl_of(&moved));
 
         revoke_kept(&root, None).expect("revoke");
         for path in [&root, &beneath] {
@@ -1594,12 +1612,31 @@ mod tests {
         );
 
         let third = Lease::acquire(std::slice::from_ref(&root), &temp("t3"), None).expect("third");
+        assert_eq!(
+            third.walked(),
+            std::slice::from_ref(&root),
+            "revoked: walks again"
+        );
         drop(third);
         assert!(
-            acl_of(&moved).contains(&sid),
+            acl_of(&beneath).contains(&sid),
             "granted again, the whole tree: {}",
-            acl_of(&moved)
+            acl_of(&beneath)
         );
+        // The moved file: not reached by the walk either; `icacls /reset`
+        // rebuilds its ACL from its folder's.
+        assert!(!acl_of(&moved).contains(&sid), "{}", acl_of(&moved));
+        let reset = std::process::Command::new("icacls")
+            .arg(&moved)
+            .arg("/reset")
+            .output()
+            .expect("icacls");
+        assert!(
+            reset.status.success(),
+            "{}",
+            String::from_utf8_lossy(&reset.stdout)
+        );
+        assert!(acl_of(&moved).contains(&sid), "reset: {}", acl_of(&moved));
         revoke_kept(&root, None).expect("cleanup");
     }
 

@@ -33,7 +33,7 @@ USAGE:
                              each still carries it
     insbx revoke <DIR>... | --all
                              Windows: take a folder's kept grant back; its next run grants
-                             it again, files moved in since included
+                             it again
 
 KEPT GRANTS (Windows):
     A writable root's grant is written into every file beneath it, so it is made by the
@@ -41,7 +41,7 @@ KEPT GRANTS (Windows):
     the tree twice per run. Each folder has its own SID, and a run's token carries only
     its own roots' SIDs, so a kept grant lets no other run write there. A file moved into
     a root from elsewhere keeps its old ACL (not writable to the command) until
-    `insbx revoke <ROOT>`.
+    `icacls <FILE> /reset` gives it its folder's.
 
 MCP OPTIONS (the ceilings; an agent can ask for less, never more):
         --root <DIR>         where sandboxes live (default: <temp>/insbx-mcp-<pid>)
