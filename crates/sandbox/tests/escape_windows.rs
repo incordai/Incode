@@ -15,11 +15,12 @@
 
 #![cfg(windows)]
 
+use std::cell::RefCell;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio};
-use std::sync::OnceLock;
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -1292,7 +1293,23 @@ fn needs_msys(test: &str) -> bool {
         eprintln!("SKIPPED {test}: Git for Windows is not at {GIT_BASH}");
         return false;
     }
+    // The msys tests share the msys account and its records: a crash test
+    // leaves a record that refuses every other msys run, so they go one at a
+    // time. The guard lives until the test's thread ends.
+    MSYS_TEST_GUARD.with(|guard| {
+        if guard.borrow().is_none() {
+            let held = MSYS_TESTS.lock().unwrap_or_else(PoisonError::into_inner);
+            *guard.borrow_mut() = Some(held);
+        }
+    });
     true
+}
+
+/// Held by every running msys test ([`needs_msys`]).
+static MSYS_TESTS: Mutex<()> = Mutex::new(());
+
+thread_local! {
+    static MSYS_TEST_GUARD: RefCell<Option<MutexGuard<'static, ()>>> = const { RefCell::new(None) };
 }
 
 /// `insbx run --msys --net deny -w <roots> -- bash -c <script>`.
@@ -1435,24 +1452,30 @@ public static class Probe {
   static extern IntPtr OpenThread(uint access, bool inherit, uint tid);
   [DllImport("kernel32.dll")]
   static extern bool CloseHandle(IntPtr h);
-  // THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME: what hijacking a thread takes.
-  public static string Open(uint tid) {
-    IntPtr h = OpenThread(0x12, false, tid);
+  public static string Open(uint tid, uint right) {
+    IntPtr h = OpenThread(right, false, tid);
     if (h == IntPtr.Zero) { return "denied:" + Marshal.GetLastWin32Error(); }
     CloseHandle(h);
     return "ok";
   }
 }
 "@
+# Each write right a command could take a thread over with, ON ITS OWN:
+# THREAD_SET_CONTEXT, THREAD_SUSPEND_RESUME, THREAD_SET_INFORMATION, WRITE_DAC, WRITE_OWNER.
+$rights = @(0x10, 0x2, 0x20, 0x40000, 0x80000)
 $n = 0
 foreach ($p in (Get-Process -Name insbx -ErrorAction SilentlyContinue)) {
   $n++
-  foreach ($t in $p.Threads) { Write-Output ("THREAD " + $p.Id + " " + $t.Id + " " + [Probe]::Open([uint32]$t.Id)) }
+  foreach ($t in $p.Threads) {
+    foreach ($r in $rights) { Write-Output ("THREAD " + $p.Id + " " + $t.Id + " " + $r + " " + [Probe]::Open([uint32]$t.Id, [uint32]$r)) }
+  }
 }
 Write-Output ("INSBX-PROCESSES " + $n)
 $c = Start-Process -FilePath cmd.exe -ArgumentList '/d','/c','ping -n 8 127.0.0.1 > nul' -PassThru -WindowStyle Hidden
 Start-Sleep -Milliseconds 500
-foreach ($t in $c.Threads) { Write-Output ("CONTROL " + [Probe]::Open([uint32]$t.Id)) }
+foreach ($t in $c.Threads) {
+  foreach ($r in $rights) { Write-Output ("CONTROL " + $r + " " + [Probe]::Open([uint32]$t.Id, [uint32]$r)) }
+}
 Stop-Process -Id $c.Id -Force
 "#;
 
@@ -1487,16 +1510,28 @@ fn the_msys_helpers_threads_cannot_be_opened_by_the_command() {
     );
     let threads: Vec<&str> = out.lines().filter(|l| l.starts_with("THREAD ")).collect();
     assert!(!threads.is_empty(), "{out}");
+    // Every right, on its own, on every thread: denied (error 5), or the
+    // thread has just exited (87).
     for line in &threads {
         assert!(
-            line.ends_with("denied:5"),
-            "the command opened a helper's thread for context/suspend: {line}\n{out}"
+            line.ends_with("denied:5") || line.ends_with("denied:87"),
+            "the command opened a helper's thread for a write right: {line}\n{out}"
         );
     }
-    assert!(
-        out.lines().any(|l| l.trim() == "CONTROL ok"),
-        "the control (a thread of its own child) must open, or the probe proves nothing: {out}"
-    );
+    for right in ["16", "2", "32", "262144", "524288"] {
+        assert!(
+            threads
+                .iter()
+                .any(|l| l.contains(&format!(" {right} denied:5"))),
+            "right {right} was probed and denied: {out}"
+        );
+        assert!(
+            out.lines()
+                .any(|l| l.trim() == format!("CONTROL {right} ok")),
+            "the control (a thread of its own child) must open for right {right}, or the \
+             probe proves nothing: {out}"
+        );
+    }
     let o = insbx(&["revoke", "."], &d.ws);
     assert_eq!(o.status.code(), Some(0), "{}", text(&o));
 }
@@ -1553,13 +1588,213 @@ fn a_crashed_msys_runs_leftovers_refuse_the_next_run_until_cleared() {
     assert!(said.contains("--msys-leftovers"), "and the way out: {said}");
     assert!(!d.ws.join("x").exists(), "nothing ran: {said}");
 
-    let cleared = insbx(&["revoke", "--msys-leftovers"], &d.ws);
+    // A root that is gone is not taken on the user's word: without
+    // `--forget-gone` the record stays, the exit code says so, and msys runs
+    // stay refused.
+    let kept = insbx(&["revoke", "--msys-leftovers"], &d.ws);
+    let said = text(&kept);
+    assert_eq!(kept.status.code(), Some(1), "{said}");
+    assert!(said.contains("--forget-gone"), "says how: {said}");
+    assert!(record.exists(), "the record is kept");
+    let still = bash_msys(&d.ws, &[], "echo ok > x");
+    assert_eq!(still.status.code(), Some(125), "{}", text(&still));
+
+    let cleared = insbx(&["revoke", "--msys-leftovers", "--forget-gone"], &d.ws);
     assert_eq!(cleared.status.code(), Some(0), "{}", text(&cleared));
     assert!(!record.exists(), "the record is dropped");
     let again = bash_msys(&d.ws, &[], "echo ok > x");
     assert_eq!(again.status.code(), Some(0), "{}", text(&again));
     assert!(d.ws.join("x").exists());
     let _ = std::fs::remove_file(&record);
+    let o = insbx(&["revoke", "."], &d.ws);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+}
+
+/// An open handle to the liveness mutex of the live run whose grant record
+/// names `root` as an msys root, closed on drop.
+struct Liveness(windows_sys::Win32::Foundation::HANDLE);
+
+impl Drop for Liveness {
+    fn drop(&mut self) {
+        // SAFETY: a handle this test opened, closed once.
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+    }
+}
+
+fn hold_liveness_of_run_rooted_at(root: &Path) -> Liveness {
+    use windows_sys::Win32::System::Threading::{OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
+    let grants = PathBuf::from(std::env::var_os("LOCALAPPDATA").expect("LOCALAPPDATA"))
+        .join("insbx")
+        .join("grants");
+    let root = root.to_string_lossy().into_owned();
+    let rid = std::fs::read_dir(&grants)
+        .expect("grants dir")
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "grant"))
+        .find(|e| {
+            std::fs::read_to_string(e.path()).is_ok_and(|t| {
+                t.lines()
+                    .any(|l| l.starts_with("modify ") && l.contains(&root))
+            })
+        })
+        .and_then(|e| e.path().file_stem()?.to_str().map(str::to_string))
+        .expect("the live run's record");
+    let name: Vec<u16> = format!("Global\\insbx-grant-{rid}")
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    // SAFETY: a NUL-terminated name; the handle is closed by `Liveness`.
+    let handle = unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, 0, name.as_ptr()) };
+    assert!(!handle.is_null(), "the run's liveness mutex");
+    Liveness(handle)
+}
+
+/// A REAL crash: an msys run is started and its `insbx run` killed, so its
+/// lease never drops and its record stays. Then its root is moved aside and a
+/// new folder made under the old name. The next msys run is refused; clearing
+/// without saying the folder is dealt with keeps the record (exit 1); only
+/// after the old folder is revoked where it went and `--forget-gone` is given
+/// does an msys run go again.
+#[test]
+fn a_root_moved_aside_and_replaced_after_a_crash_stays_refused_until_dealt_with() {
+    if !needs_msys("a_root_moved_aside_and_replaced_after_a_crash") {
+        return;
+    }
+    let d = dirs();
+    let mut crashing = base(&d.ws)
+        .args([
+            "run",
+            "--msys",
+            "--net",
+            "deny",
+            "-w",
+            ".",
+            "--",
+            GIT_BASH,
+            "-c",
+            "echo go > started; sleep 120",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("insbx");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !d.ws.join("started").exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(d.ws.join("started").exists(), "the run never started");
+    // Any other run's sweep (the offline tests run concurrently) would take
+    // the dead record's grant back, rightly, while the root still sits where
+    // it was. To test the window AFTER the move, this test keeps the run's
+    // liveness mutex open (`Global\insbx-grant-<rid>`, named in the record's
+    // file name) until the root is replaced: nobody sweeps a run that is
+    // "alive". Closing the handle is the moment the run becomes dead.
+    let alive = hold_liveness_of_run_rooted_at(&d.ws);
+    // The crash: the process that holds the lease dies; nothing revokes.
+    crashing.kill().expect("kill insbx run");
+    let _ = crashing.wait();
+
+    // Its helper notices and ends the command; then the root can be moved.
+    let aside = d.ws.with_file_name("ws.bak");
+    let moved = (0..150).any(|_| {
+        std::thread::sleep(Duration::from_millis(200));
+        std::fs::rename(&d.ws, &aside).is_ok()
+    });
+    assert!(moved, "the crashed run's command never let go of the root");
+    std::fs::create_dir(&d.ws).expect("a new root under the old name");
+    drop(alive);
+
+    let refused = bash_msys(&d.ws, &[], "echo ok > x");
+    let said = text(&refused);
+    assert_eq!(refused.status.code(), Some(125), "{said}");
+    assert!(said.contains("--msys-leftovers"), "{said}");
+    assert!(!d.ws.join("x").exists(), "{said}");
+
+    let kept = insbx(&["revoke", "--msys-leftovers"], &d.out);
+    let said = text(&kept);
+    assert_eq!(kept.status.code(), Some(1), "{said}");
+    assert!(said.contains("replaced") && said.contains("KEPT"), "{said}");
+    let still = bash_msys(&d.ws, &[], "echo ok > x");
+    assert_eq!(still.status.code(), Some(125), "{}", text(&still));
+
+    // The user takes the grant back where the folder went, then says so.
+    let o = insbx(&["revoke", aside.to_str().expect("utf8")], &d.out);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    assert!(
+        !icacls(&aside).contains(MSYS),
+        "the moved folder no longer names the account: {}",
+        icacls(&aside)
+    );
+    let o = insbx(&["revoke", "--msys-leftovers", "--forget-gone"], &d.out);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    let again = bash_msys(&d.ws, &[], "echo ok > x");
+    assert_eq!(again.status.code(), Some(0), "{}", text(&again));
+    assert!(d.ws.join("x").exists());
+    let o = insbx(&["revoke", "."], &d.ws);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+}
+
+/// A subfolder that carries its own inheritable CREATOR OWNER entry (the root
+/// does not, so the root check passes): what the msys account creates there
+/// gets an entry naming it, which a revoke cannot clear (re-propagation
+/// resolves CREATOR OWNER to the owner, still the account). The next run is
+/// refused naming the object; `--msys-leftovers` re-reads the tree, finds it
+/// comes back, keeps the record and SAYS why (exit 1), msys runs stay refused;
+/// once the CREATOR OWNER entry is removed it clears and runs go again.
+#[test]
+fn a_subfolder_with_its_own_creator_owner_entry_stays_refused_until_it_is_removed() {
+    if !needs_msys("a_subfolder_with_its_own_creator_owner_entry") {
+        return;
+    }
+    let d = dirs();
+    let sub = d.ws.join("sub");
+    std::fs::create_dir(&sub).expect("sub");
+    let set = Command::new("icacls")
+        .arg(&sub)
+        .args(["/grant", "*S-1-3-0:(OI)(CI)(IO)F"])
+        .output()
+        .expect("icacls");
+    assert!(
+        set.status.success(),
+        "{}",
+        String::from_utf8_lossy(&set.stdout)
+    );
+
+    let first = bash_msys(&d.ws, &[], "echo x > sub/f; echo ok");
+    assert_eq!(first.status.code(), Some(0), "{}", text(&first));
+    assert!(sub.join("f").exists());
+
+    // What was left is found by its effect, and the next run is refused.
+    let refused = bash_msys(&d.ws, &[], "echo y > y");
+    let said = text(&refused);
+    assert_eq!(refused.status.code(), Some(125), "{said}");
+    assert!(said.contains("sub"), "names the object: {said}");
+
+    // A revoke cannot clear it: the record is kept, with the reason.
+    let kept = insbx(&["revoke", "--msys-leftovers"], &d.ws);
+    let said = text(&kept);
+    assert_eq!(kept.status.code(), Some(1), "{said}");
+    assert!(said.contains("CREATOR OWNER"), "says why: {said}");
+    assert!(said.contains("KEPT"), "{said}");
+    let still = bash_msys(&d.ws, &[], "echo y > y");
+    assert_eq!(
+        still.status.code(),
+        Some(125),
+        "must stay refused: {}",
+        text(&still)
+    );
+
+    // Removing the CREATOR OWNER entry (and what came of it) lets it clear.
+    let o = Command::new("icacls")
+        .arg(&sub)
+        .args(["/remove:g", "*S-1-3-0"])
+        .output()
+        .expect("icacls");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stdout));
+    let cleared = insbx(&["revoke", "--msys-leftovers"], &d.ws);
+    assert_eq!(cleared.status.code(), Some(0), "{}", text(&cleared));
+    let again = bash_msys(&d.ws, &[], "echo y > y");
+    assert_eq!(again.status.code(), Some(0), "{}", text(&again));
     let o = insbx(&["revoke", "."], &d.ws);
     assert_eq!(o.status.code(), Some(0), "{}", text(&o));
 }

@@ -138,7 +138,7 @@ pub(crate) mod setup;
 mod token;
 
 #[cfg(windows)]
-pub use acl::{clear_msys_leftovers, kept_folders, revoke_kept, KeptFolder};
+pub use acl::{clear_msys_leftovers, kept_folders, revoke_kept, Cleared, KeptFolder};
 #[cfg(windows)]
 pub(crate) use helper::enter;
 

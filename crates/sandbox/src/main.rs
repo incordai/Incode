@@ -31,11 +31,14 @@ USAGE:
                              --remove undoes all of it
     insbx grants               Windows: the folders whose write grant is kept, and whether
                              each still carries it
-    insbx revoke <DIR>... | --all [--msys-leftovers]
+    insbx revoke <DIR>... | --all [--msys-leftovers [--forget-gone]]
                              Windows: take a folder's kept grant back (the msys account's
                              access too); its next run grants it again. --msys-leftovers
                              clears what a crashed --msys run left that its sweep could not
-                             take back (a moved root...), which refuses every --msys run
+                             take back (a moved root...), which refuses every --msys run;
+                             it re-reads the trees and keeps a record whose access comes
+                             back (exit 1), and keeps one naming a root that is gone or
+                             replaced unless --forget-gone says it is dealt with
 
 KEPT GRANTS (Windows):
     A writable root's grant is written into every file beneath it, so it is made by the
@@ -429,7 +432,11 @@ fn revoke(args: &[OsString]) -> Result<i32, String> {
         .map(|a| a.to_str().ok_or("an argument is not valid Unicode"))
         .collect::<Result<_, _>>()?;
     let leftovers = words.contains(&"--msys-leftovers");
-    words.retain(|w| *w != "--msys-leftovers");
+    let forget_gone = words.contains(&"--forget-gone");
+    words.retain(|w| *w != "--msys-leftovers" && *w != "--forget-gone");
+    if forget_gone && !leftovers {
+        return Err("--forget-gone goes with --msys-leftovers".into());
+    }
     if words.is_empty() && !leftovers {
         return Err("revoke what? give folders, or --all, or --msys-leftovers".into());
     }
@@ -442,14 +449,6 @@ fn revoke(args: &[OsString]) -> Result<i32, String> {
             .flat_map(|r| [r.sid.clone(), r.msys_sid.clone()])
             .collect();
         let mut failed = false;
-        if leftovers {
-            let setup = setup.as_ref().ok_or(
-                "--msys-leftovers needs the setup (`insbx setup-windows`): see `insbx doctor`",
-            )?;
-            for line in windows::clear_msys_leftovers(&setup.msys_sid)? {
-                println!("insbx revoke: {line}");
-            }
-        }
         let folders: Vec<PathBuf> = if words.is_empty() {
             Vec::new()
         } else if words == ["--all"] {
@@ -473,6 +472,18 @@ fn revoke(args: &[OsString]) -> Result<i32, String> {
                     failed = true;
                 }
             }
+        }
+        // The folders first (where a moved root now is), then the records.
+        if leftovers {
+            let setup = setup.as_ref().ok_or(
+                "--msys-leftovers needs the setup (`insbx setup-windows`): see `insbx doctor`",
+            )?;
+            let cleared = windows::clear_msys_leftovers(&setup.msys_sid, forget_gone)?;
+            for line in &cleared.lines {
+                println!("insbx revoke: {line}");
+            }
+            // Records that stay mean msys runs stay refused: not a success.
+            failed |= cleared.kept > 0;
         }
         Ok(i32::from(failed))
     }

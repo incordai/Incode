@@ -35,14 +35,14 @@ use std::ffi::OsString;
 use std::os::windows::ffi::OsStrExt;
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, SetHandleInformation, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND,
+    CloseHandle, GetLastError, SetHandleInformation, ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER,
     ERROR_PATH_NOT_FOUND, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Security::Authorization::{SetSecurityInfo, SE_KERNEL_OBJECT};
 use windows_sys::Win32::Security::{
     DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
 };
-use windows_sys::Win32::Storage::FileSystem::WRITE_DAC;
+use windows_sys::Win32::Storage::FileSystem::{WRITE_DAC, WRITE_OWNER};
 use windows_sys::Win32::System::Console::{
     GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
@@ -62,7 +62,7 @@ use windows_sys::Win32::System::Threading::{
     OpenThread, ResumeThread, TerminateProcess, WaitForMultipleObjects, WaitForSingleObject,
     CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, INFINITE, PROCESS_INFORMATION,
     PROCESS_SYNCHRONIZE, STARTF_USESTDHANDLES, STARTUPINFOW, THREAD_SET_CONTEXT,
-    THREAD_SUSPEND_RESUME,
+    THREAD_SET_INFORMATION, THREAD_SUSPEND_RESUME,
 };
 
 use super::job_flags;
@@ -190,6 +190,14 @@ fn token_for(spec: &EnterSpec) -> Result<Option<OwnedHandle>, Failure> {
 /// helper's job: confine and start the command, wait, pass its code on.
 /// Nothing to watch: if the first helper goes, its job takes this down.
 fn inner(spec: &EnterSpec, program: &OsString, args: &[OsString]) -> Result<i32, Failure> {
+    // The command's token is made FIRST, and only then is this process locked:
+    // locking sets this process token's default DACL to the thread DACL
+    // ([`harden_own_process`]), and a token made after that could take it for
+    // its own security descriptor and deny the command `TOKEN_QUERY` on its
+    // own token (PowerShell and Git Bash query it). The token already made
+    // keeps what it was given; the command does not exist until `start`.
+    let token = token_for(spec)?;
+    let (application, mut line) = command_for(program, args)?;
     // The command runs as this same account: keep it from opening this
     // (unrestricted) process to write into it.
     if let Err(e) = harden_own_process() {
@@ -202,8 +210,6 @@ fn inner(spec: &EnterSpec, program: &OsString, args: &[OsString]) -> Result<i32,
         }
         eprintln!("insbx: helper not protected from the command (best effort): {e}");
     }
-    let token = token_for(spec)?;
-    let (application, mut line) = command_for(program, args)?;
     let child = start(token.as_ref(), &application, &mut line, None)?;
     // SAFETY: the process handle is ours.
     if unsafe { WaitForSingleObject(child.0, INFINITE) } != WAIT_OBJECT_0 {
@@ -316,9 +322,9 @@ fn harden_own_threads() -> Result<(), String> {
 ///   locked thread denies even its owner `WRITE_DAC`.
 /// - Any other thread is opened for `WRITE_DAC` and locked.
 /// - One that cannot be opened for that is fine only if it is ALREADY locked:
-///   it also cannot be opened for what hijacking takes
-///   ([`thread_opens_for_hijack`]). A thread that is neither lockable nor
-///   locked is the failure.
+///   every write right is denied on it ([`thread_lock_state`]). A thread that
+///   is neither lockable nor locked is the failure. A thread that has exited
+///   meanwhile (`ERROR_INVALID_PARAMETER`) is gone, not a failure.
 fn harden_thread(tid: u32) -> Result<(), String> {
     // SAFETY: the pseudo-handle needs no closing; a thread handle opened here
     // is owned and closed.
@@ -332,27 +338,58 @@ fn harden_thread(tid: u32) -> Result<(), String> {
             return harden_handle(thread.0, HELPER_THREAD_SDDL);
         }
         let err = GetLastError();
-        if err == ERROR_ACCESS_DENIED && !thread_opens_for_hijack(tid) {
+        if err == ERROR_INVALID_PARAMETER {
             return Ok(());
         }
-        Err(format!(
-            "cannot be locked and is not locked already (OpenThread error {err})"
-        ))
+        match thread_lock_state(tid) {
+            ThreadLock::Locked | ThreadLock::Gone => Ok(()),
+            ThreadLock::Open(right) => Err(format!(
+                "cannot be locked and can still be opened for {right} (OpenThread error {err})"
+            )),
+        }
     }
 }
 
-/// Whether this process can open the thread `tid` for what hijacking it
-/// takes: `THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME`.
-fn thread_opens_for_hijack(tid: u32) -> bool {
-    // SAFETY: opens a thread by id; a handle returned is closed at once.
-    unsafe {
-        let h = OpenThread(THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME, 0, tid);
-        if h.is_null() {
-            return false;
+/// The write rights on a thread whose grant would let a command take it over
+/// (redirect it, stop it, change it, rewrite its ACL, take it over), each
+/// tried ON ITS OWN: a DACL that grants only one of them is not a locked
+/// thread.
+const THREAD_WRITE_RIGHTS: [(u32, &str); 5] = [
+    (THREAD_SET_CONTEXT, "THREAD_SET_CONTEXT"),
+    (THREAD_SUSPEND_RESUME, "THREAD_SUSPEND_RESUME"),
+    (THREAD_SET_INFORMATION, "THREAD_SET_INFORMATION"),
+    (WRITE_DAC, "WRITE_DAC"),
+    (WRITE_OWNER, "WRITE_OWNER"),
+];
+
+/// What opening a thread for each of [`THREAD_WRITE_RIGHTS`] says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThreadLock {
+    /// Every one is denied: the thread is locked.
+    Locked,
+    /// This one opens: the thread is not locked.
+    Open(&'static str),
+    /// The thread has exited (`ERROR_INVALID_PARAMETER`).
+    Gone,
+}
+
+/// Whether this process can open the thread `tid` for any of
+/// [`THREAD_WRITE_RIGHTS`], each separately.
+fn thread_lock_state(tid: u32) -> ThreadLock {
+    for (right, name) in THREAD_WRITE_RIGHTS {
+        // SAFETY: opens a thread by id; a handle returned is closed at once.
+        unsafe {
+            let h = OpenThread(right, 0, tid);
+            if !h.is_null() {
+                CloseHandle(h);
+                return ThreadLock::Open(name);
+            }
+            if GetLastError() == ERROR_INVALID_PARAMETER {
+                return ThreadLock::Gone;
+            }
         }
-        CloseHandle(h);
-        true
     }
+    ThreadLock::Locked
 }
 
 /// Start the second helper as the offline account, suspended, put it in
@@ -712,6 +749,7 @@ fn start(
 mod tests {
     use super::*;
     use crate::windows::token::set_token_default_dacl;
+    use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
     use windows_sys::Win32::Security::{
         DuplicateTokenEx, SecurityImpersonation, TokenPrimary, TOKEN_ADJUST_DEFAULT,
         TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_QUERY,
@@ -902,9 +940,12 @@ mod tests {
     fn hardening_a_thread_that_is_already_locked_is_not_an_error() {
         // An ordinary other thread: opens before, locked after.
         with_parked_thread(|tid| {
-            assert!(thread_opens_for_hijack(tid), "control: unlocked opens");
+            assert!(
+                matches!(thread_lock_state(tid), ThreadLock::Open(_)),
+                "control: unlocked opens"
+            );
             harden_thread(tid).expect("locks an unlocked thread");
-            assert!(!thread_opens_for_hijack(tid), "locked after");
+            assert_eq!(thread_lock_state(tid), ThreadLock::Locked, "locked after");
         });
         // Locked by the parent first, as `launch_offline` does: the owner
         // cannot even open it for WRITE_DAC now, and that is fine.
@@ -920,21 +961,93 @@ mod tests {
                 "a locked thread denies its owner WRITE_DAC"
             );
             harden_thread(tid).expect("already locked is not an error");
-            assert!(!thread_opens_for_hijack(tid));
+            assert_eq!(thread_lock_state(tid), ThreadLock::Locked);
         });
         // The CURRENT thread, locked already: the pseudo-handle still works.
         std::thread::spawn(|| {
             // SAFETY: reads the calling thread's id.
             let me = unsafe { GetCurrentThreadId() };
             harden_handle(unsafe { GetCurrentThread() }, HELPER_THREAD_SDDL).expect("locked");
-            assert!(!thread_opens_for_hijack(me));
+            assert_eq!(thread_lock_state(me), ThreadLock::Locked);
             harden_thread(me).expect("the current thread, locked, is hardened again");
         })
         .join()
         .expect("the thread");
-        // Neither lockable nor locked (there is no such thread): the failure.
-        let err = harden_thread(0xffff_fff0).expect_err("a thread that is not there");
-        assert!(err.contains("not locked already"), "{err}");
+        // A thread that has exited (here: one that is not there,
+        // ERROR_INVALID_PARAMETER) is gone, not a failure.
+        assert_eq!(thread_lock_state(0xffff_fff0), ThreadLock::Gone);
+        harden_thread(0xffff_fff0).expect("a thread that has exited is not an error");
+    }
+
+    /// **EACH WRITE RIGHT IS TRIED ON ITS OWN**: before locking every one of
+    /// [`THREAD_WRITE_RIGHTS`] opens (the control, right by right); after,
+    /// every one is denied, so a DACL granting just one would be seen.
+    #[test]
+    fn a_locked_thread_denies_each_write_right_separately() {
+        with_parked_thread(|tid| {
+            for (right, name) in THREAD_WRITE_RIGHTS {
+                // SAFETY: opens a thread by id; a handle returned is closed.
+                let h = unsafe { OpenThread(right, 0, tid) };
+                assert!(!h.is_null(), "control: {name} opens an ordinary thread");
+                unsafe { CloseHandle(h) };
+            }
+            harden_thread(tid).expect("locked");
+            for (right, name) in THREAD_WRITE_RIGHTS {
+                // SAFETY: as above.
+                let h = unsafe { OpenThread(right, 0, tid) };
+                assert!(h.is_null(), "{name} still opens a locked thread");
+                assert_eq!(unsafe { GetLastError() }, ERROR_ACCESS_DENIED, "{name}");
+            }
+            assert_eq!(thread_lock_state(tid), ThreadLock::Locked);
+        });
+    }
+
+    /// **LOCKING THE HELPER MUST NOT TAKE THE COMMAND'S OWN TOKEN FROM IT**:
+    /// the second helper's token default DACL becomes the thread DACL, and
+    /// the command's process (made by that helper) gets a token object. Run in
+    /// a copy of this test binary as the "helper": lock its default DACL, make
+    /// the restricted token, start a suspended child with it, and open the
+    /// CHILD's process token for `TOKEN_QUERY` (what PowerShell and Git Bash
+    /// do to their own). Measured, so the ordering in `inner` rests on it.
+    #[test]
+    fn a_command_started_by_a_locked_helper_can_query_its_own_token() {
+        const ROLE: &str = "INSBX_TEST_LOCKED_HELPER";
+        if std::env::var_os(ROLE).is_some() {
+            set_own_default_dacl(HELPER_THREAD_SDDL).expect("the helper locked");
+            let token = restricted(&crate::windows::session_sid(1), &[], None).expect("a token");
+            let pi = suspended_child_as(Some(token.0));
+            // SAFETY: the child's process handle is ours; a token handle
+            // returned is closed.
+            unsafe {
+                let mut own: HANDLE = std::ptr::null_mut();
+                let ok = OpenProcessToken(pi.hProcess, TOKEN_QUERY, &mut own);
+                if ok != 0 {
+                    CloseHandle(own);
+                    println!("TOKEN-QUERY ok");
+                } else {
+                    println!("TOKEN-QUERY denied {}", GetLastError());
+                }
+                TerminateProcess(pi.hProcess, 0);
+                CloseHandle(pi.hThread);
+                CloseHandle(pi.hProcess);
+            }
+            return;
+        }
+        let out = std::process::Command::new(std::env::current_exe().expect("this test binary"))
+            .args([
+                "a_command_started_by_a_locked_helper_can_query_its_own_token",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(ROLE, "1")
+            .output()
+            .expect("runs");
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            text.contains("TOKEN-QUERY ok"),
+            "the child's own token must stay queryable: {text}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     /// **A THREAD MADE AFTER THE SNAPSHOT IS BORN LOCKED** when the helper's

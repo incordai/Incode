@@ -801,6 +801,22 @@ fn modify_present(path: &Path, id: Option<FileId>) -> bool {
 /// are not entered). At most [`LEFTOVER_CAP`] objects are listed; past that
 /// `root` itself is listed too, so clearing it revokes the whole tree.
 fn writable_for_account_beneath(root: &Path, user: &str) -> Vec<PathBuf> {
+    let mut found = walk_writable(root, user, LEFTOVER_CAP);
+    if found.len() >= LEFTOVER_CAP && !found.iter().any(|p| p == root) {
+        found.push(root.to_path_buf());
+    }
+    found
+}
+
+/// The first object at or beneath `root` that still carries a write entry for
+/// `user`, if any: an existence check with no cap, for deciding a record is
+/// done with.
+fn first_writable_for_account_beneath(root: &Path, user: &str) -> Option<PathBuf> {
+    walk_writable(root, user, 1).into_iter().next()
+}
+
+/// The walk behind both: up to `limit` objects with a write entry for `user`.
+fn walk_writable(root: &Path, user: &str, limit: usize) -> Vec<PathBuf> {
     use std::os::windows::fs::MetadataExt;
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
     let Ok(trustee) = sid(user) else {
@@ -811,10 +827,7 @@ fn writable_for_account_beneath(root: &Path, user: &str) -> Vec<PathBuf> {
     while let Some(path) = stack.pop() {
         if allows_more_than_read(&path, &trustee) {
             found.push(path.clone());
-            if found.len() >= LEFTOVER_CAP {
-                if !found.iter().any(|p| p == root) {
-                    found.push(root.to_path_buf());
-                }
+            if found.len() >= limit {
                 break;
             }
         }
@@ -829,6 +842,16 @@ fn writable_for_account_beneath(root: &Path, user: &str) -> Vec<PathBuf> {
         }
     }
     found
+}
+
+/// The folder at or above `path` that passes down a CREATOR OWNER entry, if
+/// one does: what makes an entry for the account come BACK after a revoke
+/// (re-propagation resolves CREATOR OWNER to the owner, still the account).
+fn creator_owner_source(path: &Path) -> Option<PathBuf> {
+    path.ancestors()
+        .filter(|a| a.is_dir())
+        .find(|a| inheritable_allow_masks(a, CREATOR_OWNER).is_ok_and(|m| !m.is_empty()))
+        .map(Path::to_path_buf)
 }
 
 /// How many objects [`writable_for_account_beneath`] lists before it gives
@@ -1534,6 +1557,17 @@ fn sweep_with(dir: &Path, real_accounts: fn() -> Vec<String>) {
         let Ok(_lock) = AclLock::take() else {
             return;
         };
+        // Read again, under the lock: another process (`insbx revoke
+        // --msys-leftovers`, another run's sweep) may have cleared or
+        // rewritten the record since it was read above, and acting on the old
+        // copy would write a cleared record back (measured: the escape tests
+        // saw a record they had cleared come back).
+        let Some(record) = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| GrantRecord::parse(&t))
+        else {
+            continue;
+        };
         let mut clean = true;
         for root in record.roots.iter().filter(|r| r.exists()) {
             if change(root, &record.sid, Change::Revoke).is_err() {
@@ -1651,7 +1685,8 @@ fn refuse_msys_leftovers(dir: &Path, user: &str) -> Result<(), String> {
         "a crashed msys run left access for the msys account that could not be taken back: {}{}. \
          Every msys run trusts that account, so msys runs are refused until it is cleared: run \
          `insbx revoke <FOLDER>` for each folder (where it is now, if it was moved), then \
-         `insbx revoke --msys-leftovers`",
+         `insbx revoke --msys-leftovers` (add `--forget-gone` for a folder that is really gone: \
+         without it a record naming one is kept)",
         paths.join(", "),
         if more > 0 {
             format!(" and {more} more")
@@ -1661,30 +1696,51 @@ fn refuse_msys_leftovers(dir: &Path, user: &str) -> Result<(), String> {
     ))
 }
 
+/// What [`clear_msys_leftovers`] did: a line per step, and how many records
+/// are still there (the next msys run is still refused while any is).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cleared {
+    pub lines: Vec<String>,
+    pub kept: usize,
+}
+
 /// `insbx revoke --msys-leftovers`: take back what crashed msys runs left for
-/// the msys account `user`, and drop their records. A path that exists has the
-/// account's ACE taken off (a `--read` folder keeps its read grant); one that
-/// is gone or moved cannot be searched for, so it is said, and its record
-/// dropped all the same: the user has been told to run `insbx revoke` on
-/// wherever it went. A record whose revoke failed stays. Waits for a running
-/// msys run (it holds the lock) rather than clearing under it.
+/// the msys account `user`, and drop their records ONLY when it is done:
+///
+/// - a path that exists has the account's ACE taken off (a `--read` folder
+///   keeps its read grant), and then the tree under it is READ AGAIN for any
+///   write entry for the account (no cap): one that comes back (an inherited
+///   CREATOR OWNER entry is resolved to the owner, still the account, by every
+///   re-propagation, so a revoke cannot clear it) keeps the record, and the
+///   message says the CREATOR OWNER entry must be removed or the owner changed;
+/// - a root that is gone, moved or replaced by another folder cannot be
+///   searched for: its record is KEPT unless `forget_gone` (`--forget-gone`)
+///   says the user has dealt with where it went.
+///
+/// Waits for a running msys run (it holds the lock) rather than clearing
+/// under it.
 ///
 /// # Errors
 /// When the msys lock or the ACL lock cannot be taken.
-pub fn clear_msys_leftovers(user: &str) -> Result<Vec<String>, String> {
+pub fn clear_msys_leftovers(user: &str, forget_gone: bool) -> Result<Cleared, String> {
     let _msys = MsysLock::take()?;
     let _lock = AclLock::take()?;
     let others = Others {
         setup_reads: super::setup::read_folders(),
         ..Others::default()
     };
-    Ok(clear_leftovers_in(&records_dir(), user, &others))
+    Ok(clear_leftovers_in(
+        &records_dir(),
+        user,
+        &others,
+        forget_gone,
+    ))
 }
 
-/// [`clear_msys_leftovers`]'s work on the records in `dir`: what it did, line
-/// by line.
-fn clear_leftovers_in(dir: &Path, user: &str, others: &Others) -> Vec<String> {
+/// [`clear_msys_leftovers`]'s work on the records in `dir`.
+fn clear_leftovers_in(dir: &Path, user: &str, others: &Others, forget_gone: bool) -> Cleared {
     let mut report = Vec::new();
+    let mut kept = 0;
     for (path, record) in leftover_records(dir, user) {
         let mut done = true;
         for root in record.roots.iter().filter(|r| r.exists()) {
@@ -1705,10 +1761,19 @@ fn clear_leftovers_in(dir: &Path, user: &str, others: &Others) -> Vec<String> {
             let is_root = i < record.modify.len();
             let id = if is_root { record.modify_id(i) } else { None };
             if !p.exists() || (is_root && !modify_present(p, id)) {
-                if is_root {
+                if is_root && forget_gone {
                     report.push(format!(
-                        "{} is gone, moved or replaced by another folder: nothing to take back \
-                         there (if it was moved, run `insbx revoke` on its new place)",
+                        "{} is gone, moved or replaced by another folder: forgotten \
+                         (--forget-gone)",
+                        p.display()
+                    ));
+                } else if is_root {
+                    done = false;
+                    report.push(format!(
+                        "{} is gone, moved or replaced by another folder: its record is KEPT, \
+                         and msys runs stay refused. If it was moved, run `insbx revoke` on its \
+                         new place, then `insbx revoke --msys-leftovers --forget-gone`; if it is \
+                         really gone, `--forget-gone` alone",
                         p.display()
                     ));
                 }
@@ -1725,14 +1790,52 @@ fn clear_leftovers_in(dir: &Path, user: &str, others: &Others) -> Vec<String> {
                 }
             }
         }
+        // Read the trees again: a revoke is not proof. An entry that came
+        // back, or that the release never reached, keeps the record.
+        for (i, p) in record.modify.iter().enumerate() {
+            if !modify_present(p, record.modify_id(i)) {
+                continue;
+            }
+            if let Some(left) = first_writable_for_account_beneath(p, user) {
+                done = false;
+                report.push(still_there_message(&left));
+            }
+        }
         if done {
             let _ = std::fs::remove_file(&path);
+        } else {
+            kept += 1;
         }
     }
     if report.is_empty() {
         report.push("no msys leftovers".to_string());
     }
-    report
+    Cleared {
+        lines: report,
+        kept,
+    }
+}
+
+/// What to tell the user when the msys account still has write access to
+/// `left` after a revoke: the CREATOR OWNER entry it comes from, when that is
+/// the cause (a revoke cannot clear it), or just that it is still there.
+fn still_there_message(left: &Path) -> String {
+    match creator_owner_source(left) {
+        Some(source) => format!(
+            "{} still names the msys account after the revoke, and it comes back: {} passes down \
+             a CREATOR OWNER entry, which every re-propagation resolves to the owner (the msys \
+             account) again, so a revoke cannot clear it. Remove that entry (`icacls {} \
+             /remove:g *S-1-3-0`) or change the owner of the files; the record is KEPT",
+            left.display(),
+            source.display(),
+            source.display()
+        ),
+        None => format!(
+            "{} still has a write entry for the msys account after the revoke; the record is \
+             KEPT and msys runs stay refused",
+            left.display()
+        ),
+    }
 }
 
 /// Whether run `rid` is still alive: its liveness mutex exists. Any answer
@@ -2606,17 +2709,100 @@ mod tests {
             std::slice::from_ref(&gone),
         );
 
-        let report = clear_leftovers_in(records.path(), FAKE_MSYS, &Others::default()).join("\n");
+        // Without `--forget-gone` a record naming a root that is gone STAYS.
+        let first = clear_leftovers_in(records.path(), FAKE_MSYS, &Others::default(), false);
+        let report = first.lines.join("\n");
         assert!(report.contains("took back"), "{report}");
         assert!(report.contains("gone, moved or replaced"), "{report}");
+        assert!(report.contains("--forget-gone"), "says how: {report}");
         assert!(report.contains(&gone.display().to_string()), "{report}");
-        assert!(!a.exists() && !b.exists(), "the records are dropped");
+        assert!(
+            !a.exists(),
+            "the record whose root was taken back is dropped"
+        );
+        assert!(b.exists(), "the record naming a gone root is kept");
+        assert_eq!(first.kept, 1);
         assert!(!passes_down(&there, FAKE_MSYS, MODIFY).expect("reads the ACL"));
+        assert!(
+            refuse_msys_leftovers(records.path(), FAKE_MSYS).is_err(),
+            "msys runs stay refused"
+        );
+
+        // With it, the user's word is taken.
+        let second = clear_leftovers_in(records.path(), FAKE_MSYS, &Others::default(), true);
+        assert!(second.lines.join("\n").contains("forgotten"), "{second:?}");
+        assert!(!b.exists());
+        assert_eq!(second.kept, 0);
         assert!(refuse_msys_leftovers(records.path(), FAKE_MSYS).is_ok());
         assert_eq!(
-            clear_leftovers_in(records.path(), FAKE_MSYS, &Others::default()),
+            clear_leftovers_in(records.path(), FAKE_MSYS, &Others::default(), false).lines,
             ["no msys leftovers"]
         );
+    }
+
+    /// **A REVOKE IS NOT PROOF**: when releasing a root leaves the account's
+    /// write entry on it (here another live run "needs" it, so the release
+    /// does nothing; a CREATOR OWNER entry that resolves back to the account
+    /// does the same), clearing keeps the record, and msys runs stay refused.
+    #[test]
+    fn clearing_keeps_a_record_whose_tree_still_names_the_account() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let records = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("root");
+        let deep = root.join("a").join("b");
+        std::fs::create_dir_all(&deep).expect("tree");
+        grant_account(&root, FAKE_MSYS, MODIFY).expect("grant");
+        let stored = write_record(
+            records.path(),
+            700_000_009,
+            FAKE_MSYS,
+            std::slice::from_ref(&root),
+        );
+        // The release is a no-op: someone else is said to need the root.
+        let others = Others {
+            grants: vec![(vec![root.clone()], Vec::new())],
+            ..Others::default()
+        };
+        let cleared = clear_leftovers_in(records.path(), FAKE_MSYS, &others, true);
+        let report = cleared.lines.join("\n");
+        assert!(stored.exists(), "kept: {report}");
+        assert_eq!(cleared.kept, 1);
+        assert!(report.contains("still has a write entry"), "{report}");
+        assert!(refuse_msys_leftovers(records.path(), FAKE_MSYS).is_err());
+        // The same with the entry only deep in the tree, past any cap: the
+        // existence check walks all of it.
+        let only_deep = tempfile::tempdir().expect("tempdir");
+        let tree = only_deep.path().join("r").join("x").join("y").join("z");
+        std::fs::create_dir_all(&tree).expect("tree");
+        change(&tree, FAKE_MSYS, Change::Grant(MODIFY)).expect("an entry deep down");
+        assert_eq!(
+            first_writable_for_account_beneath(&only_deep.path().join("r"), FAKE_MSYS),
+            Some(tree.clone()),
+        );
+        // Once really released it is done.
+        let honest = clear_leftovers_in(records.path(), FAKE_MSYS, &Others::default(), true);
+        assert_eq!(honest.kept, 0, "{honest:?}");
+        assert!(!stored.exists());
+    }
+
+    /// The message for an entry that comes back names the CREATOR OWNER entry
+    /// it comes from, and what to do (a revoke cannot clear it).
+    #[test]
+    fn an_entry_that_comes_back_names_its_creator_owner_source() {
+        let dir = data_drive_folder();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).expect("sub");
+        let file = sub.join("f.txt");
+        std::fs::write(&file, "x").expect("file");
+        assert_eq!(creator_owner_source(&file), None, "no such entry yet");
+        assert!(still_there_message(&file).contains("still has a write entry"));
+        icacls_set(&sub, &["/grant", "*S-1-3-0:(OI)(CI)(IO)F"]);
+        assert_eq!(creator_owner_source(&file), Some(sub.clone()));
+        let said = still_there_message(&file);
+        assert!(said.contains("CREATOR OWNER"), "{said}");
+        assert!(said.contains("cannot clear it"), "{said}");
+        assert!(said.contains("/remove:g *S-1-3-0"), "{said}");
+        assert!(said.contains("KEPT"), "{said}");
     }
 
     /// **A SETUP `--read` FOLDER KEEPS ITS READ GRANT**: when an msys run's
@@ -2765,8 +2951,11 @@ mod tests {
         );
         let err = refuse_msys_leftovers(records.path(), FAKE_MSYS).expect_err("refused");
         assert!(err.contains("root"), "{err}");
-        let report = clear_leftovers_in(records.path(), FAKE_MSYS, &Others::default()).join("\n");
+        let report = clear_leftovers_in(records.path(), FAKE_MSYS, &Others::default(), false)
+            .lines
+            .join("\n");
         assert!(report.contains("replaced"), "{report}");
+        assert!(stored.exists(), "kept without --forget-gone");
         // Clearing is what the user then does at the folder's new place.
         release_account(&aside, FAKE_MSYS, &Others::default()).expect("revoke there");
         assert!(!passes_down(&aside, FAKE_MSYS, MODIFY).expect("reads the ACL"));
@@ -2849,8 +3038,10 @@ mod tests {
             "the root itself was revoked"
         );
 
-        let report = clear_leftovers_in(records.path(), ACCOUNT, &Others::default()).join("\n");
+        let cleared = clear_leftovers_in(records.path(), ACCOUNT, &Others::default(), false);
+        let report = cleared.lines.join("\n");
         assert!(report.contains("took back"), "{report}");
+        assert_eq!(cleared.kept, 0, "{report}");
         assert!(
             writable_for_account_beneath(&root, ACCOUNT).is_empty(),
             "cleared: {}",

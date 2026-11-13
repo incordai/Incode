@@ -439,7 +439,16 @@ insbx run --msys --net deny -w . -- "C:\Program Files\Git\bin\bash.exe" -c "make
   name counts as missing. And after every run's revoke the tree is read once
   more: an explicit entry for the account on a folder beneath a root (one the
   revoke walk cannot remove) makes exactly those objects leftovers too; a
-  read-only entry (a `--read` folder's) does not.
+  read-only entry (a `--read` folder's) does not. `insbx revoke
+  --msys-leftovers` does not take a revoke for proof either: it reads the trees
+  again, and keeps the record (exit 1, msys runs stay refused) when an entry is
+  still there or comes back. An inherited CREATOR OWNER entry does come back
+  (every re-propagation resolves it to the owner, the account again): the
+  message names the folder whose CREATOR OWNER entry must be removed (or the
+  owner of the files changed). A root that is gone, moved or replaced is not
+  taken on the user's word: its record is KEPT unless `--forget-gone` is added
+  (after `insbx revoke` on wherever the folder went, or alone for one that is
+  really gone).
 - **Refused roots:** a root whose ACL passes down a CREATOR OWNER entry (each
   file the account creates would carry an entry naming it that no revoke
   removes), or an OWNER RIGHTS entry broader than `READ_CONTROL`. The message
