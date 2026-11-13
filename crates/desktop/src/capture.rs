@@ -490,7 +490,7 @@ pub(crate) fn desktop_view(
 }
 
 /// Encode an image. Pure, so it is testable with no screen attached.
-pub(crate) fn encode(
+pub fn encode(
     image: &RgbaImage,
     format: ShotFormat,
     jpeg_quality: u8,
@@ -698,7 +698,7 @@ mod tests {
     #[cfg(all(windows, feature = "desktop-capture"))]
     mod live {
         use super::*;
-        use crate::desktop::screen_info;
+        use crate::screen_info;
 
         #[test]
         fn a_real_capture_matches_the_display_it_came_from() {

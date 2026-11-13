@@ -1,6 +1,6 @@
 //! The gates every `tools/call` passes, as the named steps
 //! `Server::call_tool` runs in order: the operator's stop file, the session's
-//! permission mode, the operator's pre-tool hook, the decision whether the
+//! permission tier, the operator's pre-tool hook, the decision whether the
 //! tool runs at all, the post-tool hook, and the journal line — with
 //! [`Server::describe`], the redaction boundary for that line.
 //!
@@ -21,11 +21,11 @@
 //! # Wired to
 //!
 //! - **Called by** `Server::call_tool` in [`super`], once per `tools/call`.
-//! - **Calls** [`crate::desktop::safety`] for the stop file and the stop,
-//!   [`crate::permissions::PermissionPolicy::authorize`] for the mode,
-//!   [`crate::hooks::HookRunner`] for the operator's commands,
+//! - **Calls** [`crate::safety`] for the stop file and the stop,
+//!   [`crate::permission::Tier::authorise`] for the tier,
+//!   [`crate::hooks::Hooks`] for the operator's commands,
 //!   [`Server::run_and_look`] in [`super::tools`] for the tool, and
-//!   [`crate::desktop::journal::Journal::record`] for the journal.
+//!   [`crate::journal::Journal::record`] for the journal.
 
 use serde_json::Value;
 
@@ -46,33 +46,30 @@ impl Server {
         // The cost is one `exists()` per tool call, beside work that takes a
         // screenshot or walks an accessibility tree.
         if let Some(path) = self.stop_file.as_deref() {
-            if crate::desktop::safety::stop_requested(path) {
+            if crate::safety::stop_requested(path) {
                 self.safety.stop();
             }
         }
     }
 
-    /// Whether this session's permission mode allows `name`, with the
-    /// mode's reason when it does not.
+    /// Whether this session's permission tier allows `name`, with the tier's
+    /// reason when it does not.
     ///
     /// Called by `Server::call_tool` after [`Server::catch_stop_file`].
-    pub(super) fn authorise(&self, name: &str, args: &Value) -> Result<(), String> {
+    pub(super) fn authorise(&self, name: &str) -> Result<(), String> {
         // WHAT THIS SESSION IS ALLOWED TO DO, asked before the stop check is
         // asked about anything and before a single pixel is read.
         //
-        // The mode reached the agent (`PermissionMode::agent_mode`) and
-        // governed its file writing, but the desktop was outside it entirely:
-        // a session started `-p read-only` could not edit a file and could
-        // type into a login form. The policy that was written for this and
-        // never called now runs here, at the one point every tool passes.
+        // The mode reached the agent and governed its file writing, but the
+        // desktop was outside it entirely: a session started `-p read-only`
+        // could not edit a file and could type into a login form. The tier
+        // that was written for this and never called now runs here, at the one
+        // point every tool passes.
         //
-        // No prompter is passed, and there is none to pass: stdin and stdout
-        // are the protocol. `Prompt` therefore denies, which is the right
-        // answer for an unattended server rather than a gap.
-        match self.permissions.authorize(name, &args.to_string(), None) {
-            crate::permissions::PermissionOutcome::Allow => Ok(()),
-            crate::permissions::PermissionOutcome::Deny { reason } => Err(reason),
-        }
+        // Nobody can be asked: stdin and stdout are the protocol. The `prompt`
+        // mode therefore denies, which is the right answer for an unattended
+        // server rather than a gap.
+        self.tier.authorise(name)
     }
 
     /// The operator's pre-tool hook's refusal, if it refused.
@@ -139,7 +136,7 @@ impl Server {
         // the one tool for finding out why.
         match (permitted, self.safety.is_stopped(), vetoed) {
             (Err(reason), _, _) => Err(reason.clone()),
-            (Ok(()), true, _) => Err(crate::desktop::safety::Refusal::Stopped.message()),
+            (Ok(()), true, _) => Err(crate::safety::Refusal::Stopped.message()),
             (Ok(()), false, Some(why)) => Err(why),
             (Ok(()), false, None) => self.run_and_look(name, args),
         }
@@ -180,7 +177,7 @@ impl Server {
     ) {
         // Journalled HERE rather than inside `run_tool`, because this is the
         // one place every tool passes through with its outcome known. Putting
-        // it in the arms would mean twelve call sites and a thirteenth tool
+        // it in the arms would mean sixteen call sites and a seventeenth tool
         // added later that nobody remembers to instrument.
         if let Some(journal) = self.journal.as_mut() {
             let (t, detail, ok) = match outcome {

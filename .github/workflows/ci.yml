@@ -89,22 +89,25 @@ jobs:
         with:
           key: ${{ matrix.target }}
       - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }} -p incord-code -p incord-sandbox
-      # The released binary must run on a machine with no desktop libraries:
+        run: cargo build --release --locked --target ${{ matrix.target }} -p incord-code -p incord-sandbox -p incord-desktop
+      # The released binaries must run on a machine with no desktop libraries:
       # screen capture talks to the X server over its socket, so nothing of
-      # Wayland, GBM, EGL, PipeWire or libxcb may be linked.
-      - name: incode links no desktop library
+      # Wayland, GBM, EGL, PipeWire or libxcb may be linked. `incu` is the
+      # desktop crate's own binary; incode links the same crate.
+      - name: incode and incu link no desktop library
         shell: bash
         run: |
           set -euo pipefail
-          bin="target/${{ matrix.target }}/release/incode"
-          ldd "$bin"
-          if ldd "$bin" | grep -E 'libxcb|libwayland|libgbm|libEGL|libpipewire|libdbus'; then
-            echo "incode links a desktop library it must not need" >&2
-            exit 1
-          fi
+          for program in incode incu; do
+            bin="target/${{ matrix.target }}/release/$program"
+            ldd "$bin"
+            if ldd "$bin" | grep -E 'libxcb|libwayland|libgbm|libEGL|libpipewire|libdbus'; then
+              echo "$program links a desktop library it must not need" >&2
+              exit 1
+            fi
+          done
 
-  # Linux screen capture (src/desktop/capture/x11.rs) against a real X
+  # Linux screen capture (crates/desktop/src/capture/x11.rs) against a real X
   # server: the display list from RandR, GetImage of the root, the pixel
   # conversion, at depth 24 (32 bits per pixel) and depth 16 (5-6-5). The
   # live test is #[ignore]d everywhere else because it needs a display;
@@ -127,11 +130,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          live=desktop::capture::x11::tests::a_real_x_screen_is_captured_at_its_size_and_in_its_colours
+          live=capture::x11::tests::a_real_x_screen_is_captured_at_its_size_and_in_its_colours
           for screen in 1280x800x24 1024x768x16; do
             echo "::group::Xvfb -screen 0 $screen"
             xvfb-run -a -s "-screen 0 $screen" \
-              cargo test --lib "$live" -- --ignored --exact --nocapture --test-threads=1 \
+              cargo test -p incord-desktop --lib "$live" -- --ignored --exact --nocapture --test-threads=1 \
               | tee "$RUNNER_TEMP/live.txt"
             grep -q "test result: ok. 1 passed" "$RUNNER_TEMP/live.txt"
             echo "::endgroup::"
@@ -189,6 +192,12 @@ jobs:
       # incode's commands under `sandbox_engine = "insbx"`, for real (Linux;
       # it says it skipped elsewhere).
       - run: cargo test --test insbx_engine
+      # The standalone computer-use crate (`incu`): Windows UI Automation,
+      # macOS accessibility and Linux X11 each build here, and its tests (the
+      # desktop server's protocol, gates, journal and kill switch) run on all
+      # three. `cargo test --lib` above is incode's alone.
+      - run: cargo clippy -p incord-desktop --all-targets -- -D warnings
+      - run: cargo test -p incord-desktop
       # The standalone sandbox (`insbx`). Its escape tests run on Linux and
       # macOS, and skip, saying so, where the OS cannot enforce what they check.
       - run: cargo clippy -p incord-sandbox --all-targets -- -D warnings

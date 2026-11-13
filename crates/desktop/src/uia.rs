@@ -1248,7 +1248,7 @@ mod tests {
                 tree.elements.len()
             );
 
-            let screen = crate::desktop::screen_info().expect("screen");
+            let screen = crate::screen_info().expect("screen");
             let bounds = screen.virtual_bounds().expect("a desktop");
 
             let on_desktop = |r: Rect| {

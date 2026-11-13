@@ -243,7 +243,7 @@ mod live {
     use x11rb::rust_connection::RustConnection;
 
     use super::{displays, scale_from_resources, to_rgba, Monitor, PixelLayout};
-    use crate::desktop::Rect;
+    use crate::Rect;
 
     /// The X server `$DISPLAY` names, and which of its screens that is.
     fn connect() -> Result<(RustConnection, usize), String> {
@@ -339,7 +339,7 @@ mod live {
     impl Monitor {
         /// Called by `capture::all_monitors`, the one place every capture and
         /// the display list start from.
-        pub(in crate::desktop::capture) fn all() -> Result<Vec<Monitor>, String> {
+        pub(in crate::capture) fn all() -> Result<Vec<Monitor>, String> {
             let (conn, screen) = connect()?;
             let setup = conn.setup();
             let screen = setup
@@ -358,49 +358,49 @@ mod live {
         }
 
         /// Called by `capture::capture` and `capture::capture_region`.
-        pub(in crate::desktop::capture) fn name(&self) -> Result<String, Infallible> {
+        pub(in crate::capture) fn name(&self) -> Result<String, Infallible> {
             Ok(self.name.clone())
         }
 
         /// The same as [`Monitor::name`]: X11 has no other. Called by
         /// `capture::monitor_infos`.
-        pub(in crate::desktop::capture) fn friendly_name(&self) -> Result<String, Infallible> {
+        pub(in crate::capture) fn friendly_name(&self) -> Result<String, Infallible> {
             Ok(self.name.clone())
         }
 
         /// Called by `capture::capture`, `capture_region` and `monitor_infos`.
-        pub(in crate::desktop::capture) fn x(&self) -> Result<i32, Infallible> {
+        pub(in crate::capture) fn x(&self) -> Result<i32, Infallible> {
             Ok(self.rect.x)
         }
 
         /// Called by `capture::capture`, `capture_region` and `monitor_infos`.
-        pub(in crate::desktop::capture) fn y(&self) -> Result<i32, Infallible> {
+        pub(in crate::capture) fn y(&self) -> Result<i32, Infallible> {
             Ok(self.rect.y)
         }
 
         /// Called by `capture::capture`, `capture_region` and `monitor_infos`.
-        pub(in crate::desktop::capture) fn width(&self) -> Result<u32, Infallible> {
+        pub(in crate::capture) fn width(&self) -> Result<u32, Infallible> {
             Ok(self.rect.width.max(0) as u32)
         }
 
         /// Called by `capture::capture`, `capture_region` and `monitor_infos`.
-        pub(in crate::desktop::capture) fn height(&self) -> Result<u32, Infallible> {
+        pub(in crate::capture) fn height(&self) -> Result<u32, Infallible> {
             Ok(self.rect.height.max(0) as u32)
         }
 
         /// Called by `capture::monitor_infos`.
-        pub(in crate::desktop::capture) fn scale_factor(&self) -> Result<f32, Infallible> {
+        pub(in crate::capture) fn scale_factor(&self) -> Result<f32, Infallible> {
             Ok(self.scale)
         }
 
         /// Called by `capture::capture_primary` and `capture::monitor_infos`.
-        pub(in crate::desktop::capture) fn is_primary(&self) -> Result<bool, Infallible> {
+        pub(in crate::capture) fn is_primary(&self) -> Result<bool, Infallible> {
             Ok(self.primary)
         }
 
         /// The display's pixels, from the root window. Called by
         /// `capture::capture` and `capture::capture_region`.
-        pub(in crate::desktop::capture) fn capture_image(&self) -> Result<RgbaImage, String> {
+        pub(in crate::capture) fn capture_image(&self) -> Result<RgbaImage, String> {
             let (conn, screen) = connect()?;
             let setup = conn.setup();
             let screen = setup
@@ -673,7 +673,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, m)| {
-                crate::desktop::capture::describe(
+                crate::capture::describe(
                     i,
                     list.len(),
                     m.name.clone(),
@@ -711,7 +711,7 @@ mod tests {
             ("screen", rect(0, 0, 1280, 800))
         );
         assert_eq!(only.scale, 2.0);
-        let info = crate::desktop::capture::describe(
+        let info = crate::capture::describe(
             0,
             list.len(),
             only.name.clone(),
@@ -764,8 +764,8 @@ mod tests {
         use x11rb::protocol::xproto::{ConnectionExt as _, CreateWindowAux, WindowClass};
         use x11rb::wrapper::ConnectionExt as _;
 
-        use crate::desktop::capture::{capture_primary, capture_region, CaptureOptions};
-        use crate::desktop::screen_info;
+        use crate::capture::{capture_primary, capture_region, CaptureOptions};
+        use crate::screen_info;
 
         let (conn, screen) = x11rb::connect(None).expect("an X server on $DISPLAY");
         let setup = conn.setup();

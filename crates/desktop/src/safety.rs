@@ -214,7 +214,11 @@ pub fn stop_path_in(workspace: &std::path::Path) -> std::path::PathBuf {
 /// it is worse than no stop button at all.
 pub fn request_stop(path: &std::path::Path) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
-        crate::folders::create_dir_all(parent)?;
+        // Plain `create_dir_all`. incode's `desktop::safety::request_stop`
+        // (`src/desktop.rs`) is this function behind incode's own
+        // `folders::create_dir_all`, which also writes the `.gitignore` of a
+        // fresh `.incode/`, so every incode caller keeps that.
+        std::fs::create_dir_all(parent)?;
     }
     // The timestamp is for a human reading the directory later. Nothing parses
     // it — see the note above.

@@ -1,15 +1,22 @@
-//! Computer use — what the agent can see of a screen, and later what it can do
-//! to one.
+//! Computer use — what the agent can see of a screen, and what it can do to
+//! one — as the `incord-desktop` crate and its `incu` binary.
 //!
-//! The design and the decisions behind it are in `docs/COMPUTER_USE.md`. Three
-//! of those decisions shape this module and are repeated here because a reader
+//! The design and the decisions behind it are in `docs/COMPUTER_USE.md`. Four
+//! of those decisions shape this crate and are repeated here because a reader
 //! who redraws them by accident will produce something that compiles and is
 //! wrong:
 //!
 //! - **This is offered to a DELEGATED agent over MCP.** It is not dispatched by
-//!   a loop in this crate, because there is no such loop — see
-//!   [`crate::tools`], which records that it was deliberately removed. Nothing
-//!   here may depend on [`crate::agent`].
+//!   a loop, because there is no such loop: the agent runs in its own process
+//!   and reaches the screen only through the 16 tools of [`mcp`].
+//!
+//! - **This crate does not depend on incode.** It began as a module of incode
+//!   (`src/desktop/`) and moved out whole. What it used to take from the rest
+//!   of incode is restated here: the permission tier ([`permission`]), the
+//!   operator's hooks ([`hooks`]), the settings ([`config`]) and a plain
+//!   `std::fs::create_dir_all`. incode depends on this crate, as it does on
+//!   `incord-sandbox`, and its `--desktop-mcp` flag is a thin wrapper over
+//!   [`cli::serve`].
 //!
 //! - **One coordinate space leaves this module: physical pixels, top-left
 //!   origin, in virtual-desktop coordinates.** Platform quirks — Windows DPI
@@ -34,11 +41,15 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 pub mod capture;
+pub mod cli;
+pub mod config;
 pub mod coords;
 pub mod dpi;
+pub mod hooks;
 pub mod journal;
 pub mod limits;
 pub mod mcp;
+pub mod permission;
 pub mod safety;
 pub mod thread;
 pub mod uia;

@@ -8,8 +8,8 @@ use super::*;
 use super::guard::off_every_screen;
 use super::tools::{image, point};
 use super::transport::code;
-use crate::desktop::capture::ShotFormat;
-use crate::desktop::coords::PhysicalPoint;
+use crate::capture::ShotFormat;
+use crate::coords::PhysicalPoint;
 
 /// Protocol tests that need no desktop: they exercise the pure shapes.
 mod protocol {
@@ -96,79 +96,15 @@ mod protocol {
         );
     }
 
-    /// The config has to name the flag that actually starts the server.
-    ///
-    /// If these two ever drift, the client launches the binary in its
-    /// NORMAL mode — which starts the interactive harness on a pipe, prints
-    /// human text to stdout, and looks to the client like a server speaking
-    /// gibberish. That is a long debugging session for a one-word mistake.
-    #[test]
-    fn the_client_config_launches_this_binary_in_server_mode() {
-        let config = client_config(
-            std::path::Path::new("C:/bin/incode.exe"),
-            None,
-            crate::permissions::PermissionMode::WorkspaceWrite,
-        );
-        let server = &config["mcpServers"][CLIENT_KEY];
-
-        assert_eq!(server["command"], "C:/bin/incode.exe");
-        assert_eq!(
-            server["args"],
-            json!(["--desktop-mcp", "-p", "workspace-write"]),
-            "the config must pass the flag that selects the server mode"
-        );
-
-        // With a journal, the path is passed as its own argument — one the
-        // server can only receive this way, since it holds no workspace.
-        let watched = client_config(
-            std::path::Path::new("C:/bin/incode.exe"),
-            Some(std::path::Path::new("C:/work/.incode/desktop.jsonl")),
-            crate::permissions::PermissionMode::ReadOnly,
-        );
-        assert_eq!(
-            watched["mcpServers"][CLIENT_KEY]["args"],
-            json!([
-                "--desktop-mcp",
-                "--desktop-journal",
-                "C:/work/.incode/desktop.jsonl",
-                "-p",
-                "read-only"
-            ]),
-            "the session's mode must reach the child process on its argv"
-        );
-
-        // The same string main.rs matches on, so a rename breaks here
-        // rather than at a client six months later.
-        assert!(
-            USAGE_FLAG_IN_MAIN.contains("--desktop-mcp"),
-            "the flag in the config no longer matches the one main.rs parses"
-        );
-    }
-
-    /// The flag `src/main.rs` parses. Kept beside the config that emits it.
-    const USAGE_FLAG_IN_MAIN: &str = "--desktop-mcp";
-
-    #[test]
-    fn the_config_is_valid_json_for_a_command_line() {
-        let text = client_config_json(
-            std::path::Path::new("/usr/local/bin/incode"),
-            None,
-            crate::permissions::PermissionMode::WorkspaceWrite,
-        );
-        let parsed: Value = serde_json::from_str(&text).expect("must be valid JSON");
-        assert_eq!(
-            parsed["mcpServers"]["desktop"]["command"],
-            "/usr/local/bin/incode"
-        );
-        // Compact, because it is passed as one shell argument.
-        assert!(!text.contains('\n'), "a multi-line config breaks the flag");
-    }
+    // `the_client_config_launches_this_binary_in_server_mode` and
+    // `the_config_is_valid_json_for_a_command_line` moved to incode's
+    // `desktop.rs`, with the `client_config` they test: it names incode's flags.
 
     #[test]
     fn a_point_on_no_display_is_refused_and_one_on_any_display_is_not() {
         let screens = [
-            crate::desktop::Rect::from_edges(-1920, 0, 0, 1080),
-            crate::desktop::Rect::from_edges(0, 0, 2560, 1440),
+            crate::Rect::from_edges(-1920, 0, 0, 1080),
+            crate::Rect::from_edges(0, 0, 2560, 1440),
         ];
         let at = |x, y| PhysicalPoint { x, y };
         for (x, y) in [(0, 0), (-1920, 500), (2559, 1439), (-1, 1079)] {
@@ -237,7 +173,7 @@ mod live {
     #[test]
     fn a_read_only_desktop_may_look_and_may_not_touch() {
         let mut s = Server::new(InputThread::start().expect("input thread"))
-            .with_permission_mode(crate::permissions::PermissionMode::ReadOnly);
+            .with_tier(crate::permission::Tier::Observe);
         s.safety().stop();
 
         let typed = call(
@@ -268,7 +204,7 @@ mod live {
         // since a stop halts reads too and would prove nothing about the
         // permission mode.
         let mut looking = Server::new(InputThread::start().expect("input thread"))
-            .with_permission_mode(crate::permissions::PermissionMode::ReadOnly);
+            .with_tier(crate::permission::Tier::Observe);
         let looked = call(
             &mut looking,
             r#"{"jsonrpc":"2.0","id":2,"method":"tools/call",
@@ -318,13 +254,6 @@ mod live {
             crate::hooks::HookConfig {
                 pre_tool_use: vec![deny.into()],
                 post_tool_use: Vec::new(),
-                user_prompt_submit: Vec::new(),
-                pre_compact: Vec::new(),
-                stop: Vec::new(),
-                notification: Vec::new(),
-                session_start: Vec::new(),
-                session_end: Vec::new(),
-                subagent_stop: Vec::new(),
             },
         );
 
@@ -361,13 +290,6 @@ mod live {
             crate::hooks::HookConfig {
                 pre_tool_use: vec![allow.into()],
                 post_tool_use: Vec::new(),
-                user_prompt_submit: Vec::new(),
-                pre_compact: Vec::new(),
-                stop: Vec::new(),
-                notification: Vec::new(),
-                session_start: Vec::new(),
-                session_end: Vec::new(),
-                subagent_stop: Vec::new(),
             },
         );
 
@@ -673,7 +595,7 @@ mod live {
             r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"click","arguments":{"x":10,"y":10}}}"#,
         );
 
-        let entries = crate::desktop::journal::since(&path, None);
+        let entries = crate::journal::since(&path, None);
         assert_eq!(entries.len(), 1, "the refusal was not journalled");
         assert_eq!(entries[0].t, "refused");
         assert!(!entries[0].ok);
@@ -790,7 +712,7 @@ mod live {
             std::process::id(),
             std::thread::current().id()
         ));
-        let stop = crate::desktop::safety::stop_file_beside(&journal);
+        let stop = crate::safety::stop_file_beside(&journal);
         let _ = std::fs::remove_file(&journal);
         let _ = std::fs::remove_file(&stop);
 
@@ -806,7 +728,7 @@ mod live {
             "the server must work before the stop, or this proves nothing"
         );
 
-        crate::desktop::safety::request_stop(&stop).expect("request the stop");
+        crate::safety::request_stop(&stop).expect("request the stop");
 
         let after = call(&mut s, probe);
         assert_eq!(
@@ -831,7 +753,7 @@ mod live {
 
         // The operator sees their own stop land in the channel they were
         // watching — that is what makes it confirmable.
-        let entries = crate::desktop::journal::since(&journal, None);
+        let entries = crate::journal::since(&journal, None);
         assert!(
             entries.iter().any(|e| e.t == "refused" && !e.ok),
             "the stop was not journalled: {entries:?}"
@@ -847,14 +769,14 @@ mod live {
     #[test]
     fn watching_and_stopping_name_the_same_place() {
         let workspace = std::path::Path::new("C:/work");
-        let journal = crate::desktop::journal::path_in(workspace);
+        let journal = crate::journal::path_in(workspace);
         assert_eq!(
-            crate::desktop::safety::stop_path_in(workspace),
-            crate::desktop::safety::stop_file_beside(&journal),
+            crate::safety::stop_path_in(workspace),
+            crate::safety::stop_file_beside(&journal),
             "the workspace path and the beside-the-journal path disagree"
         );
         assert_eq!(
-            crate::desktop::safety::stop_path_in(workspace).parent(),
+            crate::safety::stop_path_in(workspace).parent(),
             journal.parent(),
             "the stop file must live beside the journal"
         );

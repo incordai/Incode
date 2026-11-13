@@ -196,8 +196,14 @@ impl PermissionPolicy {
         self
     }
 
-    /// The requirements for the tools this harness actually dispatches: the
-    /// twelve on the desktop MCP server.
+    /// The requirements for the sixteen tools of the desktop MCP server: five
+    /// that observe and eleven that move something.
+    ///
+    /// The server is the `incord-desktop` crate now, and it runs its own
+    /// `Tier` (`crates/desktop/src/permission.rs`), which it cannot take from
+    /// here. This stays as incode's statement of the same table, and
+    /// `desktop::tests::the_crates_tier_agrees_with_the_desktop_permission_policy`
+    /// fails if the two ever disagree.
     ///
     /// # Why the desktop is where this policy finally applies
     ///
@@ -208,12 +214,13 @@ impl PermissionPolicy {
     /// ask on their behalf.
     ///
     /// The desktop server is different: it IS the dispatcher.
-    /// `desktop::mcp::call_tool` is a choke point in this crate's own process,
-    /// and every click, keystroke and screenshot passes through it.
+    /// `desktop::mcp::Server::call_tool` is a choke point in the desktop
+    /// server's own process, and every click, keystroke and screenshot passes
+    /// through it.
     ///
     /// # The split, and why it is only two rungs
     ///
-    /// The four observing tools need `ReadOnly`; the eight that move something
+    /// The five observing tools need `ReadOnly`; the eleven that move something
     /// need `WorkspaceWrite`. Not `DangerFullAccess`, even though a click
     /// reaches far outside any workspace — because `workspace-write` is the
     /// default mode, and putting the desktop above it would mean the feature

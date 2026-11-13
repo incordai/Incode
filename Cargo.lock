@@ -1999,11 +1999,9 @@ dependencies = [
  "base64 0.22.1",
  "calamine",
  "chrono",
- "clipboard-win",
  "crossterm",
  "dom_query",
  "dom_smoothie",
- "enigo",
  "flate2",
  "globset",
  "grep-regex",
@@ -2014,6 +2012,7 @@ dependencies = [
  "hyper-util",
  "ignore",
  "image",
+ "incord-desktop",
  "incord-sandbox",
  "jsonschema",
  "landlock",
@@ -2043,13 +2042,29 @@ dependencies = [
  "tree-sitter-rust",
  "tree-sitter-typescript",
  "tungstenite",
- "uiautomation",
  "uuid",
+ "windows-sys 0.61.2",
+ "zip",
+]
+
+[[package]]
+name = "incord-desktop"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "clipboard-win",
+ "enigo",
+ "image",
+ "libc",
+ "regex",
+ "serde",
+ "serde_json",
+ "uiautomation",
  "windows-sys 0.61.2",
  "x11rb",
  "xcap",
  "zbus",
- "zip",
 ]
 
 [[package]]

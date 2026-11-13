@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/sandbox"]
+members = [".", "crates/sandbox", "crates/desktop"]
 # Standalone workspace root. The crate previously inherited version/edition from
 # a parent workspace that does not exist, so cargo failed while parsing the
 # manifest, before it could even look at the source.
@@ -90,6 +90,18 @@ agent-client-protocol-schema = { version = "=1.9.1", default-features = false }
 # no new package; it adds the seccomp filter, the host-allowlist proxy and the
 # `.git` protection the built-in engine lacks.
 incord-sandbox = { path = "crates/sandbox" }
+# Computer use (`crates/desktop`, binary `incu`): the 16-tool MCP server that
+# `incode --desktop-mcp` wraps, and the journal/stop-file/capture code the run
+# server and the toolbox call. A path dependency, so no new package: it carries
+# the screen-capture, accessibility and input dependencies that used to be
+# declared here. `default-features = false` so the `desktop-capture` feature
+# below decides whether capture is built, as it always did.
+incord-desktop = { path = "crates/desktop", default-features = false }
+# PNG and JPEG for the toolbox's own picture handling (`toolbox::image`); the
+# same pin and the same two codecs as `incord-desktop`, so it is one package.
+# `default-features = false` because the default is FIFTEEN codecs (avif, exr,
+# webp, tiff, dds, ...) and pictures need png + jpeg only.
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 
 # CLI-specific
 rustyline = { version = "15", features = ["derive"] }
@@ -178,68 +190,16 @@ toml = "1"
 flate2 = "=1.1.10"
 tar = { version = "=0.4.46", default-features = false }
 
-# Computer use — see docs/COMPUTER_USE.md. THESE ARE NEW PACKAGES, unlike every
-# other entry in this file, and the vetting is recorded in .incord/RULE_ACK:
-# latest stable as resolved from the live index on 2026-09-16, pinned, MSRV
-# re-measured (unchanged at 1.88, now pinned by `image` itself), builds clean.
-#
-# Both carry `default-features = false`, which is the point:
-#   - image defaults to FIFTEEN codecs (avif, exr, webp, tiff, dds, ...). We
-#     encode screenshots, so png + jpeg is the whole requirement.
-#   - xcap's optional `image` and `wgc` features are both left OFF. `wgc` is
-#     Windows Graphics Capture, a more modern capture path than the default —
-#     worth revisiting when there is a reason, not before, since it pulls
-#     further windows crates.
-#
-# `screenshots` is NOT used: it is deprecated in favour of xcap by the same
-# author, and the 0.8.x version in the original sketch is two minor lines stale.
-#
-# xcap is the capture library on Windows and macOS ONLY — see the target table
-# below — and optional there, behind the `desktop-capture` feature.
-image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
-enigo = { version = "0.6.1", default-features = false }
+# Computer use is its own crate now: `crates/desktop` (`incord-desktop`, binary
+# `incu`), declared above. The dependencies only it uses (image, enigo, xcap,
+# clipboard-win, uiautomation, x11rb, zbus and the Win32 display bindings) moved
+# with it, with the notes on why each is pinned as it is. `image` is declared in
+# both: incode decodes and re-encodes pictures too (`toolbox::image`).
 
-# Screen capture on Windows and macOS (`src/desktop/capture.rs`), optional
-# behind the `desktop-capture` feature (on by default).
-#
-# NOT on Linux, where the screen is read from the X server with x11rb instead
-# (`src/desktop/capture/x11.rs`). xcap 0.9.8 has no feature to leave out its
-# Linux Wayland backend: it always builds libwayshot-xcap (wayland-client, GBM,
-# EGL) and PipeWire (pipewire 0.10.1 -> libspa 0.10.1, through bindgen, so
-# libclang too), none of which this crate uses — Linux computer use is X11 only
-# (docs/COMPUTER_USE.md decision 5). That backend is what broke the release
-# build: libspa 0.10 expects newer PipeWire headers than Ubuntu 22.04 (the
-# release runner, chosen for its older glibc) ships, and fails to compile
-# there (`spa_meta_first` missing, `spa_video_info_raw` has no `flags`). No
-# 0.9.x release offers a way out, so on Linux the dependency is gone.
-[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
-xcap = { version = "0.9.8", default-features = false, optional = true }
-
-# ---------------------------------------------------------------------------
-# Computer use — see docs/COMPUTER_USE.md.
-#
-# Windows only, because decision 8 ships Windows first. macOS and Linux get
-# their own target tables when they land; note that the rest of this crate
-# splits windows / not(windows), which is NOT good enough here — three
-# platforms need three arms, and `not(windows)` must never be read as Linux.
-#
-# NO NEW PACKAGE. windows-sys 0.61.2 is ALREADY resolved in Cargo.lock with 13
-# reverse dependencies of its own, so declaring it turns on Win32 bindings the
-# binary already links rather than pulling anything new — the same reasoning
-# the hyper and base64 entries above record.
-#
-# The four features are the smallest set that answers "where are the displays
-# and how is this one scaled": HiDpi for the process-awareness call and the
-# per-monitor DPI query, Gdi for the enumeration, Foundation for RECT, and
-# WindowsAndMessaging for the primary-display flag. Each was confirmed present
-# in the cached 0.61.2 manifest before being written here, rather than assumed.
 [target.'cfg(windows)'.dependencies]
-clipboard-win = "5.4.1"
-uiautomation = "0.25.1"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
-    "Win32_Graphics_Gdi",
-    "Win32_UI_HiDpi",
+    # WindowsAndMessaging: mcp_oauth::open_browser's SW_SHOWNORMAL.
     "Win32_UI_WindowsAndMessaging",
     # agent::process_tree — a job object, so stopping an agent stops everything
     # it started, and the tree dies with incode. SECURITY_ATTRIBUTES and
@@ -291,27 +251,6 @@ libc = "0.2"
 # Pinned exactly, like every other toolbox dependency.
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "=0.4.7"
-# Computer use on Linux (`src/desktop/linux.rs`), on an X11 display —
-# `docs/COMPUTER_USE.md` decision 5.
-#   - enigo's `x11rb` backend: without it enigo on Linux has no backend at all
-#     and every action fails. Vetted in a scratch copy of this manifest: it
-#     adds THREE packages — x11rb 0.13.2, x11rb-protocol 0.13.2 and
-#     gethostname 1.1.0 (MIT OR Apache-2.0, pure Rust, no C library) — and
-#     nothing on Windows or macOS, since this table is Linux-only. enigo
-#     0.6.1 (the latest) pins x11rb 0.13, so 0.14 is not a choice here.
-#   - zbus for the AT-SPI2 accessibility tree: NO NEW PACKAGE. zbus 5.19.0
-#     (the latest) was resolved by xcap when it was vetted; since xcap left
-#     Linux this line is what resolves it, with the same default features,
-#     which include the blocking API used here.
-#   - x11rb, named directly to ask the X server which window keystrokes
-#     reach (`linux::keyboard_pid`) and to capture the screen
-#     (`desktop::capture::x11`): NO NEW PACKAGE — the same 0.13.2 the enigo
-#     backend above already resolves. `randr` is for the display list
-#     (RandR 1.5 GetMonitors); enigo already turns it on for the same crate,
-#     so naming it here builds nothing new.
-enigo = { version = "0.6.1", default-features = false, features = ["x11rb"] }
-x11rb = { version = "0.13.2", default-features = false, features = ["randr"] }
-zbus = "5.19"
 
 # ---------------------------------------------------------------------------
 # Features
@@ -325,11 +264,11 @@ zbus = "5.19"
 # Every Outline grammar is on by default; each can be dropped to shrink the
 # binary, and Outline then says that language was not built in.
 default = ["desktop-capture", "lang-rust", "lang-ts", "lang-python", "lang-go", "lang-js"]
-# Screenshots and the display list for computer use (`src/desktop/capture.rs`),
-# on every OS. Without it every capture is refused by name. On Windows and
-# macOS it builds xcap; on Linux it needs no extra crate (the X server is read
-# with x11rb, which input already links), so `dep:xcap` names nothing there.
-desktop-capture = ["dep:xcap"]
+# Screenshots and the display list for computer use, on every OS: forwarded to
+# `incord-desktop` (`crates/desktop/src/capture.rs`). Without it every capture
+# is refused by name. On Windows and macOS it builds xcap; on Linux it needs no
+# extra crate (the X server is read with x11rb).
+desktop-capture = ["incord-desktop/desktop-capture"]
 lang-rust = ["dep:tree-sitter-rust"]
 lang-ts = ["dep:tree-sitter-typescript"]
 lang-python = ["dep:tree-sitter-python"]

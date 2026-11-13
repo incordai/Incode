@@ -240,7 +240,7 @@ pub(crate) fn focused_index<N>(listed: &[Listed<N>], chain: &[u32]) -> Option<us
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::desktop::limits::{self, DesktopLimits};
+    use crate::limits::{self, DesktopLimits};
 
     fn rect(x: i32, y: i32, width: i32, height: i32) -> Rect {
         Rect {

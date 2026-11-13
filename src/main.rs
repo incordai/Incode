@@ -491,56 +491,13 @@ fn main() -> anyhow::Result<()> {
                 &incord_code::admin::AdminConfig::default_dir(),
             )
             .map_err(|e| anyhow::anyhow!("the desktop will not start: {e}"))?;
-            incord_code::desktop::limits::set(
-                admin
-                    .desktop_limits
-                    .resolve()
-                    .map_err(|e| anyhow::anyhow!("the desktop will not start: {e}"))?,
-            );
-            // Linux: the display comes FIRST, while this process is still one
-            // thread — attaching sets `DISPLAY`, which the input thread reads
-            // when it connects. Held until the server returns, so a private
-            // Xvfb lives exactly as long as the desktop it backs.
-            #[cfg(target_os = "linux")]
-            let _display = {
-                let display = incord_code::desktop::linux::attach(admin.desktop_display.as_deref())
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-                eprintln!(
-                    "incode-desktop on display {}{}",
-                    display.name(),
-                    if display.is_private() {
-                        " (a private Xvfb, stopped when this server ends)"
-                    } else {
-                        ""
-                    }
-                );
-                display
-            };
-            let input = incord_code::desktop::thread::InputThread::start()
-                .map_err(|e| anyhow::anyhow!("could not start desktop input: {e}"))?;
-            let hooks = admin.desktop_hooks;
-            if !hooks.pre_tool_use.is_empty() {
-                eprintln!(
-                    "incode-desktop: {} pre-tool hook(s) will run before every action",
-                    hooks.pre_tool_use.len()
-                );
-            }
-            let mut server = incord_code::desktop::mcp::Server::new(input)
-                .with_permission_mode(permission_mode)
-                .with_hooks(hooks);
-            if let Some(path) = journal {
-                eprintln!("incode-desktop journalling to {}", path.display());
-                server = server.with_journal(path);
-            }
-
-            // Named on stderr so an operator who asked for `read-only` can see
-            // that it arrived. A capability restriction nobody can observe is
-            // one nobody trusts.
-            eprintln!(
-                "incode-desktop MCP server ready on stdio ({})",
-                permission_mode.as_str()
-            );
-            incord_code::desktop::mcp::run_stdio(server)?;
+            // The server itself is the `incord-desktop` crate's (`incu serve`
+            // is the same code); this flag is its wrapper, so every agent
+            // config and installer that launches `incode --desktop-mcp` is
+            // unchanged. The limits, the Linux display and the hooks are
+            // `admin`'s; see `incord_code::desktop::serve`.
+            incord_code::desktop::serve(journal, permission_mode, admin)
+                .map_err(|e| anyhow::anyhow!(e))?;
             return Ok(());
         }
         Parsed::Acp(config) => {
