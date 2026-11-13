@@ -11,8 +11,9 @@ use windows_sys::Win32::Security::Authorization::{
 use windows_sys::Win32::Security::{
     CreateRestrictedToken, GetSecurityDescriptorDacl, GetTokenInformation, SetTokenInformation,
     TokenDefaultDacl, TokenElevation, TokenLogonSid, TokenUser, ACL, DISABLE_MAX_PRIVILEGE,
-    SID_AND_ATTRIBUTES, TOKEN_ACCESS_MASK, TOKEN_DEFAULT_DACL, TOKEN_ELEVATION, TOKEN_GROUPS,
-    TOKEN_INFORMATION_CLASS, TOKEN_QUERY, TOKEN_USER, WRITE_RESTRICTED,
+    SID_AND_ATTRIBUTES, TOKEN_ACCESS_MASK, TOKEN_ADJUST_DEFAULT, TOKEN_DEFAULT_DACL,
+    TOKEN_ELEVATION, TOKEN_GROUPS, TOKEN_INFORMATION_CLASS, TOKEN_QUERY, TOKEN_USER,
+    WRITE_RESTRICTED,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -194,6 +195,36 @@ unsafe fn set_default_dacl(token: HANDLE, sddl: &str) -> Result<(), String> {
         return Err(last_error("SetTokenInformation(TokenDefaultDacl)"));
     }
     Ok(())
+}
+
+/// Give `token` (opened with `TOKEN_ADJUST_DEFAULT`) the default DACL `sddl`.
+pub(crate) fn set_token_default_dacl(token: HANDLE, sddl: &str) -> Result<(), String> {
+    // SAFETY: the caller's token handle is valid for the call.
+    unsafe { set_default_dacl(token, sddl) }
+}
+
+/// Give THIS process's token the default DACL `sddl`: what a thread this
+/// process creates from now on, and every other object it makes without a
+/// descriptor of its own, starts with. The second helper sets it to the
+/// hardened thread DACL, so a thread made after its threads were locked (a
+/// loader worker, say) is born locked instead of with the account's default.
+/// Not inherited by the command: its token is built with its own.
+pub(crate) fn set_own_default_dacl(sddl: &str) -> Result<(), String> {
+    // SAFETY: opens this process's token for the one adjustment; the handle
+    // is owned and closed.
+    unsafe {
+        let mut token: HANDLE = std::ptr::null_mut();
+        if OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_ADJUST_DEFAULT | TOKEN_QUERY,
+            &mut token,
+        ) == 0
+        {
+            return Err(last_error("OpenProcessToken"));
+        }
+        let token = OwnedHandle(token);
+        set_token_default_dacl(token.0, sddl)
+    }
 }
 
 /// The user SID of `token`, as a string.

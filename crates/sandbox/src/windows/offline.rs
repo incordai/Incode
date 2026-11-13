@@ -282,6 +282,43 @@ impl Record {
     }
 }
 
+/// What `insbx setup-windows` does with one read folder carried over from a
+/// version-1 record ([`carry_over`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Carried {
+    /// Give the msys account read on it too, and keep it in the record.
+    Grant(PathBuf),
+    /// Keep it in the record (so `--remove` can still take the offline
+    /// account's grant on it back) but give the msys account nothing, and why.
+    KeepOnly(PathBuf, String),
+}
+
+/// Sort the folders a version-1 record listed, with the same care `--read`
+/// takes: `resolve` gives a folder's real, canonical name (`None`: it is not
+/// a folder there now), `broad` refuses one that would reach far past a
+/// toolchain (`refuse_broad`). A folder that is missing is KEPT, not dropped:
+/// it may be a drive that is not attached at the moment, and the offline
+/// account's ACE on it must stay revocable.
+#[must_use]
+pub fn carry_over(
+    old: &[PathBuf],
+    resolve: &dyn Fn(&Path) -> Option<PathBuf>,
+    broad: &dyn Fn(&Path) -> Result<(), String>,
+) -> Vec<Carried> {
+    old.iter()
+        .map(|dir| match resolve(dir) {
+            None => Carried::KeepOnly(
+                dir.clone(),
+                "not a folder now; kept so `--remove` can still revoke it".to_string(),
+            ),
+            Some(real) => match broad(&real) {
+                Ok(()) => Carried::Grant(real),
+                Err(why) => Carried::KeepOnly(real, format!("not given to {MSYS_ACCOUNT}: {why}")),
+            },
+        })
+        .collect()
+}
+
 /// Whether `s` looks like a SID string (`S-1-` and numbers).
 #[must_use]
 pub fn is_sid(s: &str) -> bool {
@@ -817,6 +854,41 @@ mod tests {
         for right in [0x10u32, 0x2, 0x4_0000, 0x8_0000, 0x1, 0x20, 0x40] {
             assert_eq!(owner_mask & right, 0, "{right:#x}");
         }
+    }
+
+    /// Carried-over read folders get `--read`'s checks: a broad one is not
+    /// granted to the msys account, a missing one is kept all the same.
+    #[test]
+    fn carried_over_read_folders_are_resolved_checked_and_never_dropped() {
+        let resolve = |p: &Path| {
+            let s = p.to_string_lossy();
+            (!s.contains("missing")).then(|| PathBuf::from(s.replace('/', "\\")))
+        };
+        let broad = |p: &Path| {
+            if p.to_string_lossy() == r"C:\Users" {
+                Err("too broad".to_string())
+            } else {
+                Ok(())
+            }
+        };
+        let old = [
+            PathBuf::from("C:/tools/cargo"),
+            PathBuf::from(r"C:\Users"),
+            PathBuf::from(r"E:\missing"),
+        ];
+        let got = carry_over(&old, &resolve, &broad);
+        assert_eq!(got.len(), 3, "none dropped");
+        assert_eq!(got[0], Carried::Grant(PathBuf::from(r"C:\tools\cargo")));
+        assert!(
+            matches!(&got[1], Carried::KeepOnly(p, why) if p == Path::new(r"C:\Users") && why.contains("too broad")),
+            "{:?}",
+            got[1]
+        );
+        assert!(
+            matches!(&got[2], Carried::KeepOnly(p, why) if p == Path::new(r"E:\missing") && why.contains("--remove")),
+            "{:?}",
+            got[2]
+        );
     }
 
     #[test]

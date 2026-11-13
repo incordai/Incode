@@ -353,9 +353,55 @@ pub struct GrantRecord {
     /// ends or by the sweep. The offline account's own ACE on a root is kept,
     /// so it is not listed here; the msys account has none to keep.
     pub modify: Vec<PathBuf>,
+    /// Which folder each `modify` path was when it was granted (the same
+    /// length as `modify`; `None` where unknown). A path is only a name: a
+    /// root moved aside and a new folder made under the old name must not be
+    /// taken for the folder that holds the grant ([`FileId`]).
+    pub modify_ids: Vec<Option<FileId>>,
+}
+
+/// Which file or folder a path named when it was recorded: the volume's serial
+/// number and the object's file index (`GetFileInformationByHandle`), which
+/// stay with the object when it is renamed or moved on its volume and differ
+/// for a new folder of the same name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileId {
+    pub volume: u32,
+    pub index: u64,
+}
+
+impl FileId {
+    /// `<volume as 8 hex digits>:<index as 16>`.
+    #[must_use]
+    pub fn to_text(self) -> String {
+        format!("{:08x}:{:016x}", self.volume, self.index)
+    }
+
+    /// [`Self::to_text`] read back.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        let (volume, index) = text.trim().split_once(':')?;
+        Some(Self {
+            volume: u32::from_str_radix(volume, 16).ok()?,
+            index: u64::from_str_radix(index, 16).ok()?,
+        })
+    }
 }
 
 impl GrantRecord {
+    /// Add a per-run writable root with what it was ([`FileId`]).
+    pub fn push_modify(&mut self, path: PathBuf, id: Option<FileId>) {
+        self.modify_ids.resize(self.modify.len(), None);
+        self.modify.push(path);
+        self.modify_ids.push(id);
+    }
+
+    /// What `modify[i]` was when it was recorded, when it is known.
+    #[must_use]
+    pub fn modify_id(&self, i: usize) -> Option<FileId> {
+        self.modify_ids.get(i).copied().flatten()
+    }
+
     /// The record's text: `sid`, a `root` per root, then `user`, a `read`
     /// per read path, a `parent` per listed folder and a `modify` per
     /// per-run writable root when an account takes part.
@@ -374,8 +420,11 @@ impl GrantRecord {
         for parent in &self.parents {
             text.push_str(&format!("parent {}\n", parent.display()));
         }
-        for path in &self.modify {
+        for (i, path) in self.modify.iter().enumerate() {
             text.push_str(&format!("modify {}\n", path.display()));
+            if let Some(id) = self.modify_id(i) {
+                text.push_str(&format!("id {}\n", id.to_text()));
+            }
         }
         text
     }
@@ -394,10 +443,18 @@ impl GrantRecord {
                 Some(("user", v)) if offline::is_sid(v) => record.user = Some(v.to_string()),
                 Some(("read", v)) => record.reads.push(PathBuf::from(v)),
                 Some(("parent", v)) => record.parents.push(PathBuf::from(v)),
-                Some(("modify", v)) => record.modify.push(PathBuf::from(v)),
+                Some(("modify", v)) => record.push_modify(PathBuf::from(v), None),
+                // The identity of the `modify` path just above it.
+                Some(("id", v)) => {
+                    if let (Some(last), Some(id)) = (record.modify_ids.last_mut(), FileId::parse(v))
+                    {
+                        *last = Some(id);
+                    }
+                }
                 _ => {}
             }
         }
+        record.modify_ids.resize(record.modify.len(), None);
         record.sid = sid.filter(|s| is_session_sid(s))?;
         Some(record)
     }
@@ -1015,24 +1072,44 @@ mod tests {
             ],
             parents: vec![PathBuf::from(r"C:\Users\me\src")],
             modify: Vec::new(),
+            modify_ids: Vec::new(),
         };
         assert!(offline.to_text().ends_with("parent C:\\Users\\me\\src\n"));
         assert_eq!(GrantRecord::parse(&offline.to_text()), Some(offline));
         // An msys run lists the roots its account holds for this run alone.
-        let msys = GrantRecord {
+        let mut msys = GrantRecord {
             sid: session_sid(10),
             roots: vec![PathBuf::from(r"C:\tmp\run")],
             user: Some("S-1-5-21-1-2-3-1010".into()),
             reads: vec![PathBuf::from(r"C:\proj")],
-            modify: vec![PathBuf::from(r"C:\w\a"), PathBuf::from(r"D:\b c")],
             ..GrantRecord::default()
         };
+        let id = FileId {
+            volume: 0xdead_beef,
+            index: 0x0001_0000_0000_002a,
+        };
+        msys.push_modify(PathBuf::from(r"C:\w\a"), Some(id));
+        msys.push_modify(PathBuf::from(r"D:\b c"), None);
         assert!(
-            msys.to_text().ends_with("modify D:\\b c\n"),
+            msys.to_text()
+                .ends_with("modify C:\\w\\a\nid deadbeef:000100000000002a\nmodify D:\\b c\n"),
             "{}",
             msys.to_text()
         );
-        assert_eq!(GrantRecord::parse(&msys.to_text()), Some(msys));
+        assert_eq!(GrantRecord::parse(&msys.to_text()), Some(msys.clone()));
+        assert_eq!(msys.modify_id(0), Some(id));
+        assert_eq!(msys.modify_id(1), None);
+        assert_eq!(msys.modify_id(7), None);
+        // A record without identities (or a bad one) still parses: unknown.
+        let old = GrantRecord::parse(&format!(
+            "sid {}\nmodify C:\\w\nid nonsense\nmodify D:\\x\n",
+            session_sid(11)
+        ))
+        .expect("parses");
+        assert_eq!(old.modify.len(), 2);
+        assert_eq!(old.modify_ids, [None, None]);
+        assert_eq!(FileId::parse(&id.to_text()), Some(id));
+        assert_eq!(FileId::parse("zz:1"), None);
         assert!(GrantRecord::parse("sid S-1-1-0\nroot C:\\w\n").is_none());
         assert!(GrantRecord::parse(&format!("sid {SID_PREFIX}\n")).is_none());
         assert!(GrantRecord::parse("root C:\\w\n").is_none());

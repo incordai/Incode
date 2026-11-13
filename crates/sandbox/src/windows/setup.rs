@@ -469,18 +469,41 @@ fn install(args: &SetupArgs) -> Result<Vec<String>, String> {
         .map(|p| p.reads.clone())
         .unwrap_or_default();
     if let Some((_, old)) = legacy.filter(|(sid, _)| *sid == account) {
-        for dir in old.into_iter().filter(|d| d.is_dir()) {
-            match acl::grant_read(&dir, &msys_account) {
-                Ok(()) => report.push(format!(
-                    "{MSYS_ACCOUNT} may read {} (carried over from the earlier setup)",
-                    dir.display()
-                )),
-                Err(e) => report.push(format!(
-                    "{MSYS_ACCOUNT} could not be given {}: {e}",
-                    dir.display()
-                )),
+        // The same care `--read` takes; a folder that is missing or too broad
+        // stays in the record all the same, so `--remove` can still revoke the
+        // offline account's grant on it.
+        let resolve = |d: &Path| {
+            std::fs::canonicalize(d)
+                .ok()
+                .map(|c| PathBuf::from(super::strip_verbatim(&c.to_string_lossy())))
+                .filter(|c| c.is_dir())
+        };
+        let broad = |d: &Path| refuse_broad(&d.to_string_lossy(), profile.as_deref());
+        for carried in offline::carry_over(&old, &resolve, &broad) {
+            let dir = match carried {
+                offline::Carried::Grant(dir) => {
+                    match acl::grant_read(&dir, &msys_account) {
+                        Ok(()) => report.push(format!(
+                            "{MSYS_ACCOUNT} may read {} (carried over from the earlier setup)",
+                            dir.display()
+                        )),
+                        Err(e) => report.push(format!(
+                            "{MSYS_ACCOUNT} could not be given {}: {e}",
+                            dir.display()
+                        )),
+                    }
+                    dir
+                }
+                offline::Carried::KeepOnly(dir, why) => {
+                    report.push(format!("{}: {why}", dir.display()));
+                    dir
+                }
+            };
+            if !reads.iter().any(|r| {
+                super::path_key(&r.to_string_lossy()) == super::path_key(&dir.to_string_lossy())
+            }) {
+                reads.push(dir);
             }
-            reads.push(dir);
         }
     }
     for dir in &args.reads {

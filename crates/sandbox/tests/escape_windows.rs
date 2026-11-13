@@ -1230,6 +1230,41 @@ fn proxy_lets_only_the_allowlist_through_natively() {
     );
 }
 
+/// **A PLAIN `--net deny` RUN STILL STARTS** after the second helper locks its
+/// own process and threads: the first helper locks that helper's main thread
+/// before it runs, and the helper then locks every thread of its own, the
+/// current one through the pseudo-handle (a locked thread denies even its
+/// owner `WRITE_DAC`, which once refused every account run in strict mode).
+/// Both the confined and the unconfined-filesystem kinds, strict (the
+/// default).
+#[test]
+fn a_plain_network_deny_command_runs_with_the_second_helper_locked() {
+    if !needs_offline("a_plain_network_deny_command_runs_with_the_second_helper_locked") {
+        return;
+    }
+    let d = dirs();
+    let o = cmd(
+        &d.ws,
+        &["--net", "deny", "-w", "."],
+        "echo hello> out.txt & echo ran",
+    );
+    let out = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{out}");
+    assert!(out.contains("ran"), "{out}");
+    assert!(d.ws.join("out.txt").exists(), "{out}");
+    assert!(
+        !out.contains("could not protect itself"),
+        "the helper locked itself: {out}"
+    );
+
+    let o = cmd(&d.ws, &["--net", "deny", "--fs", "off"], "echo ran");
+    let out = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{out}");
+    assert!(out.contains("ran"), "{out}");
+    let o = insbx(&["revoke", "."], &d.ws);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+}
+
 // ---- `--msys`: Git Bash as the account insbx-msys (#38). ----
 
 /// Git for Windows' bash, where its installer puts it.

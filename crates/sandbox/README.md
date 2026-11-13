@@ -434,7 +434,12 @@ insbx run --msys --net deny -w . -- "C:\Program Files\Git\bin\bash.exe" -c "make
   detached, a revoke failed), the next `--msys` run is REFUSED, naming the
   paths: every msys run trusts that account, so a write ACE it keeps anywhere
   would be writable by all of them. Run `insbx revoke <FOLDER>` on each (where
-  it is now), then `insbx revoke --msys-leftovers`.
+  it is now), then `insbx revoke --msys-leftovers`. A root is told by what it
+  is, not by its name: moved aside and replaced by a new folder of the same
+  name counts as missing. And after every run's revoke the tree is read once
+  more: an explicit entry for the account on a folder beneath a root (one the
+  revoke walk cannot remove) makes exactly those objects leftovers too; a
+  read-only entry (a `--read` folder's) does not.
 - **Refused roots:** a root whose ACL passes down a CREATOR OWNER entry (each
   file the account creates would carry an entry naming it that no revoke
   removes), or an OWNER RIGHTS entry broader than `READ_CONTROL`. The message

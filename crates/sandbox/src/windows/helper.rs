@@ -35,8 +35,8 @@ use std::ffi::OsString;
 use std::os::windows::ffi::OsStrExt;
 
 use windows_sys::Win32::Foundation::{
-    GetLastError, SetHandleInformation, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, HANDLE,
-    HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+    CloseHandle, GetLastError, SetHandleInformation, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND,
+    ERROR_PATH_NOT_FOUND, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Security::Authorization::{SetSecurityInfo, SE_KERNEL_OBJECT};
 use windows_sys::Win32::Security::{
@@ -58,15 +58,18 @@ use windows_sys::Win32::System::JobObjects::{
 };
 use windows_sys::Win32::System::Threading::{
     CreateProcessAsUserW, CreateProcessW, CreateProcessWithLogonW, GetCurrentProcess,
-    GetCurrentProcessId, GetExitCodeProcess, OpenProcess, OpenThread, ResumeThread,
-    TerminateProcess, WaitForMultipleObjects, WaitForSingleObject, CREATE_NO_WINDOW,
-    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, INFINITE, PROCESS_INFORMATION,
-    PROCESS_SYNCHRONIZE, STARTF_USESTDHANDLES, STARTUPINFOW,
+    GetCurrentProcessId, GetCurrentThread, GetCurrentThreadId, GetExitCodeProcess, OpenProcess,
+    OpenThread, ResumeThread, TerminateProcess, WaitForMultipleObjects, WaitForSingleObject,
+    CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, INFINITE, PROCESS_INFORMATION,
+    PROCESS_SYNCHRONIZE, STARTF_USESTDHANDLES, STARTUPINFOW, THREAD_SET_CONTEXT,
+    THREAD_SUSPEND_RESUME,
 };
 
 use super::job_flags;
 use super::offline::{is_sid, HELPER_PROCESS_SDDL, HELPER_THREAD_SDDL};
-use super::token::{dacl_of, last_error, restricted, security_descriptor, wide, OwnedHandle};
+use super::token::{
+    dacl_of, last_error, restricted, security_descriptor, set_own_default_dacl, wide, OwnedHandle,
+};
 use super::{
     batch_command_line, command_line, is_batch, is_root_sid, is_session_sid, resolve_program,
     JobLimits,
@@ -190,7 +193,9 @@ fn inner(spec: &EnterSpec, program: &OsString, args: &[OsString]) -> Result<i32,
     // The command runs as this same account: keep it from opening this
     // (unrestricted) process to write into it.
     if let Err(e) = harden_own_process() {
-        if spec.strict {
+        // An msys run (whose token trusts this account's own SID) never goes
+        // on unprotected, whatever the mode.
+        if hardening_failure_refuses(spec.strict, spec.msys.is_some()) {
             return Err(sandbox(format!(
                 "the helper could not protect itself from the command: {e}"
             )));
@@ -210,6 +215,16 @@ fn inner(spec: &EnterSpec, program: &OsString, args: &[OsString]) -> Result<i32,
         return Err(sandbox(last_error("GetExitCodeProcess")));
     }
     Ok(code as i32)
+}
+
+/// Whether a helper that could not lock itself against the command refuses the
+/// run: strict mode does, and an msys run ALWAYS does (its command carries the
+/// account's own SID, so an unlocked helper is an unrestricted one to hijack),
+/// best effort or not. The first helper's own locking (the second's thread and
+/// process, before it runs) is belt and braces for any other run, and passes
+/// `strict = false`.
+fn hardening_failure_refuses(strict: bool, msys: bool) -> bool {
+    strict || msys
 }
 
 /// Give the kernel object `handle` (a process or a thread, with `WRITE_DAC`)
@@ -241,17 +256,26 @@ fn harden_handle(handle: HANDLE, sddl: &str) -> Result<(), String> {
 /// `GENERIC_ALL`, and an msys command's token carries the account's own SID,
 /// so it passes both halves of the check on that thread and could hijack it,
 /// then run unrestricted as the account.
+///
+/// First the process token's default DACL becomes the thread DACL
+/// ([`set_own_default_dacl`]), so a thread made AFTER the snapshot below (a
+/// loader worker started while the command's process is created) is born
+/// locked rather than with the account's default.
 fn harden_own_process() -> Result<(), String> {
+    set_own_default_dacl(HELPER_THREAD_SDDL)?;
     // SAFETY: the pseudo-handle has every right on this process.
     harden_handle(unsafe { GetCurrentProcess() }, HELPER_PROCESS_SDDL)?;
     harden_own_threads()
 }
 
 /// [`HELPER_THREAD_SDDL`] on every thread this process has (found by a
-/// Toolhelp snapshot: the ones that exist before the command starts).
+/// Toolhelp snapshot: the ones that exist before the command starts). Every
+/// thread is tried; the failures are reported together, never stopping at the
+/// first.
 fn harden_own_threads() -> Result<(), String> {
+    let mut tids = Vec::new();
     // SAFETY: a snapshot handle owned and closed here; the entry is a plain
-    // structure with its size set; every thread handle is owned and closed.
+    // structure with its size set.
     unsafe {
         let pid = GetCurrentProcessId();
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
@@ -264,17 +288,71 @@ fn harden_own_threads() -> Result<(), String> {
         let mut more = Thread32First(snapshot.0, &mut entry) != 0;
         while more {
             if entry.th32OwnerProcessID == pid {
-                let thread = OpenThread(WRITE_DAC, 0, entry.th32ThreadID);
-                if thread.is_null() {
-                    return Err(last_error("OpenThread"));
-                }
-                let thread = OwnedHandle(thread);
-                harden_handle(thread.0, HELPER_THREAD_SDDL)?;
+                tids.push(entry.th32ThreadID);
             }
             more = Thread32Next(snapshot.0, &mut entry) != 0;
         }
     }
-    Ok(())
+    let failed: Vec<String> = tids
+        .into_iter()
+        .filter_map(|tid| {
+            harden_thread(tid)
+                .err()
+                .map(|e| format!("thread {tid}: {e}"))
+        })
+        .collect();
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(failed.join("; "))
+    }
+}
+
+/// [`HELPER_THREAD_SDDL`] on the thread `tid` of this process.
+///
+/// - The CURRENT thread goes through the `GetCurrentThread` pseudo-handle,
+///   which has full access whatever the thread's DACL says: the first helper
+///   may have locked this very thread already ([`launch_offline`]), and a
+///   locked thread denies even its owner `WRITE_DAC`.
+/// - Any other thread is opened for `WRITE_DAC` and locked.
+/// - One that cannot be opened for that is fine only if it is ALREADY locked:
+///   it also cannot be opened for what hijacking takes
+///   ([`thread_opens_for_hijack`]). A thread that is neither lockable nor
+///   locked is the failure.
+fn harden_thread(tid: u32) -> Result<(), String> {
+    // SAFETY: the pseudo-handle needs no closing; a thread handle opened here
+    // is owned and closed.
+    unsafe {
+        if tid == GetCurrentThreadId() {
+            return harden_handle(GetCurrentThread(), HELPER_THREAD_SDDL);
+        }
+        let thread = OpenThread(WRITE_DAC, 0, tid);
+        if !thread.is_null() {
+            let thread = OwnedHandle(thread);
+            return harden_handle(thread.0, HELPER_THREAD_SDDL);
+        }
+        let err = GetLastError();
+        if err == ERROR_ACCESS_DENIED && !thread_opens_for_hijack(tid) {
+            return Ok(());
+        }
+        Err(format!(
+            "cannot be locked and is not locked already (OpenThread error {err})"
+        ))
+    }
+}
+
+/// Whether this process can open the thread `tid` for what hijacking it
+/// takes: `THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME`.
+fn thread_opens_for_hijack(tid: u32) -> bool {
+    // SAFETY: opens a thread by id; a handle returned is closed at once.
+    unsafe {
+        let h = OpenThread(THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME, 0, tid);
+        if h.is_null() {
+            return false;
+        }
+        CloseHandle(h);
+        true
+    }
 }
 
 /// Start the second helper as the offline account, suspended, put it in
@@ -385,11 +463,22 @@ fn launch_offline(
         }
         // The second helper's thread and process are the account's, with the
         // default DACLs the logon service gave them. Lock them before the
-        // thread first runs (the helper locks its own again, every thread,
+        // thread first runs (the helper locks every thread of its own again,
         // before it starts the command, which is what holds even if this
-        // fails: [`harden_own_process`] says why).
-        let _ = harden_handle(thread.0, HELPER_THREAD_SDDL);
-        let _ = harden_handle(process.0, HELPER_PROCESS_SDDL);
+        // fails: [`harden_own_process`] says why). An msys run, whose command
+        // carries the account's own SID, is refused if it fails, in every mode.
+        let locked = harden_handle(thread.0, HELPER_THREAD_SDDL)
+            .and_then(|()| harden_handle(process.0, HELPER_PROCESS_SDDL));
+        if let (Err(e), true) = (
+            &locked,
+            hardening_failure_refuses(false, spec.msys.is_some()),
+        ) {
+            TerminateProcess(process.0, 1);
+            return Err(sandbox(format!(
+                "the second helper could not be locked against the command, so the msys run \
+                 was not started: {e}"
+            )));
+        }
         if ResumeThread(thread.0) == u32::MAX {
             let e = last_error("ResumeThread");
             TerminateProcess(process.0, 1);
@@ -622,14 +711,22 @@ fn start(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED};
+    use crate::windows::token::set_token_default_dacl;
+    use windows_sys::Win32::Security::{
+        DuplicateTokenEx, SecurityImpersonation, TokenPrimary, TOKEN_ADJUST_DEFAULT,
+        TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_QUERY,
+    };
     use windows_sys::Win32::System::Threading::{
-        PROCESS_CREATE_THREAD, PROCESS_VM_OPERATION, PROCESS_VM_WRITE, THREAD_SET_CONTEXT,
-        THREAD_SUSPEND_RESUME,
+        OpenProcessToken, PROCESS_CREATE_THREAD, PROCESS_VM_OPERATION, PROCESS_VM_WRITE,
     };
 
     /// A `cmd.exe` of this user's, suspended: its first thread has not run.
     fn suspended_child() -> PROCESS_INFORMATION {
+        suspended_child_as(None)
+    }
+
+    /// The same, started with `token` (a primary token) when given.
+    fn suspended_child_as(token: Option<HANDLE>) -> PROCESS_INFORMATION {
         let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
         let application = wide(format!(r"{root}\System32\cmd.exe"));
         let mut line = wide("cmd.exe /d /c exit 0");
@@ -639,21 +736,90 @@ mod tests {
             let mut si: STARTUPINFOW = std::mem::zeroed();
             si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
             let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
-            let ok = CreateProcessW(
-                application.as_ptr(),
-                line.as_mut_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
-                0,
-                CREATE_SUSPENDED | CREATE_NO_WINDOW,
-                std::ptr::null(),
-                std::ptr::null(),
-                &si,
-                &mut pi,
-            );
-            assert_ne!(ok, 0, "{}", last_error("CreateProcessW"));
+            let ok = match token {
+                Some(token) => CreateProcessAsUserW(
+                    token,
+                    application.as_ptr(),
+                    line.as_mut_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    CREATE_SUSPENDED | CREATE_NO_WINDOW,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    &si,
+                    &mut pi,
+                ),
+                None => CreateProcessW(
+                    application.as_ptr(),
+                    line.as_mut_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    CREATE_SUSPENDED | CREATE_NO_WINDOW,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    &si,
+                    &mut pi,
+                ),
+            };
+            assert_ne!(ok, 0, "{}", last_error("CreateProcess"));
             pi
         }
+    }
+
+    /// A primary-token copy of this process's own, with `sddl` as its default
+    /// DACL when given.
+    fn own_token_copy(sddl: Option<&str>) -> OwnedHandle {
+        // SAFETY: opens and duplicates this process's own token; every
+        // handle is owned and closed.
+        unsafe {
+            let mut own: HANDLE = std::ptr::null_mut();
+            let access =
+                TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY | TOKEN_ADJUST_DEFAULT;
+            assert_ne!(
+                OpenProcessToken(GetCurrentProcess(), access, &mut own),
+                0,
+                "{}",
+                last_error("OpenProcessToken")
+            );
+            let own = OwnedHandle(own);
+            let mut copy: HANDLE = std::ptr::null_mut();
+            assert_ne!(
+                DuplicateTokenEx(
+                    own.0,
+                    0x000f_01ff,
+                    std::ptr::null(),
+                    SecurityImpersonation,
+                    TokenPrimary,
+                    &mut copy
+                ),
+                0,
+                "{}",
+                last_error("DuplicateTokenEx")
+            );
+            let copy = OwnedHandle(copy);
+            if let Some(sddl) = sddl {
+                set_token_default_dacl(copy.0, sddl).expect("default DACL set");
+            }
+            copy
+        }
+    }
+
+    /// Run `f(tid)` while a second thread, `tid`, is parked; then let it end.
+    fn with_parked_thread<R>(f: impl FnOnce(u32) -> R) -> R {
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let parked = std::thread::spawn(move || {
+            // SAFETY: reads the calling thread's id.
+            tid_tx.send(unsafe { GetCurrentThreadId() }).expect("tid");
+            let _ = stop_rx.recv();
+        });
+        let tid = tid_rx.recv().expect("the thread's id");
+        let result = f(tid);
+        let _ = stop_tx.send(());
+        parked.join().expect("the parked thread ends");
+        result
     }
 
     /// Whether this process may open the thread `tid` for what hijacking it
@@ -724,6 +890,96 @@ mod tests {
             WaitForSingleObject(process.0, 10_000);
             TerminateProcess(process.0, 0);
         }
+    }
+
+    /// **A THREAD THE FIRST HELPER ALREADY LOCKED IS NOT AN ERROR** (the
+    /// regression: it denied even its owner `WRITE_DAC`, so hardening every
+    /// thread by `OpenThread(WRITE_DAC)` refused every account run). An
+    /// unlocked other thread is locked; a locked one, other or the current
+    /// one, passes; a thread that cannot be locked and is not locked is the
+    /// failure.
+    #[test]
+    fn hardening_a_thread_that_is_already_locked_is_not_an_error() {
+        // An ordinary other thread: opens before, locked after.
+        with_parked_thread(|tid| {
+            assert!(thread_opens_for_hijack(tid), "control: unlocked opens");
+            harden_thread(tid).expect("locks an unlocked thread");
+            assert!(!thread_opens_for_hijack(tid), "locked after");
+        });
+        // Locked by the parent first, as `launch_offline` does: the owner
+        // cannot even open it for WRITE_DAC now, and that is fine.
+        with_parked_thread(|tid| {
+            // SAFETY: opens a thread by id for WRITE_DAC; closed on drop.
+            let parent = OwnedHandle(unsafe { OpenThread(WRITE_DAC, 0, tid) });
+            assert!(!parent.0.is_null(), "{}", last_error("OpenThread"));
+            harden_handle(parent.0, HELPER_THREAD_SDDL).expect("the parent locks it");
+            // SAFETY: opens by id; a handle returned is closed at once.
+            let again = unsafe { OpenThread(WRITE_DAC, 0, tid) };
+            assert!(
+                again.is_null(),
+                "a locked thread denies its owner WRITE_DAC"
+            );
+            harden_thread(tid).expect("already locked is not an error");
+            assert!(!thread_opens_for_hijack(tid));
+        });
+        // The CURRENT thread, locked already: the pseudo-handle still works.
+        std::thread::spawn(|| {
+            // SAFETY: reads the calling thread's id.
+            let me = unsafe { GetCurrentThreadId() };
+            harden_handle(unsafe { GetCurrentThread() }, HELPER_THREAD_SDDL).expect("locked");
+            assert!(!thread_opens_for_hijack(me));
+            harden_thread(me).expect("the current thread, locked, is hardened again");
+        })
+        .join()
+        .expect("the thread");
+        // Neither lockable nor locked (there is no such thread): the failure.
+        let err = harden_thread(0xffff_fff0).expect_err("a thread that is not there");
+        assert!(err.contains("not locked already"), "{err}");
+    }
+
+    /// **A THREAD MADE AFTER THE SNAPSHOT IS BORN LOCKED** when the helper's
+    /// token default DACL is the thread DACL: a child started with such a
+    /// token has a first thread the owner cannot open for context or suspend;
+    /// with the ordinary token it can (the control).
+    #[test]
+    fn a_thread_made_under_the_hardened_default_dacl_is_born_locked() {
+        let plain = own_token_copy(None);
+        let pi = suspended_child_as(Some(plain.0));
+        assert!(
+            can_open_thread(pi.dwThreadId).0,
+            "control: an ordinary token's thread opens"
+        );
+        // SAFETY: handles from the creation above, ended and closed here.
+        unsafe {
+            TerminateProcess(pi.hProcess, 0);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+        }
+
+        let locked = own_token_copy(Some(HELPER_THREAD_SDDL));
+        let pi = suspended_child_as(Some(locked.0));
+        assert_eq!(
+            can_open_thread(pi.dwThreadId),
+            (false, ERROR_ACCESS_DENIED),
+            "a thread born under the hardened default DACL is locked"
+        );
+        // SAFETY: as above.
+        unsafe {
+            TerminateProcess(pi.hProcess, 0);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+        }
+    }
+
+    #[test]
+    fn a_helper_that_cannot_lock_itself_refuses_an_msys_run_in_every_mode() {
+        assert!(hardening_failure_refuses(true, false), "strict");
+        assert!(hardening_failure_refuses(false, true), "msys, best effort");
+        assert!(hardening_failure_refuses(true, true));
+        assert!(
+            !hardening_failure_refuses(false, false),
+            "best effort, no msys"
+        );
     }
 
     /// Every thread of a process is found: the snapshot sees this process's.
