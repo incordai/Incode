@@ -364,7 +364,7 @@ mod tests {
         let settings = Settings {
             mode: Mode::Off,
             hooks: Some(crate::hooks::HookRunner::new(crate::hooks::HookConfig {
-                notification: vec![command],
+                notification: vec![command.into()],
                 ..crate::hooks::HookConfig::default()
             })),
             ..Settings::default()

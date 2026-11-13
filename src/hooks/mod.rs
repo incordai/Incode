@@ -32,6 +32,9 @@
 //! - It runs in the workspace, and is killed with everything it started at
 //!   [`HOOK_TIMEOUT`]; a command that could not run or ran past it allows
 //!   the call, with a message saying so.
+//! - A tool command with a `matcher` ([`HookCommand`]) runs only for the
+//!   tools it names. A plugin's commands have its folder in
+//!   `CLAUDE_PLUGIN_ROOT` and `INCODE_PLUGIN_ROOT`.
 //!
 //! # `HOOK_TOOL_INPUT` is the REAL input, not the redacted description
 //!
@@ -111,6 +114,112 @@ pub(crate) fn run_piped(
 pub const HOOK_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ---------------------------------------------------------------------------
+// HookCommand
+// ---------------------------------------------------------------------------
+
+/// One hook command: a command line, as `admin.json` and an incode plugin's
+/// `hooks.json` write it, or `{"command", "matcher"}`.
+///
+/// `matcher` is read for `pre_tool_use` and `post_tool_use` only: the tool
+/// names the command runs for, a regular expression matched against the WHOLE
+/// name (`Bash`, `Edit|Write`, `mcp__db__.*`); none, `""` or `*` is every
+/// tool. A matcher that is not a regular expression runs the command for no
+/// tool, and says so.
+///
+/// `plugin_root` and `posix` are never written: a plugin in the other
+/// agent CLI's layout sets them as it is read (`plugins::claude_layout`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(from = "RawHookCommand", into = "RawHookCommand")]
+pub struct HookCommand {
+    pub command: String,
+    pub matcher: Option<String>,
+    /// The plugin's folder, set in the command's environment as
+    /// `CLAUDE_PLUGIN_ROOT` and `INCODE_PLUGIN_ROOT`.
+    pub plugin_root: Option<std::path::PathBuf>,
+    /// Written for a POSIX shell: on Windows it runs in the `Bash` tool's
+    /// shell when that is Git Bash (`tools::shell_choice::posix`), and in
+    /// `cmd /C` like any other only when there is none.
+    pub posix: bool,
+}
+
+/// How a [`HookCommand`] is written.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+enum RawHookCommand {
+    Plain(String),
+    Matched {
+        command: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        matcher: Option<String>,
+    },
+}
+
+impl From<RawHookCommand> for HookCommand {
+    fn from(raw: RawHookCommand) -> Self {
+        match raw {
+            RawHookCommand::Plain(command) => command.into(),
+            RawHookCommand::Matched { command, matcher } => Self {
+                command,
+                matcher,
+                ..Self::default()
+            },
+        }
+    }
+}
+
+impl From<HookCommand> for RawHookCommand {
+    fn from(hook: HookCommand) -> Self {
+        match hook.matcher {
+            None => Self::Plain(hook.command),
+            matcher => Self::Matched {
+                command: hook.command,
+                matcher,
+            },
+        }
+    }
+}
+
+impl From<String> for HookCommand {
+    fn from(command: String) -> Self {
+        Self {
+            command,
+            ..Self::default()
+        }
+    }
+}
+
+impl From<&str> for HookCommand {
+    fn from(command: &str) -> Self {
+        command.to_string().into()
+    }
+}
+
+impl PartialEq<&str> for HookCommand {
+    fn eq(&self, other: &&str) -> bool {
+        self.command == *other
+    }
+}
+
+impl std::fmt::Display for HookCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.command)
+    }
+}
+
+impl HookCommand {
+    /// Whether this command runs for the tool `tool_name`, and why not when
+    /// its matcher cannot be read.
+    pub fn matches(&self, tool_name: &str) -> Result<bool, String> {
+        match self.matcher.as_deref().map(str::trim) {
+            None | Some("" | "*") => Ok(true),
+            Some(pattern) => regex::Regex::new(&format!("^(?:{pattern})$"))
+                .map(|re| re.is_match(tool_name))
+                .map_err(|e| format!("its matcher `{pattern}` is not a regular expression: {e}")),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // HookConfig
 // ---------------------------------------------------------------------------
 
@@ -119,47 +228,62 @@ pub const HOOK_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct HookConfig {
     /// Commands run BEFORE the tool. Exit code 2 refuses the call.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub pre_tool_use: Vec<String>,
+    pub pre_tool_use: Vec<HookCommand>,
     /// Commands run AFTER the tool, whatever it returned.
     ///
     /// These cannot refuse anything — the action has already happened, and a
     /// deny here would report a refusal for something that was done.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub post_tool_use: Vec<String>,
+    pub post_tool_use: Vec<HookCommand>,
     /// Commands run when a person's line is about to go to the agent. Exit
     /// code 2 refuses the line (the reason is shown, nothing is sent); stdout
     /// is added to that turn's context. The line itself is never changed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub user_prompt_submit: Vec<String>,
+    pub user_prompt_submit: Vec<HookCommand>,
     /// Commands run before `/compact` compacts the conversation. They cannot
     /// stop it; stdout is shown with the result.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub pre_compact: Vec<String>,
+    pub pre_compact: Vec<HookCommand>,
     /// Commands run when a person's turn has ended (after any continuation
     /// the memory engine asked for). They cannot reopen it; stdout is shown
     /// with the turn's notices.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub stop: Vec<String>,
+    pub stop: Vec<HookCommand>,
     /// Commands run when incode would notify the person: a long turn
     /// finished, or the agent is waiting on them. Run in the background,
     /// beside `notify_command`; they cannot change anything.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub notification: Vec<String>,
+    pub notification: Vec<HookCommand>,
     /// Commands run when a session starts (REPL, `--acp`, `-t`). They cannot
     /// stop it; stdout is shown.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub session_start: Vec<String>,
+    pub session_start: Vec<HookCommand>,
     /// Commands run when a session ends. They cannot keep it open; stdout is
     /// shown where there is still somewhere to show it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub session_end: Vec<String>,
+    pub session_end: Vec<HookCommand>,
     /// Commands run when a sub-agent (the `Agent` tool) has finished. They
     /// cannot keep it working; what they print is traced, not shown.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub subagent_stop: Vec<String>,
+    pub subagent_stop: Vec<HookCommand>,
 }
 
 impl HookConfig {
+    /// Every command, over every event, to be changed in place (a plugin's,
+    /// as it is read: `plugins::Plugin::hooks`).
+    pub fn commands_mut(&mut self) -> impl Iterator<Item = &mut HookCommand> {
+        self.pre_tool_use
+            .iter_mut()
+            .chain(self.post_tool_use.iter_mut())
+            .chain(self.user_prompt_submit.iter_mut())
+            .chain(self.pre_compact.iter_mut())
+            .chain(self.stop.iter_mut())
+            .chain(self.notification.iter_mut())
+            .chain(self.session_start.iter_mut())
+            .chain(self.session_end.iter_mut())
+            .chain(self.subagent_stop.iter_mut())
+    }
+
     /// Whether there is anything to run at all.
     ///
     /// Checked before a call so the ordinary case — no hooks configured —
@@ -334,12 +458,25 @@ impl HookRunner {
 
     fn run_commands(
         &self,
-        commands: &[String],
+        commands: &[HookCommand],
         call: &HookCall<'_>,
         side: Side<'_>,
     ) -> HookRunResult {
+        let mut messages = Vec::new();
+        // Only the commands whose matcher takes this tool; one whose matcher
+        // cannot be read runs for none, and says so.
+        let commands: Vec<&HookCommand> = commands
+            .iter()
+            .filter(|hook| match hook.matches(call.tool_name) {
+                Ok(runs) => runs,
+                Err(why) => {
+                    messages.push(format!("Hook `{hook}` was not run: {why}"));
+                    false
+                }
+            })
+            .collect();
         if commands.is_empty() {
-            return HookRunResult::allow(Vec::new());
+            return HookRunResult::allow(messages);
         }
         let mut event = json!({
             "hook_event_name": match side { Side::Pre => "PreToolUse", Side::Post { .. } => "PostToolUse" },
@@ -366,7 +503,6 @@ impl HookRunner {
                 crate::text::head_bytes(&input, MAX_ENV_INPUT_BYTES).to_string(),
             ),
         ];
-        let mut messages = Vec::new();
         for command in commands {
             match run_shell_command(command, &env, call.cwd, &payload) {
                 Ok((code, stdout, stderr)) => {
@@ -565,7 +701,7 @@ pub struct SubagentStopped<'a> {
 /// is the reason) and the rest are not run; otherwise exit 2 is like any
 /// other. Each command's stdout is a message.
 fn run_event(
-    commands: &[String],
+    commands: &[HookCommand],
     name: &str,
     fields: Value,
     session: &str,
@@ -637,34 +773,60 @@ fn parsed(tool_input: &str) -> Value {
     serde_json::from_str(tool_input).unwrap_or_else(|_| json!(tool_input))
 }
 
+/// The names a plugin's folder is given in its hook commands' environment.
+const PLUGIN_ROOT_VARS: [&str; 2] = ["CLAUDE_PLUGIN_ROOT", "INCODE_PLUGIN_ROOT"];
+
 /// One operator command, run through the shell in `cwd` with `env` set and the
 /// event on its stdin: its exit code, stdout and stderr, each trimmed.
 fn run_shell_command(
-    command: &str,
+    hook: &HookCommand,
     env: &[(&str, String)],
     cwd: Option<&Path>,
     payload: &[u8],
 ) -> std::io::Result<(i32, String, String)> {
-    // Verbatim on Windows, as the Bash tool passes its command: `Command::arg`
-    // would escape a `"` the operator wrote as `\"`, which `cmd /C` does not
-    // read that way.
+    // A plugin's folder, with `/` on Windows too: Git Bash reads a `\` in an
+    // expanded path as written, but one in a command's own text as an escape.
+    let root = hook
+        .plugin_root
+        .as_ref()
+        .map(|root| root.to_string_lossy().replace('\\', "/"));
+
+    // A command written for a POSIX shell runs in the `Bash` tool's shell
+    // when that is one. Otherwise, verbatim on Windows, as the Bash tool
+    // passes its command: `Command::arg` would escape a `"` the operator
+    // wrote as `\"`, which `cmd /C` does not read that way. cmd expands no
+    // `${…}`, so there the plugin's folder is written into the text.
     #[cfg(windows)]
-    let mut child = {
-        use std::os::windows::process::CommandExt;
-        let mut c = Command::new("cmd");
-        c.arg("/C").raw_arg(command);
-        c
+    let mut child = match hook.posix.then(crate::tools::shell_choice::posix).flatten() {
+        Some(shell) => shell.command(&hook.command),
+        None => {
+            use std::os::windows::process::CommandExt;
+            let mut text = hook.command.clone();
+            if let Some(root) = &root {
+                for var in PLUGIN_ROOT_VARS {
+                    text = text.replace(&format!("${{{var}}}"), root);
+                }
+            }
+            let mut c = Command::new("cmd");
+            c.arg("/C").raw_arg(text);
+            c
+        }
     };
 
     #[cfg(not(windows))]
     let mut child = {
         let mut c = Command::new("sh");
-        c.arg("-lc").arg(command);
+        c.arg("-lc").arg(&hook.command);
         c
     };
 
     for (name, value) in env {
         child.env(name, value);
+    }
+    if let Some(root) = &root {
+        for var in PLUGIN_ROOT_VARS {
+            child.env(var, root);
+        }
     }
     if let Some(cwd) = cwd {
         child.current_dir(cwd);
@@ -693,7 +855,7 @@ mod tests {
 
     /// A hook command that saves its stdin next to it, prints `said`, and
     /// exits with `code` after writing `why` to stderr.
-    fn hook(dir: &Path, code: i32, why: &str) -> String {
+    fn hook(dir: &Path, code: i32, why: &str) -> HookCommand {
         #[cfg(windows)]
         {
             let script = dir.join(format!("hook{code}.cmd"));
@@ -707,7 +869,7 @@ mod tests {
             .expect("hook");
             // Quoted as an operator would: the command reaches `cmd /C`
             // verbatim.
-            format!("\"{}\"", script.display())
+            format!("\"{}\"", script.display()).into()
         }
         #[cfg(not(windows))]
         {
@@ -720,7 +882,7 @@ mod tests {
                 ),
             )
             .expect("hook");
-            format!("sh '{}'", script.display())
+            format!("sh '{}'", script.display()).into()
         }
     }
 
@@ -762,6 +924,123 @@ mod tests {
         assert_eq!(event["tool_name"], "Write");
         assert_eq!(event["tool_input"]["path"], "a.txt");
         assert_eq!(event["session_id"], "sess-9");
+    }
+
+    /// **A TOOL HOOK WITH A MATCHER RUNS ONLY FOR THE TOOLS IT NAMES**, the
+    /// whole name matched: `Edit|Write` denies a `Write`, never runs for a
+    /// `Read` or a `WriteNotes`, and a matcher that is not a regular
+    /// expression runs for no tool and says so.
+    #[test]
+    fn a_tool_hook_with_a_matcher_runs_only_for_the_tools_it_names() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut denying = hook(dir.path(), 2, "no edits");
+        denying.matcher = Some("Edit|Write".to_string());
+        let runner = HookRunner::new(HookConfig {
+            pre_tool_use: vec![denying],
+            ..HookConfig::default()
+        });
+        let input = json!({"path": "a.txt"});
+        let on = |tool_name| HookCall {
+            tool_name,
+            tool_input: &input,
+            session: "",
+            cwd: Some(dir.path()),
+        };
+        for tool in ["Read", "WriteNotes"] {
+            let ran = runner.pre_tool(&on(tool));
+            assert!(!ran.is_denied(), "{tool}: {ran:?}");
+            assert!(
+                !dir.path().join("event.json").exists(),
+                "the hook ran for {tool}"
+            );
+        }
+        let ran = runner.pre_tool(&on("Write"));
+        assert!(ran.is_denied(), "{ran:?}");
+        assert_eq!(ran.messages(), ["no edits"]);
+
+        let mut unreadable = hook(dir.path(), 2, "never");
+        unreadable.matcher = Some("Edit(".to_string());
+        let ran = HookRunner::new(HookConfig {
+            pre_tool_use: vec![unreadable],
+            ..HookConfig::default()
+        })
+        .pre_tool(&on("Edit"));
+        assert!(!ran.is_denied(), "{ran:?}");
+        assert!(
+            ran.messages()[0].contains("not a regular expression"),
+            "{ran:?}"
+        );
+    }
+
+    /// **A PLUGIN'S HOOK IS TOLD ITS FOLDER** as `CLAUDE_PLUGIN_ROOT`, with
+    /// `/` for every separator — in the environment where a shell expands
+    /// it, and in the text where `cmd` would not.
+    #[test]
+    fn a_plugin_hook_is_told_its_folder() {
+        let dir = tempfile::tempdir().expect("dir");
+        let root = dir.path().join("my plugin");
+        let command = if cfg!(windows) {
+            "echo ${CLAUDE_PLUGIN_ROOT}"
+        } else {
+            "echo \"$CLAUDE_PLUGIN_ROOT\""
+        };
+        let runner = HookRunner::new(HookConfig {
+            session_start: vec![HookCommand {
+                plugin_root: Some(root.clone()),
+                ..HookCommand::from(command)
+            }],
+            ..HookConfig::default()
+        });
+        let ran = runner.session_start("startup", "", Some(dir.path()));
+        assert_eq!(
+            ran.messages(),
+            [root.to_string_lossy().replace('\\', "/")],
+            "{ran:?}"
+        );
+    }
+
+    /// **A HOOK WRITTEN FOR A POSIX SHELL RUNS IN ONE ON WINDOWS** — the
+    /// `Bash` tool's Git Bash — where `${CLAUDE_PLUGIN_ROOT}` is expanded by
+    /// the shell. Skipped where this machine has no POSIX shell to give it.
+    #[cfg(windows)]
+    #[test]
+    fn a_posix_hook_runs_in_the_posix_shell_on_windows() {
+        if crate::tools::shell_choice::posix().is_none() {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("dir");
+        let root = dir.path().join("plugin");
+        let runner = HookRunner::new(HookConfig {
+            session_start: vec![HookCommand {
+                plugin_root: Some(root.clone()),
+                posix: true,
+                ..HookCommand::from(
+                    "[ -n \"$BASH_VERSION\" ] && printf '%s' \"${CLAUDE_PLUGIN_ROOT}\"",
+                )
+            }],
+            ..HookConfig::default()
+        });
+        let ran = runner.session_start("startup", "", Some(dir.path()));
+        assert_eq!(
+            ran.messages(),
+            [root.to_string_lossy().replace('\\', "/")],
+            "{ran:?}"
+        );
+    }
+
+    /// **`admin.json` READS A HOOK AS A COMMAND LINE OR WITH A MATCHER**, and
+    /// writes each back the way it was written.
+    #[test]
+    fn a_hook_is_written_as_a_line_or_with_its_matcher() {
+        let text = r#"{"pre_tool_use":["check",{"command":"lint","matcher":"Edit|Write"}]}"#;
+        let config: HookConfig = serde_json::from_str(text).expect("parses");
+        assert_eq!(config.pre_tool_use, ["check", "lint"]);
+        assert_eq!(config.pre_tool_use[0].matcher, None);
+        assert_eq!(
+            config.pre_tool_use[1].matcher.as_deref(),
+            Some("Edit|Write")
+        );
+        assert_eq!(serde_json::to_string(&config).expect("writes"), text);
     }
 
     /// Any other exit allows, with what the hook printed; a post hook cannot
@@ -917,7 +1196,7 @@ mod tests {
         assert_eq!(event["reason"], "prompt_input_exit");
     }
 
-    fn prompt_runner(commands: Vec<String>) -> HookRunner {
+    fn prompt_runner(commands: Vec<HookCommand>) -> HookRunner {
         HookRunner::new(HookConfig {
             user_prompt_submit: commands,
             ..HookConfig::default()

@@ -380,15 +380,15 @@ fn a_tool() -> crate::ext_tools::ToolEntry {
 /// fails to compile here until it is given a hook.
 fn a_hook_on_every_desktop_event() -> crate::hooks::HookConfig {
     crate::hooks::HookConfig {
-        pre_tool_use: vec!["a-guard-command".to_string()],
-        post_tool_use: vec!["a-logging-command".to_string()],
-        user_prompt_submit: vec!["a-prompt-check".to_string()],
-        pre_compact: vec!["a-compact-note".to_string()],
-        stop: vec!["a-stop-note".to_string()],
-        notification: vec!["a-notify-hook".to_string()],
-        session_start: vec!["a-start-note".to_string()],
-        session_end: vec!["a-end-note".to_string()],
-        subagent_stop: vec!["a-subagent-note".to_string()],
+        pre_tool_use: vec!["a-guard-command".into()],
+        post_tool_use: vec!["a-logging-command".into()],
+        user_prompt_submit: vec!["a-prompt-check".into()],
+        pre_compact: vec!["a-compact-note".into()],
+        stop: vec!["a-stop-note".into()],
+        notification: vec!["a-notify-hook".into()],
+        session_start: vec!["a-start-note".into()],
+        session_end: vec!["a-end-note".into()],
+        subagent_stop: vec!["a-subagent-note".into()],
     }
 }
 

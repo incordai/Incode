@@ -316,7 +316,7 @@ mod live {
 
         let mut s = Server::new(InputThread::start().expect("input thread")).with_hooks(
             crate::hooks::HookConfig {
-                pre_tool_use: vec![deny.to_string()],
+                pre_tool_use: vec![deny.into()],
                 post_tool_use: Vec::new(),
                 user_prompt_submit: Vec::new(),
                 pre_compact: Vec::new(),
@@ -359,7 +359,7 @@ mod live {
         };
         let mut s = Server::new(InputThread::start().expect("input thread")).with_hooks(
             crate::hooks::HookConfig {
-                pre_tool_use: vec![allow.to_string()],
+                pre_tool_use: vec![allow.into()],
                 post_tool_use: Vec::new(),
                 user_prompt_submit: Vec::new(),
                 pre_compact: Vec::new(),

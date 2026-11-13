@@ -358,7 +358,7 @@ mod tests {
             format!("echo '{out}'; exit {code}")
         };
         crate::hooks::HookRunner::new(crate::hooks::HookConfig {
-            user_prompt_submit: vec![command],
+            user_prompt_submit: vec![command.into()],
             ..crate::hooks::HookConfig::default()
         })
     }

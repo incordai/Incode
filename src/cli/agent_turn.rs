@@ -1675,7 +1675,7 @@ mod tests {
             let mut s = with_memory(ws.path(), engine.path(), &[], &seen, Box::new(|_| {}));
             s.set_operator_hooks(Some(crate::hooks::HookRunner::new(
                 crate::hooks::HookConfig {
-                    user_prompt_submit: vec![operator_hook("checked", "no secrets", code)],
+                    user_prompt_submit: vec![operator_hook("checked", "no secrets", code).into()],
                     ..crate::hooks::HookConfig::default()
                 },
             )));
@@ -1736,7 +1736,7 @@ mod tests {
             let mut s = with_memory(ws.path(), engine.path(), &[], &seen, Box::new(|_| {}));
             s.set_operator_hooks(Some(crate::hooks::HookRunner::new(
                 crate::hooks::HookConfig {
-                    user_prompt_submit: vec![operator_hook("checked", "no secrets", code)],
+                    user_prompt_submit: vec![operator_hook("checked", "no secrets", code).into()],
                     ..crate::hooks::HookConfig::default()
                 },
             )));
@@ -1768,7 +1768,7 @@ mod tests {
         let mut s = with_memory(ws.path(), engine.path(), &[], &seen, Box::new(|_| {}));
         s.set_operator_hooks(Some(crate::hooks::HookRunner::new(
             crate::hooks::HookConfig {
-                stop: vec![operator_hook("turn noted", "", 0)],
+                stop: vec![operator_hook("turn noted", "", 0).into()],
                 ..crate::hooks::HookConfig::default()
             },
         )));
@@ -1800,8 +1800,8 @@ mod tests {
         let here = if cfg!(windows) { "cd" } else { "pwd" };
         s.set_operator_hooks(Some(crate::hooks::HookRunner::new(
             crate::hooks::HookConfig {
-                session_start: vec![here.to_string()],
-                session_end: vec![operator_hook("bye", "", 2)],
+                session_start: vec![here.into()],
+                session_end: vec![operator_hook("bye", "", 2).into()],
                 ..crate::hooks::HookConfig::default()
             },
         )));

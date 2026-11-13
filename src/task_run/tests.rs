@@ -23,9 +23,9 @@ fn a_refused_instruction_still_runs_the_session_end_hook() {
         )
     };
     let hooks = crate::hooks::HookRunner::new(crate::hooks::HookConfig {
-        session_start: vec![mark[0].to_string()],
-        user_prompt_submit: vec![refuse.to_string()],
-        session_end: vec![mark[1].to_string()],
+        session_start: vec![mark[0].to_string().into()],
+        user_prompt_submit: vec![refuse.to_string().into()],
+        session_end: vec![mark[1].to_string().into()],
         ..crate::hooks::HookConfig::default()
     });
     let ran = run_task_hooked(

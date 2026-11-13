@@ -26,8 +26,20 @@
 //!   "args", "env"} | {"type": "http", "url", "headers"}}}`, started beside
 //!   the external tools' servers.
 //!
+//! - `agents/*.md` — sub-agent definitions, listed as `<plugin>:<agent>`
+//!   beside the operator's own ([`crate::subagents::load`]).
+//!
 //! `${INCODE_PLUGIN_ROOT}` in a hook command or a server's command, arguments
 //! or environment is replaced with the plugin's folder.
+//!
+//! # The other agent CLI's layout
+//!
+//! A folder with `.claude-plugin/plugin.json` and no `plugin.toml` is read
+//! too, by [`claude_layout`]: the same `commands/`, `skills/` and `agents/`,
+//! its `hooks/hooks.json` translated to these events, its `.mcp.json`
+//! servers, and `${CLAUDE_PLUGIN_ROOT}`. Once installed it is an incode
+//! plugin like any other — used by every agent incode drives, approved the
+//! same way.
 //!
 //! # Whose words these are
 //!
@@ -46,6 +58,8 @@
 //! under.
 
 use std::path::{Path, PathBuf};
+
+pub mod claude_layout;
 
 /// The folder plugins live in, under `~/.incode/` or a project's `.incode/`.
 pub const PLUGINS_DIR: &str = "plugins";
@@ -126,7 +140,8 @@ pub fn discover(workspace: &Path) -> Found {
 /// left out is a problem line saying how to approve it.
 ///
 /// Every consumer of a plugin's content goes through this: `session_hooks`,
-/// `session_servers`, `session_skills` and `custom_commands::Registry::load`
+/// `session_servers`, `session_skills`, `session_agents` (for
+/// `subagents::load`) and `custom_commands::Registry::load`
 /// (whose warnings are where the left-out lines are shown, once).
 #[must_use]
 pub fn discover_usable(workspace: &Path) -> Found {
@@ -197,16 +212,29 @@ pub fn discover_in(project: Option<&Path>, user: &Path) -> Found {
     found
 }
 
-/// One plugin folder.
+/// Whether `root` holds a plugin manifest of either layout.
+fn has_manifest(root: &Path) -> bool {
+    root.join(MANIFEST).is_file() || root.join(claude_layout::MANIFEST).is_file()
+}
+
+/// A manifest reader: [`parse_manifest`] or [`claude_layout::manifest`].
+type ManifestParser = fn(&str) -> Result<Manifest, String>;
+
+/// One plugin folder: its `plugin.toml`, else its `.claude-plugin/plugin.json`.
 fn load_one(root: &Path, scope: Scope) -> Result<Plugin, String> {
-    let path = root.join(MANIFEST);
+    let (path, parse): (PathBuf, ManifestParser) = if claude_layout::is_one(root) {
+        (root.join(claude_layout::MANIFEST), claude_layout::manifest)
+    } else {
+        (root.join(MANIFEST), parse_manifest)
+    };
     let text = crate::text::read_authored(&path).map_err(|e| {
         format!(
-            "plugin at {} has no readable {MANIFEST}: {e}",
-            root.display()
+            "plugin at {} has no readable {MANIFEST} (or {}): {e}",
+            root.display(),
+            claude_layout::MANIFEST
         )
     })?;
-    let manifest = parse_manifest(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    let manifest = parse(&text).map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(Plugin {
         manifest,
         root: root.to_path_buf(),
@@ -338,26 +366,62 @@ impl Plugin {
             .collect()
     }
 
-    /// Its hook commands, with [`ROOT_VAR`] filled in.
+    /// Where its sub-agent definitions are.
+    #[must_use]
+    pub fn agents_dir(&self) -> PathBuf {
+        self.root.join("agents")
+    }
+
+    /// Its hook commands, with [`ROOT_VAR`] filled in and its folder in their
+    /// environment; in the other layout, translated by
+    /// [`claude_layout::hooks`] (what that leaves out is traced, and listed
+    /// by [`Self::notes`]).
     pub fn hooks(&self) -> Result<crate::hooks::HookConfig, String> {
+        if claude_layout::is_one(&self.root) {
+            let Some((config, left_out)) = claude_layout::hooks(&self.root)? else {
+                return Ok(crate::hooks::HookConfig::default());
+            };
+            for why in &left_out {
+                crate::trace!("plugins", "{}: left out {why}", self.manifest.name);
+            }
+            return Ok(config);
+        }
         let path = self.root.join("hooks.json");
         let Ok(text) = crate::text::read_authored(&path) else {
             return Ok(crate::hooks::HookConfig::default());
         };
         let mut config: crate::hooks::HookConfig =
             serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
-        for command in config
-            .pre_tool_use
-            .iter_mut()
-            .chain(config.post_tool_use.iter_mut())
-        {
-            *command = self.fill(command);
+        for hook in config.commands_mut() {
+            hook.command = self.fill(&hook.command);
+            hook.plugin_root = Some(self.root.clone());
         }
         Ok(config)
     }
 
+    /// What this plugin brings that incode does not use, one line each, for
+    /// `incode plugin list` and an approval: only the other layout has any.
+    #[must_use]
+    pub fn notes(&self) -> Vec<String> {
+        if !claude_layout::is_one(&self.root) {
+            return Vec::new();
+        }
+        let mut notes = claude_layout::unread(&self.root);
+        match claude_layout::hooks(&self.root) {
+            Ok(Some((_, left_out))) => {
+                notes.extend(left_out.into_iter().map(|why| format!("left out {why}")));
+            }
+            Ok(None) => {}
+            Err(why) => notes.push(why),
+        }
+        notes
+    }
+
     /// Its MCP servers, named `<plugin>_<server>`.
     pub(crate) fn servers(&self) -> Result<Vec<crate::toolbox::ServerSpec>, String> {
+        if claude_layout::is_one(&self.root) {
+            return claude_layout::servers(&self.root, &self.manifest.name);
+        }
         let Some(path) = [".mcp.json", "mcp.json"]
             .iter()
             .map(|f| self.root.join(f))
@@ -432,6 +496,20 @@ impl Plugin {
 #[must_use]
 pub fn session_skills() -> Vec<crate::skills::Skill> {
     usable_here().iter().flat_map(Plugin::skills).collect()
+}
+
+/// Every usable plugin's `agents/` folder for `workspace`, with the plugin's
+/// name: read by `subagents::load`, which names each definition
+/// `<plugin>:<agent>`. Unapproved project plugins are left out here and said
+/// by `custom_commands::Registry::load`, as for servers.
+#[must_use]
+pub fn session_agents(workspace: &Path) -> Vec<(String, PathBuf)> {
+    discover_usable(workspace)
+        .plugins
+        .iter()
+        .map(|p| (p.manifest.name.clone(), p.agents_dir()))
+        .filter(|(_, dir)| dir.is_dir())
+        .collect()
 }
 
 /// Every plugin's hook commands, for the process's own directory. A plugin
@@ -600,8 +678,13 @@ pub fn listing(found: &Found) -> String {
                 format!("    approval could not be checked: {why}\n")
             }
         };
+        let notes: String = plugin
+            .notes()
+            .iter()
+            .map(|note| format!("    note: {note}\n"))
+            .collect();
         out.push_str(&format!(
-            "{} {} ({}) — {}\n    {}\n    {}\n{approval}",
+            "{} {} ({}) — {}\n    {}\n    {}\n{notes}{approval}",
             m.name,
             if m.version.is_empty() {
                 "-"
@@ -633,7 +716,22 @@ fn contents(plugin: &Plugin) -> String {
         .map(|h| h.count())
         .unwrap_or(0);
     let servers = plugin.servers().map(|s| s.len()).unwrap_or(0);
-    format!("{commands} command(s), {skills} skill(s), {hooks} hook(s), {servers} MCP server(s)")
+    let agents = std::fs::read_dir(plugin.agents_dir())
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|e| {
+                    e.path()
+                        .extension()
+                        .is_some_and(|x| x.eq_ignore_ascii_case("md"))
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    format!(
+        "{commands} command(s), {skills} skill(s), {agents} agent(s), {hooks} hook(s), \
+         {servers} MCP server(s)"
+    )
 }
 
 /// Install a plugin from a local folder (copied) or a git URL (cloned with
@@ -862,7 +960,7 @@ pub fn update_all(target: &Path) -> Result<String, String> {
         .map(|entries| {
             entries
                 .filter_map(Result::ok)
-                .filter(|e| e.path().join(MANIFEST).is_file())
+                .filter(|e| has_manifest(&e.path()))
                 .map(|e| e.file_name().to_string_lossy().into_owned())
                 .filter(|n| !n.starts_with('.'))
                 .collect()
@@ -932,7 +1030,7 @@ fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
 pub fn remove(name: &str, target: &Path) -> Result<PathBuf, String> {
     check_name(name)?;
     let dest = target.join(name);
-    if !dest.join(MANIFEST).is_file() {
+    if !has_manifest(&dest) {
         return Err(format!(
             "no plugin `{name}` in {} (`incode plugin list` shows what is installed)",
             target.display()
@@ -1143,7 +1241,7 @@ mod tests {
         let hooks = p.hooks().expect("hooks");
         assert_eq!(
             hooks.pre_tool_use,
-            vec![format!("{}/check.sh", root.display())]
+            [format!("{}/check.sh", root.display()).as_str()]
         );
 
         let servers = p.servers().expect("servers");
