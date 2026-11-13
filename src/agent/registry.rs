@@ -495,21 +495,73 @@ pub fn discover() -> Vec<DetectedAgent> {
     discover_in(&configured_table())
 }
 
+/// The `.exe` a Windows spawn of the bare name `cmd` starts, from the
+/// folders of `path_env` in order: `cmd` itself when it has an extension,
+/// else `cmd.exe`. `None` for a name with a folder in it, or when no folder
+/// holds it. `is_file` is asked about each candidate.
+///
+/// Why not `where`'s first line: `where` lists every extension `PATHEXT`
+/// names, so for npm's codex it answers `...\npm\codex` (a shell script) and
+/// `codex.cmd` ahead of any `codex.exe`, while `Command::new("codex")` only
+/// ever starts a `.exe`. Measured on Windows 11: the shell's `codex` was npm's
+/// 0.167.0, `incode --admin` showed npm's path, and every run incode started
+/// was the Codex desktop app's `codex.exe`, 0.145.0, further down `PATH`
+/// (each run's version read from codex's own session file). A `.cmd` is not
+/// started in its place: Rust refuses some arguments to a batch file
+/// (newlines among them), and a prompt has newlines.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn exe_on_path(
+    cmd: &str,
+    path_env: Option<&str>,
+    is_file: &dyn Fn(&std::path::Path) -> bool,
+) -> Option<std::path::PathBuf> {
+    if cmd.contains(['\\', '/', ':']) {
+        return None;
+    }
+    let name = if std::path::Path::new(cmd).extension().is_some() {
+        cmd.to_string()
+    } else {
+        format!("{cmd}.exe")
+    };
+    path_env?
+        .split(';')
+        .map(|dir| dir.trim().trim_matches('"'))
+        .filter(|dir| !dir.is_empty())
+        .map(|dir| std::path::Path::new(dir).join(&name))
+        .find(|candidate| is_file(candidate))
+}
+
+/// What to start for `cmd`, and where it is: on Windows the `.exe` a spawn
+/// would find ([`exe_on_path`]), named by its absolute path so the version
+/// probed, the path shown and the program run are one and the same; else
+/// the name as given, found by `where` / `which` ([`find_command_path`]).
+fn resolve_command(cmd: &str) -> Option<(String, String)> {
+    #[cfg(windows)]
+    if let Some(exe) = exe_on_path(cmd, std::env::var("PATH").ok().as_deref(), &|p| p.is_file()) {
+        let exe = exe.to_string_lossy().into_owned();
+        return Some((exe.clone(), exe));
+    }
+    find_command_path(cmd).map(|path| (cmd.to_string(), path))
+}
+
 /// Discover every agent of `table` present on this machine.
+///
+/// Its `command` is what the run starts (`task_run::drive`, `cli::prepare`,
+/// `acp_agent`), so it is resolved here once ([`resolve_command`]).
 #[must_use]
 pub fn discover_in(table: &[AgentSpec]) -> Vec<DetectedAgent> {
     let mut found = Vec::new();
     for spec in table {
         for cmd in &spec.commands {
-            let Some(path) = find_command_path(cmd) else {
+            let Some((command, path)) = resolve_command(cmd) else {
                 continue;
             };
             found.push(DetectedAgent {
                 id: spec.id.clone(),
                 display_name: spec.display_name.clone(),
-                command: cmd.clone(),
+                version: probe_version(&command, &spec.version_args),
+                command,
                 path: Some(path),
-                version: probe_version(cmd, &spec.version_args),
                 protocol: spec.protocol,
             });
             break; // first matching command wins
@@ -769,6 +821,42 @@ mod tests {
             "claude-code"
         );
         assert!(choose(&[], Some("claude-code")).is_none());
+    }
+
+    /// **WHAT A SPAWN STARTS, NOT WHAT `where` LISTS FIRST.** The layout
+    /// measured on Windows 11: npm's folder first on `PATH`, holding `codex`
+    /// (a shell script) and `codex.cmd`; the Codex desktop app's `codex.exe`
+    /// further down. A spawn of `codex` starts the desktop app's `.exe`, so
+    /// that is the one named, probed and run.
+    #[test]
+    fn the_program_found_is_the_exe_a_spawn_starts() {
+        let files = [
+            r"C:\npm\codex",
+            r"C:\npm\codex.cmd",
+            r"C:\desk\bin\codex.exe",
+            r"C:\tools\claude.exe",
+            r"C:\tools\agy.cmd",
+        ];
+        let is_file = |p: &std::path::Path| files.iter().any(|f| std::path::Path::new(f) == p);
+        let path = Some(r#"C:\npm;"C:\desk\bin";;C:\tools"#);
+        assert_eq!(
+            exe_on_path("codex", path, &is_file),
+            Some(std::path::PathBuf::from(r"C:\desk\bin\codex.exe"))
+        );
+        assert_eq!(
+            exe_on_path("claude", path, &is_file),
+            Some(std::path::PathBuf::from(r"C:\tools\claude.exe"))
+        );
+        // Only a batch shim: no `.exe` a spawn could start.
+        assert_eq!(exe_on_path("agy", path, &is_file), None);
+        // A name with its extension is taken as written.
+        assert_eq!(
+            exe_on_path("codex.cmd", path, &is_file),
+            Some(std::path::PathBuf::from(r"C:\npm\codex.cmd"))
+        );
+        // A path, or no PATH at all: not this function's to resolve.
+        assert_eq!(exe_on_path(r"C:\desk\bin\codex", path, &is_file), None);
+        assert_eq!(exe_on_path("codex", None, &is_file), None);
     }
 
     /// Drivable chain preserves preferred agent at the front and appends all
