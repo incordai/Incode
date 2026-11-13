@@ -117,6 +117,74 @@ fn project_settings_with_a_byte_order_mark_still_deny() {
     );
 }
 
+/// **A PROJECT SETTINGS FILE INCODE CANNOT USE REFUSES EVERY CALL, AND SAYS
+/// WHY.** Issue #19's own steps wrote `{"deny":["Write(secret.txt)"]}`: a
+/// top-level `deny` incode does not read. It was dropped without a word, and
+/// the Write it was meant to stop ran (measured on a real `-t` run). Now that
+/// file, a typo inside `permissions`, and bad JSON each fail closed, the
+/// refusal naming the file and the fix. Control: the right shape denies only
+/// what it lists.
+#[test]
+fn a_project_settings_file_incode_cannot_use_refuses_every_call_and_says_why() {
+    let ws_for = |dir: &tempfile::TempDir| PathContext {
+        workspace: dir.path().to_path_buf(),
+        home: None,
+    };
+    let write = |path: &str| Subject::Paths(vec![path.to_string()]);
+    for (text, says) in [
+        (
+            r#"{"deny":["Write(secret.txt)"]}"#,
+            "`deny` at the top level",
+        ),
+        (
+            r#"{"permissions": {"denny": ["Write(secret.txt)"]}}"#,
+            "`permissions` has `denny`",
+        ),
+        (
+            r#"{"permissions": {"deny": ["Write(secret.txt)"]"#,
+            "not valid JSON",
+        ),
+        (r#"["Write(secret.txt)"]"#, "must be a JSON object"),
+    ] {
+        let dir = tempfile::tempdir().expect("dir");
+        std::fs::create_dir_all(dir.path().join(".incode")).expect("mkdir");
+        std::fs::write(dir.path().join(PROJECT_SETTINGS), text).expect("write");
+        let rules = PermissionRules::load(dir.path());
+        let ws = ws_for(&dir);
+        for (tool, subject) in [
+            ("Write", write("secret.txt")),
+            ("Read", write("other.txt")),
+            ("Bash", Subject::Command("ls".to_string())),
+        ] {
+            let verdict = rules.decide(tool, &subject, &ws).expect("decided");
+            assert_eq!(verdict.effect, Effect::Deny, "{text}: {tool}");
+            assert_eq!(verdict.layer, Layer::Project, "{text}");
+            let said = verdict.describe();
+            assert!(said.contains(says), "{text}: {said}");
+            assert!(said.contains(PROJECT_SETTINGS), "{text}: {said}");
+        }
+        assert_eq!(rules.warnings().len(), 1, "{:?}", rules.warnings());
+    }
+
+    let dir = tempfile::tempdir().expect("dir");
+    std::fs::create_dir_all(dir.path().join(".incode")).expect("mkdir");
+    std::fs::write(
+        dir.path().join(PROJECT_SETTINGS),
+        r#"{"permissions": {"deny": ["Write(secret.txt)"]}}"#,
+    )
+    .expect("write");
+    let rules = PermissionRules::load(dir.path());
+    let ws = ws_for(&dir);
+    assert!(rules.warnings().is_empty(), "{:?}", rules.warnings());
+    assert_eq!(
+        rules
+            .decide("Write", &write("secret.txt"), &ws)
+            .map(|v| v.effect),
+        Some(Effect::Deny)
+    );
+    assert_eq!(rules.decide("Write", &write("other.txt"), &ws), None);
+}
+
 // --- a turn's allowlist ---------------------------------------------------
 
 fn listed(texts: &[&str]) -> Allowlist {
