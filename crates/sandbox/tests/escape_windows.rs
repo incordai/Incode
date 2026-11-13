@@ -27,6 +27,8 @@ use serde_json::{json, Value};
 const INSBX: &str = env!("CARGO_BIN_EXE_insbx");
 /// Every run SID starts with this (`incord_sandbox::windows::SID_PREFIX`).
 const SID_MARK: &str = "4242424242";
+/// Every root's kept SID has this (`incord_sandbox::windows::ROOT_SID_PREFIX`).
+const KEEP_MARK: &str = "4141414141";
 /// The offline account (`incord_sandbox::windows::offline::ACCOUNT`).
 const OFFLINE: &str = "insbx-offline";
 
@@ -195,20 +197,62 @@ fn writes_land_only_inside_the_writable_root() {
     assert!(!outside.exists(), "wrote outside the root: {}", text(&o));
 }
 
+/// The root's grant is its own SID's, kept after the run (later runs only
+/// check it); the temp directory's is the run's SID, gone with the run.
+/// `insbx grants` lists the root and `insbx revoke` takes the grant back.
 #[test]
-fn the_grant_is_held_for_the_run_and_revoked_after() {
+fn the_roots_grant_is_kept_the_temp_grant_is_not_and_revoke_takes_it_back() {
     let d = dirs();
-    let o = cmd(&d.ws, &["-w", "."], "icacls .");
+    let o = cmd(&d.ws, &["-w", "."], "icacls . & icacls %TEMP%");
+    let during = text(&o);
+    assert!(during.contains(KEEP_MARK), "the root's own ACE: {during}");
+    assert!(during.contains(SID_MARK), "the temp's run ACE: {during}");
+    let after = icacls(&d.ws);
+    assert!(after.contains(KEEP_MARK), "kept after the run: {after}");
+    assert!(!after.contains(SID_MARK), "no run SID on the root: {after}");
+
+    let ws = d.ws.display().to_string().to_ascii_lowercase();
+    let listed = text(&insbx(&["grants"], &d.ws)).to_ascii_lowercase();
     assert!(
-        text(&o).contains(SID_MARK),
-        "the root carries the run's ACE during the run: {}",
+        listed
+            .lines()
+            .any(|l| l.starts_with("granted") && l.ends_with(&ws)),
+        "{listed}"
+    );
+    let o = insbx(&["revoke", "."], &d.ws);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    let revoked = icacls(&d.ws);
+    assert!(!revoked.contains(KEEP_MARK), "{revoked}");
+    let listed = text(&insbx(&["grants"], &d.ws)).to_ascii_lowercase();
+    assert!(!listed.contains(&ws), "{listed}");
+}
+
+/// A kept grant lets no other run write there: a run whose roots do not
+/// include the folder holds no SID its ACE names.
+#[test]
+fn a_kept_grant_is_writable_only_to_runs_that_name_the_folder() {
+    let d = dirs();
+    let o = cmd(&d.out, &["-w", "."], "echo a> first.txt");
+    assert!(d.out.join("first.txt").exists(), "{}", text(&o));
+    assert!(icacls(&d.out).contains(KEEP_MARK), "kept on out");
+    let target = d.out.join("from-ws.txt");
+    let o = cmd(
+        &d.ws,
+        &["-w", "."],
+        &format!("echo bad> {} & echo ok> mine.txt", target.display()),
+    );
+    assert!(d.ws.join("mine.txt").exists(), "{}", text(&o));
+    assert!(
+        !target.exists(),
+        "a run for ws wrote in out's kept grant: {}",
         text(&o)
     );
-    let after = icacls(&d.ws);
-    assert!(
-        !after.contains(SID_MARK),
-        "the ACE outlived the run: {after}"
-    );
+    // Control: naming out again, it writes.
+    let o = cmd(&d.out, &["-w", "."], "echo b> second.txt");
+    assert!(d.out.join("second.txt").exists(), "{}", text(&o));
+    for dir in [&d.ws, &d.out] {
+        insbx(&["revoke", dir.to_str().expect("utf8")], dir);
+    }
 }
 
 #[test]
@@ -900,15 +944,17 @@ fn under_network_deny_writes_stay_confined_and_exit_codes_pass_through() {
     assert_eq!(o.status.code(), Some(127), "{}", text(&o));
 }
 
+/// Under network deny the account's ACE on a root is kept with the root's
+/// own, and `insbx revoke` takes both back.
 #[test]
-fn the_offline_accounts_grant_lasts_the_run_and_no_longer() {
-    if !needs_offline("the_offline_accounts_grant_lasts_the_run") {
+fn the_offline_accounts_grant_on_a_root_is_kept_until_revoked() {
+    if !needs_offline("the_offline_accounts_grant_on_a_root_is_kept") {
         return;
     }
     let d = dirs();
     let o = cmd(&d.ws, &["--net", "deny", "-w", "."], "icacls . & whoami");
     let during = text(&o);
-    assert!(during.contains(SID_MARK), "{during}");
+    assert!(during.contains(KEEP_MARK), "{during}");
     assert!(during.contains(OFFLINE), "the account's ACE: {during}");
     assert!(
         during
@@ -917,11 +963,14 @@ fn the_offline_accounts_grant_lasts_the_run_and_no_longer() {
         "whoami names the offline account: {during}"
     );
     let after = icacls(&d.ws);
+    assert!(after.contains(KEEP_MARK), "{after}");
+    assert!(after.contains(OFFLINE), "kept: {after}");
     assert!(!after.contains(SID_MARK), "{after}");
-    assert!(
-        !after.contains(OFFLINE),
-        "the account's ACE outlived the run: {after}"
-    );
+    let o = insbx(&["revoke", "."], &d.ws);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    let revoked = icacls(&d.ws);
+    assert!(!revoked.contains(KEEP_MARK), "{revoked}");
+    assert!(!revoked.contains(OFFLINE), "{revoked}");
 }
 
 #[test]
@@ -968,8 +1017,8 @@ fn concurrent_deny_runs_share_a_root_and_cannot_write_each_others() {
     while !d.ws.join("started.txt").exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(100));
     }
-    // B: the same workspace only. `out` carries the account's ACE (A's),
-    // but not B's run SID: B cannot write there.
+    // B: the same workspace only. `out` carries the account's ACE and out's
+    // own kept SID, which B's token does not hold: B cannot write there.
     let o = cmd(
         &d.ws,
         &["--net", "deny", "-w", "."],
@@ -991,7 +1040,11 @@ fn concurrent_deny_runs_share_a_root_and_cannot_write_each_others() {
         "A lost its grant when B ended: {}",
         text(&a)
     );
-    assert!(!icacls(&d.ws).contains(OFFLINE), "{}", icacls(&d.ws));
+    for dir in [&d.ws, &other] {
+        let o = insbx(&["revoke", dir.to_str().expect("utf8")], &d.ws);
+        assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+        assert!(!icacls(dir).contains(OFFLINE), "{}", icacls(dir));
+    }
 }
 
 /// The account's ACE lines in `icacls` output.
@@ -1110,6 +1163,11 @@ fn powershell_under_network_deny_starts_in_the_current_folder() {
     );
     assert!(offline_aces(&icacls(&sibling)).is_empty());
     assert!(offline_aces(&icacls(&d.out)).is_empty());
+    // The workspace is the run's root: its grant, the account's included,
+    // is kept until revoked.
+    assert!(!offline_aces(&icacls(&d.ws)).is_empty(), "kept on the root");
+    let o = insbx(&["revoke", "."], &d.ws);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
     assert!(offline_aces(&icacls(&d.ws)).is_empty());
 }
 

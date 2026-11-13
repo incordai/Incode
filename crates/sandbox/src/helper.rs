@@ -303,6 +303,7 @@ mod tests {
             strict: true,
             supervise: false,
             sid: None,
+            root_sids: Vec::new(),
             parent_pid: Some(7),
             offline: Offline::No,
             offline_record: None,
