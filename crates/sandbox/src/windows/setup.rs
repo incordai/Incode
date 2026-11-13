@@ -384,6 +384,16 @@ fn filter_missing(spec: &FilterSpec) -> bool {
     err == FWP_E_FILTER_NOT_FOUND as u32
 }
 
+/// The folders `insbx setup-windows --read` granted both accounts, from the
+/// record (none when it cannot be read: only the user who ran the setup can).
+pub(crate) fn read_folders() -> Vec<PathBuf> {
+    std::fs::read_to_string(record_path())
+        .ok()
+        .and_then(|t| Record::parse(&t).ok())
+        .map(|r| r.reads)
+        .unwrap_or_default()
+}
+
 /// The account name, SID and password of the offline account, or with `msys`
 /// of the msys account, from the record at `path`.
 ///
@@ -392,11 +402,16 @@ fn filter_missing(spec: &FilterSpec) -> bool {
 pub(crate) fn password(path: &Path, msys: bool) -> Result<(String, String, Secret), String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let record = Record::parse(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    // The account to log on as is the constant name, never the one the
+    // record says: the record is only trusted for the SID and the password.
     let (account, sid, sealed) = if msys {
-        let m = record.msys;
-        (m.account, m.sid, m.password)
+        (
+            MSYS_ACCOUNT.to_string(),
+            record.msys.sid,
+            record.msys.password,
+        )
     } else {
-        (record.account, record.sid, record.password)
+        (ACCOUNT.to_string(), record.sid, record.password)
     };
     let mut plain = unprotect(&sealed)
         .map_err(|e| format!("the account {account}'s password cannot be read: {e}"))?;
@@ -426,9 +441,13 @@ pub fn run(args: &SetupArgs) -> Result<Vec<String>, String> {
 fn install(args: &SetupArgs) -> Result<Vec<String>, String> {
     let mut report = Vec::new();
     let owner = current_user_sid()?;
-    let previous = std::fs::read_to_string(record_path())
-        .ok()
-        .and_then(|t| Record::parse(&t).ok());
+    let text = std::fs::read_to_string(record_path()).ok();
+    let previous = text.as_deref().and_then(|t| Record::parse(t).ok());
+    // A version-1 record (from before the msys account) cannot be read whole,
+    // but its read folders and the offline account's SID can: those folders
+    // are carried over, so `--remove` still takes their grants back and the
+    // msys account gets them too.
+    let legacy = text.as_deref().and_then(Record::legacy_reads);
     // The password is about to change: an old record would name the wrong
     // one if a step below failed. Without a record, runs say "not set up".
     match std::fs::remove_file(record_path()) {
@@ -449,6 +468,21 @@ fn install(args: &SetupArgs) -> Result<Vec<String>, String> {
         .filter(|p| p.sid == account && p.msys.sid == msys_account)
         .map(|p| p.reads.clone())
         .unwrap_or_default();
+    if let Some((_, old)) = legacy.filter(|(sid, _)| *sid == account) {
+        for dir in old.into_iter().filter(|d| d.is_dir()) {
+            match acl::grant_read(&dir, &msys_account) {
+                Ok(()) => report.push(format!(
+                    "{MSYS_ACCOUNT} may read {} (carried over from the earlier setup)",
+                    dir.display()
+                )),
+                Err(e) => report.push(format!(
+                    "{MSYS_ACCOUNT} could not be given {}: {e}",
+                    dir.display()
+                )),
+            }
+            reads.push(dir);
+        }
+    }
     for dir in &args.reads {
         let dir = std::fs::canonicalize(dir)
             .map(|d| PathBuf::from(super::strip_verbatim(&d.to_string_lossy())))
@@ -841,14 +875,20 @@ fn write_record(record: &Record) -> Result<(), String> {
 fn remove() -> Result<Vec<String>, String> {
     let mut report = Vec::new();
     let mut failed = Vec::new();
-    let record = std::fs::read_to_string(record_path())
-        .ok()
-        .and_then(|t| Record::parse(&t).ok());
+    let text = std::fs::read_to_string(record_path()).ok();
+    let record = text.as_deref().and_then(|t| Record::parse(t).ok());
+    // The read folders of a version-1 record (the offline account's alone).
+    let legacy = text.as_deref().and_then(Record::legacy_reads);
     for name in [ACCOUNT, MSYS_ACCOUNT] {
-        let (Some(record), Some(account)) = (&record, account_sid(name)) else {
+        let Some(account) = account_sid(name) else {
             continue;
         };
-        for dir in record.reads.iter().filter(|d| d.exists()) {
+        let reads: Vec<PathBuf> = match (&record, &legacy) {
+            (Some(record), _) => record.reads.clone(),
+            (None, Some((_, old))) if name == ACCOUNT => old.clone(),
+            _ => Vec::new(),
+        };
+        for dir in reads.iter().filter(|d| d.exists()) {
             match acl::revoke(dir, &account) {
                 Ok(()) => report.push(format!("{name} may no longer read {}", dir.display())),
                 Err(e) => failed.push(format!("{}: {e}", dir.display())),

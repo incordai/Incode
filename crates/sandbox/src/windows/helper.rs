@@ -42,8 +42,12 @@ use windows_sys::Win32::Security::Authorization::{SetSecurityInfo, SE_KERNEL_OBJ
 use windows_sys::Win32::Security::{
     DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
 };
+use windows_sys::Win32::Storage::FileSystem::WRITE_DAC;
 use windows_sys::Win32::System::Console::{
     GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+};
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
 };
 use windows_sys::Win32::System::Environment::{FreeEnvironmentStringsW, GetEnvironmentStringsW};
 use windows_sys::Win32::System::JobObjects::{
@@ -54,13 +58,14 @@ use windows_sys::Win32::System::JobObjects::{
 };
 use windows_sys::Win32::System::Threading::{
     CreateProcessAsUserW, CreateProcessW, CreateProcessWithLogonW, GetCurrentProcess,
-    GetExitCodeProcess, OpenProcess, ResumeThread, TerminateProcess, WaitForMultipleObjects,
-    WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, INFINITE,
-    PROCESS_INFORMATION, PROCESS_SYNCHRONIZE, STARTF_USESTDHANDLES, STARTUPINFOW,
+    GetCurrentProcessId, GetExitCodeProcess, OpenProcess, OpenThread, ResumeThread,
+    TerminateProcess, WaitForMultipleObjects, WaitForSingleObject, CREATE_NO_WINDOW,
+    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, INFINITE, PROCESS_INFORMATION,
+    PROCESS_SYNCHRONIZE, STARTF_USESTDHANDLES, STARTUPINFOW,
 };
 
 use super::job_flags;
-use super::offline::{is_sid, HELPER_PROCESS_SDDL};
+use super::offline::{is_sid, HELPER_PROCESS_SDDL, HELPER_THREAD_SDDL};
 use super::token::{dacl_of, last_error, restricted, security_descriptor, wide, OwnedHandle};
 use super::{
     batch_command_line, command_line, is_batch, is_root_sid, is_session_sid, resolve_program,
@@ -207,14 +212,15 @@ fn inner(spec: &EnterSpec, program: &OsString, args: &[OsString]) -> Result<i32,
     Ok(code as i32)
 }
 
-/// Give this process the DACL [`HELPER_PROCESS_SDDL`].
-fn harden_own_process() -> Result<(), String> {
-    let sd = security_descriptor(HELPER_PROCESS_SDDL)?;
-    // SAFETY: the pseudo-handle has every right on this process; the DACL
-    // lives inside `sd` across the call.
+/// Give the kernel object `handle` (a process or a thread, with `WRITE_DAC`)
+/// the protected DACL `sddl`.
+fn harden_handle(handle: HANDLE, sddl: &str) -> Result<(), String> {
+    let sd = security_descriptor(sddl)?;
+    // SAFETY: the caller's handle is valid for the call; the DACL lives
+    // inside `sd` across it.
     let err = unsafe {
         SetSecurityInfo(
-            GetCurrentProcess(),
+            handle,
             SE_KERNEL_OBJECT,
             DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
             std::ptr::null_mut(),
@@ -225,6 +231,48 @@ fn harden_own_process() -> Result<(), String> {
     };
     if err != 0 {
         return Err(format!("SetSecurityInfo failed with error {err}"));
+    }
+    Ok(())
+}
+
+/// Give this process the DACL [`HELPER_PROCESS_SDDL`] and every thread of it
+/// [`HELPER_THREAD_SDDL`]. The process object alone is not enough: the main
+/// thread the logon service made has a default DACL that grants the account
+/// `GENERIC_ALL`, and an msys command's token carries the account's own SID,
+/// so it passes both halves of the check on that thread and could hijack it,
+/// then run unrestricted as the account.
+fn harden_own_process() -> Result<(), String> {
+    // SAFETY: the pseudo-handle has every right on this process.
+    harden_handle(unsafe { GetCurrentProcess() }, HELPER_PROCESS_SDDL)?;
+    harden_own_threads()
+}
+
+/// [`HELPER_THREAD_SDDL`] on every thread this process has (found by a
+/// Toolhelp snapshot: the ones that exist before the command starts).
+fn harden_own_threads() -> Result<(), String> {
+    // SAFETY: a snapshot handle owned and closed here; the entry is a plain
+    // structure with its size set; every thread handle is owned and closed.
+    unsafe {
+        let pid = GetCurrentProcessId();
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Err(last_error("CreateToolhelp32Snapshot"));
+        }
+        let snapshot = OwnedHandle(snapshot);
+        let mut entry: THREADENTRY32 = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+        let mut more = Thread32First(snapshot.0, &mut entry) != 0;
+        while more {
+            if entry.th32OwnerProcessID == pid {
+                let thread = OpenThread(WRITE_DAC, 0, entry.th32ThreadID);
+                if thread.is_null() {
+                    return Err(last_error("OpenThread"));
+                }
+                let thread = OwnedHandle(thread);
+                harden_handle(thread.0, HELPER_THREAD_SDDL)?;
+            }
+            more = Thread32Next(snapshot.0, &mut entry) != 0;
+        }
     }
     Ok(())
 }
@@ -335,6 +383,13 @@ fn launch_offline(
             TerminateProcess(process.0, 1);
             return Err(sandbox(format!("the command was not run: {e}")));
         }
+        // The second helper's thread and process are the account's, with the
+        // default DACLs the logon service gave them. Lock them before the
+        // thread first runs (the helper locks its own again, every thread,
+        // before it starts the command, which is what holds even if this
+        // fails: [`harden_own_process`] says why).
+        let _ = harden_handle(thread.0, HELPER_THREAD_SDDL);
+        let _ = harden_handle(process.0, HELPER_PROCESS_SDDL);
         if ResumeThread(thread.0) == u32::MAX {
             let e = last_error("ResumeThread");
             TerminateProcess(process.0, 1);
@@ -561,5 +616,132 @@ fn start(
             return Err(sandbox(e));
         }
         Ok(process)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED};
+    use windows_sys::Win32::System::Threading::{
+        PROCESS_CREATE_THREAD, PROCESS_VM_OPERATION, PROCESS_VM_WRITE, THREAD_SET_CONTEXT,
+        THREAD_SUSPEND_RESUME,
+    };
+
+    /// A `cmd.exe` of this user's, suspended: its first thread has not run.
+    fn suspended_child() -> PROCESS_INFORMATION {
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        let application = wide(format!(r"{root}\System32\cmd.exe"));
+        let mut line = wide("cmd.exe /d /c exit 0");
+        // SAFETY: Win32 process creation with NUL-terminated strings that
+        // outlive the call; a zeroed STARTUPINFOW with its size set is valid.
+        unsafe {
+            let mut si: STARTUPINFOW = std::mem::zeroed();
+            si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+            let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
+            let ok = CreateProcessW(
+                application.as_ptr(),
+                line.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                CREATE_SUSPENDED | CREATE_NO_WINDOW,
+                std::ptr::null(),
+                std::ptr::null(),
+                &si,
+                &mut pi,
+            );
+            assert_ne!(ok, 0, "{}", last_error("CreateProcessW"));
+            pi
+        }
+    }
+
+    /// Whether this process may open the thread `tid` for what hijacking it
+    /// takes (set its context, suspend and resume it); and why not.
+    fn can_open_thread(tid: u32) -> (bool, u32) {
+        // SAFETY: opens a thread by id; a handle returned is closed at once.
+        unsafe {
+            let h = OpenThread(THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME, 0, tid);
+            if h.is_null() {
+                return (false, GetLastError());
+            }
+            CloseHandle(h);
+            (true, 0)
+        }
+    }
+
+    fn can_open_process(pid: u32) -> (bool, u32) {
+        // SAFETY: opens a process by id; a handle returned is closed at once.
+        unsafe {
+            let h = OpenProcess(
+                PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_CREATE_THREAD,
+                0,
+                pid,
+            );
+            if h.is_null() {
+                return (false, GetLastError());
+            }
+            CloseHandle(h);
+            (true, 0)
+        }
+    }
+
+    /// **A HARDENED THREAD (AND PROCESS) CANNOT BE OPENED FOR CONTEXT OR
+    /// SUSPEND/RESUME, EVEN BY ITS OWN OWNER**, which is who the confined
+    /// command is relative to the second helper (the same account). Measured
+    /// on a suspended child of this user's: before, the owner opens it; after
+    /// [`harden_handle`], `ERROR_ACCESS_DENIED`; the handle the creator holds
+    /// keeps working (the creator resumes and ends it).
+    #[test]
+    fn a_hardened_thread_and_process_cannot_be_opened_even_by_their_owner() {
+        let pi = suspended_child();
+        let (thread, process) = (OwnedHandle(pi.hThread), OwnedHandle(pi.hProcess));
+        // The control: nothing locked yet, the owner opens both.
+        assert!(can_open_thread(pi.dwThreadId).0, "control: the thread");
+        assert!(can_open_process(pi.dwProcessId).0, "control: the process");
+
+        harden_handle(thread.0, HELPER_THREAD_SDDL).expect("thread hardened");
+        harden_handle(process.0, HELPER_PROCESS_SDDL).expect("process hardened");
+        assert_eq!(
+            can_open_thread(pi.dwThreadId),
+            (false, ERROR_ACCESS_DENIED),
+            "the thread of the second helper must not open for context or suspend"
+        );
+        assert_eq!(
+            can_open_process(pi.dwProcessId),
+            (false, ERROR_ACCESS_DENIED),
+            "nor the process for memory or threads"
+        );
+        // The creator's own handles still work.
+        // SAFETY: handles owned above.
+        unsafe {
+            assert_ne!(
+                ResumeThread(thread.0),
+                u32::MAX,
+                "{}",
+                last_error("ResumeThread")
+            );
+            WaitForSingleObject(process.0, 10_000);
+            TerminateProcess(process.0, 0);
+        }
+    }
+
+    /// Every thread of a process is found: the snapshot sees this process's.
+    #[test]
+    fn the_thread_snapshot_finds_this_processs_threads() {
+        // SAFETY: a snapshot owned and closed here; a plain entry structure.
+        unsafe {
+            let snapshot = OwnedHandle(CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0));
+            let mut entry: THREADENTRY32 = std::mem::zeroed();
+            entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+            let pid = GetCurrentProcessId();
+            let mut mine = 0;
+            let mut more = Thread32First(snapshot.0, &mut entry) != 0;
+            while more {
+                mine += usize::from(entry.th32OwnerProcessID == pid);
+                more = Thread32Next(snapshot.0, &mut entry) != 0;
+            }
+            assert!(mine >= 1, "the test's own thread is in it");
+        }
     }
 }

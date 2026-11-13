@@ -102,9 +102,16 @@
 //! - one msys run at a time (the mutex `Global\insbx-msys`), since the account
 //!   is shared by every run that holds the mutex;
 //! - each root carries an inheritable OWNER RIGHTS entry of `READ_CONTROL`
-//!   only (kept), so a file the account creates, which it owns, never gives it
-//!   `WRITE_DAC` in a later run; the user's own `READ_CONTROL | WRITE_DAC`
-//!   entry ([`acl`]) still lets the user re-ACL it.
+//!   only (kept), so a file the account creates with the default ACL, which it
+//!   owns, does not give it an owner's implicit `WRITE_DAC` in a later run (a
+//!   file created with its own explicit, protected ACL is not covered, and
+//!   `Everyone` is a restricting SID too); the user's own `READ_CONTROL |
+//!   WRITE_DAC` entry ([`acl`]) still lets the user re-ACL it. A root whose
+//!   ACL passes down a CREATOR OWNER entry, or a broader OWNER RIGHTS one, is
+//!   refused;
+//! - what a crashed msys run left for the account, and a revoke could not take
+//!   back (a root moved or gone, a failed revoke), refuses the next msys run
+//!   until `insbx revoke --msys-leftovers` clears it ([`acl::Lease`]).
 //!
 //! It only means something here, with network `deny` or `proxy` (a run uses an
 //! account only then, [`msys_gap`]); on Linux and macOS `msys` is ignored.
@@ -131,7 +138,7 @@ pub(crate) mod setup;
 mod token;
 
 #[cfg(windows)]
-pub use acl::{kept_folders, revoke_kept, KeptFolder};
+pub use acl::{clear_msys_leftovers, kept_folders, revoke_kept, KeptFolder};
 #[cfg(windows)]
 pub(crate) use helper::enter;
 

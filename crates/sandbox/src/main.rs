@@ -31,9 +31,11 @@ USAGE:
                              --remove undoes all of it
     insbx grants               Windows: the folders whose write grant is kept, and whether
                              each still carries it
-    insbx revoke <DIR>... | --all
-                             Windows: take a folder's kept grant back; its next run grants
-                             it again
+    insbx revoke <DIR>... | --all [--msys-leftovers]
+                             Windows: take a folder's kept grant back (the msys account's
+                             access too); its next run grants it again. --msys-leftovers
+                             clears what a crashed --msys run left that its sweep could not
+                             take back (a moved root...), which refuses every --msys run
 
 KEPT GRANTS (Windows):
     A writable root's grant is written into every file beneath it, so it is made by the
@@ -416,21 +418,41 @@ fn grants() -> Result<i32, String> {
     }
 }
 
-/// `insbx revoke <DIR>... | --all`: take kept grants back
-/// (`incord_sandbox::windows::revoke_kept`), the offline account's too when
-/// it is set up. Every folder is tried; the exit code is 1 when any failed.
+/// `insbx revoke <DIR>... | --all [--msys-leftovers]`: take kept grants back
+/// (`incord_sandbox::windows::revoke_kept`), the offline and msys accounts'
+/// too when set up; with `--msys-leftovers`, clear what a crashed msys run
+/// left (`incord_sandbox::windows::clear_msys_leftovers`). Every folder is
+/// tried; the exit code is 1 when any failed.
 fn revoke(args: &[OsString]) -> Result<i32, String> {
-    let words: Vec<&str> = args
+    let mut words: Vec<&str> = args
         .iter()
         .map(|a| a.to_str().ok_or("an argument is not valid Unicode"))
         .collect::<Result<_, _>>()?;
-    if words.is_empty() {
-        return Err("revoke what? give folders, or --all".into());
+    let leftovers = words.contains(&"--msys-leftovers");
+    words.retain(|w| *w != "--msys-leftovers");
+    if words.is_empty() && !leftovers {
+        return Err("revoke what? give folders, or --all, or --msys-leftovers".into());
     }
     #[cfg(windows)]
     {
         use incord_sandbox::windows;
-        let folders: Vec<PathBuf> = if words == ["--all"] {
+        let setup = windows::offline_setup().ok();
+        let accounts: Vec<String> = setup
+            .iter()
+            .flat_map(|r| [r.sid.clone(), r.msys_sid.clone()])
+            .collect();
+        let mut failed = false;
+        if leftovers {
+            let setup = setup.as_ref().ok_or(
+                "--msys-leftovers needs the setup (`insbx setup-windows`): see `insbx doctor`",
+            )?;
+            for line in windows::clear_msys_leftovers(&setup.msys_sid)? {
+                println!("insbx revoke: {line}");
+            }
+        }
+        let folders: Vec<PathBuf> = if words.is_empty() {
+            Vec::new()
+        } else if words == ["--all"] {
             windows::kept_folders()?
                 .into_iter()
                 .map(|k| k.path)
@@ -443,10 +465,8 @@ fn revoke(args: &[OsString]) -> Result<i32, String> {
                 .map(|w| std::fs::canonicalize(w).map_err(|e| format!("{w}: {e}")))
                 .collect::<Result<_, _>>()?
         };
-        let account = windows::offline_setup().ok().map(|r| r.sid);
-        let mut failed = false;
         for folder in folders {
-            match windows::revoke_kept(&folder, account.as_deref()) {
+            match windows::revoke_kept(&folder, &accounts) {
                 Ok(()) => println!("insbx revoke: {}", strip_verbatim(&folder)),
                 Err(e) => {
                     eprintln!("insbx revoke: {}: {e}", strip_verbatim(&folder));

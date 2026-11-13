@@ -429,16 +429,29 @@ insbx run --msys --net deny -w . -- "C:\Program Files\Git\bin\bash.exe" -c "make
   run ends, by walking each writable root and read folder (NTFS stores
   inheritance in every object: about 2.4 s each way on 18,673 objects,
   measured by incode), so a big workspace pays that on every `--msys` run,
-  not once. A run that crashes leaves its ACEs for the next run's sweep.
+  not once. A run that crashes leaves its ACEs for the next run's sweep. If
+  the sweep cannot take them back (the root was moved or renamed, a drive is
+  detached, a revoke failed), the next `--msys` run is REFUSED, naming the
+  paths: every msys run trusts that account, so a write ACE it keeps anywhere
+  would be writable by all of them. Run `insbx revoke <FOLDER>` on each (where
+  it is now), then `insbx revoke --msys-leftovers`.
+- **Refused roots:** a root whose ACL passes down a CREATOR OWNER entry (each
+  file the account creates would carry an entry naming it that no revoke
+  removes), or an OWNER RIGHTS entry broader than `READ_CONTROL`. The message
+  gives the `icacls /remove:g` that clears it. Only the root's own ACL is
+  read, not every folder beneath it.
 - **One `--msys` run at a time**, since the account is shared by every run
   (the named mutex `Global\insbx-msys`). A second one waits, and says so.
 - **What stays kept:** each root's own SID (useless without a token that
   carries it), the user's `READ_CONTROL | WRITE_DAC` entry (as for the offline
   account), and one inheritable OWNER RIGHTS entry granting only
   `READ_CONTROL`. A file the msys account creates is owned by it, and an owner
-  holds `WRITE_DAC` implicitly; without the entry a later run could rewrite
-  that file's ACL. With it, it cannot, and you, whose own entry survives, can
-  still re-ACL it. `insbx revoke` leaves these two entries.
+  holds `WRITE_DAC` implicitly; the entry takes that implicit right away from
+  a file created with the default ACL, and you, whose own entry survives, can
+  still re-ACL it. It does not cover a file the account creates with its own
+  explicit, protected ACL (the creator decides what is on its own file), and
+  `Everyone` is a restricting SID, so wherever `Everyone` may write the msys
+  token passes already. `insbx revoke` leaves these two entries.
 - The roots' and read folders' access is the account's, so what it creates
   there is owned by `insbx-msys`, as under `deny` it is owned by
   `insbx-offline`.

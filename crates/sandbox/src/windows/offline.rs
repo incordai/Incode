@@ -71,8 +71,16 @@
 //! - its token trusts its own SID (the helper accepts it only when it equals
 //!   the account's SID in the record, and the token's own user SID);
 //! - the roots carry an OWNER RIGHTS entry that leaves an owner only
-//!   `READ_CONTROL`, so a file the account creates (it owns it) never gives it
-//!   `WRITE_DAC` in a later run.
+//!   `READ_CONTROL`, so a file the account creates with the default ACL (it
+//!   owns it) does not give it the implicit `WRITE_DAC` of an owner in a later
+//!   run. (A file it creates with its own explicit, protected ACL is not
+//!   covered: the creator decides what is on its own file. `Everyone` is also
+//!   a restricting SID, so where `Everyone` may write the token already passes.)
+//!   A root whose ACL passes down a CREATOR OWNER entry, or an OWNER RIGHTS one
+//!   broader than `READ_CONTROL`, is refused;
+//! - what a crashed msys run left for the account, and a revoke could not take
+//!   back, refuses the next msys run (`insbx revoke --msys-leftovers` clears
+//!   it).
 //!
 //! It has the same firewall filters as the offline account, and
 //! `insbx setup-windows --read` grants both.
@@ -250,6 +258,28 @@ impl Record {
             },
         })
     }
+
+    /// What a version-1 record (written before the msys account) still tells
+    /// `insbx setup-windows`: the offline account's SID and the folders
+    /// granted it for reading, so an upgrade can carry them over (the msys
+    /// account is given them too, and `--remove` can still take them back).
+    /// `None` for any other text. Best effort: only those lines are read.
+    #[must_use]
+    pub fn legacy_reads(text: &str) -> Option<(String, Vec<PathBuf>)> {
+        let mut lines = text.lines();
+        if lines.next()?.trim() != format!("{RECORD_MAGIC} 1") {
+            return None;
+        }
+        let (mut sid, mut reads) = (None, Vec::new());
+        for line in lines {
+            match line.split_once(' ') {
+                Some(("sid", v)) if is_sid(v.trim()) => sid = Some(v.trim().to_string()),
+                Some(("read", v)) if !v.trim().is_empty() => reads.push(PathBuf::from(v.trim())),
+                _ => {}
+            }
+        }
+        sid.map(|sid| (sid, reads))
+    }
 }
 
 /// Whether `s` looks like a SID string (`S-1-` and numbers).
@@ -370,6 +400,17 @@ pub fn state_dir_sddl(owner_sid: &str) -> String {
 /// `WRITE_DAC`). The command cannot open its unrestricted parent to write
 /// to it.
 pub const HELPER_PROCESS_SDDL: &str = "D:P(A;;GA;;;SY)(A;;0x101000;;;OW)";
+
+/// The same for each THREAD of that helper: the second helper's main thread
+/// comes from the logon service with a default DACL that grants the account
+/// `GENERIC_ALL`, and a restricted command whose token carries the account's
+/// own SID (an msys run) passes both halves of the access check on it, so it
+/// could suspend or redirect the unrestricted thread (`THREAD_SET_CONTEXT`,
+/// `THREAD_SUSPEND_RESUME`). The owner, the command, keeps only `SYNCHRONIZE`
+/// and `THREAD_QUERY_LIMITED_INFORMATION` (0x800); `OW` removes the owner's
+/// implicit `WRITE_DAC`. Applied by the first helper before the thread
+/// first runs, and by the second helper to every thread of its own.
+pub const HELPER_THREAD_SDDL: &str = "D:P(A;;GA;;;SY)(A;;0x100800;;;OW)";
 
 // ---- The filters. ----
 
@@ -761,6 +802,48 @@ mod tests {
         assert!(dir.contains("(A;OICI;FR;;;S-1-5-21-9-1001)"), "{dir}");
         assert!(!dir.contains(";BU)") && !dir.contains(";WD)") && !dir.contains(";AU)"));
         assert!(HELPER_PROCESS_SDDL.contains(";OW)"));
+        // The thread's is the process's with the thread's query right, and
+        // gives the owner (the command) nothing that opens a thread for
+        // context or suspend/resume: no THREAD_SET_CONTEXT (0x10), no
+        // THREAD_SUSPEND_RESUME (0x2), no WRITE_DAC (0x40000).
+        assert!(HELPER_THREAD_SDDL.starts_with("D:P(A;;GA;;;SY)"));
+        let owner_mask = HELPER_THREAD_SDDL
+            .split(";;;OW)")
+            .next()
+            .and_then(|s| s.rsplit(";;").next())
+            .and_then(|m| u32::from_str_radix(m.trim_start_matches("0x"), 16).ok())
+            .expect("the owner's ACE");
+        assert_eq!(owner_mask, 0x0010_0800);
+        for right in [0x10u32, 0x2, 0x4_0000, 0x8_0000, 0x1, 0x20, 0x40] {
+            assert_eq!(owner_mask & right, 0, "{right:#x}");
+        }
+    }
+
+    #[test]
+    fn a_version_1_record_still_gives_its_read_folders_and_the_offline_sid() {
+        let v1 = "insbx-offline-record 1\naccount insbx-offline\nsid S-1-5-21-1-2-3-1009\n\
+                  owner S-1-5-21-1-2-3-1001\nproxy-ports 47600-47615\n\
+                  read C:\\Users\\me\\.cargo\nread D:\\tools x\npassword 0001abff\n";
+        assert_eq!(
+            Record::legacy_reads(v1),
+            Some((
+                "S-1-5-21-1-2-3-1009".to_string(),
+                vec![
+                    PathBuf::from(r"C:\Users\me\.cargo"),
+                    PathBuf::from(r"D:\tools x")
+                ]
+            ))
+        );
+        // CRLF, as a file edited on Windows may come back.
+        assert!(Record::legacy_reads(&v1.replace('\n', "\r\n")).is_some());
+        // Only version 1; anything else is not this function's.
+        assert_eq!(Record::legacy_reads(&record().to_text()), None);
+        assert_eq!(Record::legacy_reads(""), None);
+        assert_eq!(
+            Record::legacy_reads("insbx-offline-record 1\nread C:\\x\n"),
+            None
+        );
+        assert_eq!(Record::legacy_reads("something else\nsid S-1-1-0\n"), None);
     }
 
     #[test]

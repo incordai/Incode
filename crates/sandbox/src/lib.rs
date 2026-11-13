@@ -218,6 +218,15 @@ pub struct Sandbox {
 
 /// Everything a running command needs kept alive: the proxy and the private
 /// temp directory. Dropped after the command exits.
+///
+/// **Keep it until the command has ended.** On Windows it holds the run's ACL
+/// grants and, for an `msys` run, the lock that keeps msys runs one at a time
+/// (`Global\insbx-msys`); dropping it while the helper still runs takes the
+/// grants back and releases the lock under a command that is still the msys
+/// account, which a second msys run could then share. [`Sandbox::run`] and
+/// [`Sandbox::run_captured`] do this: they hold it past the wait, and kill the
+/// command if the wait itself fails. A caller that spawns the [`Command`]
+/// itself must do the same.
 pub struct Guard {
     proxy: Option<proxy::Proxy>,
     /// Windows: the run's ACL grant on its roots and temp directory, revoked
@@ -290,6 +299,16 @@ impl Outcome {
         }
         1
     }
+}
+
+/// Whether a Windows grant that could not be made refuses the run. Strict
+/// always does; best effort normally runs the command with the writes
+/// unconfined and the network open (and says so), but NEVER an `msys` run: it
+/// is a request for a particular confinement, and falling back to none after
+/// a lock timeout or a failed mutex would run Git Bash with no sandbox at all.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn lease_failure_refuses(strict: bool, msys: bool) -> bool {
+    strict || msys
 }
 
 impl Sandbox {
@@ -557,9 +576,14 @@ impl Sandbox {
                 per_run: msys,
             }
         });
+        let msys = account.as_ref().is_some_and(|a| a.per_run);
         match windows::acl::Lease::acquire(&grant, &temp.path, account) {
             Ok(lease) => Ok(Some(lease)),
-            Err(e) if self.strict => Err(e),
+            Err(e) if lease_failure_refuses(self.strict, msys) => Err(if self.strict {
+                e
+            } else {
+                format!("an msys run is never run unconfined, best effort or not: {e}")
+            }),
             Err(e) => {
                 eprintln!("insbx: writes not confined and network not denied (best effort): {e}");
                 *offline = None;
@@ -877,8 +901,25 @@ fn forward_signals_to_group(pid: u32) {
     let _ = pid;
 }
 
+/// Wait for the command, enforcing the wall-clock limit. When the wait itself
+/// fails the command is killed before the error is returned: the caller drops
+/// the [`Guard`] (the run's grants, the msys lock) on that error, and nothing
+/// those guard may be left running.
 fn wait(
     mut child: Child,
+    wall: Option<Duration>,
+    own_group: bool,
+) -> Result<(ExitStatus, bool), String> {
+    let result = wait_for(&mut child, wall, own_group);
+    if result.is_err() {
+        kill(&mut child, own_group);
+        let _ = child.wait();
+    }
+    result
+}
+
+fn wait_for(
+    child: &mut Child,
     wall: Option<Duration>,
     own_group: bool,
 ) -> Result<(ExitStatus, bool), String> {
@@ -891,7 +932,7 @@ fn wait(
             return Ok((status, false));
         }
         if Instant::now() >= deadline {
-            kill(&mut child, own_group);
+            kill(child, own_group);
             let status = child.wait().map_err(|e| e.to_string())?;
             return Ok((status, true));
         }
@@ -1003,6 +1044,34 @@ mod tests {
         assert_eq!(back.offline, Offline::No);
         assert_eq!(back.offline_record, None);
         assert_eq!(back.msys, None);
+    }
+
+    /// **A FAILED LEASE ALWAYS REFUSES AN MSYS RUN**: best effort may fall back
+    /// to no confinement for any other, never for msys.
+    #[test]
+    fn a_lease_failure_refuses_an_msys_run_even_in_best_effort() {
+        assert!(lease_failure_refuses(true, false), "strict refuses");
+        assert!(lease_failure_refuses(true, true));
+        assert!(lease_failure_refuses(false, true), "msys never falls back");
+        assert!(
+            !lease_failure_refuses(false, false),
+            "best effort otherwise"
+        );
+    }
+
+    /// `wait` kills the command when the wait itself fails, so the `Guard` the
+    /// caller then drops is not released under a running msys command; and
+    /// otherwise returns the command's own status.
+    #[test]
+    fn wait_returns_the_commands_status() {
+        #[cfg(windows)]
+        let (program, args) = ("cmd", ["/d", "/c", "exit 3"]);
+        #[cfg(not(windows))]
+        let (program, args) = ("sh", ["-c", "exit 3", ""]);
+        let child = Command::new(program).args(args).spawn().expect("spawns");
+        let (status, timed_out) = wait(child, Some(Duration::from_secs(30)), false).expect("waits");
+        assert_eq!(status.code(), Some(3));
+        assert!(!timed_out);
     }
 
     /// The msys account's SID travels in the spec, to the second helper too.

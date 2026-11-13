@@ -1389,6 +1389,146 @@ fn an_msys_runs_account_is_gone_from_the_root_afterwards() {
     assert_eq!(o.status.code(), Some(0), "{}", text(&o));
 }
 
+/// What the thread probe prints, one line per thread of every `insbx`
+/// process, then the control.
+const THREAD_PROBE: &str = r#"
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class Probe {
+  [DllImport("kernel32.dll", SetLastError=true)]
+  static extern IntPtr OpenThread(uint access, bool inherit, uint tid);
+  [DllImport("kernel32.dll")]
+  static extern bool CloseHandle(IntPtr h);
+  // THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME: what hijacking a thread takes.
+  public static string Open(uint tid) {
+    IntPtr h = OpenThread(0x12, false, tid);
+    if (h == IntPtr.Zero) { return "denied:" + Marshal.GetLastWin32Error(); }
+    CloseHandle(h);
+    return "ok";
+  }
+}
+"@
+$n = 0
+foreach ($p in (Get-Process -Name insbx -ErrorAction SilentlyContinue)) {
+  $n++
+  foreach ($t in $p.Threads) { Write-Output ("THREAD " + $p.Id + " " + $t.Id + " " + [Probe]::Open([uint32]$t.Id)) }
+}
+Write-Output ("INSBX-PROCESSES " + $n)
+$c = Start-Process -FilePath cmd.exe -ArgumentList '/d','/c','ping -n 8 127.0.0.1 > nul' -PassThru -WindowStyle Hidden
+Start-Sleep -Milliseconds 500
+foreach ($t in $c.Threads) { Write-Output ("CONTROL " + [Probe]::Open([uint32]$t.Id)) }
+Stop-Process -Id $c.Id -Force
+"#;
+
+/// The second helper runs as `insbx-msys`, unrestricted, and the confined
+/// command is `insbx-msys` too, with that SID among its restricting SIDs: so
+/// every part of the helper must be locked, not only its process object. The
+/// helper's main thread came from the logon service with a default DACL
+/// granting the account `GENERIC_ALL`; the command could have opened it for
+/// `THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME` and hijacked it, unrestricted.
+/// Every thread of every `insbx` process the command can see must refuse that
+/// (the first helper and `insbx run` are the user's; the second helper's are
+/// hardened); the control, a child the command started itself, must open.
+#[test]
+fn the_msys_helpers_threads_cannot_be_opened_by_the_command() {
+    if !needs_msys("the_msys_helpers_threads_cannot_be_opened_by_the_command") {
+        return;
+    }
+    let d = dirs();
+    let script = d.ws.join("probe-threads.ps1");
+    std::fs::write(&script, THREAD_PROBE).expect("script");
+    let o = ps_file(&d.ws, &["--msys", "--net", "deny", "-w", "."], &script);
+    let out = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{out}");
+    let processes: usize = out
+        .lines()
+        .find_map(|l| l.strip_prefix("INSBX-PROCESSES "))
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap_or_else(|| panic!("the probe did not finish: {out}"));
+    assert!(
+        processes >= 2,
+        "the helpers should be visible (the first and the second): {out}"
+    );
+    let threads: Vec<&str> = out.lines().filter(|l| l.starts_with("THREAD ")).collect();
+    assert!(!threads.is_empty(), "{out}");
+    for line in &threads {
+        assert!(
+            line.ends_with("denied:5"),
+            "the command opened a helper's thread for context/suspend: {line}\n{out}"
+        );
+    }
+    assert!(
+        out.lines().any(|l| l.trim() == "CONTROL ok"),
+        "the control (a thread of its own child) must open, or the probe proves nothing: {out}"
+    );
+    let o = insbx(&["revoke", "."], &d.ws);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+}
+
+/// The msys account's SID, as Windows has it.
+fn msys_sid() -> String {
+    let o = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!(
+                "([System.Security.Principal.NTAccount]'{MSYS}').Translate(\
+                 [System.Security.Principal.SecurityIdentifier]).Value"
+            ),
+        ])
+        .output()
+        .expect("powershell");
+    String::from_utf8_lossy(&o.stdout).trim().to_string()
+}
+
+/// A crashed msys run whose root cannot be found any more leaves a record the
+/// sweep cannot finish. The msys account is trusted by every msys run, so the
+/// next one is REFUSED, naming the path, until `insbx revoke --msys-leftovers`.
+#[test]
+fn a_crashed_msys_runs_leftovers_refuse_the_next_run_until_cleared() {
+    if !needs_msys("a_crashed_msys_runs_leftovers_refuse_the_next_run") {
+        return;
+    }
+    let d = dirs();
+    let sid = msys_sid();
+    assert!(sid.starts_with("S-1-5-21-"), "the msys SID: {sid}");
+    let grants = PathBuf::from(std::env::var_os("LOCALAPPDATA").expect("LOCALAPPDATA"))
+        .join("insbx")
+        .join("grants");
+    std::fs::create_dir_all(&grants).expect("grants dir");
+    // A dead run (nothing holds its liveness mutex) whose msys root was moved.
+    let rid = 2_000_000_001u32;
+    let record = grants.join(format!("{rid}.grant"));
+    let moved = d.out.join("moved-away");
+    std::fs::write(
+        &record,
+        format!(
+            "sid S-1-5-21-1111111111-2222222222-4242424242-{rid}\nuser {sid}\nmodify {}\n",
+            moved.display()
+        ),
+    )
+    .expect("record");
+
+    let refused = bash_msys(&d.ws, &[], "echo ok > x");
+    let said = text(&refused);
+    assert_eq!(refused.status.code(), Some(125), "{said}");
+    assert!(said.contains("moved-away"), "names the path: {said}");
+    assert!(said.contains("--msys-leftovers"), "and the way out: {said}");
+    assert!(!d.ws.join("x").exists(), "nothing ran: {said}");
+
+    let cleared = insbx(&["revoke", "--msys-leftovers"], &d.ws);
+    assert_eq!(cleared.status.code(), Some(0), "{}", text(&cleared));
+    assert!(!record.exists(), "the record is dropped");
+    let again = bash_msys(&d.ws, &[], "echo ok > x");
+    assert_eq!(again.status.code(), Some(0), "{}", text(&again));
+    assert!(d.ws.join("x").exists());
+    let _ = std::fs::remove_file(&record);
+    let o = insbx(&["revoke", "."], &d.ws);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+}
+
 /// One msys run at a time: the second waits for the first to end.
 #[test]
 fn two_msys_runs_serialize() {

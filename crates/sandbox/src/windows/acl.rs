@@ -105,13 +105,29 @@
 //!   (`S-1-3-4`) granting only `READ_CONTROL` ([`keep_owner_rights`]), kept
 //!   like [`keep_acl_rights`]'s. Without an OWNER RIGHTS ACE the owner of an
 //!   object holds `READ_CONTROL | WRITE_DAC` implicitly, so a file the msys
-//!   account creates (it owns it) would let it rewrite that file's ACL in a
-//!   later run, whoever was granted what. With the entry it holds
-//!   `READ_CONTROL` and nothing more. The user's own `READ_CONTROL |
+//!   account creates with the default ACL (it owns it) would let it rewrite
+//!   that file's ACL in a later run. With the entry it holds `READ_CONTROL`
+//!   and nothing more. It does NOT cover a file the account creates with its
+//!   own explicit, protected ACL (the creator decides what is on its own
+//!   file), and `Everyone` is a restricting SID too, so wherever `Everyone`
+//!   may write the msys token passes already. The user's own `READ_CONTROL |
 //!   WRITE_DAC` entry ([`keep_acl_rights`], added to msys roots too, before
 //!   the OWNER RIGHTS one) is a separate ACE for the user's SID, so the user,
 //!   who owns the files the user creates, can still re-ACL everything.
-//!   `insbx revoke` leaves both entries, as it leaves the user's.
+//!   `insbx revoke` leaves both entries, as it leaves the user's. A root
+//!   whose ACL passes down a CREATOR OWNER entry, or an OWNER RIGHTS one
+//!   broader than `READ_CONTROL`, is refused ([`refuse_msys_roots`]).
+//! - What a crashed msys run left for the account and the sweep could not
+//!   take back (a root moved, renamed or on a detached drive, so its path
+//!   is gone; a failed revoke; the ACL lock busy) is NOT forgotten: the
+//!   record stays, and the next msys run is refused on it
+//!   ([`refuse_msys_leftovers`]) until `insbx revoke <FOLDER>` and
+//!   `insbx revoke --msys-leftovers` ([`clear_msys_leftovers`]) clear it. The
+//!   account's SID is trusted by every msys token, so a write ACE it keeps
+//!   anywhere is writable by every later msys run.
+//! - A folder `insbx setup-windows --read` granted both accounts keeps its read
+//!   grant when an msys run's access to it (as a root or the current folder)
+//!   is taken back ([`release_account`]).
 //!
 //! # A crash leaves the ACE behind: the sweep
 //!
@@ -178,6 +194,9 @@ const ACL_RIGHTS: u32 = READ_CONTROL | WRITE_DAC;
 /// OWNER RIGHTS, `S-1-3-4`: the ACE for it replaces the rights an owner holds
 /// implicitly (`READ_CONTROL | WRITE_DAC`) with the ACE's own.
 const OWNER_RIGHTS: &str = "S-1-3-4";
+/// CREATOR OWNER, `S-1-3-0`: an inheritable ACE for it is replaced, on what
+/// is created beneath, by an ACE for the creator's owner ([`refuse_msys_roots`]).
+const CREATOR_OWNER: &str = "S-1-3-0";
 /// What an msys root's OWNER RIGHTS ACE grants: reading the ACL, nothing else.
 const OWNER_RIGHTS_ALLOWED: u32 = READ_CONTROL;
 
@@ -248,6 +267,55 @@ impl OfflineGrant {
             parents,
         })
     }
+}
+
+/// Refuse an msys run whose root hands the msys account rights that no revoke
+/// can take back, for [`Lease::acquire`]: checked for every root before
+/// anything is granted.
+///
+/// - **CREATOR OWNER** (`S-1-3-0`): an inheritable ACE for it becomes, on each
+///   file the msys account creates, an ACE naming the account (often Full
+///   Control). Revoking the account's ACEs re-propagates the root's ACL, which
+///   resolves CREATOR OWNER to the owner again, still the account, so it
+///   survives, and the OWNER RIGHTS entry does not cover it. The account's
+///   SID is trusted by every msys token, so that ACE would be writable by
+///   every later msys run.
+/// - **OWNER RIGHTS broader than `READ_CONTROL`**: an inheritable entry that
+///   grants an owner more (`WRITE_DAC`, Full Control) would let the account
+///   rewrite the ACL of what it creates, which is what [`keep_owner_rights`]
+///   is for. insbx does not strip an ACL it did not write: the run is refused.
+///
+/// Only the root's own ACL is read (a folder beneath may carry its own).
+fn refuse_msys_roots(roots: &[PathBuf]) -> Result<(), String> {
+    for root in roots {
+        if !inheritable_allow_masks(root, CREATOR_OWNER)?.is_empty() {
+            return Err(format!(
+                "msys refuses {}: its ACL passes down a CREATOR OWNER entry, so every file the \
+                 msys account creates would carry an entry naming it that insbx cannot take \
+                 back; remove it (`icacls {} /remove:g *S-1-3-0`) or use another folder",
+                root.display(),
+                root.display()
+            ));
+        }
+        if broader_owner_rights(root)? {
+            return Err(format!(
+                "msys refuses {}: its ACL passes down an OWNER RIGHTS entry that grants more \
+                 than READ_CONTROL, which would let the msys account rewrite the ACL of what it \
+                 creates; remove it (`icacls {} /remove:g *S-1-3-4`) or use another folder",
+                root.display(),
+                root.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Whether an inheritable OWNER RIGHTS entry on `root` grants more than
+/// [`OWNER_RIGHTS_ALLOWED`].
+fn broader_owner_rights(root: &Path) -> Result<bool, String> {
+    Ok(inheritable_allow_masks(root, OWNER_RIGHTS)?
+        .iter()
+        .any(|mask| mask & !OWNER_RIGHTS_ALLOWED != 0))
 }
 
 /// Refuse the run when a root may not be granted, for [`Lease::acquire`]: it
@@ -359,12 +427,20 @@ impl Lease {
         } else {
             reads.into_iter().partition(|r| r.is_dir())
         };
+        if msys {
+            refuse_msys_roots(&roots)?;
+        }
         // One msys run at a time, from before the sweep to the lease's end;
         // waits (and says so) while another holds it.
         let msys_lock = msys.then(MsysLock::take).transpose()?;
         let dir = records_dir();
         std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         sweep(&dir);
+        // Whatever the sweep could not take back, a run that trusts the msys
+        // SID must not go on over.
+        if let (true, Some(user)) = (msys, &user) {
+            refuse_msys_leftovers(&dir, user)?;
+        }
 
         let (rid, alive) = claim_rid(&dir)?;
         let temp = vec![temp.to_path_buf()];
@@ -564,7 +640,21 @@ impl Drop for Lease {
             }
             // An msys run's writable roots: the account's ACE was this run's
             // alone.
-            for path in self.account_roots.iter().filter(|p| p.exists()) {
+            for path in &self.account_roots {
+                if !path.exists() {
+                    // Moved or gone during the run: the ACE may be on the
+                    // moved folder, where nothing here can find it. The
+                    // record stays, and the next msys run is refused until
+                    // it is cleared ([`refuse_msys_leftovers`]).
+                    eprintln!(
+                        "insbx: {} is gone or moved, so the msys account's access to it could \
+                         not be taken back; msys runs are refused until `insbx revoke` and \
+                         `insbx revoke --msys-leftovers` clear it",
+                        path.display()
+                    );
+                    stuck.modify.push(path.clone());
+                    continue;
+                }
                 if let Err(e) = release_account(path, user, &others) {
                     eprintln!(
                         "insbx: could not revoke the msys account's access to {} ({e}); the \
@@ -607,7 +697,16 @@ fn release_account(path: &Path, user: &str, others: &Others) -> Result<(), Strin
             change(path, user, Change::Revoke)?;
             change(path, user, Change::Grant(READ_EXECUTE))?;
         }
-        Need::None => change(path, user, Change::Revoke)?,
+        Need::None => {
+            change(path, user, Change::Revoke)?;
+            // The revoke took every ACE of the account's, the read grant
+            // `insbx setup-windows --read` put on this folder too (an msys
+            // run's root or current folder may be exactly that folder): put
+            // that back.
+            if is_listed(path, &others.setup_reads) {
+                change(path, user, Change::Grant(READ_EXECUTE))?;
+            }
+        }
     }
     // The revoke took every ACE of the account's, a listing ACE another live
     // run put on this folder too: put that back.
@@ -833,12 +932,12 @@ pub fn kept_folders() -> Result<Vec<KeptFolder>, String> {
 ///
 /// # Errors
 /// When an ACE cannot be removed; the folder stays listed then.
-pub fn revoke_kept(path: &Path, user: Option<&str>) -> Result<(), String> {
+pub fn revoke_kept(path: &Path, users: &[String]) -> Result<(), String> {
     let _lock = AclLock::take()?;
     let key = path_key(&path.to_string_lossy());
     if path.exists() {
         change(path, &root_sid(path)?, Change::Revoke)?;
-        if let Some(user) = user {
+        for user in users {
             change(path, user, Change::Revoke)?;
         }
     }
@@ -889,6 +988,14 @@ fn keep_acl_rights(root: &Path) -> Result<bool, String> {
 /// the next run walks and reports it again instead of trusting a tree only
 /// part done.
 fn keep_owner_rights(root: &Path) -> Result<bool, String> {
+    // `passes_down` accepts an entry that grants MORE than READ_CONTROL; one
+    // that does is refused, not trusted ([`refuse_msys_roots`]).
+    if broader_owner_rights(root)? {
+        return Err(format!(
+            "{} passes down an OWNER RIGHTS entry that grants more than READ_CONTROL",
+            root.display()
+        ));
+    }
     if passes_down(root, OWNER_RIGHTS, OWNER_RIGHTS_ALLOWED)? {
         return Ok(false);
     }
@@ -897,6 +1004,71 @@ fn keep_owner_rights(root: &Path) -> Result<bool, String> {
         return Err(e);
     }
     Ok(true)
+}
+
+/// The rights of every allow ACE for `sid_text` in `path`'s DACL that is
+/// inherited by what is created beneath it (object- or container-inherit,
+/// inherit-only ones included): what [`refuse_msys_roots`] looks for.
+fn inheritable_allow_masks(path: &Path, sid_text: &str) -> Result<Vec<u32>, String> {
+    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+    const OBJECT_OR_CONTAINER_INHERIT: u8 = 0x1 | 0x2;
+    let trustee = sid(sid_text)?;
+    let mut masks = Vec::new();
+    // SAFETY: as in `passes_down`: the DACL points into `descriptor`, freed
+    // only at the end of the block; each ACE read is inside the DACL
+    // `GetAce` returned it from, and only its header and fixed part are read;
+    // each call is checked.
+    unsafe {
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut descriptor: *mut core::ffi::c_void = std::ptr::null_mut();
+        let err = GetNamedSecurityInfoW(
+            wide(path).as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut descriptor,
+        );
+        if err != 0 {
+            return Err(format!(
+                "reading the ACL of {} failed with error {err}",
+                path.display()
+            ));
+        }
+        let _descriptor = LocalPtr(descriptor);
+        if dacl.is_null() {
+            return Ok(masks);
+        }
+        let mut info = ACL_SIZE_INFORMATION::default();
+        if GetAclInformation(
+            dacl,
+            (&raw mut info).cast(),
+            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        ) == 0
+        {
+            return Err(last_error("GetAclInformation"));
+        }
+        for index in 0..info.AceCount {
+            let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
+            if GetAce(dacl, index, &mut ace) == 0 {
+                return Err(last_error("GetAce"));
+            }
+            let header = *ace.cast::<ACE_HEADER>();
+            if header.AceType != ACCESS_ALLOWED_ACE_TYPE
+                || header.AceFlags & OBJECT_OR_CONTAINER_INHERIT == 0
+            {
+                continue;
+            }
+            let allowed = ace.cast::<ACCESS_ALLOWED_ACE>();
+            if EqualSid((&raw mut (*allowed).SidStart).cast(), trustee.0) != 0 {
+                masks.push((*allowed).Mask);
+            }
+        }
+    }
+    Ok(masks)
 }
 
 /// Whether `path`'s DACL allows `sid_text` all of `rights` on everything
@@ -971,13 +1143,19 @@ struct Others {
     grants: Vec<(Vec<PathBuf>, Vec<PathBuf>)>,
     /// Every folder some run lets it list.
     parents: Vec<PathBuf>,
+    /// The folders `insbx setup-windows --read` granted both accounts, which
+    /// a revoke must leave readable ([`release_account`]).
+    setup_reads: Vec<PathBuf>,
 }
 
 /// What every other live run granted the account `user` (the offline account
 /// or the msys one: a run's grants are the other account's business, never
 /// this one's).
 fn live_account_grants(own: &Path, user: &str) -> Others {
-    let mut others = Others::default();
+    let mut others = Others {
+        setup_reads: super::setup::read_folders(),
+        ..Others::default()
+    };
     let Ok(entries) = std::fs::read_dir(records_dir()) else {
         return others;
     };
@@ -1118,11 +1296,15 @@ fn record_rid(path: &Path) -> Option<u32> {
 
 /// Revoke what dead runs left: every record whose liveness mutex is gone.
 fn sweep(dir: &Path) {
+    sweep_with(dir, super::setup::account_sids);
+}
+
+/// [`sweep`], with the real accounts' SIDs (offline, msys) from `real_accounts`,
+/// looked up once and only if a dead record names an account.
+fn sweep_with(dir: &Path, real_accounts: fn() -> Vec<String>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
-    // The real accounts' SIDs (offline, msys), looked up once and only if a
-    // dead record names an account.
     let mut accounts: Option<Vec<String>> = None;
     for entry in entries.flatten() {
         let path = entry.path();
@@ -1151,7 +1333,7 @@ fn sweep(dir: &Path) {
             }
         }
         if let Some(user) = &record.user {
-            let real = accounts.get_or_insert_with(super::setup::account_sids);
+            let real = accounts.get_or_insert_with(real_accounts);
             // Only a real account's ACEs; a record naming anyone else is
             // not acted on (and an account since removed left only ACEs for
             // a SID nothing can carry any more).
@@ -1173,12 +1355,149 @@ fn sweep(dir: &Path) {
                         clean = false;
                     }
                 }
+                // An msys run's writable root that is not there any more
+                // (moved, renamed, a detached drive) may still carry the
+                // account's write ACE where nothing here can reach it: the
+                // record is NOT done with. It stays, and the next msys run is
+                // refused on it ([`refuse_msys_leftovers`]).
+                if record.modify.iter().any(|p| !p.exists()) {
+                    clean = false;
+                }
             }
         }
         if clean {
             let _ = std::fs::remove_file(&path);
         }
     }
+}
+
+/// The dead runs' records in `dir` that still name the account `user`, after
+/// a sweep: what it could not take back (a path moved or gone, a revoke that
+/// failed, the ACL lock busy).
+fn leftover_records(dir: &Path, user: &str) -> Vec<(PathBuf, GrantRecord)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|e| e.path())
+        .filter_map(|p| Some((record_rid(&p)?, p)))
+        .filter(|(rid, _)| !is_alive(*rid))
+        .filter_map(|(_, p)| {
+            let record = GrantRecord::parse(&std::fs::read_to_string(&p).ok()?)?;
+            (record.user.as_deref() == Some(user)).then_some((p, record))
+        })
+        .collect()
+}
+
+/// Refuse an msys run while a crashed one's grants for the msys account `user`
+/// are still on disk, for [`Lease::acquire`], called after the sweep and
+/// while this run holds the msys lock (so no other msys run is alive: every
+/// record that names the account is a dead run's). The account's SID is
+/// trusted by every msys token, so a write ACE it keeps anywhere is writable
+/// by every later msys run. Says which paths, and how to clear them
+/// ([`clear_msys_leftovers`]).
+fn refuse_msys_leftovers(dir: &Path, user: &str) -> Result<(), String> {
+    let left = leftover_records(dir, user);
+    if left.is_empty() {
+        return Ok(());
+    }
+    let mut paths: Vec<String> = Vec::new();
+    for (_, record) in &left {
+        for p in record
+            .modify
+            .iter()
+            .chain(&record.roots)
+            .chain(&record.reads)
+        {
+            let shown = p.display().to_string();
+            if !paths.contains(&shown) {
+                paths.push(shown);
+            }
+        }
+    }
+    let more = paths.len().saturating_sub(5);
+    paths.truncate(5);
+    Err(format!(
+        "a crashed msys run left access for the msys account that could not be taken back: {}{}. \
+         Every msys run trusts that account, so msys runs are refused until it is cleared: run \
+         `insbx revoke <FOLDER>` for each folder (where it is now, if it was moved), then \
+         `insbx revoke --msys-leftovers`",
+        paths.join(", "),
+        if more > 0 {
+            format!(" and {more} more")
+        } else {
+            String::new()
+        }
+    ))
+}
+
+/// `insbx revoke --msys-leftovers`: take back what crashed msys runs left for
+/// the msys account `user`, and drop their records. A path that exists has the
+/// account's ACE taken off (a `--read` folder keeps its read grant); one that
+/// is gone or moved cannot be searched for, so it is said, and its record
+/// dropped all the same: the user has been told to run `insbx revoke` on
+/// wherever it went. A record whose revoke failed stays. Waits for a running
+/// msys run (it holds the lock) rather than clearing under it.
+///
+/// # Errors
+/// When the msys lock or the ACL lock cannot be taken.
+pub fn clear_msys_leftovers(user: &str) -> Result<Vec<String>, String> {
+    let _msys = MsysLock::take()?;
+    let _lock = AclLock::take()?;
+    let others = Others {
+        setup_reads: super::setup::read_folders(),
+        ..Others::default()
+    };
+    Ok(clear_leftovers_in(&records_dir(), user, &others))
+}
+
+/// [`clear_msys_leftovers`]'s work on the records in `dir`: what it did, line
+/// by line.
+fn clear_leftovers_in(dir: &Path, user: &str, others: &Others) -> Vec<String> {
+    let mut report = Vec::new();
+    for (path, record) in leftover_records(dir, user) {
+        let mut done = true;
+        for root in record.roots.iter().filter(|r| r.exists()) {
+            if change(root, &record.sid, Change::Revoke).is_err() {
+                done = false;
+            }
+        }
+        for p in record
+            .modify
+            .iter()
+            .chain(&record.roots)
+            .chain(&record.reads)
+        {
+            if !p.exists() {
+                if record.modify.contains(p) {
+                    report.push(format!(
+                        "{} is gone or moved: nothing to take back there (if it was moved, run \
+                         `insbx revoke` on its new place)",
+                        p.display()
+                    ));
+                }
+                continue;
+            }
+            match release_account(p, user, others) {
+                Ok(()) => report.push(format!(
+                    "took back the msys account's access to {}",
+                    p.display()
+                )),
+                Err(e) => {
+                    done = false;
+                    report.push(format!("{}: {e}", p.display()));
+                }
+            }
+        }
+        if done {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    if report.is_empty() {
+        report.push("no msys leftovers".to_string());
+    }
+    report
 }
 
 /// Whether run `rid` is still alive: its liveness mutex exists. Any answer
@@ -1765,7 +2084,7 @@ mod tests {
             .filter_map(|e| GrantRecord::parse(&std::fs::read_to_string(e.path()).ok()?))
             .any(|r| r.roots.contains(&temp));
         assert!(!left, "the run's record was removed");
-        revoke_kept(&granted, None).expect("revoke");
+        revoke_kept(&granted, &[]).expect("revoke");
     }
 
     /// **A KEPT GRANT IS MADE ONCE, THEN ONLY READ; REVOKE TAKES IT BACK**:
@@ -1819,7 +2138,7 @@ mod tests {
         drop(second);
         assert!(!acl_of(&moved).contains(&sid), "{}", acl_of(&moved));
 
-        revoke_kept(&root, None).expect("revoke");
+        revoke_kept(&root, &[]).expect("revoke");
         for path in [&root, &beneath] {
             let acl = acl_of(path);
             assert!(!acl.contains(&sid), "revoked: {}: {acl}", path.display());
@@ -1855,7 +2174,7 @@ mod tests {
             String::from_utf8_lossy(&reset.stdout)
         );
         assert!(acl_of(&moved).contains(&sid), "reset: {}", acl_of(&moved));
-        revoke_kept(&root, None).expect("cleanup");
+        revoke_kept(&root, &[]).expect("cleanup");
     }
 
     /// **AN MSYS ROOT LEAVES AN OWNER ONLY `READ_CONTROL`, AND THE USER KEEPS
@@ -1945,7 +2264,212 @@ mod tests {
             .filter_map(|e| GrantRecord::parse(&std::fs::read_to_string(e.path()).ok()?))
             .any(|r| r.modify.contains(&root));
         assert!(!left, "the record was removed");
-        revoke_kept(&root, None).expect("cleanup");
+        revoke_kept(&root, &[]).expect("cleanup");
+    }
+
+    /// A made-up msys account, and another one (ACEs and records name any SID).
+    const FAKE_MSYS: &str = "S-1-5-21-7777777-7777777-7777777-4343";
+    const FAKE_OTHER: &str = "S-1-5-21-7777777-7777777-7777777-9999";
+
+    /// A dead run's record in `dir` (no liveness mutex of that RID exists).
+    fn write_record(dir: &Path, rid: u32, user: &str, modify: &[PathBuf]) -> PathBuf {
+        let record = GrantRecord {
+            sid: session_sid(rid),
+            user: Some(user.to_string()),
+            modify: modify.to_vec(),
+            ..GrantRecord::default()
+        };
+        let path = dir.join(format!("{rid}.grant"));
+        std::fs::write(&path, record.to_text()).expect("record");
+        path
+    }
+
+    /// **A CRASHED MSYS RUN'S LEFTOVERS REFUSE THE NEXT MSYS RUN**, naming the
+    /// paths and the way out; another account's record, and no record, do not.
+    #[test]
+    fn a_dead_msys_run_that_could_not_be_cleaned_refuses_the_next_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let moved = dir.path().join("moved-away");
+        write_record(
+            dir.path(),
+            700_000_001,
+            FAKE_MSYS,
+            std::slice::from_ref(&moved),
+        );
+        write_record(
+            dir.path(),
+            700_000_002,
+            FAKE_OTHER,
+            &[PathBuf::from(r"C:\other-account")],
+        );
+        let err = refuse_msys_leftovers(dir.path(), FAKE_MSYS).expect_err("refused");
+        assert!(err.contains("moved-away"), "{err}");
+        assert!(err.contains("insbx revoke --msys-leftovers"), "{err}");
+        assert!(!err.contains("other-account"), "{err}");
+        let empty = tempfile::tempdir().expect("tempdir");
+        assert!(refuse_msys_leftovers(empty.path(), FAKE_MSYS).is_ok());
+        assert!(refuse_msys_leftovers(dir.path(), "S-1-5-21-7777777-7777777-7777777-1").is_ok());
+    }
+
+    /// **THE SWEEP DOES NOT FORGET AN MSYS ROOT IT CANNOT FIND**: the record
+    /// of a dead run whose root is gone (moved, a detached drive) is kept, so
+    /// the next msys run is refused on it; one whose roots are all there is
+    /// taken back and dropped.
+    #[test]
+    fn the_sweep_keeps_an_msys_record_whose_root_is_gone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let records = tempfile::tempdir().expect("tempdir");
+        let there = dir.path().join("there");
+        std::fs::create_dir(&there).expect("root");
+        grant_account(&there, FAKE_MSYS, MODIFY).expect("grant");
+        let done = write_record(
+            records.path(),
+            700_000_003,
+            FAKE_MSYS,
+            std::slice::from_ref(&there),
+        );
+        let stuck = write_record(
+            records.path(),
+            700_000_004,
+            FAKE_MSYS,
+            &[dir.path().join("gone")],
+        );
+
+        sweep_with(records.path(), || vec![FAKE_MSYS.to_string()]);
+        assert!(!done.exists(), "a record whose roots are all there is done");
+        assert!(
+            !passes_down(&there, FAKE_MSYS, MODIFY).expect("reads the ACL"),
+            "and its grant was taken back"
+        );
+        assert!(
+            stuck.exists(),
+            "a record naming a root that is gone is kept"
+        );
+        assert!(refuse_msys_leftovers(records.path(), FAKE_MSYS).is_err());
+    }
+
+    /// **`insbx revoke --msys-leftovers`**: takes back what a stuck record
+    /// names where the path exists, says what is gone, and drops the records.
+    #[test]
+    fn clearing_the_msys_leftovers_takes_back_the_grants_and_drops_the_records() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let records = tempfile::tempdir().expect("tempdir");
+        let there = dir.path().join("there");
+        std::fs::create_dir(&there).expect("root");
+        grant_account(&there, FAKE_MSYS, MODIFY).expect("grant");
+        let gone = dir.path().join("gone");
+        let a = write_record(
+            records.path(),
+            700_000_005,
+            FAKE_MSYS,
+            std::slice::from_ref(&there),
+        );
+        let b = write_record(
+            records.path(),
+            700_000_006,
+            FAKE_MSYS,
+            std::slice::from_ref(&gone),
+        );
+
+        let report = clear_leftovers_in(records.path(), FAKE_MSYS, &Others::default()).join("\n");
+        assert!(report.contains("took back"), "{report}");
+        assert!(report.contains("gone or moved"), "{report}");
+        assert!(report.contains(&gone.display().to_string()), "{report}");
+        assert!(!a.exists() && !b.exists(), "the records are dropped");
+        assert!(!passes_down(&there, FAKE_MSYS, MODIFY).expect("reads the ACL"));
+        assert!(refuse_msys_leftovers(records.path(), FAKE_MSYS).is_ok());
+        assert_eq!(
+            clear_leftovers_in(records.path(), FAKE_MSYS, &Others::default()),
+            ["no msys leftovers"]
+        );
+    }
+
+    /// **A SETUP `--read` FOLDER KEEPS ITS READ GRANT**: when an msys run's
+    /// root or current folder is exactly such a folder, taking the run's
+    /// access back must not strip the read grant merged into the same ACE.
+    #[test]
+    fn a_setup_read_folder_keeps_its_read_grant_when_the_msys_access_is_taken_back() {
+        let dir = data_drive_folder();
+        let folder = dir.path().to_path_buf();
+        grant_read(&folder, FAKE_MSYS).expect("setup --read");
+        grant_account(&folder, FAKE_MSYS, MODIFY).expect("the run's grant, merged");
+        assert!(passes_down(&folder, FAKE_MSYS, MODIFY).expect("reads"));
+
+        let others = Others {
+            setup_reads: vec![folder.clone()],
+            ..Others::default()
+        };
+        release_account(&folder, FAKE_MSYS, &others).expect("released");
+        assert!(
+            passes_down(&folder, FAKE_MSYS, READ_EXECUTE).expect("reads"),
+            "the read grant is back: {}",
+            acl_of(&folder)
+        );
+        assert!(
+            !passes_down(&folder, FAKE_MSYS, MODIFY).expect("reads"),
+            "and the write is not: {}",
+            acl_of(&folder)
+        );
+
+        // Control: a folder that is not a setup read folder loses it all.
+        grant_account(&folder, FAKE_MSYS, MODIFY).expect("again");
+        release_account(&folder, FAKE_MSYS, &Others::default()).expect("released");
+        assert!(!passes_down(&folder, FAKE_MSYS, READ_EXECUTE).expect("reads"));
+    }
+
+    /// Run `icacls <path> <args>`.
+    fn icacls_set(path: &Path, args: &[&str]) {
+        let o = std::process::Command::new("icacls")
+            .arg(path)
+            .args(args)
+            .output()
+            .expect("icacls");
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stdout));
+    }
+
+    /// **A ROOT THAT PASSES DOWN CREATOR OWNER IS REFUSED FOR MSYS**: what the
+    /// account creates would carry an entry naming it that no revoke removes.
+    #[test]
+    fn an_msys_root_that_passes_down_creator_owner_is_refused() {
+        let dir = data_drive_folder();
+        let root = dir.path().to_path_buf();
+        assert!(refuse_msys_roots(std::slice::from_ref(&root)).is_ok());
+        icacls_set(&root, &["/grant", "*S-1-3-0:(OI)(CI)(IO)F"]);
+        let err = refuse_msys_roots(std::slice::from_ref(&root)).expect_err("refused");
+        assert!(err.contains("CREATOR OWNER"), "{err}");
+        assert!(err.contains(&root.display().to_string()), "{err}");
+        assert!(err.contains("/remove:g *S-1-3-0"), "{err}");
+        // Removed, it is accepted again.
+        icacls_set(&root, &["/remove:g", "*S-1-3-0"]);
+        assert!(refuse_msys_roots(std::slice::from_ref(&root)).is_ok());
+    }
+
+    /// **AN OWNER RIGHTS ENTRY BROADER THAN `READ_CONTROL` IS REFUSED**, not
+    /// trusted as "already there" and not stripped: the entry insbx adds
+    /// (`READ_CONTROL` only) is fine.
+    #[test]
+    fn a_broader_owner_rights_entry_is_refused_for_msys() {
+        let dir = data_drive_folder();
+        let root = dir.path().to_path_buf();
+        icacls_set(&root, &["/grant", "*S-1-3-4:(OI)(CI)F"]);
+        assert!(
+            passes_down(&root, OWNER_RIGHTS, READ_CONTROL).expect("reads"),
+            "`passes_down` alone would call it fine"
+        );
+        let err = refuse_msys_roots(std::slice::from_ref(&root)).expect_err("refused");
+        assert!(err.contains("OWNER RIGHTS"), "{err}");
+        let err = keep_owner_rights(&root).expect_err("refused");
+        assert!(err.contains("OWNER RIGHTS"), "{err}");
+        // The user's ACL was not touched on the way.
+        let user = current_user_sid().expect("the user's SID");
+        assert!(!passes_down(&root, &user, ACL_RIGHTS).expect("reads"));
+
+        // The entry insbx itself adds is not broader.
+        let fine = data_drive_folder();
+        assert!(keep_acl_rights(fine.path()).expect("user rights"));
+        assert!(keep_owner_rights(fine.path()).expect("added"));
+        assert!(!keep_owner_rights(fine.path()).expect("checked"));
+        assert!(refuse_msys_roots(&[fine.path().to_path_buf()]).is_ok());
     }
 
     /// **MSYS RUNS GO ONE AT A TIME**: a second, on another thread (a
