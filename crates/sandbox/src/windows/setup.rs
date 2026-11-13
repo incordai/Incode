@@ -1,7 +1,7 @@
-//! `insbx setup-windows`: the offline account, its password, and the WFP
-//! filters that cut it off ([`super::offline`] says why each is so); and,
-//! at run time, finding them ([`ready`]) and reading the password
-//! ([`password`]).
+//! `insbx setup-windows`: the offline account and the msys account, their
+//! passwords, and the WFP filters that cut both off ([`super::offline`] says
+//! why each is so); and, at run time, finding them ([`ready`]) and reading a
+//! password ([`password`]).
 //!
 //! Everything here that changes the machine needs an elevated process and
 //! refuses clearly without one. Each step is idempotent: running the setup
@@ -55,9 +55,9 @@ use windows_sys::Win32::System::Registry::{
 use windows_sys::Win32::System::WindowsProgramming::GetComputerNameW;
 
 use super::offline::{
-    self, password_from, Cond, FilterSpec, Layer, Ready, Record, SetupArgs, ACCOUNT,
-    ACCOUNT_COMMENT, DEFAULT_PROXY_PORTS, DPAPI_ENTROPY, FILTERS, MAIN_FILTER, PROVIDER_KEY,
-    RECORD_FILE, STATE_DIR, SUBLAYER_KEY, SUBLAYER_WEIGHT,
+    self, password_from, Cond, FilterSpec, Layer, MsysAccount, Ready, Record, SetupArgs, ACCOUNT,
+    ACCOUNT_COMMENT, DEFAULT_PROXY_PORTS, DPAPI_ENTROPY, FILTERS, MAIN_FILTER, MSYS_ACCOUNT,
+    MSYS_ACCOUNT_COMMENT, PROVIDER_KEY, RECORD_FILE, STATE_DIR, SUBLAYER_KEY, SUBLAYER_WEIGHT,
 };
 use super::token::{
     current_user_sid, dacl_of, is_elevated, last_error, security_descriptor, sid, sid_to_string,
@@ -243,9 +243,19 @@ fn qualified(name: &str) -> String {
     }
 }
 
-/// The offline account's SID, if it exists.
-pub(crate) fn account_sid() -> Option<String> {
-    lookup_sid(&qualified(ACCOUNT)).ok()
+/// The SID of the local account `name` ([`ACCOUNT`] or [`MSYS_ACCOUNT`]), if
+/// it exists.
+pub(crate) fn account_sid(name: &str) -> Option<String> {
+    lookup_sid(&qualified(name)).ok()
+}
+
+/// The SIDs of the accounts that exist (the offline account's, the msys
+/// account's): the only ones a sweep may revoke ACEs of.
+pub(crate) fn account_sids() -> Vec<String> {
+    [ACCOUNT, MSYS_ACCOUNT]
+        .into_iter()
+        .filter_map(account_sid)
+        .collect()
 }
 
 fn lookup_sid(name: &str) -> Result<String, String> {
@@ -328,17 +338,19 @@ fn probe() -> Result<Ready, String> {
     };
     let record = Record::parse(&text)
         .map_err(|e| format!("{} is damaged ({e}); set it up again", path.display()))?;
-    match account_sid() {
-        Some(sid) if sid == record.sid => {}
-        Some(_) => {
-            return Err(format!(
-                "the account {ACCOUNT} is not the one the setup made; set it up again"
-            ))
-        }
-        None => {
-            return Err(format!(
-                "the account {ACCOUNT} no longer exists; set it up again"
-            ))
+    for (name, recorded) in [(ACCOUNT, &record.sid), (MSYS_ACCOUNT, &record.msys.sid)] {
+        match account_sid(name) {
+            Some(sid) if sid == *recorded => {}
+            Some(_) => {
+                return Err(format!(
+                    "the account {name} is not the one the setup made; set it up again"
+                ))
+            }
+            None => {
+                return Err(format!(
+                    "the account {name} no longer exists; set it up again"
+                ))
+            }
         }
     }
     if filter_missing(MAIN_FILTER) {
@@ -346,6 +358,7 @@ fn probe() -> Result<Ready, String> {
     }
     Ok(Ready {
         sid: record.sid,
+        msys_sid: record.msys.sid,
         proxy_ports: record.proxy_ports,
         record: path,
     })
@@ -371,19 +384,41 @@ fn filter_missing(spec: &FilterSpec) -> bool {
     err == FWP_E_FILTER_NOT_FOUND as u32
 }
 
-/// The account name and its password, from the record at `path`.
+/// The folders `insbx setup-windows --read` granted both accounts, from the
+/// record (none when it cannot be read: only the user who ran the setup can).
+pub(crate) fn read_folders() -> Vec<PathBuf> {
+    std::fs::read_to_string(record_path())
+        .ok()
+        .and_then(|t| Record::parse(&t).ok())
+        .map(|r| r.reads)
+        .unwrap_or_default()
+}
+
+/// The account name, SID and password of the offline account, or with `msys`
+/// of the msys account, from the record at `path`.
 ///
 /// # Errors
 /// When the record cannot be read or decrypted.
-pub(crate) fn password(path: &Path) -> Result<(String, Secret), String> {
+pub(crate) fn password(path: &Path, msys: bool) -> Result<(String, String, Secret), String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let record = Record::parse(&text).map_err(|e| format!("{}: {e}", path.display()))?;
-    let mut plain = unprotect(&record.password)
-        .map_err(|e| format!("the offline account's password cannot be read: {e}"))?;
+    // The account to log on as is the constant name, never the one the
+    // record says: the record is only trusted for the SID and the password.
+    let (account, sid, sealed) = if msys {
+        (
+            MSYS_ACCOUNT.to_string(),
+            record.msys.sid,
+            record.msys.password,
+        )
+    } else {
+        (ACCOUNT.to_string(), record.sid, record.password)
+    };
+    let mut plain = unprotect(&sealed)
+        .map_err(|e| format!("the account {account}'s password cannot be read: {e}"))?;
     let text = String::from_utf8(plain.clone());
     zero(&mut plain);
-    let text = text.map_err(|_| "the offline account's password is damaged".to_string())?;
-    Ok((record.account, Secret::from_string(text)))
+    let text = text.map_err(|_| format!("the account {account}'s password is damaged"))?;
+    Ok((account, sid, Secret::from_string(text)))
 }
 
 // ---- Setup. ----
@@ -406,9 +441,13 @@ pub fn run(args: &SetupArgs) -> Result<Vec<String>, String> {
 fn install(args: &SetupArgs) -> Result<Vec<String>, String> {
     let mut report = Vec::new();
     let owner = current_user_sid()?;
-    let previous = std::fs::read_to_string(record_path())
-        .ok()
-        .and_then(|t| Record::parse(&t).ok());
+    let text = std::fs::read_to_string(record_path()).ok();
+    let previous = text.as_deref().and_then(|t| Record::parse(t).ok());
+    // A version-1 record (from before the msys account) cannot be read whole,
+    // but its read folders and the offline account's SID can: those folders
+    // are carried over, so `--remove` still takes their grants back and the
+    // msys account gets them too.
+    let legacy = text.as_deref().and_then(Record::legacy_reads);
     // The password is about to change: an old record would name the wrong
     // one if a step below failed. Without a record, runs say "not set up".
     match std::fs::remove_file(record_path()) {
@@ -417,33 +456,56 @@ fn install(args: &SetupArgs) -> Result<Vec<String>, String> {
         Err(e) => return Err(format!("{}: {e}", record_path().display())),
     }
 
-    // 1. The account, with a fresh password nobody sees.
-    let mut random = random_bytes()?;
-    let password = Secret::from_string(password_from(&random));
-    zero(&mut random);
-    let created = ensure_account(&password)?;
-    report.push(format!(
-        "account {ACCOUNT}: {} (in Users, not Administrators; password random, not shown)",
-        if created {
-            "created"
-        } else {
-            "exists, password reset"
-        }
-    ));
-    let account = lookup_sid(&qualified(ACCOUNT))?;
-    check_logon(&password)?;
-    match hide_from_sign_in(true) {
-        Ok(()) => report.push("hidden from the sign-in screen".to_string()),
-        Err(e) => report.push(format!("not hidden from the sign-in screen ({e})")),
-    }
+    // 1. The accounts, each with a fresh password nobody sees.
+    let (account, sealed) = install_account(ACCOUNT, ACCOUNT_COMMENT, &mut report)?;
+    let (msys_account, msys_sealed) =
+        install_account(MSYS_ACCOUNT, MSYS_ACCOUNT_COMMENT, &mut report)?;
 
-    // 2. Folders it may read (toolchains): the earlier ones kept.
+    // 2. Folders they may read (toolchains): the earlier ones kept.
     let profile = std::env::var("USERPROFILE").ok();
     let mut reads: Vec<PathBuf> = previous
         .as_ref()
-        .filter(|p| p.sid == account)
+        .filter(|p| p.sid == account && p.msys.sid == msys_account)
         .map(|p| p.reads.clone())
         .unwrap_or_default();
+    if let Some((_, old)) = legacy.filter(|(sid, _)| *sid == account) {
+        // The same care `--read` takes; a folder that is missing or too broad
+        // stays in the record all the same, so `--remove` can still revoke the
+        // offline account's grant on it.
+        let resolve = |d: &Path| {
+            std::fs::canonicalize(d)
+                .ok()
+                .map(|c| PathBuf::from(super::strip_verbatim(&c.to_string_lossy())))
+                .filter(|c| c.is_dir())
+        };
+        let broad = |d: &Path| refuse_broad(&d.to_string_lossy(), profile.as_deref());
+        for carried in offline::carry_over(&old, &resolve, &broad) {
+            let dir = match carried {
+                offline::Carried::Grant(dir) => {
+                    match acl::grant_read(&dir, &msys_account) {
+                        Ok(()) => report.push(format!(
+                            "{MSYS_ACCOUNT} may read {} (carried over from the earlier setup)",
+                            dir.display()
+                        )),
+                        Err(e) => report.push(format!(
+                            "{MSYS_ACCOUNT} could not be given {}: {e}",
+                            dir.display()
+                        )),
+                    }
+                    dir
+                }
+                offline::Carried::KeepOnly(dir, why) => {
+                    report.push(format!("{}: {why}", dir.display()));
+                    dir
+                }
+            };
+            if !reads.iter().any(|r| {
+                super::path_key(&r.to_string_lossy()) == super::path_key(&dir.to_string_lossy())
+            }) {
+                reads.push(dir);
+            }
+        }
+    }
     for dir in &args.reads {
         let dir = std::fs::canonicalize(dir)
             .map(|d| PathBuf::from(super::strip_verbatim(&d.to_string_lossy())))
@@ -453,8 +515,10 @@ fn install(args: &SetupArgs) -> Result<Vec<String>, String> {
         }
         refuse_broad(&dir.to_string_lossy(), profile.as_deref())
             .map_err(|e| format!("--read {e}"))?;
-        acl::grant_read(&dir, &account)?;
-        report.push(format!("{ACCOUNT} may read {}", dir.display()));
+        for (name, sid) in [(ACCOUNT, &account), (MSYS_ACCOUNT, &msys_account)] {
+            acl::grant_read(&dir, sid)?;
+            report.push(format!("{name} may read {}", dir.display()));
+        }
         if !reads.iter().any(|r| {
             super::path_key(&r.to_string_lossy()) == super::path_key(&dir.to_string_lossy())
         }) {
@@ -467,26 +531,28 @@ fn install(args: &SetupArgs) -> Result<Vec<String>, String> {
         .proxy_ports
         .or(previous.as_ref().map(|p| p.proxy_ports))
         .unwrap_or(DEFAULT_PROXY_PORTS);
-    install_filters(&account, ports)?;
+    install_filters(&[&account, &msys_account], ports)?;
     report.push(format!(
-        "Windows Filtering Platform: {} filters block every connection {ACCOUNT} makes or \
-         accepts, except TCP to 127.0.0.1 ports {}-{} (the proxy)",
+        "Windows Filtering Platform: {} filters block every connection {ACCOUNT} and \
+         {MSYS_ACCOUNT} make or accept, except TCP to 127.0.0.1 ports {}-{} (the proxy)",
         FILTERS.len(),
         ports.0,
         ports.1
     ));
 
     // 4. The record, last: its presence says everything above is in place.
-    let mut plain = password.utf8();
-    let sealed = protect(&plain);
-    zero(&mut plain);
     let record = Record {
         account: ACCOUNT.to_string(),
         sid: account,
         owner,
         proxy_ports: ports,
         reads,
-        password: sealed?,
+        password: sealed,
+        msys: MsysAccount {
+            account: MSYS_ACCOUNT.to_string(),
+            sid: msys_account,
+            password: msys_sealed,
+        },
     };
     write_record(&record)?;
     report.push(format!(
@@ -495,6 +561,38 @@ fn install(args: &SetupArgs) -> Result<Vec<String>, String> {
         account_name(&record.owner)
     ));
     Ok(report)
+}
+
+/// Make the account `name` with a fresh random password nobody sees: in
+/// `Users`, checked to log on, hidden from the sign-in screen. Its SID and
+/// its password, DPAPI-protected for the record. What it did goes on `report`.
+fn install_account(
+    name: &str,
+    comment: &str,
+    report: &mut Vec<String>,
+) -> Result<(String, Vec<u8>), String> {
+    let mut random = random_bytes()?;
+    let password = Secret::from_string(password_from(&random));
+    zero(&mut random);
+    let created = ensure_account(name, comment, &password)?;
+    report.push(format!(
+        "account {name}: {} (in Users, not Administrators; password random, not shown)",
+        if created {
+            "created"
+        } else {
+            "exists, password reset"
+        }
+    ));
+    let sid = lookup_sid(&qualified(name))?;
+    check_logon(name, &password)?;
+    match hide_from_sign_in(name, true) {
+        Ok(()) => report.push(format!("{name} hidden from the sign-in screen")),
+        Err(e) => report.push(format!("{name} not hidden from the sign-in screen ({e})")),
+    }
+    let mut plain = password.utf8();
+    let sealed = protect(&plain);
+    zero(&mut plain);
+    Ok((sid, sealed?))
 }
 
 /// A SID's `DOMAIN\name`, or the SID itself.
@@ -529,11 +627,11 @@ fn account_name(sid_text: &str) -> String {
     )
 }
 
-/// Create the account, or reset an existing one's password; `Users` only.
-/// Whether it was created.
-fn ensure_account(password: &Secret) -> Result<bool, String> {
-    let name = wide(ACCOUNT);
-    let comment = wide(ACCOUNT_COMMENT);
+/// Create the account `account`, or reset an existing one's password; `Users`
+/// only. Whether it was created.
+fn ensure_account(account: &str, comment: &str, password: &Secret) -> Result<bool, String> {
+    let name = wide(account);
+    let comment = wide(comment);
     let flags = UF_SCRIPT | UF_NORMAL_ACCOUNT | UF_DONT_EXPIRE_PASSWD | UF_PASSWD_CANT_CHANGE;
     let info = USER_INFO_1 {
         usri1_name: name.as_ptr().cast_mut(),
@@ -573,7 +671,7 @@ fn ensure_account(password: &Secret) -> Result<bool, String> {
             };
             if status != 0 {
                 return Err(format!(
-                    "resetting {ACCOUNT}'s password failed with error {status}"
+                    "resetting {account}'s password failed with error {status}"
                 ));
             }
             // Enabled again if someone disabled it, and the flags as made.
@@ -592,22 +690,22 @@ fn ensure_account(password: &Secret) -> Result<bool, String> {
             };
             if status != 0 {
                 return Err(format!(
-                    "setting {ACCOUNT}'s flags failed with error {status}"
+                    "setting {account}'s flags failed with error {status}"
                 ));
             }
             false
         }
         e => {
             return Err(format!(
-                "creating the account {ACCOUNT} failed with error {e} (parameter {parm})"
+                "creating the account {account} failed with error {e} (parameter {parm})"
             ))
         }
     };
     // `Users` (needed to log on and to read the system folders), and never
     // `Administrators`, even if someone added it there.
-    let account = sid(&lookup_sid(&qualified(ACCOUNT))?)?;
+    let member_sid = sid(&lookup_sid(&qualified(account))?)?;
     let member = LOCALGROUP_MEMBERS_INFO_0 {
-        lgrmi0_sid: account.0,
+        lgrmi0_sid: member_sid.0,
     };
     for (group, add) in [(USERS, true), (ADMINISTRATORS, false)] {
         let group_w = group_name(group)?;
@@ -636,7 +734,7 @@ fn ensure_account(password: &Secret) -> Result<bool, String> {
             || (!add && status == ERROR_MEMBER_NOT_IN_ALIAS);
         if !fine {
             return Err(format!(
-                "{} {ACCOUNT} {} {} failed with error {status}",
+                "{} {account} {} {} failed with error {status}",
                 if add { "adding" } else { "removing" },
                 if add { "to" } else { "from" },
                 String::from_utf16_lossy(&group_w[..group_w.len() - 1])
@@ -648,12 +746,12 @@ fn ensure_account(password: &Secret) -> Result<bool, String> {
 
 /// Log the account on once, as a run will: a policy that denies it local
 /// logon would otherwise only show up at the first run.
-fn check_logon(password: &Secret) -> Result<(), String> {
+fn check_logon(account: &str, password: &Secret) -> Result<(), String> {
     let mut token: HANDLE = std::ptr::null_mut();
     // SAFETY: NUL-terminated strings; the token, if any, is owned and closed.
     let ok = unsafe {
         LogonUserW(
-            wide(ACCOUNT).as_ptr(),
+            wide(account).as_ptr(),
             wide(".").as_ptr(),
             password.as_ptr(),
             LOGON32_LOGON_INTERACTIVE,
@@ -663,7 +761,7 @@ fn check_logon(password: &Secret) -> Result<(), String> {
     };
     if ok == 0 {
         return Err(format!(
-            "{ACCOUNT} cannot log on ({}); a group policy may deny it \"Allow log on locally\"",
+            "{account} cannot log on ({}); a group policy may deny it \"Allow log on locally\"",
             last_error("LogonUserW")
         ));
     }
@@ -671,9 +769,9 @@ fn check_logon(password: &Secret) -> Result<(), String> {
     Ok(())
 }
 
-/// Hide (or show again) the account on the sign-in screen.
-fn hide_from_sign_in(hide: bool) -> Result<(), String> {
-    let name = wide(ACCOUNT);
+/// Hide (or show again) the account `account` on the sign-in screen.
+fn hide_from_sign_in(account: &str, hide: bool) -> Result<(), String> {
+    let name = wide(account);
     // SAFETY: registry calls with NUL-terminated strings; the key is closed.
     unsafe {
         if !hide {
@@ -800,14 +898,22 @@ fn write_record(record: &Record) -> Result<(), String> {
 fn remove() -> Result<Vec<String>, String> {
     let mut report = Vec::new();
     let mut failed = Vec::new();
-    let record = std::fs::read_to_string(record_path())
-        .ok()
-        .and_then(|t| Record::parse(&t).ok());
-    let account = account_sid();
-    if let (Some(record), Some(account)) = (&record, &account) {
-        for dir in record.reads.iter().filter(|d| d.exists()) {
-            match acl::revoke(dir, account) {
-                Ok(()) => report.push(format!("{ACCOUNT} may no longer read {}", dir.display())),
+    let text = std::fs::read_to_string(record_path()).ok();
+    let record = text.as_deref().and_then(|t| Record::parse(t).ok());
+    // The read folders of a version-1 record (the offline account's alone).
+    let legacy = text.as_deref().and_then(Record::legacy_reads);
+    for name in [ACCOUNT, MSYS_ACCOUNT] {
+        let Some(account) = account_sid(name) else {
+            continue;
+        };
+        let reads: Vec<PathBuf> = match (&record, &legacy) {
+            (Some(record), _) => record.reads.clone(),
+            (None, Some((_, old))) if name == ACCOUNT => old.clone(),
+            _ => Vec::new(),
+        };
+        for dir in reads.iter().filter(|d| d.exists()) {
+            match acl::revoke(dir, &account) {
+                Ok(()) => report.push(format!("{name} may no longer read {}", dir.display())),
                 Err(e) => failed.push(format!("{}: {e}", dir.display())),
             }
         }
@@ -816,14 +922,16 @@ fn remove() -> Result<Vec<String>, String> {
         Ok(()) => report.push("Windows Filtering Platform filters removed".to_string()),
         Err(e) => failed.push(format!("filters: {e}")),
     }
-    // SAFETY: a NUL-terminated name.
-    match unsafe { NetUserDel(std::ptr::null(), wide(ACCOUNT).as_ptr()) } {
-        0 => report.push(format!("account {ACCOUNT} deleted")),
-        NERR_USER_NOT_FOUND => report.push(format!("account {ACCOUNT}: not there")),
-        e => failed.push(format!("deleting {ACCOUNT} failed with error {e}")),
-    }
-    if let Err(e) = hide_from_sign_in(false) {
-        failed.push(format!("sign-in screen entry: {e}"));
+    for name in [ACCOUNT, MSYS_ACCOUNT] {
+        // SAFETY: a NUL-terminated name.
+        match unsafe { NetUserDel(std::ptr::null(), wide(name).as_ptr()) } {
+            0 => report.push(format!("account {name} deleted")),
+            NERR_USER_NOT_FOUND => report.push(format!("account {name}: not there")),
+            e => failed.push(format!("deleting {name} failed with error {e}")),
+        }
+        if let Err(e) = hide_from_sign_in(name, false) {
+            failed.push(format!("{name}'s sign-in screen entry: {e}"));
+        }
     }
     let dir = state_dir();
     let plain_dir = std::fs::symlink_metadata(&dir)
@@ -926,15 +1034,18 @@ fn layer_key(layer: Layer) -> Guid {
     }
 }
 
-fn install_filters(account_sid: &str, ports: (u16, u16)) -> Result<(), String> {
+/// Add every filter, each matching the sockets of any of `account_sids` (the
+/// offline account and the msys account).
+fn install_filters(account_sids: &[&str], ports: (u16, u16)) -> Result<(), String> {
     let engine = Engine::open(30_000)?;
-    let user_sd = security_descriptor(&offline::user_condition_sddl(account_sid))?;
+    let user_sd = security_descriptor(&offline::user_condition_sddl(account_sids))?;
     // SAFETY: a valid self-relative descriptor.
     let user_sd_len = unsafe { GetSecurityDescriptorLength(user_sd.0) };
     let provider_key = guid(PROVIDER_KEY);
     let sublayer_key = guid(SUBLAYER_KEY);
-    let name = wide("insbx offline account");
-    let description = wide("insbx setup-windows: the insbx-offline account has no network");
+    let name = wide("insbx offline and msys accounts");
+    let description =
+        wide("insbx setup-windows: the insbx-offline and insbx-msys accounts have no network");
     engine.transaction(|| {
         // SAFETY: every structure passed points at locals that outlive the
         // calls (names, keys, the descriptor blob, the range); WFP copies

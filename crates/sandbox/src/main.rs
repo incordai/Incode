@@ -31,9 +31,14 @@ USAGE:
                              --remove undoes all of it
     insbx grants               Windows: the folders whose write grant is kept, and whether
                              each still carries it
-    insbx revoke <DIR>... | --all
-                             Windows: take a folder's kept grant back; its next run grants
-                             it again
+    insbx revoke <DIR>... | --all [--msys-leftovers [--forget-gone]]
+                             Windows: take a folder's kept grant back (the msys account's
+                             access too); its next run grants it again. --msys-leftovers
+                             clears what a crashed --msys run left that its sweep could not
+                             take back (a moved root...), which refuses every --msys run;
+                             it re-reads the trees and keeps a record whose access comes
+                             back (exit 1), and keeps one naming a root that is gone or
+                             replaced unless --forget-gone says it is dealt with
 
 KEPT GRANTS (Windows):
     A writable root's grant is written into every file beneath it, so it is made by the
@@ -57,6 +62,10 @@ POLICY (a file, then flags on top of it):
         --fs <MODE>          off | read-only | workspace-write
     -w, --write <DIR>        writable root (implies --fs workspace-write; repeatable)
         --deny-read <PATH>   hide this path entirely, reads included (repeatable)
+        --msys               Windows, with --net deny or proxy: run as the account insbx-msys
+                             so Git Bash (msys) works. Costs per-run grants (each root is
+                             walked, then taken back) and one such run at a time. Refused
+                             with --net allow; ignored on Linux and macOS
         --net <MODE>         allow | deny | proxy
         --allow-host <HOST>  host the proxy lets through (implies --net proxy; repeatable)
         --allow-private      an allowed host may resolve to a private address
@@ -235,9 +244,10 @@ mod windows_backend {
         }
         match incord_sandbox::windows::offline_setup() {
             Ok(r) => println!(
-                "  [ok  ] offline user   {} and its firewall filters are set up (insbx setup-windows): \
-                 network deny and proxy run natively (proxy ports {}-{})",
+                "  [ok  ] offline user   {} and {} (--msys) and their firewall filters are set up \
+                 (insbx setup-windows): network deny and proxy run natively (proxy ports {}-{})",
                 incord_sandbox::windows::offline::ACCOUNT,
+                incord_sandbox::windows::offline::MSYS_ACCOUNT,
                 r.proxy_ports.0,
                 r.proxy_ports.1
             ),
@@ -411,21 +421,37 @@ fn grants() -> Result<i32, String> {
     }
 }
 
-/// `insbx revoke <DIR>... | --all`: take kept grants back
-/// (`incord_sandbox::windows::revoke_kept`), the offline account's too when
-/// it is set up. Every folder is tried; the exit code is 1 when any failed.
+/// `insbx revoke <DIR>... | --all [--msys-leftovers]`: take kept grants back
+/// (`incord_sandbox::windows::revoke_kept`), the offline and msys accounts'
+/// too when set up; with `--msys-leftovers`, clear what a crashed msys run
+/// left (`incord_sandbox::windows::clear_msys_leftovers`). Every folder is
+/// tried; the exit code is 1 when any failed.
 fn revoke(args: &[OsString]) -> Result<i32, String> {
-    let words: Vec<&str> = args
+    let mut words: Vec<&str> = args
         .iter()
         .map(|a| a.to_str().ok_or("an argument is not valid Unicode"))
         .collect::<Result<_, _>>()?;
-    if words.is_empty() {
-        return Err("revoke what? give folders, or --all".into());
+    let leftovers = words.contains(&"--msys-leftovers");
+    let forget_gone = words.contains(&"--forget-gone");
+    words.retain(|w| *w != "--msys-leftovers" && *w != "--forget-gone");
+    if forget_gone && !leftovers {
+        return Err("--forget-gone goes with --msys-leftovers".into());
+    }
+    if words.is_empty() && !leftovers {
+        return Err("revoke what? give folders, or --all, or --msys-leftovers".into());
     }
     #[cfg(windows)]
     {
         use incord_sandbox::windows;
-        let folders: Vec<PathBuf> = if words == ["--all"] {
+        let setup = windows::offline_setup().ok();
+        let accounts: Vec<String> = setup
+            .iter()
+            .flat_map(|r| [r.sid.clone(), r.msys_sid.clone()])
+            .collect();
+        let mut failed = false;
+        let folders: Vec<PathBuf> = if words.is_empty() {
+            Vec::new()
+        } else if words == ["--all"] {
             windows::kept_folders()?
                 .into_iter()
                 .map(|k| k.path)
@@ -438,16 +464,26 @@ fn revoke(args: &[OsString]) -> Result<i32, String> {
                 .map(|w| std::fs::canonicalize(w).map_err(|e| format!("{w}: {e}")))
                 .collect::<Result<_, _>>()?
         };
-        let account = windows::offline_setup().ok().map(|r| r.sid);
-        let mut failed = false;
         for folder in folders {
-            match windows::revoke_kept(&folder, account.as_deref()) {
+            match windows::revoke_kept(&folder, &accounts) {
                 Ok(()) => println!("insbx revoke: {}", strip_verbatim(&folder)),
                 Err(e) => {
                     eprintln!("insbx revoke: {}: {e}", strip_verbatim(&folder));
                     failed = true;
                 }
             }
+        }
+        // The folders first (where a moved root now is), then the records.
+        if leftovers {
+            let setup = setup.as_ref().ok_or(
+                "--msys-leftovers needs the setup (`insbx setup-windows`): see `insbx doctor`",
+            )?;
+            let cleared = windows::clear_msys_leftovers(&setup.msys_sid, forget_gone)?;
+            for line in &cleared.lines {
+                println!("insbx revoke: {line}");
+            }
+            // Records that stay mean msys runs stay refused: not a success.
+            failed |= cleared.kept > 0;
         }
         Ok(i32::from(failed))
     }
@@ -669,8 +705,8 @@ fn apply_flag(policy: &mut Policy, flag: &str, v: String) -> Result<(), String> 
     }
 }
 
-/// `--fs`, `-w`/`--write`, `--deny-read`, `--no-protect-git`; `Ok(false)` for
-/// any other flag.
+/// `--fs`, `-w`/`--write`, `--deny-read`, `--no-protect-git`, `--msys`;
+/// `Ok(false)` for any other flag.
 fn apply_fs_flag(policy: &mut Policy, flag: &str, v: &str) -> Result<bool, String> {
     match flag {
         "--fs" => {
@@ -687,6 +723,7 @@ fn apply_fs_flag(policy: &mut Policy, flag: &str, v: &str) -> Result<bool, Strin
             policy.fs.deny_read.push(PathBuf::from(v));
         }
         "--no-protect-git" => policy.fs.protect_git = false,
+        "--msys" => policy.fs.msys = true,
         _ => return Ok(false),
     }
     Ok(true)
@@ -839,6 +876,7 @@ mod tests {
             "--deny-read",
             "/secret",
             "--no-protect-git",
+            "--msys",
             "--allow-host",
             "crates.io",
             "--allow-private",
@@ -861,6 +899,7 @@ mod tests {
         assert_eq!(p.fs.write, [PathBuf::from("/w")]);
         assert_eq!(p.fs.deny_read, [PathBuf::from("/secret")]);
         assert!(!p.fs.protect_git);
+        assert!(p.fs.msys);
         assert_eq!(p.network.mode, NetMode::Proxy);
         assert_eq!(p.network.allow, ["crates.io"]);
         assert!(p.network.allow_private);

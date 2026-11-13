@@ -75,8 +75,16 @@ impl Enforcement {
 /// The enforcement of `policy` on this machine.
 #[must_use]
 pub fn enforcement(policy: &Policy) -> Enforcement {
+    // `fs.msys` only means something on Windows, with an account (network
+    // deny or proxy): there, asking for it with `allow` is a gap. Linux and
+    // macOS ignore it.
+    let msys_gap = if cfg!(windows) {
+        windows::msys_gap(&policy.fs, policy.network.mode)
+    } else {
+        None
+    };
     Enforcement {
-        filesystem: fs_status(&policy.fs),
+        filesystem: msys_gap.unwrap_or_else(|| fs_status(&policy.fs)),
         network: net_status(policy.network.mode),
         limits: limits::status(&policy.limits),
         environment: Status::Enforced(environment_summary(&policy.env)),
@@ -210,6 +218,31 @@ mod tests {
                 "environment: enforced - inherited",
             ]
         );
+    }
+
+    /// `fs.msys` is ignored off Windows, and with network `allow` on Windows
+    /// it is the one gap an otherwise empty policy can have.
+    #[test]
+    fn msys_is_a_gap_only_on_windows_with_the_network_open() {
+        let mut policy = Policy::default();
+        policy.fs.msys = true;
+        let e = enforcement(&policy);
+        if cfg!(windows) {
+            assert!(
+                matches!(&e.filesystem, Status::NotEnforced(s) if s.contains("--net deny")),
+                "{:?}",
+                e.filesystem
+            );
+            assert_eq!(e.gaps().len(), 1);
+            policy.network.mode = NetMode::Deny;
+            assert!(!matches!(
+                enforcement(&policy).filesystem,
+                Status::NotEnforced(ref s) if s.contains("msys")
+            ));
+        } else {
+            assert_eq!(e.filesystem, Status::NotRequested);
+            assert!(e.gaps().is_empty());
+        }
     }
 
     /// The environment summary names what the policy strips and removes.

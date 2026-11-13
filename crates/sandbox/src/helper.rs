@@ -307,6 +307,7 @@ mod tests {
             parent_pid: Some(7),
             offline: Offline::No,
             offline_record: None,
+            msys: None,
         };
         serde_json::to_string(&spec).expect("encodes")
     }

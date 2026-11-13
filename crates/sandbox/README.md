@@ -31,6 +31,7 @@ It builds to one binary, `insbx`, and a library, `incord_sandbox`.
 mode = "workspace-write"        # off | read-only | workspace-write
 write = ["."]                   # writable roots
 deny_read = ["../private"]      # hidden: not even readable
+msys = false                    # Windows, network deny/proxy: Git Bash works (--msys, see below)
 
 [network]
 mode = "proxy"                  # allow | deny | proxy
@@ -258,10 +259,13 @@ Windows. This crate's port is checked by its tests
 - **Places `Everyone` may write** stay writable to the command, because
   `Everyone` is one of the token's restricting SIDs.
 - **Git Bash and every msys program** fail to start under the token: the
-  msys runtime maps a shared section the token may not map writable, and
-  dies with `CreateFileMapping ..., Win32 error 5` (measured by incode).
-  Use `cmd` or PowerShell natively, or `INSBX_BACKEND=wsl` for a POSIX shell.
-  `insbx mcp` scripts default to PowerShell on Windows.
+  msys runtime builds its pipes and sections with a DACL that grants only the
+  token's user, which a write-restricted token may not write
+  (`couldn't create signal pipe, Win32 error 5`, measured). They work with
+  [`--msys`](#git-bash-natively---msys) (network `deny` or `proxy`, after
+  `insbx setup-windows`); otherwise use `cmd` or PowerShell natively, or
+  `INSBX_BACKEND=wsl` for a POSIX shell. `insbx mcp` scripts default to
+  PowerShell on Windows.
 - **Grants are visible, and kept.** Every object under a root that a run
   has used carries the root's ACE until `insbx revoke`. A file moved into a
   root from elsewhere keeps the ACL it had (no grant re-ACLs it, kept or
@@ -290,7 +294,9 @@ password and re-adds each filter):
    to log on locally and to read `C:\Windows` and `Program Files`; it is
    taken out of `Administrators` if anyone put it there), with a random
    password (256 bits) that is never shown, hidden from the sign-in screen.
-2. **Its password**, DPAPI-protected with machine scope, in
+   **And a second one, `insbx-msys`, the same way**, for `--msys` runs
+   ([below](#git-bash-natively---msys)).
+2. **Their passwords**, DPAPI-protected with machine scope, in
    `%ProgramData%\insbx\offline.conf`. The folder's ACL allows SYSTEM,
    Administrators and the user who ran the setup, and nobody else: not
    `Users`, so not the offline account, and not a sandboxed command. Machine
@@ -299,7 +305,8 @@ password and re-adds each filter):
    private data because only administrators can read that back, and runs
    are not elevated. The ACL is the protection; DPAPI makes the file
    useless off this machine.
-3. **Persistent WFP filters** for that account's SID
+3. **Persistent WFP filters** for both accounts' SIDs, in one condition so
+   they can never differ
    (`FWPM_CONDITION_ALE_USER_ID`): every outbound connection and every first
    UDP/raw packet (`ALE_AUTH_CONNECT`), every inbound connection
    (`ALE_AUTH_RECV_ACCEPT`), IPv4 and IPv6, loopback included, and raw ICMP
@@ -307,8 +314,11 @@ password and re-adds each filter):
    them: TCP to `127.0.0.1` on ports 47600-47615 (`--proxy-ports` changes
    the range), where a `proxy` run's proxy listens. WFP directly
    (`FwpmFilterAdd0`, in one transaction, under fixed keys), not `netsh`.
-4. `--read <DIR>` (repeatable, kept across re-runs) lets the account read a
+4. `--read <DIR>` (repeatable, kept across re-runs) lets both accounts read a
    folder: a toolchain under your profile (see *Reads* below).
+
+A machine set up before `insbx-msys` existed needs `insbx setup-windows`
+again: the record changed (version 2), and `insbx doctor` says so.
 
 At run time (unelevated), `insbx` starts its helper a second time as the
 account with `CreateProcessWithLogonW`, the one call an unprivileged process
@@ -388,6 +398,82 @@ first leaves the first its grant, and cannot write the first's other root);
 the proxy letting through only its allowlist, a direct connection refused;
 `insbx mcp` running a deny sandbox's PowerShell script as the account.
 Without the setup these tests print SKIPPED.
+
+### Git Bash natively: `--msys`
+
+Git Bash and every msys program fail under the write-restricted token. The
+msys runtime builds its pipes and shared sections with a DACL that grants
+only the token's user (msys2-runtime `sec_acl`: `GENERIC_ALL` for the user's
+SID and Administrators, nothing else), and a write-restricted token passes a
+write only where one of its restricting SIDs is granted. So `bash -c "echo ok
+> x"` dies with `couldn't create signal pipe, Win32 error 5`. Measured: adding
+the token's own user SID to its restricting SIDs makes it work.
+
+That cannot be done as the offline account: its ACEs on roots and current
+folders are kept across runs, and with its SID trusted a run wrote into
+another folder an earlier deny run had used (measured). So `--msys` (or
+`[fs] msys = true` in a policy) runs the command as the second account,
+`insbx-msys`, which has no kept ACE anywhere:
+
+```powershell
+insbx run --msys --net deny -w . -- "C:\Program Files\Git\bin\bash.exe" -c "make test"
+```
+
+- **Needs** `insbx setup-windows` (it makes `insbx-msys` and gives it the
+  same firewall filters and `--read` folders as `insbx-offline`), and network
+  `deny` or `proxy`, the modes that run as an account. With `allow` the run
+  is refused in strict mode (it would run as you, where Git Bash does not
+  start); `--best-effort` runs it without `--msys`. `--msys` is ignored on
+  Linux and macOS, whose sandboxes have no such limit.
+- **Costs:** the account's access is granted per run and taken back when the
+  run ends, by walking each writable root and read folder (NTFS stores
+  inheritance in every object: about 2.4 s each way on 18,673 objects,
+  measured by incode), so a big workspace pays that on every `--msys` run,
+  not once. A run that crashes leaves its ACEs for the next run's sweep. If
+  the sweep cannot take them back (the root was moved or renamed, a drive is
+  detached, a revoke failed), the next `--msys` run is REFUSED, naming the
+  paths: every msys run trusts that account, so a write ACE it keeps anywhere
+  would be writable by all of them. Run `insbx revoke <FOLDER>` on each (where
+  it is now), then `insbx revoke --msys-leftovers`. A root is told by what it
+  is, not by its name: moved aside and replaced by a new folder of the same
+  name counts as missing. And after every run's revoke the tree is read once
+  more: an explicit entry for the account on a folder beneath a root (one the
+  revoke walk cannot remove) makes exactly those objects leftovers too; a
+  read-only entry (a `--read` folder's) does not. `insbx revoke
+  --msys-leftovers` does not take a revoke for proof either: it reads the trees
+  again, and keeps the record (exit 1, msys runs stay refused) when an entry is
+  still there or comes back. An inherited CREATOR OWNER entry does come back
+  (every re-propagation resolves it to the owner, the account again): the
+  message names the folder whose CREATOR OWNER entry must be removed (or the
+  owner of the files changed). A root that is gone, moved or replaced is not
+  taken on the user's word: its record is KEPT unless `--forget-gone` is added
+  (after `insbx revoke` on wherever the folder went, or alone for one that is
+  really gone).
+- **Refused roots:** a root whose ACL passes down a CREATOR OWNER entry (each
+  file the account creates would carry an entry naming it that no revoke
+  removes), or an OWNER RIGHTS entry broader than `READ_CONTROL`. The message
+  gives the `icacls /remove:g` that clears it. Only the root's own ACL is
+  read, not every folder beneath it.
+- **One `--msys` run at a time**, since the account is shared by every run
+  (the named mutex `Global\insbx-msys`). A second one waits, and says so.
+- **What stays kept:** each root's own SID (useless without a token that
+  carries it), the user's `READ_CONTROL | WRITE_DAC` entry (as for the offline
+  account), and one inheritable OWNER RIGHTS entry granting only
+  `READ_CONTROL`. A file the msys account creates is owned by it, and an owner
+  holds `WRITE_DAC` implicitly; the entry takes that implicit right away from
+  a file created with the default ACL, and you, whose own entry survives, can
+  still re-ACL it. It does not cover a file the account creates with its own
+  explicit, protected ACL (the creator decides what is on its own file), and
+  `Everyone` is a restricting SID, so wherever `Everyone` may write the msys
+  token passes already. `insbx revoke` leaves these two entries.
+- The roots' and read folders' access is the account's, so what it creates
+  there is owned by `insbx-msys`, as under `deny` it is owned by
+  `insbx-offline`.
+
+`tests/escape_windows.rs` checks it where the account exists (else SKIPPED):
+`bash -c "echo ok > x && cat x"` as `insbx-msys`; a write into a folder
+another run kept a grant on refused; the account's ACEs gone from the root
+afterwards, the root's SID and OWNER RIGHTS entry kept; two runs serialized.
 
 ### WSL2
 

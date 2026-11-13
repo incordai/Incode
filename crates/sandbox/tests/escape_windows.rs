@@ -15,11 +15,12 @@
 
 #![cfg(windows)]
 
+use std::cell::RefCell;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio};
-use std::sync::OnceLock;
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -1228,4 +1229,623 @@ fn proxy_lets_only_the_allowlist_through_natively() {
         out.contains("not allowed") || out.contains("403") || out.contains("NOT-ALLOWED:"),
         "{out}"
     );
+}
+
+/// **A PLAIN `--net deny` RUN STILL STARTS** after the second helper locks its
+/// own process and threads: the first helper locks that helper's main thread
+/// before it runs, and the helper then locks every thread of its own, the
+/// current one through the pseudo-handle (a locked thread denies even its
+/// owner `WRITE_DAC`, which once refused every account run in strict mode).
+/// Both the confined and the unconfined-filesystem kinds, strict (the
+/// default).
+#[test]
+fn a_plain_network_deny_command_runs_with_the_second_helper_locked() {
+    if !needs_offline("a_plain_network_deny_command_runs_with_the_second_helper_locked") {
+        return;
+    }
+    let d = dirs();
+    let o = cmd(
+        &d.ws,
+        &["--net", "deny", "-w", "."],
+        "echo hello> out.txt & echo ran",
+    );
+    let out = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{out}");
+    assert!(out.contains("ran"), "{out}");
+    assert!(d.ws.join("out.txt").exists(), "{out}");
+    assert!(
+        !out.contains("could not protect itself"),
+        "the helper locked itself: {out}"
+    );
+
+    let o = cmd(&d.ws, &["--net", "deny", "--fs", "off"], "echo ran");
+    let out = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{out}");
+    assert!(out.contains("ran"), "{out}");
+    let o = insbx(&["revoke", "."], &d.ws);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+}
+
+// ---- `--msys`: Git Bash as the account insbx-msys (#38). ----
+
+/// Git for Windows' bash, where its installer puts it.
+const GIT_BASH: &str = r"C:\Program Files\Git\bin\bash.exe";
+/// The msys account (`incord_sandbox::windows::offline::MSYS_ACCOUNT`).
+const MSYS: &str = "insbx-msys";
+
+/// The `--msys` tests' gate: the layer-2 setup, the msys account that
+/// `insbx setup-windows` makes beside the offline one, and Git Bash. Else
+/// says it skipped. (Run `insbx setup-windows` as administrator again on a
+/// machine set up before `--msys` existed.)
+fn needs_msys(test: &str) -> bool {
+    if !needs_offline(test) {
+        return false;
+    }
+    let account = Command::new("net")
+        .args(["user", MSYS])
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !account {
+        eprintln!("SKIPPED {test}: the account {MSYS} does not exist; run `insbx setup-windows`");
+        return false;
+    }
+    if !Path::new(GIT_BASH).is_file() {
+        eprintln!("SKIPPED {test}: Git for Windows is not at {GIT_BASH}");
+        return false;
+    }
+    // The msys tests share the msys account and its records: a crash test
+    // leaves a record that refuses every other msys run, so they go one at a
+    // time. The guard lives until the test's thread ends.
+    MSYS_TEST_GUARD.with(|guard| {
+        if guard.borrow().is_none() {
+            let held = MSYS_TESTS.lock().unwrap_or_else(PoisonError::into_inner);
+            *guard.borrow_mut() = Some(held);
+        }
+    });
+    true
+}
+
+/// Held by every running msys test ([`needs_msys`]).
+static MSYS_TESTS: Mutex<()> = Mutex::new(());
+
+thread_local! {
+    static MSYS_TEST_GUARD: RefCell<Option<MutexGuard<'static, ()>>> = const { RefCell::new(None) };
+}
+
+/// `insbx run --msys --net deny -w <roots> -- bash -c <script>`.
+fn bash_msys(cwd: &Path, extra: &[&str], script: &str) -> Output {
+    let mut args = vec!["run", "--msys", "--net", "deny", "-w", "."];
+    args.extend_from_slice(extra);
+    args.extend_from_slice(&["--", GIT_BASH, "-c", script]);
+    insbx(&args, cwd)
+}
+
+/// A path as Git Bash takes it: forward slashes.
+fn msys_path(p: &Path) -> String {
+    p.to_string_lossy().replace('\\', "/")
+}
+
+#[test]
+fn git_bash_runs_under_msys_and_not_without_it() {
+    if !needs_msys("git_bash_runs_under_msys") {
+        return;
+    }
+    let d = dirs();
+    let o = bash_msys(&d.ws, &[], "echo ok > x && cat x && whoami");
+    let out = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{out}");
+    assert!(out.contains("ok"), "{out}");
+    assert!(d.ws.join("x").exists(), "{out}");
+    // (msys's own `whoami` prints the bare name.)
+    assert!(
+        out.to_ascii_lowercase().contains(MSYS),
+        "runs as the msys account: {out}"
+    );
+    // The control: without `--msys` the same command dies where msys builds
+    // its pipes (measured: "couldn't create signal pipe, Win32 error 5").
+    let o = insbx(
+        &[
+            "run",
+            "--net",
+            "deny",
+            "-w",
+            ".",
+            "--",
+            GIT_BASH,
+            "-c",
+            "echo ok > y",
+        ],
+        &d.ws,
+    );
+    assert!(
+        !o.status.success() && !d.ws.join("y").exists(),
+        "bash without --msys: {}",
+        text(&o)
+    );
+    let o = insbx(&["revoke", "."], &d.ws);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+}
+
+/// The reason for a second account: the offline account's grant on a folder
+/// is KEPT, so trusting its SID would let a run write into every folder an
+/// earlier deny run used (measured). An msys run must not.
+#[test]
+fn an_msys_run_cannot_write_where_another_run_kept_a_grant() {
+    if !needs_msys("an_msys_run_cannot_write_where_another_run_kept_a_grant") {
+        return;
+    }
+    let d = dirs();
+    // B: an earlier deny run leaves insbx-offline's kept grant on `out`.
+    let o = cmd(&d.out, &["--net", "deny", "-w", "."], "echo a> f");
+    assert!(d.out.join("f").exists(), "{}", text(&o));
+    assert!(icacls(&d.out).contains(OFFLINE), "{}", icacls(&d.out));
+
+    // A msys run in `ws` writes in `ws` and not in `out`.
+    let target = d.out.join("from-msys");
+    let o = bash_msys(
+        &d.ws,
+        &[],
+        &format!(
+            "echo ok > here; echo bad > '{}'; echo bad2 > '{}/g'; true",
+            msys_path(&target),
+            msys_path(&d.out)
+        ),
+    );
+    let out = text(&o);
+    assert!(d.ws.join("here").exists(), "the run's own root: {out}");
+    assert!(
+        !target.exists(),
+        "an msys run wrote into a kept grant: {out}"
+    );
+    assert!(!d.out.join("g").exists(), "{out}");
+    for dir in [&d.ws, &d.out] {
+        let o = insbx(&["revoke", dir.to_str().expect("utf8")], &d.ws);
+        assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    }
+}
+
+/// The msys account's ACEs are the run's alone: gone from the root and what
+/// is beneath it afterwards, while the root's own SID and the OWNER RIGHTS
+/// entry stay.
+#[test]
+fn an_msys_runs_account_is_gone_from_the_root_afterwards() {
+    if !needs_msys("an_msys_runs_account_is_gone_from_the_root_afterwards") {
+        return;
+    }
+    let d = dirs();
+    let o = bash_msys(&d.ws, &[], "icacls . && echo ok > made");
+    let during = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{during}");
+    assert!(
+        during.contains(MSYS),
+        "the account's ACE during the run: {during}"
+    );
+    assert!(d.ws.join("made").exists(), "{during}");
+    for path in [d.ws.clone(), d.ws.join("made")] {
+        let after = icacls(&path);
+        assert!(!after.contains(MSYS), "{}: {after}", path.display());
+        assert!(!after.contains(SID_MARK), "{}: {after}", path.display());
+    }
+    let after = icacls(&d.ws);
+    assert!(
+        after.contains(KEEP_MARK),
+        "the root's own SID is kept: {after}"
+    );
+    assert!(
+        after.contains("OWNER RIGHTS"),
+        "and the OWNER RIGHTS entry: {after}"
+    );
+    // Nothing of the offline account either: this run was not its.
+    assert!(!after.contains(OFFLINE), "{after}");
+    let o = insbx(&["revoke", "."], &d.ws);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+}
+
+/// What the thread probe prints, one line per thread of every `insbx`
+/// process, then the control.
+const THREAD_PROBE: &str = r#"
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class Probe {
+  [DllImport("kernel32.dll", SetLastError=true)]
+  static extern IntPtr OpenThread(uint access, bool inherit, uint tid);
+  [DllImport("kernel32.dll")]
+  static extern bool CloseHandle(IntPtr h);
+  public static string Open(uint tid, uint right) {
+    IntPtr h = OpenThread(right, false, tid);
+    if (h == IntPtr.Zero) { return "denied:" + Marshal.GetLastWin32Error(); }
+    CloseHandle(h);
+    return "ok";
+  }
+}
+"@
+# Each write right a command could take a thread over with, ON ITS OWN:
+# THREAD_SET_CONTEXT, THREAD_SUSPEND_RESUME, THREAD_SET_INFORMATION, WRITE_DAC, WRITE_OWNER.
+$rights = @(0x10, 0x2, 0x20, 0x40000, 0x80000)
+$n = 0
+foreach ($p in (Get-Process -Name insbx -ErrorAction SilentlyContinue)) {
+  $n++
+  foreach ($t in $p.Threads) {
+    foreach ($r in $rights) { Write-Output ("THREAD " + $p.Id + " " + $t.Id + " " + $r + " " + [Probe]::Open([uint32]$t.Id, [uint32]$r)) }
+  }
+}
+Write-Output ("INSBX-PROCESSES " + $n)
+$c = Start-Process -FilePath cmd.exe -ArgumentList '/d','/c','ping -n 8 127.0.0.1 > nul' -PassThru -WindowStyle Hidden
+Start-Sleep -Milliseconds 500
+foreach ($t in $c.Threads) {
+  foreach ($r in $rights) { Write-Output ("CONTROL " + $r + " " + [Probe]::Open([uint32]$t.Id, [uint32]$r)) }
+}
+Stop-Process -Id $c.Id -Force
+"#;
+
+/// The second helper runs as `insbx-msys`, unrestricted, and the confined
+/// command is `insbx-msys` too, with that SID among its restricting SIDs: so
+/// every part of the helper must be locked, not only its process object. The
+/// helper's main thread came from the logon service with a default DACL
+/// granting the account `GENERIC_ALL`; the command could have opened it for
+/// `THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME` and hijacked it, unrestricted.
+/// Every thread of every `insbx` process the command can see must refuse that
+/// (the first helper and `insbx run` are the user's; the second helper's are
+/// hardened); the control, a child the command started itself, must open.
+#[test]
+fn the_msys_helpers_threads_cannot_be_opened_by_the_command() {
+    if !needs_msys("the_msys_helpers_threads_cannot_be_opened_by_the_command") {
+        return;
+    }
+    let d = dirs();
+    let script = d.ws.join("probe-threads.ps1");
+    std::fs::write(&script, THREAD_PROBE).expect("script");
+    let o = ps_file(&d.ws, &["--msys", "--net", "deny", "-w", "."], &script);
+    let out = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{out}");
+    let processes: usize = out
+        .lines()
+        .find_map(|l| l.strip_prefix("INSBX-PROCESSES "))
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap_or_else(|| panic!("the probe did not finish: {out}"));
+    assert!(
+        processes >= 2,
+        "the helpers should be visible (the first and the second): {out}"
+    );
+    let threads: Vec<&str> = out.lines().filter(|l| l.starts_with("THREAD ")).collect();
+    assert!(!threads.is_empty(), "{out}");
+    // Every right, on its own, on every thread: denied (error 5), or the
+    // thread has just exited (87).
+    for line in &threads {
+        assert!(
+            line.ends_with("denied:5") || line.ends_with("denied:87"),
+            "the command opened a helper's thread for a write right: {line}\n{out}"
+        );
+    }
+    for right in ["16", "2", "32", "262144", "524288"] {
+        assert!(
+            threads
+                .iter()
+                .any(|l| l.contains(&format!(" {right} denied:5"))),
+            "right {right} was probed and denied: {out}"
+        );
+        assert!(
+            out.lines()
+                .any(|l| l.trim() == format!("CONTROL {right} ok")),
+            "the control (a thread of its own child) must open for right {right}, or the \
+             probe proves nothing: {out}"
+        );
+    }
+    let o = insbx(&["revoke", "."], &d.ws);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+}
+
+/// The msys account's SID, as Windows has it.
+fn msys_sid() -> String {
+    let o = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!(
+                "([System.Security.Principal.NTAccount]'{MSYS}').Translate(\
+                 [System.Security.Principal.SecurityIdentifier]).Value"
+            ),
+        ])
+        .output()
+        .expect("powershell");
+    String::from_utf8_lossy(&o.stdout).trim().to_string()
+}
+
+/// A crashed msys run whose root cannot be found any more leaves a record the
+/// sweep cannot finish. The msys account is trusted by every msys run, so the
+/// next one is REFUSED, naming the path, until `insbx revoke --msys-leftovers`.
+#[test]
+fn a_crashed_msys_runs_leftovers_refuse_the_next_run_until_cleared() {
+    if !needs_msys("a_crashed_msys_runs_leftovers_refuse_the_next_run") {
+        return;
+    }
+    let d = dirs();
+    let sid = msys_sid();
+    assert!(sid.starts_with("S-1-5-21-"), "the msys SID: {sid}");
+    let grants = PathBuf::from(std::env::var_os("LOCALAPPDATA").expect("LOCALAPPDATA"))
+        .join("insbx")
+        .join("grants");
+    std::fs::create_dir_all(&grants).expect("grants dir");
+    // A dead run (nothing holds its liveness mutex) whose msys root was moved.
+    let rid = 2_000_000_001u32;
+    let record = grants.join(format!("{rid}.grant"));
+    let moved = d.out.join("moved-away");
+    std::fs::write(
+        &record,
+        format!(
+            "sid S-1-5-21-1111111111-2222222222-4242424242-{rid}\nuser {sid}\nmodify {}\n",
+            moved.display()
+        ),
+    )
+    .expect("record");
+
+    let refused = bash_msys(&d.ws, &[], "echo ok > x");
+    let said = text(&refused);
+    assert_eq!(refused.status.code(), Some(125), "{said}");
+    assert!(said.contains("moved-away"), "names the path: {said}");
+    assert!(said.contains("--msys-leftovers"), "and the way out: {said}");
+    assert!(!d.ws.join("x").exists(), "nothing ran: {said}");
+
+    // A root that is gone is not taken on the user's word: without
+    // `--forget-gone` the record stays, the exit code says so, and msys runs
+    // stay refused.
+    let kept = insbx(&["revoke", "--msys-leftovers"], &d.ws);
+    let said = text(&kept);
+    assert_eq!(kept.status.code(), Some(1), "{said}");
+    assert!(said.contains("--forget-gone"), "says how: {said}");
+    assert!(record.exists(), "the record is kept");
+    let still = bash_msys(&d.ws, &[], "echo ok > x");
+    assert_eq!(still.status.code(), Some(125), "{}", text(&still));
+
+    let cleared = insbx(&["revoke", "--msys-leftovers", "--forget-gone"], &d.ws);
+    assert_eq!(cleared.status.code(), Some(0), "{}", text(&cleared));
+    assert!(!record.exists(), "the record is dropped");
+    let again = bash_msys(&d.ws, &[], "echo ok > x");
+    assert_eq!(again.status.code(), Some(0), "{}", text(&again));
+    assert!(d.ws.join("x").exists());
+    let _ = std::fs::remove_file(&record);
+    let o = insbx(&["revoke", "."], &d.ws);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+}
+
+/// An open handle to the liveness mutex of the live run whose grant record
+/// names `root` as an msys root, closed on drop.
+struct Liveness(windows_sys::Win32::Foundation::HANDLE);
+
+impl Drop for Liveness {
+    fn drop(&mut self) {
+        // SAFETY: a handle this test opened, closed once.
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+    }
+}
+
+fn hold_liveness_of_run_rooted_at(root: &Path) -> Liveness {
+    use windows_sys::Win32::System::Threading::{OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
+    let grants = PathBuf::from(std::env::var_os("LOCALAPPDATA").expect("LOCALAPPDATA"))
+        .join("insbx")
+        .join("grants");
+    let root = root.to_string_lossy().into_owned();
+    let rid = std::fs::read_dir(&grants)
+        .expect("grants dir")
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "grant"))
+        .find(|e| {
+            std::fs::read_to_string(e.path()).is_ok_and(|t| {
+                t.lines()
+                    .any(|l| l.starts_with("modify ") && l.contains(&root))
+            })
+        })
+        .and_then(|e| e.path().file_stem()?.to_str().map(str::to_string))
+        .expect("the live run's record");
+    let name: Vec<u16> = format!("Global\\insbx-grant-{rid}")
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    // SAFETY: a NUL-terminated name; the handle is closed by `Liveness`.
+    let handle = unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, 0, name.as_ptr()) };
+    assert!(!handle.is_null(), "the run's liveness mutex");
+    Liveness(handle)
+}
+
+/// A REAL crash: an msys run is started and its `insbx run` killed, so its
+/// lease never drops and its record stays. Then its root is moved aside and a
+/// new folder made under the old name. The next msys run is refused; clearing
+/// without saying the folder is dealt with keeps the record (exit 1); only
+/// after the old folder is revoked where it went and `--forget-gone` is given
+/// does an msys run go again.
+#[test]
+fn a_root_moved_aside_and_replaced_after_a_crash_stays_refused_until_dealt_with() {
+    if !needs_msys("a_root_moved_aside_and_replaced_after_a_crash") {
+        return;
+    }
+    let d = dirs();
+    let mut crashing = base(&d.ws)
+        .args([
+            "run",
+            "--msys",
+            "--net",
+            "deny",
+            "-w",
+            ".",
+            "--",
+            GIT_BASH,
+            "-c",
+            "echo go > started; sleep 120",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("insbx");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !d.ws.join("started").exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(d.ws.join("started").exists(), "the run never started");
+    // Any other run's sweep (the offline tests run concurrently) would take
+    // the dead record's grant back, rightly, while the root still sits where
+    // it was. To test the window AFTER the move, this test keeps the run's
+    // liveness mutex open (`Global\insbx-grant-<rid>`, named in the record's
+    // file name) until the root is replaced: nobody sweeps a run that is
+    // "alive". Closing the handle is the moment the run becomes dead.
+    let alive = hold_liveness_of_run_rooted_at(&d.ws);
+    // The crash: the process that holds the lease dies; nothing revokes.
+    crashing.kill().expect("kill insbx run");
+    let _ = crashing.wait();
+
+    // Its helper notices and ends the command; then the root can be moved.
+    let aside = d.ws.with_file_name("ws.bak");
+    let moved = (0..150).any(|_| {
+        std::thread::sleep(Duration::from_millis(200));
+        std::fs::rename(&d.ws, &aside).is_ok()
+    });
+    assert!(moved, "the crashed run's command never let go of the root");
+    std::fs::create_dir(&d.ws).expect("a new root under the old name");
+    drop(alive);
+
+    let refused = bash_msys(&d.ws, &[], "echo ok > x");
+    let said = text(&refused);
+    assert_eq!(refused.status.code(), Some(125), "{said}");
+    assert!(said.contains("--msys-leftovers"), "{said}");
+    assert!(!d.ws.join("x").exists(), "{said}");
+
+    let kept = insbx(&["revoke", "--msys-leftovers"], &d.out);
+    let said = text(&kept);
+    assert_eq!(kept.status.code(), Some(1), "{said}");
+    assert!(said.contains("replaced") && said.contains("KEPT"), "{said}");
+    let still = bash_msys(&d.ws, &[], "echo ok > x");
+    assert_eq!(still.status.code(), Some(125), "{}", text(&still));
+
+    // The user takes the grant back where the folder went, then says so.
+    let o = insbx(&["revoke", aside.to_str().expect("utf8")], &d.out);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    assert!(
+        !icacls(&aside).contains(MSYS),
+        "the moved folder no longer names the account: {}",
+        icacls(&aside)
+    );
+    let o = insbx(&["revoke", "--msys-leftovers", "--forget-gone"], &d.out);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    let again = bash_msys(&d.ws, &[], "echo ok > x");
+    assert_eq!(again.status.code(), Some(0), "{}", text(&again));
+    assert!(d.ws.join("x").exists());
+    let o = insbx(&["revoke", "."], &d.ws);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+}
+
+/// A subfolder that carries its own inheritable CREATOR OWNER entry (the root
+/// does not, so the root check passes): what the msys account creates there
+/// gets an entry naming it, which a revoke cannot clear (re-propagation
+/// resolves CREATOR OWNER to the owner, still the account). The next run is
+/// refused naming the object; `--msys-leftovers` re-reads the tree, finds it
+/// comes back, keeps the record and SAYS why (exit 1), msys runs stay refused;
+/// once the CREATOR OWNER entry is removed it clears and runs go again.
+#[test]
+fn a_subfolder_with_its_own_creator_owner_entry_stays_refused_until_it_is_removed() {
+    if !needs_msys("a_subfolder_with_its_own_creator_owner_entry") {
+        return;
+    }
+    let d = dirs();
+    let sub = d.ws.join("sub");
+    std::fs::create_dir(&sub).expect("sub");
+    let set = Command::new("icacls")
+        .arg(&sub)
+        .args(["/grant", "*S-1-3-0:(OI)(CI)(IO)F"])
+        .output()
+        .expect("icacls");
+    assert!(
+        set.status.success(),
+        "{}",
+        String::from_utf8_lossy(&set.stdout)
+    );
+
+    let first = bash_msys(&d.ws, &[], "echo x > sub/f; echo ok");
+    assert_eq!(first.status.code(), Some(0), "{}", text(&first));
+    assert!(sub.join("f").exists());
+
+    // What was left is found by its effect, and the next run is refused.
+    let refused = bash_msys(&d.ws, &[], "echo y > y");
+    let said = text(&refused);
+    assert_eq!(refused.status.code(), Some(125), "{said}");
+    assert!(said.contains("sub"), "names the object: {said}");
+
+    // A revoke cannot clear it: the record is kept, with the reason.
+    let kept = insbx(&["revoke", "--msys-leftovers"], &d.ws);
+    let said = text(&kept);
+    assert_eq!(kept.status.code(), Some(1), "{said}");
+    assert!(said.contains("CREATOR OWNER"), "says why: {said}");
+    assert!(said.contains("KEPT"), "{said}");
+    let still = bash_msys(&d.ws, &[], "echo y > y");
+    assert_eq!(
+        still.status.code(),
+        Some(125),
+        "must stay refused: {}",
+        text(&still)
+    );
+
+    // Removing the CREATOR OWNER entry (and what came of it) lets it clear.
+    let o = Command::new("icacls")
+        .arg(&sub)
+        .args(["/remove:g", "*S-1-3-0"])
+        .output()
+        .expect("icacls");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stdout));
+    let cleared = insbx(&["revoke", "--msys-leftovers"], &d.ws);
+    assert_eq!(cleared.status.code(), Some(0), "{}", text(&cleared));
+    let again = bash_msys(&d.ws, &[], "echo y > y");
+    assert_eq!(again.status.code(), Some(0), "{}", text(&again));
+    let o = insbx(&["revoke", "."], &d.ws);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+}
+
+/// One msys run at a time: the second waits for the first to end.
+#[test]
+fn two_msys_runs_serialize() {
+    if !needs_msys("two_msys_runs_serialize") {
+        return;
+    }
+    let d = dirs();
+    let first = base(&d.ws)
+        .args([
+            "run",
+            "--msys",
+            "--net",
+            "deny",
+            "-w",
+            ".",
+            "--",
+            GIT_BASH,
+            "-c",
+            "echo go > a-start; sleep 4; echo done > a-end",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("insbx");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !d.ws.join("a-start").exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(d.ws.join("a-start").exists(), "the first run never started");
+    let second = bash_msys(&d.ws, &[], "echo go > b-start");
+    let second_out = text(&second);
+    let first = first.wait_with_output().expect("first run");
+    assert_eq!(first.status.code(), Some(0), "{}", text(&first));
+    assert_eq!(second.status.code(), Some(0), "{second_out}");
+    let modified = |name: &str| {
+        std::fs::metadata(d.ws.join(name))
+            .and_then(|m| m.modified())
+            .unwrap_or_else(|e| panic!("{name}: {e}"))
+    };
+    assert!(
+        modified("b-start") >= modified("a-end"),
+        "the second run started before the first ended: {second_out}"
+    );
+    assert!(
+        second_out.contains("another msys run"),
+        "the second says it waited: {second_out}"
+    );
+    let o = insbx(&["revoke", "."], &d.ws);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
 }
