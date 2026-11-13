@@ -751,12 +751,136 @@ mod tests {
     use crate::windows::token::set_token_default_dacl;
     use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
     use windows_sys::Win32::Security::{
-        DuplicateTokenEx, SecurityImpersonation, TokenPrimary, TOKEN_ADJUST_DEFAULT,
-        TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_QUERY,
+        CreateRestrictedToken, DuplicateTokenEx, SecurityImpersonation, TokenImpersonation,
+        TokenPrimary, DISABLE_MAX_PRIVILEGE, TOKEN_ADJUST_DEFAULT, TOKEN_ASSIGN_PRIMARY,
+        TOKEN_DUPLICATE, TOKEN_QUERY,
     };
     use windows_sys::Win32::System::Threading::{
-        OpenProcessToken, PROCESS_CREATE_THREAD, PROCESS_VM_OPERATION, PROCESS_VM_WRITE,
+        OpenProcessToken, SetThreadToken, PROCESS_CREATE_THREAD, PROCESS_VM_OPERATION,
+        PROCESS_VM_WRITE,
     };
+
+    /// Run `body` on this thread AS THE COMMAND WOULD: impersonating this
+    /// process's token with every privilege but `SeChangeNotify` removed (the
+    /// command's token is made with `DISABLE_MAX_PRIVILEGE`), reverted after.
+    ///
+    /// Every "can it be opened" probe below is a question about what the
+    /// command can do, and an elevated process (the CI runner is an
+    /// administrator) holds `SeDebugPrivilege`, which opens any thread or
+    /// process whatever its DACL says. Probed with the privileges stripped,
+    /// the answer is the command's, on an elevated machine and an ordinary
+    /// one alike. If the stripped token cannot be made, the test prints
+    /// SKIPPED and says why, rather than passing on a probe that proves
+    /// nothing.
+    fn as_command(test: &str, body: impl FnOnce()) {
+        /// Back to the process's own token when dropped, even on a panic.
+        struct Revert;
+        impl Drop for Revert {
+            fn drop(&mut self) {
+                // SAFETY: a null token reverts this thread to the process's.
+                unsafe { SetThreadToken(std::ptr::null(), std::ptr::null_mut()) };
+            }
+        }
+        // SAFETY: opens, restricts and duplicates this process's own token;
+        // every handle is owned and closed.
+        let impersonating = unsafe {
+            let mut own: HANDLE = std::ptr::null_mut();
+            let access = TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | TOKEN_QUERY;
+            if OpenProcessToken(GetCurrentProcess(), access, &mut own) == 0 {
+                Err(last_error("OpenProcessToken"))
+            } else {
+                let own = OwnedHandle(own);
+                let mut stripped: HANDLE = std::ptr::null_mut();
+                if CreateRestrictedToken(
+                    own.0,
+                    DISABLE_MAX_PRIVILEGE,
+                    0,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    &mut stripped,
+                ) == 0
+                {
+                    Err(last_error("CreateRestrictedToken"))
+                } else {
+                    let stripped = OwnedHandle(stripped);
+                    let mut copy: HANDLE = std::ptr::null_mut();
+                    if DuplicateTokenEx(
+                        stripped.0,
+                        0x000f_01ff,
+                        std::ptr::null(),
+                        SecurityImpersonation,
+                        TokenImpersonation,
+                        &mut copy,
+                    ) == 0
+                    {
+                        Err(last_error("DuplicateTokenEx"))
+                    } else {
+                        let copy = OwnedHandle(copy);
+                        if SetThreadToken(std::ptr::null(), copy.0) == 0 {
+                            Err(last_error("SetThreadToken"))
+                        } else {
+                            Ok(())
+                        }
+                    }
+                }
+            }
+        };
+        match impersonating {
+            Ok(()) => {
+                let _revert = Revert;
+                body();
+            }
+            Err(why) => eprintln!("SKIPPED {test}: cannot probe as the command would: {why}"),
+        }
+    }
+
+    /// The probe's token really is stripped: at most `SeChangeNotify` is left,
+    /// whatever the process itself holds (an elevated one holds many).
+    #[test]
+    fn the_probe_runs_with_every_privilege_but_change_notify_removed() {
+        use windows_sys::Win32::Security::{
+            GetTokenInformation, TokenPrivileges, TOKEN_PRIVILEGES,
+        };
+        use windows_sys::Win32::System::Threading::OpenThreadToken;
+        as_command("the_probe_runs_with_every_privilege_removed", || {
+            // SAFETY: opens this thread's (impersonation) token for query and
+            // reads the privileges into an aligned buffer; handles are owned.
+            unsafe {
+                let mut token: HANDLE = std::ptr::null_mut();
+                assert_ne!(
+                    OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut token),
+                    0,
+                    "{}",
+                    last_error("OpenThreadToken")
+                );
+                let token = OwnedHandle(token);
+                let mut len = 0u32;
+                GetTokenInformation(token.0, TokenPrivileges, std::ptr::null_mut(), 0, &mut len);
+                let mut buf = vec![0u64; (len as usize).div_ceil(8)];
+                assert_ne!(
+                    GetTokenInformation(
+                        token.0,
+                        TokenPrivileges,
+                        buf.as_mut_ptr().cast(),
+                        len,
+                        &mut len
+                    ),
+                    0,
+                    "{}",
+                    last_error("GetTokenInformation")
+                );
+                let privileges = &*buf.as_ptr().cast::<TOKEN_PRIVILEGES>();
+                assert!(
+                    privileges.PrivilegeCount <= 1,
+                    "{} privileges left on the probe's token",
+                    privileges.PrivilegeCount
+                );
+            }
+        });
+    }
 
     /// A `cmd.exe` of this user's, suspended: its first thread has not run.
     fn suspended_child() -> PROCESS_INFORMATION {
@@ -898,6 +1022,13 @@ mod tests {
     /// keeps working (the creator resumes and ends it).
     #[test]
     fn a_hardened_thread_and_process_cannot_be_opened_even_by_their_owner() {
+        as_command(
+            "a_hardened_thread_and_process_cannot_be_opened_even_by_their_owner",
+            a_hardened_thread_and_process_body,
+        );
+    }
+
+    fn a_hardened_thread_and_process_body() {
         let pi = suspended_child();
         let (thread, process) = (OwnedHandle(pi.hThread), OwnedHandle(pi.hProcess));
         // The control: nothing locked yet, the owner opens both.
@@ -938,6 +1069,13 @@ mod tests {
     /// failure.
     #[test]
     fn hardening_a_thread_that_is_already_locked_is_not_an_error() {
+        as_command(
+            "hardening_a_thread_that_is_already_locked_is_not_an_error",
+            hardening_an_already_locked_thread_body,
+        );
+    }
+
+    fn hardening_an_already_locked_thread_body() {
         // An ordinary other thread: opens before, locked after.
         with_parked_thread(|tid| {
             assert!(
@@ -965,11 +1103,18 @@ mod tests {
         });
         // The CURRENT thread, locked already: the pseudo-handle still works.
         std::thread::spawn(|| {
-            // SAFETY: reads the calling thread's id.
-            let me = unsafe { GetCurrentThreadId() };
-            harden_handle(unsafe { GetCurrentThread() }, HELPER_THREAD_SDDL).expect("locked");
-            assert_eq!(thread_lock_state(me), ThreadLock::Locked);
-            harden_thread(me).expect("the current thread, locked, is hardened again");
+            // (This thread probes as the command too: see `as_command`.)
+            as_command(
+                "hardening_a_thread_that_is_already_locked (current thread)",
+                || {
+                    // SAFETY: reads the calling thread's id.
+                    let me = unsafe { GetCurrentThreadId() };
+                    harden_handle(unsafe { GetCurrentThread() }, HELPER_THREAD_SDDL)
+                        .expect("locked");
+                    assert_eq!(thread_lock_state(me), ThreadLock::Locked);
+                    harden_thread(me).expect("the current thread, locked, is hardened again");
+                },
+            );
         })
         .join()
         .expect("the thread");
@@ -984,6 +1129,13 @@ mod tests {
     /// every one is denied, so a DACL granting just one would be seen.
     #[test]
     fn a_locked_thread_denies_each_write_right_separately() {
+        as_command(
+            "a_locked_thread_denies_each_write_right_separately",
+            a_locked_thread_denies_each_right_body,
+        );
+    }
+
+    fn a_locked_thread_denies_each_right_body() {
         with_parked_thread(|tid| {
             for (right, name) in THREAD_WRITE_RIGHTS {
                 // SAFETY: opens a thread by id; a handle returned is closed.
@@ -1056,6 +1208,13 @@ mod tests {
     /// with the ordinary token it can (the control).
     #[test]
     fn a_thread_made_under_the_hardened_default_dacl_is_born_locked() {
+        as_command(
+            "a_thread_made_under_the_hardened_default_dacl_is_born_locked",
+            a_thread_born_under_the_hardened_default_dacl_body,
+        );
+    }
+
+    fn a_thread_born_under_the_hardened_default_dacl_body() {
         let plain = own_token_copy(None);
         let pi = suspended_child_as(Some(plain.0));
         assert!(
