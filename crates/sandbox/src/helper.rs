@@ -22,7 +22,7 @@ pub fn enter_if_requested() {
     let code = match enter(&rest) {
         Ok(never) => match never {},
         Err(e) => {
-            eprintln!("sbx: {e}");
+            eprintln!("insbx: {e}");
             e.code
         }
     };
@@ -173,7 +173,7 @@ fn confine(spec: &EnterSpec) -> Result<(), EnterError> {
         if spec.strict {
             return Err(sandbox_err(e));
         }
-        eprintln!("sbx: limit not applied (best effort): {e}");
+        eprintln!("insbx: limit not applied (best effort): {e}");
     }
     #[cfg(target_os = "linux")]
     {
@@ -181,7 +181,7 @@ fn confine(spec: &EnterSpec) -> Result<(), EnterError> {
             if spec.strict {
                 return Err(sandbox_err(format!("Landlock: {e}")));
             }
-            eprintln!("sbx: Landlock not applied (best effort): {e}");
+            eprintln!("insbx: Landlock not applied (best effort): {e}");
         }
         let network = spec.net_mode != NetMode::Allow;
         let fs = spec.fs_mode != FsMode::Off && seccomp::available();
@@ -190,7 +190,7 @@ fn confine(spec: &EnterSpec) -> Result<(), EnterError> {
                 if spec.strict && network {
                     return Err(sandbox_err(format!("seccomp: {e}")));
                 }
-                eprintln!("sbx: seccomp not applied (best effort): {e}");
+                eprintln!("insbx: seccomp not applied (best effort): {e}");
             }
         }
     }
@@ -244,7 +244,7 @@ fn supervise(program: &OsString, args: &[OsString], parent: libc::pid_t) -> Neve
                 .unwrap_or(1)
         }
         Err(e) => {
-            eprintln!("sbx: cannot run {}: {e}", Path::new(program).display());
+            eprintln!("insbx: cannot run {}: {e}", Path::new(program).display());
             if e.kind() == std::io::ErrorKind::NotFound {
                 127
             } else {
@@ -348,7 +348,7 @@ mod tests {
         }
     }
 
-    /// A process not started as the helper (no `__sbx-enter` first) goes on
+    /// A process not started as the helper (no `__insbx-enter` first) goes on
     /// at once: this test binary was not, and the call returns.
     #[test]
     fn a_process_not_started_as_the_helper_carries_on() {

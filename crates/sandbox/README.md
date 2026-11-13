@@ -1,27 +1,27 @@
-# sbx: one sandbox for any agent
+# insbx: one sandbox for any agent
 
-`sbx` runs a command under one policy: what it may write, what it may read,
+`insbx` runs a command under one policy: what it may write, what it may read,
 which hosts it may reach, which environment it starts with, and how much it
 may use. It works with any agent CLI (`claude`, `codex`, `incode`, `aider`,
 …), with a test suite a harness runs, or with a single tool call. The policy
 means the same thing on every platform. Where a platform cannot enforce part
-of it, `sbx` says so before anything runs. By default it then refuses
+of it, `insbx` says so before anything runs. By default it then refuses
 instead of running with less.
 
 ```sh
 # Write only in this project; network only to the package registry; 30 minutes.
-sbx run -w . --allow-host crates.io --allow-host '*.crates.io' --wall 1800 -- cargo build
+insbx run -w . --allow-host crates.io --allow-host '*.crates.io' --wall 1800 -- cargo build
 
 # An agent CLI confined to its workspace, with a folder it must not see.
-sbx run -w . -w ~/.claude -w ~/.claude.json --deny-read ../private-checks -- claude -p "fix the failing test"
+insbx run -w . -w ~/.claude -w ~/.claude.json --deny-read ../private-checks -- claude -p "fix the failing test"
 
 # What would this machine enforce?
-sbx doctor
-sbx check --policy agent.toml --json
+insbx doctor
+insbx check --policy agent.toml --json
 ```
 
 It's a crate in the incode repository for now and doesn't depend on incode.
-It builds to one binary, `sbx`, and a library, `incord_sandbox`.
+It builds to one binary, `insbx`, and a library, `incord_sandbox`.
 
 ## The policy file
 
@@ -53,7 +53,7 @@ file_size_mb = 1024
 open_files = 4096
 ```
 
-Every flag of `sbx run` has a policy key. Flags apply on top of `--policy`.
+Every flag of `insbx run` has a policy key. Flags apply on top of `--policy`.
 An unknown key is an error, so a misspelt `wirte` can't silently do nothing.
 
 ## What is enforced, and how
@@ -62,16 +62,16 @@ An unknown key is an error, so a misspelt `wirte` can't silently do nothing.
 |---|---|---|---|
 | filesystem: write | Landlock (5.13+) | Seatbelt | write-restricted token + a per-run ACE on each root |
 | filesystem: `deny_read` | Landlock | Seatbelt | **not enforced** (WSL2 does it) |
-| network: `deny` | Landlock TCP (6.7+) + seccomp for every other socket | Seatbelt | after `sbx setup-windows`: runs as an offline account WFP filters cut off; else **not enforced** (WSL2 does it) |
-| network: `proxy` | Landlock: TCP only to the proxy's port; seccomp as for `deny` | Seatbelt: outbound only to the proxy | after `sbx setup-windows`: the offline account may reach only the proxy's loopback ports; else **not enforced** (WSL2 does it) |
+| network: `deny` | Landlock TCP (6.7+) + seccomp for every other socket | Seatbelt | after `insbx setup-windows`: runs as an offline account WFP filters cut off; else **not enforced** (WSL2 does it) |
+| network: `proxy` | Landlock: TCP only to the proxy's port; seccomp as for `deny` | Seatbelt: outbound only to the proxy | after `insbx setup-windows`: the offline account may reach only the proxy's loopback ports; else **not enforced** (WSL2 does it) |
 | `.git/hooks`, `.git/config` | snapshotted, put back after the run | Seatbelt refuses the write | snapshotted, put back after the run |
 | signals, abstract Unix sockets | Landlock scopes (6.12+): only within the sandbox | Seatbelt default | the token cannot open other processes for writing (measured by incode) |
 | Windows programs (inside WSL2) | interop interpreter and sockets hidden, `WSL_INTEROP` removed, vsock refused | n/a | n/a |
 | limits | `setrlimit` + wall clock; no core dumps | `setrlimit` + wall clock; no core dumps | job object: wall clock, CPU and committed memory per process; **no** `file_size_mb`, `open_files` |
 | environment | yes | yes | yes |
 
-On Windows, `sbx.exe` runs natively when native enforces the whole policy,
-and forwards it to the Linux `sbx` inside WSL2 when it doesn't (see
+On Windows, `insbx.exe` runs natively when native enforces the whole policy,
+and forwards it to the Linux `insbx` inside WSL2 when it doesn't (see
 [Windows](#windows-native-or-wsl2)).
 
 - **Every process it starts.** The confinement is applied in a helper
@@ -120,9 +120,9 @@ and forwards it to the Linux `sbx` inside WSL2 when it doesn't (see
     those ports on this machine, say a dev server a browser test loads,
     without `allow_private`. The request must name `localhost`, `127.0.0.1`
     or `::1`, and only a loopback address is connected to. Nothing else
-    private opens, and other ports stay refused. `sbx mcp` never gives a
+    private opens, and other ports stay refused. `insbx mcp` never gives a
     sandbox these ports, even when its base policy names some.
-  - When `sbx` itself runs behind an HTTP proxy, allowed requests are chained
+  - When `insbx` itself runs behind an HTTP proxy, allowed requests are chained
     through it, and that proxy does the resolving. Requests for this
     machine's own ports go straight to loopback, never through it.
 - **`deny_read`.** Landlock only grants, so a hidden path is carved out by
@@ -136,17 +136,17 @@ and forwards it to the Linux `sbx` inside WSL2 when it doesn't (see
   - **Why:** a hook, or a `core.fsmonitor`/`core.hooksPath` line, is code
     git runs the next time anyone uses the repository, outside any sandbox.
   - **How (Linux):** Landlock can't make part of a writable root read-only
-    without also blocking file creation in the root, so `sbx` snapshots each
+    without also blocking file creation in the root, so `insbx` snapshots each
     root's `.git/hooks` and `.git/config` before the run. Anything changed is
     put back afterwards and reported (`protected path changed by the
-    command, restored …`, and `protected_restored` from `sbx mcp`).
+    command, restored …`, and `protected_restored` from `insbx mcp`).
   - **How (macOS):** Seatbelt also refuses the writes.
   - **Worktrees:** a `.git` file (`gitdir:`) and its `commondir` are
     followed.
   - **Opting out:** `--no-protect-git` for a run that should change hooks.
 - **Signals and abstract sockets.** On Landlock ABI v6 (Linux 6.12+) a
   sandboxed command can't signal processes outside its sandbox, or connect to
-  an abstract Unix socket made outside it (a D-Bus session bus, X11). `sbx
+  an abstract Unix socket made outside it (a D-Bus session bus, X11). `insbx
   doctor` says whether the kernel does this.
 - **Code the loader would inject.** `LD_PRELOAD`, `LD_AUDIT`,
   `DYLD_INSERT_LIBRARIES` and `DYLD_FORCE_FLAT_NAMESPACE` are removed by
@@ -155,9 +155,9 @@ and forwards it to the Linux `sbx` inside WSL2 when it doesn't (see
   (`RLIMIT_CORE=0`), so a crash can't write the process's memory to disk.
 - **Process lifetime.**
   - With a wall-clock limit, the command gets its own process group. The
-    limit kills all of it, and `SIGINT`/`SIGTERM`/`SIGHUP` sent to `sbx` are
+    limit kills all of it, and `SIGINT`/`SIGTERM`/`SIGHUP` sent to `insbx` are
     passed on.
-  - If `sbx` is killed with `SIGKILL`, a supervisor kills the group too.
+  - If `insbx` is killed with `SIGKILL`, a supervisor kills the group too.
   - Without a limit, the command stays in the caller's process group, so the
     caller's own group kill reaches it.
 
@@ -178,22 +178,22 @@ and forwards it to the Linux `sbx` inside WSL2 when it doesn't (see
 
 ## Windows: native, or WSL2
 
-`sbx.exe` has two backends, picked per run by `SBX_BACKEND`:
+`insbx.exe` has two backends, picked per run by `INSBX_BACKEND`:
 
-| `SBX_BACKEND` | what runs |
+| `INSBX_BACKEND` | what runs |
 |---|---|
 | `auto` (default) | natively when native enforces everything the policy asks for; otherwise in WSL2 when it is set up; otherwise refused, naming both ways forward |
 | `native` | always natively; what it can't enforce is refused (strict) or reported (`--best-effort`) |
-| `wsl` | always the Linux `sbx` inside WSL2 |
+| `wsl` | always the Linux `insbx` inside WSL2 |
 
-`SBX_NATIVE=1`, the older switch, still means `native`. `sbx doctor` shows
+`INSBX_NATIVE=1`, the older switch, still means `native`. `insbx doctor` shows
 what native enforces and whether WSL2 forwarding is available.
 
 So a policy that confines files, environment and time runs natively. One
 that asks for `network: deny`/`proxy` runs natively too once
-[`sbx setup-windows`](#network-natively-sbx-setup-windows) has been run on
+[`insbx setup-windows`](#network-natively-insbx-setup-windows) has been run on
 the machine, and goes to WSL2 otherwise. `deny_read` always goes to WSL2.
-`sbx mcp` follows the same rule from its ceilings: with `--net allow` it
+`insbx mcp` follows the same rule from its ceilings: with `--net allow` it
 runs natively, with `--net deny` (its default) or `proxy` natively after
 the setup and in WSL2 without it.
 
@@ -216,26 +216,26 @@ Windows. This crate's port is checked by its tests
   (incode measured about 2.5 s each way on 18,673 files). No file's contents
   or modification time change, and incode found the tree's ACLs
   byte-identical afterwards. A grant is written down first
-  (`%LOCALAPPDATA%\sbx\grants`). If `sbx` crashes, the next run removes
+  (`%LOCALAPPDATA%\insbx\grants`). If `insbx` crashes, the next run removes
   the ACE it left. A drive root and any folder holding your user profile
   are refused as roots.
 - **Everything it starts.** The command starts suspended, goes into a job
   object, and only then runs. Everything it starts is in the job too and
   cannot leave it. The job is killed when the command exits, at the
-  wall-clock limit, or when `sbx` itself dies. So on Windows nothing the
+  wall-clock limit, or when `insbx` itself dies. So on Windows nothing the
   command started outlives the run, even without a time limit.
 - **Limits.** `memory_mb` caps the memory each process *commits* (an
   allocation beyond it fails), which is not quite `RLIMIT_AS`. `cpu_secs`
   caps each process's user-mode CPU time. `file_size_mb` and `open_files`
   have no Windows equivalent: asking for them is reported not enforced.
-  (`sbx mcp` sets no file size limit on Windows for this reason.)
+  (`insbx mcp` sets no file size limit on Windows for this reason.)
 - **Programs.** The program is found on `PATH` with `PATHEXT`, never in the
   current folder, so a `cmd.exe` planted in the workspace is not picked up.
   A `.bat`/`.cmd` runs through `cmd.exe /d`, so `cmd` parses its arguments.
 - **Exit codes** are passed through whole (32 bits).
 
 **Not enforced natively, and why:**
-- **Network, until `sbx setup-windows` has run.** No token restricts the
+- **Network, until `insbx setup-windows` has run.** No token restricts the
   network (incode measured TCP, HTTP and HTTPS all working under it). Only
   an AppContainer does, and an AppContainer reads only what is granted to
   it: the workspace, your toolchains, your profile. So without the setup
@@ -250,12 +250,12 @@ Windows. This crate's port is checked by its tests
 - **Git Bash and every msys program** fail to start under the token: the
   msys runtime maps a shared section the token may not map writable, and
   dies with `CreateFileMapping ..., Win32 error 5` (measured by incode).
-  Use `cmd` or PowerShell natively, or `SBX_BACKEND=wsl` for a POSIX shell.
-  `sbx mcp` scripts default to PowerShell on Windows.
+  Use `cmd` or PowerShell natively, or `INSBX_BACKEND=wsl` for a POSIX shell.
+  `insbx mcp` scripts default to PowerShell on Windows.
 - **Grants are visible.** While a run lasts, every object under a root
   carries the run's ACE, and the grant and revoke cost time on large trees.
 
-### Network natively: `sbx setup-windows`
+### Network natively: `insbx setup-windows`
 
 The Windows Filtering Platform can block a connection by the *user* who
 makes it. So, the way OpenAI Codex's Windows sandbox does it
@@ -264,21 +264,21 @@ that the firewall cuts off, and `deny`/`proxy` runs start the command as
 that account. From an elevated prompt (Run as administrator), once:
 
 ```powershell
-sbx setup-windows                         # or: ... --read C:\Users\me\.cargo --read C:\Users\me\.rustup
-sbx doctor                                # [ok  ] offline user ...
-sbx run -w . --net deny -- cargo test     # natively now, not in WSL2
-sbx setup-windows --remove                # undoes all of it
+insbx setup-windows                         # or: ... --read C:\Users\me\.cargo --read C:\Users\me\.rustup
+insbx doctor                                # [ok  ] offline user ...
+insbx run -w . --net deny -- cargo test     # natively now, not in WSL2
+insbx setup-windows --remove                # undoes all of it
 ```
 
 What it does (each step is idempotent; running it again resets the
 password and re-adds each filter):
 
-1. **An account, `sbx-offline`**, member of `Users` only (it needs `Users`
+1. **An account, `insbx-offline`**, member of `Users` only (it needs `Users`
    to log on locally and to read `C:\Windows` and `Program Files`; it is
    taken out of `Administrators` if anyone put it there), with a random
    password (256 bits) that is never shown, hidden from the sign-in screen.
 2. **Its password**, DPAPI-protected with machine scope, in
-   `%ProgramData%\sbx\offline.conf`. The folder's ACL allows SYSTEM,
+   `%ProgramData%\insbx\offline.conf`. The folder's ACL allows SYSTEM,
    Administrators and the user who ran the setup, and nobody else: not
    `Users`, so not the offline account, and not a sandboxed command. Machine
    scope rather than user scope because the setup may run elevated as a
@@ -297,7 +297,7 @@ password and re-adds each filter):
 4. `--read <DIR>` (repeatable, kept across re-runs) lets the account read a
    folder: a toolchain under your profile (see *Reads* below).
 
-At run time (unelevated), `sbx` starts its helper a second time as the
+At run time (unelevated), `insbx` starts its helper a second time as the
 account with `CreateProcessWithLogonW`, the one call an unprivileged process
 can start another user's process with (`CreateProcessAsUserW` with that
 user's token needs `SeAssignPrimaryTokenPrivilege`, and
@@ -306,13 +306,13 @@ runner the same way). That helper builds the write-restricted token from its
 own token, as above, and starts the command; the job object holds both, so
 limits, the wall clock, killing the tree and exit codes work as before. No
 profile is loaded for the account (Codex's runner doesn't either): it would
-create `C:\Users\sbx-offline`, a home every run would share. The command
+create `C:\Users\insbx-offline`, a home every run would share. The command
 gets the run's computed environment.
 
 What changes for the command:
 - **Reads.** It reads what the account may read, not what you may: system
   folders, and what each run grants it (the writable roots, the folder it
-  starts in, the `sbx` program, its private temp directory), plus folders
+  starts in, the `insbx` program, its private temp directory), plus folders
   granted with `--read`. A toolchain installed under your profile
   (`.cargo`, `.rustup`, a per-user Python or Node) needs `--read` once.
   Narrower than without network deny, never wider. One more right: the
@@ -331,7 +331,7 @@ What changes for the command:
   With `--fs off` the command is not write-restricted but is still the
   account: it can write the folder it starts in and its temp directory, and
   what the account itself may write.
-- **`sbx` itself** must be readable by the account; it is granted per run
+- **`insbx` itself** must be readable by the account; it is granted per run
   when you own the file (a build under your profile), and is already when
   installed under `Program Files`.
 
@@ -356,13 +356,13 @@ What changes for the command:
   requests for `localhost` past any proxy; tools that honour `HTTPS_PROXY`
   (`curl`, `git`, `cargo`, `npm`, `pip`) work.
 - Only the user who ran the setup can use it (the record is readable by
-  that user alone). Another user's `sbx doctor` says so.
+  that user alone). Another user's `insbx doctor` says so.
 - The thread objects of the account's helper get the account logon's default
   DACL, which is not measured yet; its process object is locked down
   explicitly (`D:P(A;;GA;;;SY)(A;;0x101000;;;OW)`).
 
 **Tested:** `tests/escape_windows.rs` runs on the `windows-latest` CI
-runner after `sbx setup-windows` (CI runs it; the runner is an
+runner after `insbx setup-windows` (CI runs it; the runner is an
 administrator): TCP to a local server and to the internet refused under
 `deny` with the filesystem confined, read-only and off (and allowed without
 `deny`); UDP refused; writes confined, temp writable, exit codes and
@@ -370,13 +370,13 @@ administrator): TCP to a local server and to the internet refused under
 run and gone after; two concurrent runs sharing a root (the second ending
 first leaves the first its grant, and cannot write the first's other root);
 the proxy letting through only its allowlist, a direct connection refused;
-`sbx mcp` running a deny sandbox's PowerShell script as the account.
+`insbx mcp` running a deny sandbox's PowerShell script as the account.
 Without the setup these tests print SKIPPED.
 
 ### WSL2
 
 Inside WSL2 the sandbox is the Linux one: Landlock, seccomp, the git
-protection and `sbx mcp` all apply unchanged.
+protection and `insbx mcp` all apply unchanged.
 
 **Setup, once** (PowerShell, from the incode folder):
 
@@ -387,18 +387,18 @@ powershell -ExecutionPolicy Bypass -File scripts\install-windows.ps1
 It:
 1. installs WSL2 and Ubuntu if they're missing (asks first, one
    administrator prompt, usually a restart, then run it again);
-2. builds the Linux `sbx` inside WSL2 at `~/.local/bin/sbx`;
-3. builds `sbx.exe` and adds it to your PATH;
-4. runs `sbx doctor`.
+2. builds the Linux `insbx` inside WSL2 at `~/.local/bin/insbx`;
+3. builds `insbx.exe` and adds it to your PATH;
+4. runs `insbx doctor`.
 
-**How `sbx.exe` forwards.**
-- The command (`run`, `check`, `mcp`; `doctor` too under `SBX_BACKEND=wsl`)
-  is passed to the Linux `sbx` with `wsl.exe`, from the same folder.
+**How `insbx.exe` forwards.**
+- The command (`run`, `check`, `mcp`; `doctor` too under `INSBX_BACKEND=wsl`)
+  is passed to the Linux `insbx` with `wsl.exe`, from the same folder.
 - Paths are translated: `C:\work\app` becomes `/mnt/c/work/app`, and
   `\\wsl$\Ubuntu\home\me` becomes `/home/me`.
-- Output, input and the exit code pass straight through, so `sbx mcp` works
+- Output, input and the exit code pass straight through, so `insbx mcp` works
   for agents on Windows too.
-- **Choosing a distribution:** `SBX_WSL_DISTRO` picks one other than the
+- **Choosing a distribution:** `INSBX_WSL_DISTRO` picks one other than the
   default.
 - **Windows environment variables don't reach WSL** unless listed in
   `WSLENV` (for example `WSLENV=ANTHROPIC_API_KEY`).
@@ -407,7 +407,7 @@ It:
 WSL2 adds one way out that plain Linux doesn't have: starting a Windows
 program (`cmd.exe`, `powershell.exe`, any `.exe` under `/mnt/c`), which
 runs on Windows, outside the sandbox. When the filesystem is confined and
-WSL is detected, `sbx` closes it (`fs.block_wsl_interop`, on by default):
+WSL is detected, `insbx` closes it (`fs.block_wsl_interop`, on by default):
 - WSL's interop interpreter (`/init`, read from
   `/proc/sys/fs/binfmt_misc/WSLInterop`) is hidden like a `deny_read` path,
   so no `.exe` can start;
@@ -419,7 +419,7 @@ Hiding `/init` means `ls /` is refused inside the sandbox; files beneath
 `/` still read normally.
 
 **Network inside WSL2:** `network: deny` needs Landlock's TCP rules (Linux
-6.7+). On an older WSL kernel only UDP/DNS are blocked, `sbx doctor` says
+6.7+). On an older WSL kernel only UDP/DNS are blocked, `insbx doctor` says
 the network is not enforced, and strict mode refuses `deny`/`proxy` rather
 than pretend. Update WSL (`wsl --update`) for a newer kernel.
 
@@ -436,24 +436,24 @@ relying on this.
 |---|---|
 | the command's | it ran |
 | 124 | the wall-clock limit killed it |
-| 125 | `sbx` refused (strict, or a bad policy) or failed |
+| 125 | `insbx` refused (strict, or a bad policy) or failed |
 | 126 / 127 | the command could not be run / found |
 | 128 + n | it was killed by signal n |
 
-## Sandboxes as a service: `sbx mcp`
+## Sandboxes as a service: `insbx mcp`
 
-`sbx mcp` is an MCP server (stdio) that lets an agent work in sandboxes:
+`insbx mcp` is an MCP server (stdio) that lets an agent work in sandboxes:
 create one, write scripts and files into it, run them, read what they
 produced, and delete it. Any agent that speaks MCP can use it: Claude Code,
 Codex, incode, or your own.
 
 ```json
-{ "mcpServers": { "sbx": { "command": "sbx", "args": ["mcp", "--net", "proxy", "--allow-host", "pypi.org", "--allow-host", "*.pythonhosted.org"] } } }
+{ "mcpServers": { "insbx": { "command": "insbx", "args": ["mcp", "--net", "proxy", "--allow-host", "pypi.org", "--allow-host", "*.pythonhosted.org"] } } }
 ```
 
 | Tool | What it does |
 |---|---|
-| `sandbox_create` | A private folder. Network `deny` unless the agent asks for `proxy` with hosts (or `allow`) within the server's limits. Natively on Windows `deny` and `proxy` need `sbx setup-windows` first; without it asking for them is refused at once, saying so. |
+| `sandbox_create` | A private folder. Network `deny` unless the agent asks for `proxy` with hosts (or `allow`) within the server's limits. Natively on Windows `deny` and `proxy` need `insbx setup-windows` first; without it asking for them is refused at once, saying so. |
 | `sandbox_write_file` | Write a script or file, creating folders; `executable` sets 755. |
 | `sandbox_run` | Run `command` (argv) or `script` (text, run with `interpreter`, default `sh`; PowerShell natively on Windows) with optional `stdin`, `cwd` and `timeout_secs`. Returns `exit_code`, `stdout`, `stderr` (64 KB each), `timed_out` and `network_refused`. |
 | `sandbox_read_file` / `sandbox_list` | Read results back (256 KB at most). |
@@ -506,7 +506,7 @@ holds the proxy and the temp directory.
 ## Tests
 
 `cargo test -p incord-sandbox` runs:
-- `tests/mcp.rs`: `sbx mcp` driven over stdio like an agent drives it. It writes a script, runs it and reads its result; tries escapes (writing outside, the network, host secrets, a planted symlink, `..`, absolute paths); checks the time limit and background cleanup, the limits on what an agent may ask for, and that sandboxes are removed on exit;
+- `tests/mcp.rs`: `insbx mcp` driven over stdio like an agent drives it. It writes a script, runs it and reads its result; tries escapes (writing outside, the network, host secrets, a planted symlink, `..`, absolute paths); checks the time limit and background cleanup, the limits on what an agent may ask for, and that sandboxes are removed on exit;
 - the unit tests (policy, environment, allowlist, Seatbelt profile, and the
   Windows backend's pure parts on every platform: backend choice, SID and
   record handling, root checks, program lookup, command-line quoting, job
@@ -522,12 +522,12 @@ holds the proxy and the temp directory.
 - on Windows (`tests/escape_windows.rs`, with only `cmd` and PowerShell):
   writes outside the root, the grant held during the run and gone after,
   read-only and its private temp, child `cmd` and PowerShell, a planted
-  program in the current folder, the wall limit and killing `sbx` taking
+  program in the current folder, the wall limit and killing `insbx` taking
   the whole tree, the job's memory and CPU limits, the environment, exit
   codes, refusing what native can't enforce, `auto` without WSL, `doctor`,
-  and `sbx mcp` run natively; and, where `sbx setup-windows` has run (CI
+  and `insbx mcp` run natively; and, where `insbx setup-windows` has run (CI
   runs it first), network deny and proxy natively (see
-  [above](#network-natively-sbx-setup-windows)).
+  [above](#network-natively-insbx-setup-windows)).
 
 Each escape test skips, and says so, on a kernel that cannot enforce what
 it checks.

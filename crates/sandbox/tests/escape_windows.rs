@@ -1,15 +1,15 @@
 //! Escape tests against the native Windows sandbox (write-restricted token,
 //! ACL grant, job object): the Linux escape tests that apply on Windows,
-//! through the real `sbx.exe`.
+//! through the real `insbx.exe`.
 //!
 //! They use only what a stock Windows (and the `windows-latest` CI runner)
 //! has: `cmd.exe` and Windows PowerShell. Scripts are written to files
 //! rather than passed inline, so no test depends on how `cmd` re-parses
-//! quotes. Every run is native (`SBX_BACKEND=native`) unless the test is
+//! quotes. Every run is native (`INSBX_BACKEND=native`) unless the test is
 //! about choosing the backend.
 //!
 //! The network tests (layer 2: the offline account and its WFP filters) run
-//! only where `sbx setup-windows` has been run (CI runs it before the
+//! only where `insbx setup-windows` has been run (CI runs it before the
 //! tests); elsewhere they print SKIPPED. They reach the network with
 //! `curl.exe` (in System32 since Windows 10 1803) and PowerShell.
 
@@ -24,34 +24,34 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-const SBX: &str = env!("CARGO_BIN_EXE_sbx");
+const INSBX: &str = env!("CARGO_BIN_EXE_insbx");
 /// Every run SID starts with this (`incord_sandbox::windows::SID_PREFIX`).
 const SID_MARK: &str = "4242424242";
 /// The offline account (`incord_sandbox::windows::offline::ACCOUNT`).
-const OFFLINE: &str = "sbx-offline";
+const OFFLINE: &str = "insbx-offline";
 
 fn base(cwd: &Path) -> Command {
-    let mut c = Command::new(SBX);
+    let mut c = Command::new(INSBX);
     c.current_dir(cwd)
-        .env("SBX_BACKEND", "native")
-        .env_remove("SBX_NATIVE")
+        .env("INSBX_BACKEND", "native")
+        .env_remove("INSBX_NATIVE")
         .stdin(Stdio::null());
     c
 }
 
-fn sbx(args: &[&str], cwd: &Path) -> Output {
-    base(cwd).args(args).output().expect("sbx runs")
+fn insbx(args: &[&str], cwd: &Path) -> Output {
+    base(cwd).args(args).output().expect("insbx runs")
 }
 
-/// `sbx run <flags> -- cmd /d /s /c <line>`.
+/// `insbx run <flags> -- cmd /d /s /c <line>`.
 fn cmd(cwd: &Path, flags: &[&str], line: &str) -> Output {
     let mut args = vec!["run"];
     args.extend_from_slice(flags);
     args.extend_from_slice(&["--", "cmd", "/d", "/s", "/c", line]);
-    sbx(&args, cwd)
+    insbx(&args, cwd)
 }
 
-/// `sbx run <flags> -- powershell ... -File <script>`.
+/// `insbx run <flags> -- powershell ... -File <script>`.
 fn ps_file(cwd: &Path, flags: &[&str], script: &Path) -> Output {
     let script = script.to_str().expect("utf8");
     let mut args = vec!["run"];
@@ -66,10 +66,10 @@ fn ps_file(cwd: &Path, flags: &[&str], script: &Path) -> Output {
         "-File",
         script,
     ]);
-    sbx(&args, cwd)
+    insbx(&args, cwd)
 }
 
-/// `sbx run <flags> -- powershell ... -Command <command>`.
+/// `insbx run <flags> -- powershell ... -Command <command>`.
 fn ps(cwd: &Path, flags: &[&str], command: &str) -> Output {
     let mut args = vec!["run"];
     args.extend_from_slice(flags);
@@ -81,7 +81,7 @@ fn ps(cwd: &Path, flags: &[&str], command: &str) -> Output {
         "-Command",
         command,
     ]);
-    sbx(&args, cwd)
+    insbx(&args, cwd)
 }
 
 fn text(o: &Output) -> String {
@@ -125,12 +125,12 @@ fn icacls(path: &Path) -> String {
     String::from_utf8_lossy(&o.stdout).into_owned()
 }
 
-/// Whether `sbx setup-windows` has run here: `check --net deny` passes.
+/// Whether `insbx setup-windows` has run here: `check --net deny` passes.
 fn offline_ready() -> bool {
     static READY: OnceLock<bool> = OnceLock::new();
     *READY.get_or_init(|| {
         let d = std::env::temp_dir();
-        sbx(&["check", "--net", "deny"], &d).status.code() == Some(0)
+        insbx(&["check", "--net", "deny"], &d).status.code() == Some(0)
     })
 }
 
@@ -139,7 +139,7 @@ fn needs_offline(test: &str) -> bool {
     if offline_ready() {
         return true;
     }
-    eprintln!("SKIPPED {test}: `sbx setup-windows` has not been run on this machine");
+    eprintln!("SKIPPED {test}: `insbx setup-windows` has not been run on this machine");
     false
 }
 
@@ -169,7 +169,7 @@ fn http_server(body: &'static str) -> u16 {
     port
 }
 
-/// `sbx run <flags> -- curl.exe <args>`: what it printed and its exit code.
+/// `insbx run <flags> -- curl.exe <args>`: what it printed and its exit code.
 fn curl_in(cwd: &Path, flags: &[&str], args: &[&str]) -> (String, Option<i32>) {
     let curl = curl().expect("curl.exe");
     let mut all = vec!["run"];
@@ -178,7 +178,7 @@ fn curl_in(cwd: &Path, flags: &[&str], args: &[&str]) -> (String, Option<i32>) {
     all.push(curl.to_str().expect("utf8"));
     all.extend_from_slice(&["-s", "--max-time", "8"]);
     all.extend_from_slice(args);
-    let o = sbx(&all, cwd);
+    let o = insbx(&all, cwd);
     (text(&o), o.status.code())
 }
 
@@ -225,7 +225,7 @@ fn read_only_writes_nothing_but_its_private_temp() {
         out.contains("tmp-ok"),
         "the private temp is writable: {out}"
     );
-    assert!(out.contains(r"\sbx-"), "TEMP is the private one: {out}");
+    assert!(out.contains(r"\insbx-"), "TEMP is the private one: {out}");
     assert!(!out.contains(r"TEMP=\\?\"), "TEMP is a plain path: {out}");
 }
 
@@ -250,7 +250,7 @@ fn child_processes_are_confined_too() {
     )
     .expect("parent");
     // A batch file by path: started through cmd.exe, under the token.
-    let o = sbx(&["run", "-w", ".", "--", r".\parent.cmd"], &d.ws);
+    let o = insbx(&["run", "-w", ".", "--", r".\parent.cmd"], &d.ws);
     assert!(d.ws.join("inside.txt").exists(), "{}", text(&o));
     assert!(!via_cmd.exists(), "a child cmd wrote outside: {}", text(&o));
     assert!(
@@ -264,7 +264,7 @@ fn child_processes_are_confined_too() {
 fn the_current_folder_is_not_searched_for_the_program() {
     let d = dirs();
     std::fs::write(d.ws.join("planted.cmd"), "@echo planted\r\n").expect("plant");
-    let o = sbx(&["run", "--", "planted"], &d.ws);
+    let o = insbx(&["run", "--", "planted"], &d.ws);
     assert_eq!(o.status.code(), Some(127), "{}", text(&o));
 }
 
@@ -304,7 +304,7 @@ fn the_wall_limit_kills_the_whole_tree() {
 }
 
 #[test]
-fn killing_sbx_takes_the_command_with_it() {
+fn killing_insbx_takes_the_command_with_it() {
     let d = dirs();
     let (script, started, survived) = tree_script(&d, 12);
     let mut child = base(&d.ws)
@@ -320,7 +320,7 @@ fn killing_sbx_takes_the_command_with_it() {
             script.to_str().expect("utf8"),
         ])
         .spawn()
-        .expect("sbx");
+        .expect("insbx");
     let deadline = Instant::now() + Duration::from_secs(40);
     while !started.exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(100));
@@ -329,7 +329,7 @@ fn killing_sbx_takes_the_command_with_it() {
     child.kill().expect("TerminateProcess");
     let _ = child.wait();
     std::thread::sleep(Duration::from_secs(16));
-    assert!(!survived.exists(), "the command outlived sbx");
+    assert!(!survived.exists(), "the command outlived insbx");
 }
 
 #[test]
@@ -385,7 +385,7 @@ fn the_agent_session_and_git_redirects_are_stripped_and_credentials_kept() {
         .env("GIT_DIR", r"C:\elsewhere\.git")
         .env("ANTHROPIC_API_KEY", "key")
         .output()
-        .expect("sbx");
+        .expect("insbx");
     assert_eq!(
         String::from_utf8_lossy(&o.stdout).trim(),
         "[][][][key]",
@@ -402,9 +402,9 @@ fn exit_codes() {
     // Windows codes are 32 bits; they pass through whole.
     let o = cmd(&d.ws, &[], "exit 300");
     assert_eq!(o.status.code(), Some(300), "{}", text(&o));
-    let o = sbx(&["run", "--", "no-such-command-sbx"], &d.ws);
+    let o = insbx(&["run", "--", "no-such-command-insbx"], &d.ws);
     assert_eq!(o.status.code(), Some(127), "{}", text(&o));
-    let o = sbx(
+    let o = insbx(
         &["run", "-w", "missing-root", "--", "cmd", "/c", "exit 0"],
         &d.ws,
     );
@@ -416,7 +416,7 @@ fn what_native_cannot_enforce_is_refused_and_said() {
     let d = dirs();
     std::fs::create_dir(d.out.join("secret")).expect("secret");
     let secret = d.out.join("secret");
-    let o = sbx(
+    let o = insbx(
         &[
             "check",
             "--fs",
@@ -436,19 +436,19 @@ fn what_native_cannot_enforce_is_refused_and_said() {
     ];
     if offline_ready() {
         // Layer 2 is set up: the network is enforced, and says how.
-        let o = sbx(&["check", "--net", "deny"], &d.ws);
+        let o = insbx(&["check", "--net", "deny"], &d.ws);
         assert!(text(&o).contains(OFFLINE), "{}", text(&o));
     } else {
         refused.push(vec!["--net", "deny"]);
         refused.push(vec!["--allow-host", "example.com"]);
-        let o = sbx(&["check", "--net", "deny"], &d.ws);
-        assert!(text(&o).contains("sbx setup-windows"), "{}", text(&o));
+        let o = insbx(&["check", "--net", "deny"], &d.ws);
+        assert!(text(&o).contains("insbx setup-windows"), "{}", text(&o));
     }
     for flags in refused {
         let mut args = vec!["run"];
         args.extend(flags.iter().copied());
         args.extend(["--", "cmd", "/c", "exit 0"]);
-        let o = sbx(&args, &d.ws);
+        let o = insbx(&args, &d.ws);
         assert_eq!(o.status.code(), Some(125), "{flags:?}: {}", text(&o));
         assert!(text(&o).contains("NOT ENFORCED"), "{flags:?}: {}", text(&o));
     }
@@ -459,7 +459,7 @@ fn auto_refuses_a_network_policy_when_wsl_cannot_take_it() {
     let d = dirs();
     if offline_ready() {
         // With layer 2 set up, auto runs network deny natively.
-        let o = Command::new(SBX)
+        let o = Command::new(INSBX)
             .args([
                 "run",
                 "--net",
@@ -473,23 +473,23 @@ fn auto_refuses_a_network_policy_when_wsl_cannot_take_it() {
                 "echo ok> auto-deny.txt",
             ])
             .current_dir(&d.ws)
-            .env_remove("SBX_BACKEND")
-            .env_remove("SBX_NATIVE")
+            .env_remove("INSBX_BACKEND")
+            .env_remove("INSBX_NATIVE")
             .stdin(Stdio::null())
             .output()
-            .expect("sbx");
+            .expect("insbx");
         assert_eq!(o.status.code(), Some(0), "{}", text(&o));
         assert!(d.ws.join("auto-deny.txt").exists(), "{}", text(&o));
         return;
     }
-    let o = Command::new(SBX)
+    let o = Command::new(INSBX)
         .args(["run", "--net", "deny", "--", "cmd", "/c", "exit 0"])
         .current_dir(&d.ws)
-        .env_remove("SBX_BACKEND")
-        .env_remove("SBX_NATIVE")
+        .env_remove("INSBX_BACKEND")
+        .env_remove("INSBX_NATIVE")
         .stdin(Stdio::null())
         .output()
-        .expect("sbx");
+        .expect("insbx");
     if o.status.code() != Some(125) {
         eprintln!(
             "SKIPPED: this machine forwarded to WSL2 (code {:?})",
@@ -501,7 +501,7 @@ fn auto_refuses_a_network_policy_when_wsl_cannot_take_it() {
     assert!(out.contains("install-windows.ps1"), "{out}");
     assert!(out.contains("--best-effort"), "{out}");
     // And a policy native enforces in full runs natively under auto.
-    let o = Command::new(SBX)
+    let o = Command::new(INSBX)
         .args([
             "run",
             "-w",
@@ -513,18 +513,18 @@ fn auto_refuses_a_network_policy_when_wsl_cannot_take_it() {
             "echo ok> auto.txt",
         ])
         .current_dir(&d.ws)
-        .env_remove("SBX_BACKEND")
-        .env_remove("SBX_NATIVE")
+        .env_remove("INSBX_BACKEND")
+        .env_remove("INSBX_NATIVE")
         .stdin(Stdio::null())
         .output()
-        .expect("sbx");
+        .expect("insbx");
     assert!(d.ws.join("auto.txt").exists(), "{}", text(&o));
 }
 
 #[test]
 fn doctor_reports_native_and_wsl() {
     let d = dirs();
-    let o = sbx(&["doctor"], &d.ws);
+    let o = insbx(&["doctor"], &d.ws);
     let out = text(&o);
     assert!(out.contains("write-restricted token"), "{out}");
     assert!(out.contains("WSL2"), "{out}");
@@ -534,11 +534,11 @@ fn doctor_reports_native_and_wsl() {
         assert!(out.contains("[ok  ] offline user"), "{out}");
         assert!(out.contains("Windows Filtering Platform"), "{out}");
     } else {
-        assert!(out.contains("sbx setup-windows"), "{out}");
+        assert!(out.contains("insbx setup-windows"), "{out}");
     }
 }
 
-// ---- sbx mcp, natively ----
+// ---- insbx mcp, natively ----
 
 struct Mcp {
     child: Child,
@@ -549,16 +549,16 @@ struct Mcp {
 
 impl Mcp {
     fn start(args: &[&str]) -> Self {
-        // No SBX_BACKEND: with `--net allow`, auto must pick native.
-        let mut child = Command::new(SBX)
+        // No INSBX_BACKEND: with `--net allow`, auto must pick native.
+        let mut child = Command::new(INSBX)
             .arg("mcp")
             .args(args)
-            .env_remove("SBX_BACKEND")
-            .env_remove("SBX_NATIVE")
+            .env_remove("INSBX_BACKEND")
+            .env_remove("INSBX_NATIVE")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
-            .expect("sbx mcp starts");
+            .expect("insbx mcp starts");
         let stdin = child.stdin.take().expect("stdin");
         let stdout = BufReader::new(child.stdout.take().expect("stdout"));
         let mut m = Self {
@@ -568,7 +568,7 @@ impl Mcp {
             next: 0,
         };
         let init = m.request("initialize", json!({"protocolVersion": "2025-06-18"}));
-        assert_eq!(init["serverInfo"]["name"], "sbx");
+        assert_eq!(init["serverInfo"]["name"], "insbx");
         writeln!(
             m.stdin,
             "{}",
@@ -616,7 +616,7 @@ fn mcp_runs_a_script_natively_and_keeps_it_in_its_folder() {
         "allow",
     ]);
 
-    // The default (deny) is enforced natively only after `sbx
+    // The default (deny) is enforced natively only after `insbx
     // setup-windows`; without it that is said at once.
     let deny = m.call("sandbox_create", json!({}));
     if offline_ready() {
@@ -698,7 +698,7 @@ fn mcp_runs_a_script_natively_and_keeps_it_in_its_folder() {
     m.stop();
 }
 
-// ---- Layer 2: network deny natively (after `sbx setup-windows`) ----
+// ---- Layer 2: network deny natively (after `insbx setup-windows`) ----
 
 #[test]
 fn network_deny_refuses_tcp_to_a_local_server_and_to_the_internet() {
@@ -721,7 +721,7 @@ fn network_deny_refuses_tcp_to_a_local_server_and_to_the_internet() {
         let (out, code) = curl_in(&d.ws, flags, &["--noproxy", "*", &local]);
         assert!(!out.contains("listener-ok"), "{flags:?} reached it: {out}");
         assert_ne!(code, Some(0), "{flags:?}: {out}");
-        assert_ne!(code, Some(125), "{flags:?}: sbx refused instead: {out}");
+        assert_ne!(code, Some(125), "{flags:?}: insbx refused instead: {out}");
     }
     // Outside, by address (no DNS needed): only if the control gets there.
     let outside = "http://1.1.1.1/";
@@ -893,8 +893,8 @@ fn under_network_deny_writes_stay_confined_and_exit_codes_pass_through() {
     assert_eq!(o.status.code(), Some(7), "{}", text(&o));
     let o = cmd(&d.ws, &["--net", "deny"], "exit 300");
     assert_eq!(o.status.code(), Some(300), "{}", text(&o));
-    let o = sbx(
-        &["run", "--net", "deny", "--", "no-such-command-sbx"],
+    let o = insbx(
+        &["run", "--net", "deny", "--", "no-such-command-insbx"],
         &d.ws,
     );
     assert_eq!(o.status.code(), Some(127), "{}", text(&o));
@@ -963,7 +963,7 @@ fn concurrent_deny_runs_share_a_root_and_cannot_write_each_others() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("sbx");
+        .expect("insbx");
     let deadline = Instant::now() + Duration::from_secs(60);
     while !d.ws.join("started.txt").exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(100));
@@ -1044,7 +1044,7 @@ fn powershell_under_network_deny_starts_in_the_current_folder() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("sbx");
+        .expect("insbx");
     let deadline = Instant::now() + Duration::from_secs(60);
     while !d.ws.join("rel.txt").exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(100));
@@ -1060,7 +1060,7 @@ fn powershell_under_network_deny_starts_in_the_current_folder() {
     let sibling_during = icacls(&sibling);
     let out_during = icacls(&d.out);
     std::fs::write(d.ws.join("go.txt"), "go").expect("go");
-    let o = child.wait_with_output().expect("sbx ends");
+    let o = child.wait_with_output().expect("insbx ends");
     let printed = text(&o);
 
     let ws = d.ws.to_string_lossy().to_lowercase();
@@ -1141,7 +1141,7 @@ fn proxy_lets_only_the_allowlist_through_natively() {
     )
     .expect("script");
     let host = format!("127.0.0.1:{allowed}");
-    let o = sbx(
+    let o = insbx(
         &[
             "run",
             "-w",

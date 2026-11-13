@@ -162,7 +162,7 @@ The design is in `docs/ARCHITECTURE.md`; the tool layer is its §5a and §5b.
 
 ## Install
 
-Prebuilt `incode` (and `sbx`, the [standalone sandbox](crates/sandbox)) for
+Prebuilt `incode` (and `insbx`, the [standalone sandbox](crates/sandbox)) for
 Linux (x86_64, aarch64; glibc), macOS (Intel, Apple silicon) and Windows
 (x86_64) are published on each GitHub release. The install scripts fetch the
 latest one, check it against the release's `SHA256SUMS`, and install it:
@@ -180,7 +180,7 @@ irm https://raw.githubusercontent.com/incordai/incode/main/scripts/install.ps1 |
 At the end, both scripts set up the [sandbox](#the-os-sandbox) and install
 incode's [tools](#external-tools):
 
-- **Windows**: `sbx setup-windows` (an offline account and firewall filters, so
+- **Windows**: `insbx setup-windows` (an offline account and firewall filters, so
   commands can be cut off the network) runs through the Windows administrator
   prompt, once; it is skipped when already done.
 - **Linux and macOS**: nothing to set up and no root needed (Landlock and
@@ -195,7 +195,7 @@ is missing. `INCODE_NO_SANDBOX_SETUP=1` skips the sandbox step and
 
 Set `INCODE_VERSION=v0.2.0` to pin a release instead of the latest. Once
 installed, `incode update --check` says whether a newer release exists, and
-`incode update` installs it in place (sha256-checked; `sbx` is updated too when
+`incode update` installs it in place (sha256-checked; `insbx` is updated too when
 it sits beside `incode`). The Linux binary links no desktop library: screen
 capture reads the X server over its socket, so it runs on a server with no
 X11, Wayland or GPU libraries installed.
@@ -218,15 +218,15 @@ install -m755 target/release/incode ~/.local/bin/incode
 Copy-Item target\release\incode.exe $env:USERPROFILE\.local\bin\
 ```
 
-**On Windows, also set up the sandbox** (`sbx`, which runs inside WSL2):
+**On Windows, also set up the sandbox** (`insbx`, which runs inside WSL2):
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\install-windows.ps1
 ```
 
 It installs WSL2 if it's missing (asks first; needs administrator rights
-once and usually a restart, then run it again). It then builds `sbx` inside
-WSL2 and puts `sbx.exe` on your PATH. `sbx.exe` forwards every command into
+once and usually a restart, then run it again). It then builds `insbx` inside
+WSL2 and puts `insbx.exe` on your PATH. `insbx.exe` forwards every command into
 WSL2, where the Linux sandbox confines it. macOS and Linux need no extra
 step.
 
@@ -1192,12 +1192,12 @@ sandboxed. Where a mode cannot be applied, the command runs unconfined and the
 trace says which.
 
 **The engine**: `admin.json` `sandbox_engine` or `INCODE_SANDBOX_ENGINE`,
-`builtin` (the default: everything above) or `sbx`, which confines the same
-commands with [`sbx`](#sbx-the-same-sandbox-for-any-agent) instead, with the
+`builtin` (the default: everything above) or `insbx`, which confines the same
+commands with [`insbx`](#insbx-the-same-sandbox-for-any-agent) instead, with the
 same mode and network switch, and adds:
 
 - `sandbox_allow_hosts` (or `INCODE_SANDBOX_ALLOW_HOSTS`, comma-separated): the
-  only hosts a command may reach, through a proxy sbx runs for it;
+  only hosts a command may reach, through a proxy insbx runs for it;
 - `sandbox_loopback_ports` (`admin.json` only): this machine's own ports a
   command may also reach on `localhost`, `127.0.0.1` or `::1`, such as a dev
   server a browser test loads. Nothing else private opens. Like
@@ -1209,19 +1209,19 @@ same mode and network switch, and adds:
   library stripped; a private temp directory per command.
 
 ```json
-{ "sandbox_engine": "sbx", "sandbox_allow_hosts": ["crates.io", "static.crates.io", "github.com"] }
+{ "sandbox_engine": "insbx", "sandbox_allow_hosts": ["crates.io", "static.crates.io", "github.com"] }
 ```
 
-Linux and macOS run it inside incode. Windows runs `sbx.exe` (installed beside
+Linux and macOS run it inside incode. Windows runs `insbx.exe` (installed beside
 `incode.exe`), natively or inside WSL2 as `sandbox_backend` (or
 `INCODE_SANDBOX_BACKEND`) says: `native`, `wsl` or `auto`; under `wsl` the
 command runs in WSL's `sh`. What a machine cannot enforce is named in the
-trace and `/doctor`; a run sbx cannot start at all is refused, not run
+trace and `/doctor`; a run insbx cannot start at all is refused, not run
 unconfined.
 
-### `sbx`: the same sandbox for any agent
+### `insbx`: the same sandbox for any agent
 
-`crates/sandbox` builds `sbx`, a standalone sandbox that doesn't depend on
+`crates/sandbox` builds `insbx`, a standalone sandbox that doesn't depend on
 incode. It runs any command, whether an agent CLI, a test suite or Insi's
 workers, under one policy file:
 - writable roots, plus paths hidden even from reading (`deny_read`);
@@ -1233,7 +1233,7 @@ It refuses a policy the machine cannot enforce in full instead of running
 with less. To confine a whole incode run:
 
 ```sh
-sbx run -w . -w ~/.claude -w ~/.claude.json -w ~/.incode --wall 1800 -- incode -t "…"
+insbx run -w . -w ~/.claude -w ~/.claude.json -w ~/.incode --wall 1800 -- incode -t "…"
 ```
 
 Details, the policy format and what each OS enforces are in
@@ -1436,7 +1436,7 @@ and `--admin` prints which layer decided each value.
 | `browser_bin` · `pdf_renderer` | For development, a headless browser executable that wins over the installed one · which program `RenderPdf` uses |
 | `sandbox` | `off` · `workspace-write` · `read-only`; unset follows the permission mode |
 | `sandbox_network` | `allow` (default) · `deny` — see [the OS sandbox](#the-os-sandbox) |
-| `sandbox_engine` · `sandbox_allow_hosts` · `sandbox_loopback_ports` · `sandbox_backend` | `builtin` (default) · `sbx`; under sbx, the hosts a command may reach, this machine's own ports it may reach, and, on Windows, `native` · `wsl` · `auto` — see [the OS sandbox](#the-os-sandbox) |
+| `sandbox_engine` · `sandbox_allow_hosts` · `sandbox_loopback_ports` · `sandbox_backend` | `builtin` (default) · `insbx`; under insbx, the hosts a command may reach, this machine's own ports it may reach, and, on Windows, `native` · `wsl` · `auto` — see [the OS sandbox](#the-os-sandbox) |
 | `codex_tools` | `incode` (default) · `own` — whose tools a `codex` model runs; see [the codex route](#the-codex-route-whose-tools) |
 | `agy_tools` | `incode` (default) · `own` — whose tools an `agy` model runs; see [the agy route](#the-agy-route-whose-tools) |
 | `hooks` (also `desktop_hooks`) | Your `pre_tool_use` / `post_tool_use` commands, run for every tool, and `user_prompt_submit`, run for each line you send. The event is JSON on stdin (`hook_event_name`, `session_id`, `cwd`, and `tool_name`/`tool_input` or `prompt`); exit 2 on a pre-tool command denies the call, on a prompt command refuses the line (the reason is shown and nothing is sent — not to the agent, not to the memory engine); a prompt command's stdout is added to that turn's context, and your line is never changed; bounded at 10 s. The prompt hook runs for lines typed in the REPL or sent over `--acp`, and for `-t`; for `/review` it sees the review prompt (the change included), and for `/run` each task's instruction before a worker or lane gets it — a refused task fails that attempt, and the hook's output rides that task's turn. It is taken from here and from your own plugins (`~/.incode/plugins/`), never from a project's `.incode/plugins/`, which arrives with whatever was cloned. `pre_compact` runs before `/compact` (event field `trigger`: `manual`, plus `custom_instructions`; when the agent compacts its own conversation, as a CLI agent does, it still runs and nothing is compacted by incode) and before the API route compacts on its own near the context window (`trigger`: `auto`, its output shown as incode's note during the turn); a CLI agent's own automatic compaction happens inside that agent and fires nothing, and `stop` when one of your turns has ended (`last_assistant_message`); neither can refuse anything, and their stdout is shown — with the compaction result, and with the turn's notices. `session_start` runs when a session opens (`source`: `startup`) and `session_end` when it closes (`reason`, e.g. `prompt_input_exit`, `other`), in the REPL, `--acp` and `-t`; neither can stop or keep anything, and their stdout is shown (on stderr for `-t`; a `--acp` session's end output goes to the trace, as the client has gone). They supersede a project's `.incode/lifecycle.json` (or the `lifecycle` section of `.incode.json`), whose `on_session_start`/`on_session_end` still run in the REPL — but only once you approve them as they are, since they arrive with whatever was cloned: `incode lifecycle show` lists them, `incode lifecycle approve` approves them, and any change needs approving again. `subagent_stop` runs when a sub-agent (the `Agent` tool) has finished, told `agent_type` (its definition, role, or `sub-agent`), `task`, `last_assistant_message` and `outcome` (`completed`, `failed` or `cancelled`); it cannot keep it working, and its output is traced, not shown. `notification` runs whenever incode would notify you (`notification_type`: `turn_done` or `input_needed`, plus `message`), in the background beside `notify_command`, in the REPL; its output is not shown |

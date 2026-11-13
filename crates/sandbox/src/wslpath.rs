@@ -1,4 +1,4 @@
-//! Windows paths as WSL sees them, for `sbx.exe` forwarding a command into
+//! Windows paths as WSL sees them, for `insbx.exe` forwarding a command into
 //! WSL2 (where the Linux sandbox does the confining).
 //!
 //! `C:\work\app` is `/mnt/c/work/app` in WSL's default mount layout
@@ -35,7 +35,7 @@ pub fn to_wsl(path: &str) -> Option<String> {
     None
 }
 
-/// The options of `sbx` whose value is a path.
+/// The options of `insbx` whose value is a path.
 pub const PATH_OPTIONS: &[&str] = &[
     "-w",
     "--write",
@@ -46,7 +46,7 @@ pub const PATH_OPTIONS: &[&str] = &[
     "--root",
 ];
 
-/// `sbx` arguments rewritten for WSL: each path option's value, and any
+/// `insbx` arguments rewritten for WSL: each path option's value, and any
 /// argument after `--` that is a drive path (`C:\...`), translated.
 ///
 /// # Errors

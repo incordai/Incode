@@ -15,7 +15,7 @@ name = "incord_sandbox"
 path = "src/lib.rs"
 
 [[bin]]
-name = "sbx"
+name = "insbx"
 path = "src/main.rs"
 
 [dependencies]
@@ -28,7 +28,7 @@ libc = "0.2"
 
 # The native Windows sandbox (`src/windows`): a write-restricted token, an
 # ACE per writable root, and a job object; and for network deny (layer 2,
-# `sbx setup-windows`) a local account, DPAPI for its password and Windows
+# `insbx setup-windows`) a local account, DPAPI for its password and Windows
 # Filtering Platform filters. The same windows-sys incode itself already
 # resolves (0.61.2 is in Cargo.lock), so nothing new is downloaded; the extra
 # features only add bindings.

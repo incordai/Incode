@@ -1,7 +1,7 @@
 //! The grant: one inheritable `Modify` ACE per writable root, for one run.
 //!
 //! Ported from incode's `sandbox::windows::acl`. incode grants once per
-//! session and keeps the roots granted across commands; `sbx` runs one
+//! session and keeps the roots granted across commands; `insbx` runs one
 //! command per policy, so each run gets its own SID and its own [`Lease`]:
 //! granted when the command is prepared, revoked when the lease drops after
 //! it exits. Two runs at once never share a SID, so neither can write the
@@ -51,9 +51,9 @@
 //! # A crash leaves the ACE behind: the sweep
 //!
 //! Every grant is written down before it is made, in
-//! `%LOCALAPPDATA%\sbx\grants\<rid>.grant` (the SID and each root, and the
+//! `%LOCALAPPDATA%\insbx\grants\<rid>.grant` (the SID and each root, and the
 //! account's SID and read paths), and the process holds a named mutex
-//! `Global\sbx-grant-<rid>` while the lease lives. Every new lease first
+//! `Global\insbx-grant-<rid>` while the lease lives. Every new lease first
 //! sweeps: a record whose mutex no longer exists belongs to a process that
 //! died, so its ACEs are revoked and the record deleted. A record whose
 //! revoke failed is kept for the next sweep. An ACE a dead run left is
@@ -137,7 +137,7 @@ impl OfflineGrant {
                 )
             })?;
         }
-        // Only what this process may re-ACL: anything else (an sbx.exe under
+        // Only what this process may re-ACL: anything else (an insbx.exe under
         // Program Files) is the system's, readable by `Users` already or not
         // this run's to open up. If it is not readable, starting the command
         // says so.
@@ -299,7 +299,7 @@ impl Lease {
             self.parents.push(parent.clone());
             if let Err(e) = set_list(parent, user, true) {
                 eprintln!(
-                    "sbx: could not let the offline account list {} ({e}); PowerShell \
+                    "insbx: could not let the offline account list {} ({e}); PowerShell \
                      may start at the drive root instead of the current folder",
                     parent.display()
                 );
@@ -327,7 +327,7 @@ impl Drop for Lease {
             // (The temp directory may already be gone.)
             if let Err(e) = change(root, &self.record.sid, Change::Revoke) {
                 eprintln!(
-                    "sbx: could not revoke the sandbox's access to {} ({e}); the next run \
+                    "insbx: could not revoke the sandbox's access to {} ({e}); the next run \
                      sweeps it",
                     root.display()
                 );
@@ -345,7 +345,7 @@ impl Drop for Lease {
             {
                 if let Err(e) = release_account(path, user, &others) {
                     eprintln!(
-                        "sbx: could not revoke the offline account's access to {} ({e}); the \
+                        "insbx: could not revoke the offline account's access to {} ({e}); the \
                          next run sweeps it",
                         path.display()
                     );
@@ -359,7 +359,7 @@ impl Drop for Lease {
             for parent in self.parents.iter().filter(|p| p.exists()) {
                 if let Err(e) = release_list(parent, user, &others) {
                     eprintln!(
-                        "sbx: could not take back the offline account's listing of {} ({e}); \
+                        "insbx: could not take back the offline account's listing of {} ({e}); \
                          the next run sweeps it",
                         parent.display()
                     );
@@ -542,7 +542,7 @@ fn live_account_grants(own: &Path) -> Others {
 }
 
 /// Let the offline account read `path` (a folder and all beneath it, or one
-/// file), for `sbx setup-windows --read`.
+/// file), for `insbx setup-windows --read`.
 ///
 /// # Errors
 /// When the ACL cannot be read or written.
@@ -609,8 +609,8 @@ pub(crate) fn owner_of(path: &Path) -> Result<String, String> {
 /// refused).
 fn records_dir() -> PathBuf {
     std::env::var_os("LOCALAPPDATA")
-        .map(|d| PathBuf::from(d).join("sbx").join("grants"))
-        .unwrap_or_else(|| std::env::temp_dir().join("sbx-grants"))
+        .map(|d| PathBuf::from(d).join("insbx").join("grants"))
+        .unwrap_or_else(|| std::env::temp_dir().join("insbx-grants"))
 }
 
 /// A fresh RID nobody is using, and the liveness mutex that holds it.
@@ -743,7 +743,7 @@ fn is_alive(rid: u32) -> bool {
 }
 
 fn alive_name(rid: u32) -> String {
-    format!("Global\\sbx-grant-{rid}")
+    format!("Global\\insbx-grant-{rid}")
 }
 
 #[derive(Clone, Copy)]
@@ -1017,7 +1017,7 @@ impl AclLock {
     fn take() -> Result<Self, String> {
         // SAFETY: a NUL-terminated name; the handle is owned by the guard.
         unsafe {
-            let handle = CreateMutexW(std::ptr::null(), 0, wide("Global\\sbx-acl").as_ptr());
+            let handle = CreateMutexW(std::ptr::null(), 0, wide("Global\\insbx-acl").as_ptr());
             if handle.is_null() {
                 return Err(last_error("CreateMutexW"));
             }

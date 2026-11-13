@@ -112,7 +112,7 @@ pub(crate) fn enter(
         if spec.strict {
             return Err(sandbox(format!("job object: {e}")));
         }
-        eprintln!("sbx: job object limits not applied (best effort): {e}");
+        eprintln!("insbx: job object limits not applied (best effort): {e}");
         job(&JobLimits::from_limits(&crate::policy::Limits::default()))
             .map_err(|e| sandbox(format!("job object: {e}")))
     })?;
@@ -165,7 +165,7 @@ fn token_for(spec: &EnterSpec) -> Result<Option<OwnedHandle>, Failure> {
             spec.fs_mode.as_str()
         ))),
         Err(e) => {
-            eprintln!("sbx: restricted token not applied (best effort): {e}");
+            eprintln!("insbx: restricted token not applied (best effort): {e}");
             Ok(None)
         }
     }
@@ -183,7 +183,7 @@ fn inner(spec: &EnterSpec, program: &OsString, args: &[OsString]) -> Result<i32,
                 "the helper could not protect itself from the command: {e}"
             )));
         }
-        eprintln!("sbx: helper not protected from the command (best effort): {e}");
+        eprintln!("insbx: helper not protected from the command (best effort): {e}");
     }
     let token = token_for(spec)?;
     let (application, mut line) = command_for(program, args)?;
@@ -357,10 +357,10 @@ fn startup_info() -> STARTUPINFOW {
 fn logon_failure(err: u32, account: &str, exe: &str) -> String {
     let why = match err {
         1326 => format!(
-            "{account}'s password no longer matches the one sbx stored; run `sbx setup-windows` \
+            "{account}'s password no longer matches the one insbx stored; run `insbx setup-windows` \
              as administrator again"
         ),
-        1331 => format!("{account} is disabled; run `sbx setup-windows` as administrator again"),
+        1331 => format!("{account} is disabled; run `insbx setup-windows` as administrator again"),
         1385 => format!("a policy denies {account} local logon (\"Allow log on locally\")"),
         267 => format!("{account} cannot use the current folder"),
         5 => format!("access denied (can {account} read {exe}?)"),
@@ -395,7 +395,7 @@ fn confining_token(spec: &EnterSpec) -> Result<OwnedHandle, String> {
         .as_deref()
         .ok_or("the helper was started without the run's SID")?;
     if !is_session_sid(sid) {
-        return Err(format!("{sid} is not an sbx run SID"));
+        return Err(format!("{sid} is not an insbx run SID"));
     }
     restricted(sid)
 }

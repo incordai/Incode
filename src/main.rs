@@ -299,7 +299,7 @@ const COMPLETION: completions::Command = {
 };
 
 fn main() -> anyhow::Result<()> {
-    // The sbx engine's helper (`incode __sbx-enter ...`): confine this
+    // The insbx engine's helper (`incode __insbx-enter ...`): confine this
     // process and exec the command, before any thread starts. Returns at once
     // for every other invocation.
     incord_sandbox::enter_if_requested();

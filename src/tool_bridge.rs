@@ -495,7 +495,7 @@ impl Turn {
 /// with, and a model with no tools may write tool calls out as plain text
 /// that nothing ran. Its reply is not a result, so the turn fails and says
 /// why rather than reporting success. Measured: under a Windows
-/// write-restricted token (sbx, native), Node cannot give a child piped
+/// write-restricted token (insbx, native), Node cannot give a child piped
 /// stdio, so Claude Code starts no MCP server at all (#68).
 ///
 /// Called by the Claude Code route (`agent/claude_code/turn.rs` `run_once`)

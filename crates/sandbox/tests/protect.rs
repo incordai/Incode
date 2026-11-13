@@ -22,7 +22,7 @@ fn a_planted_hook_and_config_are_put_back_after_the_run() {
     git(&["init", "-q"]);
     let config_before = std::fs::read_to_string(repo.join(".git/config")).expect("config");
 
-    let out = Command::new(env!("CARGO_BIN_EXE_sbx"))
+    let out = Command::new(env!("CARGO_BIN_EXE_insbx"))
         .args([
             "run",
             "--best-effort",
@@ -36,7 +36,7 @@ fn a_planted_hook_and_config_are_put_back_after_the_run() {
         ])
         .current_dir(&repo)
         .output()
-        .expect("sbx");
+        .expect("insbx");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!repo.join(".git/hooks/pre-commit").exists(), "{stderr}");
     assert_eq!(
@@ -57,7 +57,7 @@ fn a_planted_hook_and_config_are_put_back_after_the_run() {
     }
 
     // Opted out, the change stays.
-    Command::new(env!("CARGO_BIN_EXE_sbx"))
+    Command::new(env!("CARGO_BIN_EXE_insbx"))
         .args([
             "run",
             "--best-effort",
@@ -71,6 +71,6 @@ fn a_planted_hook_and_config_are_put_back_after_the_run() {
         ])
         .current_dir(&repo)
         .output()
-        .expect("sbx");
+        .expect("insbx");
     assert!(repo.join(".git/hooks/post-commit").exists());
 }

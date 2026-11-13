@@ -1,15 +1,15 @@
-//! `sbx mcp`: sandboxes as a service an agent drives over MCP (stdio).
+//! `insbx mcp`: sandboxes as a service an agent drives over MCP (stdio).
 //!
 //! An agent creates a sandbox, writes scripts and files into it, runs them,
 //! reads what they produced, and throws it away. Every run happens under the
-//! same policy machinery as `sbx run`: the command may write only inside its
+//! same policy machinery as `insbx run`: the command may write only inside its
 //! sandbox's folder, sees the network only as the operator allowed, gets a
 //! cleaned environment, and is killed at its time limit along with anything
 //! it started.
 //!
 //! # Who decides what
 //!
-//! The OPERATOR (whoever starts `sbx mcp`) sets the ceilings: how much
+//! The OPERATOR (whoever starts `insbx mcp`) sets the ceilings: how much
 //! network a sandbox may ever have, which hosts, the longest a run may take.
 //! The AGENT (whoever sends the tool calls) chooses within them, and gets
 //! less by default: no network, no inherited secrets. A request above a
@@ -84,7 +84,7 @@ impl Ceilings {
 impl Ceilings {
     /// The most a sandbox under these ceilings may ask for, as one policy:
     /// what a caller checks to know whether this machine can serve them
-    /// (`sbx.exe` choosing between native Windows and WSL2).
+    /// (`insbx.exe` choosing between native Windows and WSL2).
     #[must_use]
     pub fn widest_policy(&self) -> Policy {
         let mut p = self.base.clone();
@@ -167,7 +167,7 @@ impl Server {
                     .and_then(Value::as_str)
                     .unwrap_or("2025-06-18"),
                 "capabilities": { "tools": {} },
-                "serverInfo": { "name": "sbx", "version": env!("CARGO_PKG_VERSION") },
+                "serverInfo": { "name": "insbx", "version": env!("CARGO_PKG_VERSION") },
                 "instructions": INSTRUCTIONS,
             }),
             "ping" => json!({}),
@@ -210,7 +210,7 @@ impl Server {
         let (network, hosts) = self.requested_network(args)?;
         self.refuse_unenforceable(network)?;
         self.next += 1;
-        let id = format!("sbx-{}-{}", std::process::id(), self.next);
+        let id = format!("insbx-{}-{}", std::process::id(), self.next);
         let dir = self.ceilings.root.join(&id);
         std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         let dir = crate::plain_path(std::fs::canonicalize(&dir).map_err(|e| e.to_string())?);
@@ -282,7 +282,7 @@ impl Server {
         Ok(())
     }
 
-    /// On native Windows, where `deny` and `proxy` need `sbx setup-windows`
+    /// On native Windows, where `deny` and `proxy` need `insbx setup-windows`
     /// first, say so now rather than at every run, which would each be
     /// refused anyway. (Elsewhere enforcement depends on the kernel, and each
     /// run says.)
@@ -431,7 +431,7 @@ impl Server {
                     .unwrap_or(DEFAULT_INTERPRETER);
                 let runs = self.boxes.get(&id).map_or(0, |b| b.runs) + 1;
                 let (ext, _) = interpreter_style(interpreter, cfg!(windows));
-                let name = format!(".sbx/script-{runs}{ext}");
+                let name = format!(".insbx/script-{runs}{ext}");
                 let path = inside(&dir, &name, true)?;
                 write_new(&path, script.as_bytes())?;
                 script_argv(interpreter, &path.display().to_string(), cfg!(windows))
@@ -726,7 +726,7 @@ mod tests {
             .create(&json!({"network": "proxy", "allow_hosts": ["evil.example"]}))
             .is_err());
         // Within the ceilings. Native Windows enforces proxy and deny only
-        // after `sbx setup-windows`, and without it says so at once instead.
+        // after `insbx setup-windows`, and without it says so at once instead.
         let mut deny = Policy::default();
         deny.network.mode = NetMode::Deny;
         let unenforced = cfg!(windows) && crate::enforcement(&deny).network.is_gap();
@@ -746,12 +746,12 @@ mod tests {
     #[test]
     fn scripts_get_what_their_interpreter_needs_on_windows() {
         assert_eq!(
-            script_argv("sh", "/b/.sbx/script-1", false),
-            ["sh", "/b/.sbx/script-1"]
+            script_argv("sh", "/b/.insbx/script-1", false),
+            ["sh", "/b/.insbx/script-1"]
         );
         assert_eq!(interpreter_style("powershell", false), ("", &[][..]));
         assert_eq!(
-            script_argv("powershell", r"C:\b\.sbx\script-1.ps1", true),
+            script_argv("powershell", r"C:\b\.insbx\script-1.ps1", true),
             [
                 "powershell",
                 "-NoProfile",
@@ -759,7 +759,7 @@ mod tests {
                 "-ExecutionPolicy",
                 "Bypass",
                 "-File",
-                r"C:\b\.sbx\script-1.ps1"
+                r"C:\b\.insbx\script-1.ps1"
             ]
         );
         assert_eq!(interpreter_style(r"C:\x\PWSH.EXE", true).0, ".ps1");

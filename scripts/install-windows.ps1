@@ -1,22 +1,22 @@
 <#
 .SYNOPSIS
-  Set up incode's sandbox (sbx) on Windows: WSL2, the Linux sbx inside it,
-  and sbx.exe on Windows, which runs a policy natively when it can and
+  Set up incode's sandbox (insbx) on Windows: WSL2, the Linux insbx inside it,
+  and insbx.exe on Windows, which runs a policy natively when it can and
   forwards it into WSL2 when it can't.
 
 .DESCRIPTION
-  sbx.exe confines writes, the environment and limits natively; network deny
-  and proxy natively after `sbx setup-windows` (step 4); everything else
+  insbx.exe confines writes, the environment and limits natively; network deny
+  and proxy natively after `insbx setup-windows` (step 4); everything else
   (deny_read) through the Linux sandbox (Landlock + seccomp) inside WSL2.
   This script, run from the incode folder:
     1. checks for WSL2 and a Linux distribution, and installs them if missing
        (asks first; needs administrator rights once, then a restart);
-    2. builds sbx inside WSL2 and installs it at ~/.local/bin/sbx there;
-    3. builds sbx.exe on Windows and puts it on your PATH;
-    4. when run as administrator, offers `sbx setup-windows`: an offline
+    2. builds insbx inside WSL2 and installs it at ~/.local/bin/insbx there;
+    3. builds insbx.exe on Windows and puts it on your PATH;
+    4. when run as administrator, offers `insbx setup-windows`: an offline
        account the firewall cuts off, so network deny and proxy run natively
        too, without WSL2 (from a normal prompt it says how to do it later);
-    5. runs `sbx doctor` to show what is enforced.
+    5. runs `insbx doctor` to show what is enforced.
   Run it again after the restart if step 1 installed WSL2. It is safe to run
   more than once.
 
@@ -27,10 +27,10 @@
   The WSL distribution to use (default: Ubuntu).
 
 .PARAMETER NativeOnly
-  Skip WSL2 (steps 1 and 2): only sbx.exe, and `sbx setup-windows`.
+  Skip WSL2 (steps 1 and 2): only insbx.exe, and `insbx setup-windows`.
 
 .PARAMETER SetupNative
-  Run `sbx setup-windows` without asking (needs an elevated prompt).
+  Run `insbx setup-windows` without asking (needs an elevated prompt).
 
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File scripts\install-windows.ps1
@@ -48,7 +48,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-function Say($text) { Write-Host "sbx setup: $text" }
+function Say($text) { Write-Host "insbx setup: $text" }
 
 function Test-Admin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -111,43 +111,43 @@ if ($line -and $line -match '\s1\s*$') {
     if ($LASTEXITCODE -ne 0) { throw "Could not convert $Distro to WSL2." }
 }
 
-# --- 2. sbx inside WSL2 -----------------------------------------------------
+# --- 2. insbx inside WSL2 -----------------------------------------------------
 $repoInWsl = (& wsl.exe -d $Distro -e wslpath -a "$repo" | Out-String).Trim()
 if (-not $repoInWsl) { throw "Could not find $repo from inside WSL." }
-Say "Building sbx inside WSL2 ($Distro) from $repoInWsl ..."
+Say "Building insbx inside WSL2 ($Distro) from $repoInWsl ..."
 
 $build = @'
 set -eu
 REPO="$1"
 if ! command -v cc >/dev/null 2>&1; then
-  echo "sbx setup: installing a C toolchain (sudo may ask for your Linux password)"
+  echo "insbx setup: installing a C toolchain (sudo may ask for your Linux password)"
   sudo apt-get update -qq && sudo apt-get install -y -qq build-essential pkg-config
 fi
 if ! command -v cargo >/dev/null 2>&1 && [ ! -x "$HOME/.cargo/bin/cargo" ]; then
-  echo "sbx setup: installing Rust (rustup, minimal profile)"
+  echo "insbx setup: installing Rust (rustup, minimal profile)"
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
 fi
 [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
 # Build outside /mnt/c: the Windows drive is slow from WSL.
-export CARGO_TARGET_DIR="$HOME/.cache/sbx-target"
+export CARGO_TARGET_DIR="$HOME/.cache/insbx-target"
 cargo build --release --locked -p incord-sandbox --manifest-path "$REPO/Cargo.toml"
-install -D -m 755 "$CARGO_TARGET_DIR/release/sbx" "$HOME/.local/bin/sbx"
-echo "sbx setup: installed $HOME/.local/bin/sbx"
+install -D -m 755 "$CARGO_TARGET_DIR/release/insbx" "$HOME/.local/bin/insbx"
+echo "insbx setup: installed $HOME/.local/bin/insbx"
 '@
-& wsl.exe -d $Distro -e bash -c $build sbx-setup "$repoInWsl"
-if ($LASTEXITCODE -ne 0) { throw "Building sbx inside WSL2 failed (exit $LASTEXITCODE)." }
+& wsl.exe -d $Distro -e bash -c $build insbx-setup "$repoInWsl"
+if ($LASTEXITCODE -ne 0) { throw "Building insbx inside WSL2 failed (exit $LASTEXITCODE)." }
 } # -not $NativeOnly
 
-# --- 3. sbx.exe on Windows ----------------------------------------------------
+# --- 3. insbx.exe on Windows ----------------------------------------------------
 $bin = Join-Path $env:USERPROFILE ".local\bin"
 New-Item -ItemType Directory -Force -Path $bin | Out-Null
 if (Get-Command cargo -ErrorAction SilentlyContinue) {
-    Say "Building sbx.exe ..."
+    Say "Building insbx.exe ..."
     & cargo build --release --locked -p incord-sandbox
-    if ($LASTEXITCODE -ne 0) { throw "Building sbx.exe failed." }
-    Copy-Item -Force (Join-Path $repo "target\release\sbx.exe") $bin
+    if ($LASTEXITCODE -ne 0) { throw "Building insbx.exe failed." }
+    Copy-Item -Force (Join-Path $repo "target\release\insbx.exe") $bin
 } else {
-    Say "Rust is not installed on Windows, so sbx.exe was not built."
+    Say "Rust is not installed on Windows, so insbx.exe was not built."
     Say "Install it from https://rustup.rs and run this script again."
     exit 1
 }
@@ -158,41 +158,41 @@ if (-not ($userPath -split ';' | Where-Object { $_ -eq $bin })) {
     Say "Added $bin to your PATH (new terminals pick it up)."
 }
 
-# --- 4. Network deny natively (sbx setup-windows) ---------------------------------
+# --- 4. Network deny natively (insbx setup-windows) ---------------------------------
 # An offline local account that Windows Filtering Platform filters cut off
-# from the network; `sbx run --net deny` then runs as that account natively
+# from the network; `insbx run --net deny` then runs as that account natively
 # instead of in WSL2. Needs administrator rights once. See crates\sandbox\README.md.
-$sbxExe = Join-Path $bin "sbx.exe"
+$insbxExe = Join-Path $bin "insbx.exe"
 if (Test-Admin) {
     $answer = "y"
     if (-not $SetupNative) {
-        Say "sbx setup-windows creates a local account, sbx-offline, that firewall filters"
+        Say "insbx setup-windows creates a local account, insbx-offline, that firewall filters"
         Say "cut off from the network, so network deny runs natively (without WSL2)."
-        $answer = Read-Host "Run sbx setup-windows now? [y/N]"
+        $answer = Read-Host "Run insbx setup-windows now? [y/N]"
     }
     if ($answer -match '^(y|yes)$') {
-        & $sbxExe setup-windows
+        & $insbxExe setup-windows
         if ($LASTEXITCODE -ne 0) {
-            Say "sbx setup-windows failed (exit $LASTEXITCODE); network deny still needs WSL2."
+            Say "insbx setup-windows failed (exit $LASTEXITCODE); network deny still needs WSL2."
         }
     }
 } else {
     if ($SetupNative) {
         Say "-SetupNative needs an elevated prompt (Run as administrator); skipped."
     }
-    Say "For network deny natively (without WSL2), run 'sbx setup-windows' once from an"
+    Say "For network deny natively (without WSL2), run 'insbx setup-windows' once from an"
     Say "elevated prompt (Run as administrator)."
 }
 
 # --- 5. What is enforced --------------------------------------------------------
-if ($Distro -ne "Ubuntu") { $env:SBX_WSL_DISTRO = $Distro }
+if ($Distro -ne "Ubuntu") { $env:INSBX_WSL_DISTRO = $Distro }
 Say "Checking the sandbox:"
-& $sbxExe doctor
+& $insbxExe doctor
 if ($NativeOnly) {
-    Say "Done. 'sbx run -w . -- <command>' runs <command> sandboxed natively."
+    Say "Done. 'insbx run -w . -- <command>' runs <command> sandboxed natively."
 } else {
-    Say "Done. 'sbx run -w . -- <command>' runs <command> sandboxed, natively or inside WSL2."
+    Say "Done. 'insbx run -w . -- <command>' runs <command> sandboxed, natively or inside WSL2."
 }
 if ($Distro -ne "Ubuntu" -and -not $NativeOnly) {
-    Say "Set SBX_WSL_DISTRO=$Distro in your environment so sbx.exe uses it."
+    Say "Set INSBX_WSL_DISTRO=$Distro in your environment so insbx.exe uses it."
 }

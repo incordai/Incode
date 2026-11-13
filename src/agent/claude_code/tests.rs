@@ -534,7 +534,7 @@ fn a_whole_turn_reports_these_events_and_this_outcome() {
 }
 
 /// A stand-in that prints a whole, successful-looking turn but never starts
-/// incode's tool server: the shape measured under sbx on Windows, where the
+/// incode's tool server: the shape measured under insbx on Windows, where the
 /// CLI could not start any child with piped stdio (#68).
 fn a_cli_whose_tool_server_never_starts(dir: &std::path::Path) -> PathBuf {
     const LINES: [&str; 3] = [
@@ -587,7 +587,7 @@ fn a_turn_whose_tool_server_never_started_fails_and_says_so() {
 }
 
 /// A stand-in whose `init` line says incode's server failed, as Claude Code
-/// says it under sbx on Windows (#68), and which then goes on, as the
+/// says it under insbx on Windows (#68), and which then goes on, as the
 /// toolless model did until the wall clock: about five seconds later it
 /// writes `still-running.txt` beside itself, then a result.
 fn a_cli_reporting_the_tool_server_failed(dir: &std::path::Path) -> PathBuf {

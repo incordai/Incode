@@ -118,9 +118,9 @@ pub struct BashJob {
     /// What the job's shell started, so a kill ends the command and not just
     /// the shell around it.
     tree: crate::agent::process_tree::Tree,
-    /// The sbx engine's proxy, temp directory and `.git` snapshot, released
+    /// The insbx engine's proxy, temp directory and `.git` snapshot, released
     /// (and any `.git` change undone) as soon as the job is seen to end.
-    sandbox: Option<crate::sandbox::sbx::Keep>,
+    sandbox: Option<crate::sandbox::insbx::Keep>,
 }
 
 impl BashJob {

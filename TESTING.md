@@ -6,7 +6,7 @@ Everything CI runs, and the parts it cannot, from your own machine.
 
 ```sh
 scripts/test-all.sh                 # every part this machine has the toolchain for
-scripts/test-all.sh rust sbx        # only some parts: rust sbx python ts vscode
+scripts/test-all.sh rust insbx        # only some parts: rust insbx python ts vscode
 QUICK=1 scripts/test-all.sh         # the same without clippy (the slowest step)
 ```
 
@@ -36,8 +36,8 @@ an email (`git config --global user.name ...`, `user.email ...`).
 | Part | Commands | What it covers |
 |---|---|---|
 | rust | `cargo fmt --all -- --check` · `cargo clippy --all-targets -- -D warnings` · `cargo test --lib` · `cargo test --bins` | incode itself: about 2,100 library and 50 binary tests |
-| rust | `cargo test --test sbx_engine` | Real shell commands run under `sandbox_engine = "sbx"`: a write outside the workspace refused (with an unconfined control), a planted git hook undone, `GIT_DIR` stripped. Linux; says it skipped elsewhere |
-| sbx | `cargo clippy -p incord-sandbox --all-targets -- -D warnings` · `cargo test -p incord-sandbox` | The standalone sandbox: escape tests per OS, the MCP server, `.git` protection, WSL path translation. On Windows CI, `sbx setup-windows` runs first so the native network-deny tests run |
+| rust | `cargo test --test insbx_engine` | Real shell commands run under `sandbox_engine = "insbx"`: a write outside the workspace refused (with an unconfined control), a planted git hook undone, `GIT_DIR` stripped. Linux; says it skipped elsewhere |
+| insbx | `cargo clippy -p incord-sandbox --all-targets -- -D warnings` · `cargo test -p incord-sandbox` | The standalone sandbox: escape tests per OS, the MCP server, `.git` protection, WSL path translation. On Windows CI, `insbx setup-windows` runs first so the native network-deny tests run |
 | python | `python3 -m unittest discover sdk/python/tests` | The Python SDK, against a fake incode |
 | ts | `cd sdk/typescript && npm install && npm test` | The TypeScript SDK, against the same fake |
 | vscode | `cd editors/vscode && npm install && npm run compile && npm test` | The VS Code extension's ACP client, against a fake agent |
@@ -54,16 +54,16 @@ From the incode folder, in PowerShell:
 powershell -ExecutionPolicy Bypass -File scripts\test-windows.ps1
 ```
 
-It builds `sbx`, runs its Windows tests (writes outside the workspace, child
-processes, the time, CPU and memory limits, killing `sbx`, the environment,
-exit codes, the MCP server) and writes `sbx-windows-report.txt`. These need
+It builds `insbx`, runs its Windows tests (writes outside the workspace, child
+processes, the time, CPU and memory limits, killing `insbx`, the environment,
+exit codes, the MCP server) and writes `insbx-windows-report.txt`. These need
 real Windows: Wine cannot check Windows' own security. Nothing is installed
 and nothing outside a temp folder is changed.
 
 The network tests (deny and proxy natively: TCP, UDP, the offline account's
 grants, concurrent runs, the proxy's allowlist) run only where
-`sbx setup-windows` has been run, from an elevated prompt (it makes a local
-account and firewall filters; `sbx setup-windows --remove` undoes it);
+`insbx setup-windows` has been run, from an elevated prompt (it makes a local
+account and firewall filters; `insbx setup-windows --remove` undoes it);
 elsewhere they print SKIPPED. CI runs the setup on `windows-latest` before
 `cargo test -p incord-sandbox`, so they always run there.
 
@@ -92,7 +92,7 @@ Things the suites cannot judge, worth a minute in a real terminal and editor:
   `.incode/commands/`, `/review`.
 - `incode review` on a branch with a change; `incode mcp login <name>` against
   a remote MCP server that needs a login; `incode plugin add` / `update`.
-- `sandbox_engine = "sbx"` with `sandbox_allow_hosts`, then a command that
+- `sandbox_engine = "insbx"` with `sandbox_allow_hosts`, then a command that
   reaches an allowed host and one that does not.
 - The VS Code extension (install the `.vsix` its README builds) and any ACP
   editor (`incode --acp`).

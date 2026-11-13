@@ -7,14 +7,14 @@
 //! (`codex-rs/windows-sandbox-rs`, Apache-2.0: `setup_provisioning/
 //! sandbox_users.rs`, `setup_provisioning/firewall.rs`, `wfp.rs`, `dpapi.rs`,
 //! `elevated/runner_client.rs`), a one-time elevated setup
-//! (`sbx setup-windows`):
+//! (`insbx setup-windows`):
 //!
 //! 1. creates a local account, [`ACCOUNT`], member of `Users` only (it needs
 //!    `Users` to log on locally and to read `C:\Windows` and `Program Files`;
 //!    Codex adds its accounts to `Users` too), with a random password nobody
 //!    is shown, hidden from the sign-in screen;
 //! 2. stores that password DPAPI-protected (machine scope) in a record under
-//!    `%ProgramData%\sbx`, readable by SYSTEM, Administrators and the user who
+//!    `%ProgramData%\insbx`, readable by SYSTEM, Administrators and the user who
 //!    ran the setup only ([`state_dir_sddl`]);
 //! 3. adds persistent WFP filters ([`FILTERS`]) that block every connection
 //!    the account makes or accepts, TCP, UDP and ICMP, loopback included, and
@@ -38,13 +38,13 @@
 //!   what the user may: system folders, and what each run grants it (the
 //!   writable roots, the current folder, the helper program, the private
 //!   temp directory). A toolchain under the user's profile must be granted
-//!   once with `sbx setup-windows --read <DIR>`. Narrower, never wider.
+//!   once with `insbx setup-windows --read <DIR>`. Narrower, never wider.
 //! - **Writes** need both the account (the token's normal check) and the
 //!   run's SID (its restricted check): each root gets an ACE for each. The
 //!   account's ACE is shared by concurrent runs, so it is only revoked when
 //!   no other live run still needs it ([`still_needed`]).
 //! - **No profile is loaded** (`dwLogonFlags = 0`, as Codex's runner does):
-//!   loading it would create `C:\Users\sbx-offline` on first use, a home every
+//!   loading it would create `C:\Users\insbx-offline` on first use, a home every
 //!   run shares and could leave things in for the next. The command gets the
 //!   run's computed environment instead.
 //!
@@ -64,11 +64,11 @@ use crate::policy::NetMode;
 use crate::Status;
 
 /// The local account commands run as when the network is denied.
-pub const ACCOUNT: &str = "sbx-offline";
+pub const ACCOUNT: &str = "insbx-offline";
 
 /// The account's description, shown in Computer Management.
 pub const ACCOUNT_COMMENT: &str =
-    "sbx: runs sandboxed commands with no network (made by sbx setup-windows)";
+    "insbx: runs sandboxed commands with no network (made by insbx setup-windows)";
 
 /// The loopback ports a `proxy` run's proxy may listen on, one per
 /// concurrent run. Below Windows' dynamic range (49152-65535), so the system
@@ -76,19 +76,19 @@ pub const ACCOUNT_COMMENT: &str =
 pub const DEFAULT_PROXY_PORTS: (u16, u16) = (47_600, 47_615);
 
 /// The folder under `%ProgramData%` that holds the record.
-pub const STATE_DIR: &str = "sbx";
+pub const STATE_DIR: &str = "insbx";
 /// The record's file name.
 pub const RECORD_FILE: &str = "offline.conf";
 
 /// DPAPI's optional entropy: the blob is useless to anything that does not
 /// also know this, which keeps a generic "decrypt every machine blob" tool
 /// from reading it in passing. The file's ACL is the protection.
-pub const DPAPI_ENTROPY: &[u8] = b"sbx-offline-v1";
+pub const DPAPI_ENTROPY: &[u8] = b"insbx-offline-v1";
 
-const RECORD_MAGIC: &str = "sbx-offline-record";
+const RECORD_MAGIC: &str = "insbx-offline-record";
 const RECORD_VERSION: u32 = 1;
 
-/// What `sbx setup-windows` wrote down.
+/// What `insbx setup-windows` wrote down.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Record {
     /// The account name ([`ACCOUNT`]).
@@ -137,10 +137,10 @@ impl Record {
             Some((RECORD_MAGIC, v)) if v.trim() == RECORD_VERSION.to_string() => {}
             Some((RECORD_MAGIC, v)) => {
                 return Err(format!(
-                    "the record is version {v}; this sbx reads version {RECORD_VERSION}"
+                    "the record is version {v}; this insbx reads version {RECORD_VERSION}"
                 ))
             }
-            _ => return Err("not an sbx offline record".to_string()),
+            _ => return Err("not an insbx offline record".to_string()),
         }
         let (mut account, mut sid, mut owner, mut ports, mut password) =
             (None, None, None, None, None);
@@ -358,7 +358,7 @@ const IPPROTO_ICMPV6: u8 = 58;
 pub const FILTERS: &[FilterSpec] = &[
     FilterSpec {
         key: 0x41ae_b76d_b1c6_46e2_a8ec_2773_5b76_7fb3,
-        name: "sbx_offline_block_connect_v4",
+        name: "insbx_offline_block_connect_v4",
         layer: Layer::ConnectV4,
         permit: false,
         weight: 1,
@@ -366,7 +366,7 @@ pub const FILTERS: &[FilterSpec] = &[
     },
     FilterSpec {
         key: 0x1933_8d8b_ba7f_4fbd_aa2d_ac85_c850_0a44,
-        name: "sbx_offline_block_connect_v6",
+        name: "insbx_offline_block_connect_v6",
         layer: Layer::ConnectV6,
         permit: false,
         weight: 1,
@@ -374,7 +374,7 @@ pub const FILTERS: &[FilterSpec] = &[
     },
     FilterSpec {
         key: 0x992a_71cd_6ae4_49d0_a019_245c_7fe3_cc39,
-        name: "sbx_offline_block_accept_v4",
+        name: "insbx_offline_block_accept_v4",
         layer: Layer::AcceptV4,
         permit: false,
         weight: 1,
@@ -382,7 +382,7 @@ pub const FILTERS: &[FilterSpec] = &[
     },
     FilterSpec {
         key: 0xf187_fa38_db37_4fd8_874d_6df8_c8ef_6b78,
-        name: "sbx_offline_block_accept_v6",
+        name: "insbx_offline_block_accept_v6",
         layer: Layer::AcceptV6,
         permit: false,
         weight: 1,
@@ -392,7 +392,7 @@ pub const FILTERS: &[FilterSpec] = &[
     // blocked at connect anyway.
     FilterSpec {
         key: 0x9124_0db3_5eea_4a0d_be98_364b_aa57_e626,
-        name: "sbx_offline_block_icmp_v4",
+        name: "insbx_offline_block_icmp_v4",
         layer: Layer::AssignV4,
         permit: false,
         weight: 1,
@@ -400,7 +400,7 @@ pub const FILTERS: &[FilterSpec] = &[
     },
     FilterSpec {
         key: 0xb436_7d8e_cbdc_4ded_8b82_d6e4_350b_daee,
-        name: "sbx_offline_block_icmp_v6",
+        name: "insbx_offline_block_icmp_v6",
         layer: Layer::AssignV6,
         permit: false,
         weight: 1,
@@ -408,7 +408,7 @@ pub const FILTERS: &[FilterSpec] = &[
     },
     FilterSpec {
         key: 0x4deb_7adf_bcc1_442f_aad6_b1b7_d307_a302,
-        name: "sbx_offline_permit_proxy_v4",
+        name: "insbx_offline_permit_proxy_v4",
         layer: Layer::ConnectV4,
         permit: true,
         weight: 15,
@@ -424,9 +424,9 @@ pub const FILTERS: &[FilterSpec] = &[
 /// The filter whose presence says the setup is in place.
 pub const MAIN_FILTER: &FilterSpec = &FILTERS[0];
 
-// ---- `sbx setup-windows`'s arguments. ----
+// ---- `insbx setup-windows`'s arguments. ----
 
-/// What `sbx setup-windows` was asked to do.
+/// What `insbx setup-windows` was asked to do.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SetupArgs {
     /// `--remove`: undo everything.
@@ -437,7 +437,7 @@ pub struct SetupArgs {
     pub proxy_ports: Option<(u16, u16)>,
 }
 
-/// Parse `sbx setup-windows`'s arguments.
+/// Parse `insbx setup-windows`'s arguments.
 ///
 /// # Errors
 /// For an unknown option, a missing value, or `--remove` with anything else.
@@ -463,7 +463,7 @@ pub fn parse_setup_args(args: &[String]) -> Result<SetupArgs, String> {
             }
             other => {
                 return Err(format!(
-                    "sbx setup-windows: unknown option `{other}` (--remove, --read <DIR>, \
+                    "insbx setup-windows: unknown option `{other}` (--remove, --read <DIR>, \
                      --proxy-ports <LO-HI>)"
                 ))
             }
@@ -471,7 +471,7 @@ pub fn parse_setup_args(args: &[String]) -> Result<SetupArgs, String> {
         i += 1;
     }
     if out.remove && (!out.reads.is_empty() || out.proxy_ports.is_some()) {
-        return Err("sbx setup-windows --remove takes no other option".to_string());
+        return Err("insbx setup-windows --remove takes no other option".to_string());
     }
     Ok(out)
 }
@@ -490,16 +490,16 @@ pub struct Ready {
 }
 
 /// How to get layer 2, for messages.
-pub const SETUP_HINT: &str = "run `sbx setup-windows` as administrator once (it creates the \
-     offline account sbx-offline and its firewall filters), or use WSL2 (SBX_BACKEND=wsl, or auto)";
+pub const SETUP_HINT: &str = "run `insbx setup-windows` as administrator once (it creates the \
+     offline account insbx-offline and its firewall filters), or use WSL2 (INSBX_BACKEND=wsl, or auto)";
 
 /// What native Windows enforces of the network policy, given whether the
 /// setup is in place (`Err` says why not).
 #[must_use]
 pub fn net_status(mode: NetMode, setup: &Result<Ready, String>) -> Status {
-    let reads = "the command runs as the local account sbx-offline and so reads only what that \
+    let reads = "the command runs as the local account insbx-offline and so reads only what that \
                  account may: system folders, the run's roots, current folder and temp \
-                 directory, and folders granted with `sbx setup-windows --read`";
+                 directory, and folders granted with `insbx setup-windows --read`";
     match (mode, setup) {
         (NetMode::Allow, _) => Status::NotRequested,
         (NetMode::Deny, Ok(_)) => Status::Enforced(format!(
@@ -571,7 +571,7 @@ mod tests {
     fn a_record_round_trips() {
         let r = record();
         let text = r.to_text();
-        assert!(text.starts_with("sbx-offline-record 1\n"), "{text}");
+        assert!(text.starts_with("insbx-offline-record 1\n"), "{text}");
         assert!(text.contains("password 0001abff\n"), "{text}");
         assert!(text.contains("proxy-ports 47600-47615\n"), "{text}");
         assert_eq!(Record::parse(&text), Ok(r));
@@ -594,7 +594,7 @@ mod tests {
             ("password 0001abff", "password xyz"),
             ("password 0001abff", "password abc"),
             ("proxy-ports 47600-47615", "proxy-ports 9-1"),
-            ("account sbx-offline", "account "),
+            ("account insbx-offline", "account "),
         ] {
             let bad = record().to_text().replace(from, to);
             assert!(Record::parse(&bad).is_err(), "{to}");
@@ -665,7 +665,7 @@ mod tests {
         names.dedup();
         assert_eq!(names.len(), FILTERS.len());
         for f in FILTERS {
-            assert!(f.name.starts_with("sbx_offline_"), "{}", f.name);
+            assert!(f.name.starts_with("insbx_offline_"), "{}", f.name);
             assert!(f.conditions.contains(&Cond::User), "{} is per-user", f.name);
             assert!(f.weight <= 15);
         }
@@ -728,11 +728,11 @@ mod tests {
         let ready = Ok(Ready {
             sid: "S-1-5-21-1-1009".into(),
             proxy_ports: (5000, 5003),
-            record: PathBuf::from(r"C:\ProgramData\sbx\offline.conf"),
+            record: PathBuf::from(r"C:\ProgramData\insbx\offline.conf"),
         });
         assert_eq!(net_status(NetMode::Allow, &ready), Status::NotRequested);
         assert!(
-            matches!(net_status(NetMode::Deny, &ready), Status::Enforced(s) if s.contains("sbx-offline") && s.contains("loopback"))
+            matches!(net_status(NetMode::Deny, &ready), Status::Enforced(s) if s.contains("insbx-offline") && s.contains("loopback"))
         );
         assert!(
             matches!(net_status(NetMode::Proxy, &ready), Status::Enforced(s) if s.contains("5000-5003"))
@@ -741,7 +741,7 @@ mod tests {
         for mode in [NetMode::Deny, NetMode::Proxy] {
             let st = net_status(mode, &missing);
             assert!(
-                matches!(&st, Status::NotEnforced(s) if s.contains("sbx setup-windows` as administrator") && s.contains("not set up")),
+                matches!(&st, Status::NotEnforced(s) if s.contains("insbx setup-windows` as administrator") && s.contains("not set up")),
                 "{st:?}"
             );
         }

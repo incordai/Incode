@@ -11,7 +11,7 @@
 //! # How a command is confined
 //!
 //! ```text
-//! parent (sbx, or your program)          helper (same binary, re-executed)
+//! parent (insbx, or your program)          helper (same binary, re-executed)
 //!   private temp dir                       setrlimit
 //!   allowlisting proxy (network=proxy)     Landlock restrict_self (Linux)
 //!   environment computed                   seccomp socket filter (Linux, network)
@@ -32,7 +32,7 @@
 //! |---|---|---|---|
 //! | Linux | Landlock (5.13+) | Landlock TCP (6.7+) + seccomp | setrlimit + wall |
 //! | macOS | Seatbelt | Seatbelt | setrlimit + wall |
-//! | Windows | write-restricted token + ACL grant (writes only; no `deny_read`) | after `sbx setup-windows`: an offline account WFP cuts off ([`windows::offline`]); else WSL2 (see [`backend`]) | job object + wall |
+//! | Windows | write-restricted token + ACL grant (writes only; no `deny_read`) | after `insbx setup-windows`: an offline account WFP cuts off ([`windows::offline`]); else WSL2 (see [`backend`]) | job object + wall |
 
 pub mod backend;
 pub mod env;
@@ -68,7 +68,7 @@ use serde::{Deserialize, Serialize};
 pub use policy::{FsMode, Inherit, Limits, NetMode, Policy};
 
 /// The first argument that turns the binary into the helper.
-pub const ENTER_ARG: &str = "__sbx-enter";
+pub const ENTER_ARG: &str = "__insbx-enter";
 
 /// Exit code for "the sandbox refused or failed", as `docker run` uses it.
 pub const EXIT_SANDBOX: i32 = 125;
@@ -176,7 +176,7 @@ pub(crate) struct InnerLaunch {
 /// The variable [`InnerLaunch`] travels in; removed before the command
 /// starts.
 #[cfg_attr(not(windows), allow(dead_code))]
-pub(crate) const INNER_ENV: &str = "SBX_INNER_LAUNCH";
+pub(crate) const INNER_ENV: &str = "INSBX_INNER_LAUNCH";
 /// The helper's argument that says its spec is in [`INNER_ENV`].
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) const INNER_ARG: &str = "@env";
@@ -351,7 +351,7 @@ impl Sandbox {
             None => std::env::current_exe().map_err(|e| format!("cannot name the helper: {e}"))?,
         };
         // Windows, network deny or proxy: the command runs as the offline
-        // account, when `sbx setup-windows` has made it (otherwise the gap
+        // account, when `insbx setup-windows` has made it (otherwise the gap
         // was refused above, or accepted with --best-effort).
         #[cfg(windows)]
         let mut offline = if self.policy.network.mode == NetMode::Allow {
@@ -493,7 +493,7 @@ impl Sandbox {
             Ok(lease) => Ok(Some(lease)),
             Err(e) if self.strict => Err(e),
             Err(e) => {
-                eprintln!("sbx: writes not confined and network not denied (best effort): {e}");
+                eprintln!("insbx: writes not confined and network not denied (best effort): {e}");
                 *offline = None;
                 Ok(None)
             }
@@ -789,7 +789,7 @@ extern "C" fn forward(sig: libc::c_int) {
 }
 
 /// Pass SIGINT, SIGTERM, SIGHUP and SIGQUIT on to the command's process
-/// group, so a caller that stops sbx stops what sbx started.
+/// group, so a caller that stops insbx stops what insbx started.
 fn forward_signals_to_group(pid: u32) {
     #[cfg(unix)]
     {
@@ -862,7 +862,7 @@ impl TempDir {
                 .map(|d| d.subsec_nanos())
                 .unwrap_or(0);
             let name = format!(
-                "sbx-{}-{}-{nanos:x}",
+                "insbx-{}-{}-{nanos:x}",
                 std::process::id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
             );
@@ -917,7 +917,7 @@ mod tests {
             sid: None,
             parent_pid: Some(7),
             offline: Offline::Launch,
-            offline_record: Some(PathBuf::from(r"C:\ProgramData\sbx\offline.conf")),
+            offline_record: Some(PathBuf::from(r"C:\ProgramData\insbx\offline.conf")),
         }
     }
 

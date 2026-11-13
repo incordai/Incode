@@ -91,10 +91,10 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $sbx = Join-Path $env:RUNNER_TEMP 'incode-bin\sbx.exe'
-          & $sbx check --net deny
+          $insbx = Join-Path $env:RUNNER_TEMP 'incode-bin\insbx.exe'
+          & $insbx check --net deny
           if ($LASTEXITCODE -ne 0) {
-            Write-Output "::error::after install.ps1, sbx check --net deny exited ${LASTEXITCODE}: the sandbox setup did not run"
+            Write-Output "::error::after install.ps1, insbx check --net deny exited ${LASTEXITCODE}: the sandbox setup did not run"
             exit 1
           }
       # Linux and macOS need no sandbox setup; install.sh checks what the
@@ -105,10 +105,10 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
-          sbx="$RUNNER_TEMP/incode-bin/sbx"
-          "$sbx" check --fs workspace-write --net deny
-          echo "sbx check exited $?"
-          "$sbx" doctor
+          insbx="$RUNNER_TEMP/incode-bin/insbx"
+          "$insbx" check --fs workspace-write --net deny
+          echo "insbx check exited $?"
+          "$insbx" doctor
           if ! grep -Eq 'incode-install: sandbox( ready|: incode works)' "$RUNNER_TEMP/install.log"; then
             echo "::error::install.sh did not report the sandbox's state"
             exit 1
@@ -132,7 +132,7 @@ jobs:
           set -euo pipefail
           bin="$RUNNER_TEMP/incode-bin"
           want="${TAG#v}"
-          for program in incode sbx; do
+          for program in incode insbx; do
             got="$("$bin/$program" --version)"
             echo "$program --version: $got"
             if [ "$got" != "$program $want" ]; then

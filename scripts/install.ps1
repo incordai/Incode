@@ -1,4 +1,4 @@
-# Install incode (and sbx, the standalone sandbox) on Windows from a GitHub
+# Install incode (and insbx, the standalone sandbox) on Windows from a GitHub
 # release.
 #
 #   irm https://raw.githubusercontent.com/incordai/incode/main/scripts/install.ps1 | iex
@@ -12,7 +12,7 @@
 # The archive is checked against the release's SHA256SUMS before anything is
 # unpacked; a mismatch, or no checksum for it, stops the install. The folder is
 # added to the user PATH (not the machine's), so installing needs no
-# elevation. The sandbox's network layer does: its one-time setup (`sbx
+# elevation. The sandbox's network layer does: its one-time setup (`insbx
 # setup-windows`: an offline account and firewall filters) is run at the end
 # through the Windows elevation prompt, so nobody has to run it by hand. It is
 # skipped when already done; declining the prompt leaves incode installed and
@@ -77,7 +77,7 @@ try {
     }
 
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-    foreach ($program in 'incode.exe', 'sbx.exe') {
+    foreach ($program in 'incode.exe', 'insbx.exe') {
         $from = Join-Path $unpacked $program
         if (-not (Test-Path $from)) { continue }
         $to = Join-Path $InstallDir $program
@@ -107,31 +107,31 @@ $installed = & (Join-Path $InstallDir 'incode.exe') --version
 Say "installed $installed to $InstallDir"
 
 # The sandbox's one-time machine setup, asked for here rather than left to
-# the user. `sbx check --net deny` exits 0 once network deny is enforced
+# the user. `insbx check --net deny` exits 0 once network deny is enforced
 # natively, that is, once the setup is in place.
-$sbx = Join-Path $InstallDir 'sbx.exe'
+$insbx = Join-Path $InstallDir 'insbx.exe'
 if ($env:INCODE_NO_SANDBOX_SETUP -eq '1') {
     Say 'sandbox setup skipped (INCODE_NO_SANDBOX_SETUP=1)'
-} elseif (Test-Path $sbx) {
-    & $sbx check --net deny --quiet 2>$null | Out-Null
+} elseif (Test-Path $insbx) {
+    & $insbx check --net deny --quiet 2>$null | Out-Null
     if ($LASTEXITCODE -eq 0) {
         Say 'sandbox already set up'
     } else {
         Say 'setting up the sandbox; Windows asks once for administrator rights'
         try {
-            $setup = Start-Process -FilePath $sbx -ArgumentList 'setup-windows' -Verb RunAs -Wait -PassThru
-            & $sbx check --net deny --quiet 2>$null | Out-Null
+            $setup = Start-Process -FilePath $insbx -ArgumentList 'setup-windows' -Verb RunAs -Wait -PassThru
+            & $insbx check --net deny --quiet 2>$null | Out-Null
             if ($LASTEXITCODE -eq 0) {
                 Say 'sandbox set up: commands can now be cut off the network natively'
             } else {
-                Say "sandbox setup did not complete (exit $($setup.ExitCode)); incode works, network deny under sbx is not available yet"
+                Say "sandbox setup did not complete (exit $($setup.ExitCode)); incode works, network deny under insbx is not available yet"
             }
         } catch {
-            Say "sandbox setup was not allowed ($($_.Exception.Message)); incode works, network deny under sbx is not available yet"
+            Say "sandbox setup was not allowed ($($_.Exception.Message)); incode works, network deny under insbx is not available yet"
         }
     }
 } else {
-    Say 'sandbox: this release has no sbx.exe, so commands run unconfined'
+    Say 'sandbox: this release has no insbx.exe, so commands run unconfined'
 }
 
 # `incode --install-tools` prints a line per tool on stdout and exits non-zero

@@ -1,4 +1,4 @@
-//! `sbx mcp` driven the way an agent drives it: over stdio, one JSON-RPC
+//! `insbx mcp` driven the way an agent drives it: over stdio, one JSON-RPC
 //! message per line. Create a sandbox, write a script, run it, read what it
 //! made, and try to get out.
 
@@ -18,13 +18,13 @@ struct Mcp {
 
 impl Mcp {
     fn start(args: &[&str]) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_sbx"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_insbx"))
             .arg("mcp")
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
-            .expect("sbx mcp starts");
+            .expect("insbx mcp starts");
         let stdin = child.stdin.take().expect("stdin");
         let stdout = BufReader::new(child.stdout.take().expect("stdout"));
         let mut m = Self {
@@ -34,7 +34,7 @@ impl Mcp {
             next: 0,
         };
         let init = m.request("initialize", json!({"protocolVersion": "2025-06-18"}));
-        assert_eq!(init["serverInfo"]["name"], "sbx");
+        assert_eq!(init["serverInfo"]["name"], "insbx");
         writeln!(
             m.stdin,
             "{}",
@@ -74,7 +74,7 @@ impl Mcp {
 }
 
 fn landlock() -> bool {
-    Command::new(env!("CARGO_BIN_EXE_sbx"))
+    Command::new(env!("CARGO_BIN_EXE_insbx"))
         .args(["check", "--fs", "workspace-write", "--net", "deny"])
         .output()
         .expect("check")
@@ -189,7 +189,7 @@ fn an_agent_writes_a_script_runs_it_and_reads_the_result() {
         .is_err());
 
     // The time limit stops the run and what it left in the background.
-    let tag = format!("sbx_mcp_bg_{}", std::process::id());
+    let tag = format!("insbx_mcp_bg_{}", std::process::id());
     let ran = m
         .call(
             "sandbox_run",

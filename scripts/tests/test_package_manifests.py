@@ -49,7 +49,7 @@ class Render(unittest.TestCase):
         )
         self.assertIn(f"InstallerSha256: {HASHES[pm.WINDOWS_X64].upper()}\n", installer)
         self.assertIn("PortableCommandAlias: incode\n", installer)
-        self.assertIn("PortableCommandAlias: sbx\n", installer)
+        self.assertIn("PortableCommandAlias: insbx\n", installer)
         for name in self.files:
             if name.startswith("winget/"):
                 self.assertIn("PackageVersion: 1.2.3\n", self.files[name], name)
@@ -59,7 +59,7 @@ class Render(unittest.TestCase):
         self.assertEqual(manifest["version"], "1.2.3")
         self.assertEqual(manifest["architecture"]["64bit"]["hash"], HASHES[pm.WINDOWS_X64])
         self.assertTrue(manifest["architecture"]["64bit"]["url"].endswith(pm.WINDOWS_X64))
-        self.assertEqual(manifest["bin"], ["incode.exe", "sbx.exe"])
+        self.assertEqual(manifest["bin"], ["incode.exe", "insbx.exe"])
 
     def test_homebrew_gives_each_platform_its_own_archive_and_hash(self) -> None:
         formula = self.files["homebrew/incode.rb"]
@@ -67,7 +67,7 @@ class Render(unittest.TestCase):
             block = f'url "{pm.url("v1.2.3", archive)}"\n      sha256 "{HASHES[archive]}"\n'
             self.assertIn(block, formula, archive)
         self.assertNotIn(pm.WINDOWS_X64, formula)
-        self.assertIn('bin.install "incode", "sbx"', formula)
+        self.assertIn('bin.install "incode", "insbx"', formula)
 
     def test_the_summary_fits_homebrews_rules(self) -> None:
         self.assertLess(len(pm.SUMMARY), 80)

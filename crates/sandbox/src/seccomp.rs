@@ -54,7 +54,7 @@
 //! On aarch64, 32-bit ARM is checked with its own numbers.
 //!
 //! Not covered: `socketpair` (it only makes connected local pairs), sockets
-//! and terminals passed in already open (`sbx` passes none but stdio; a
+//! and terminals passed in already open (`insbx` passes none but stdio; a
 //! terminal on stdio can still be written to and read from, which is what
 //! a terminal is for), and name lookups a local daemon does on the
 //! command's behalf over a Unix socket: with `nss-resolve`
