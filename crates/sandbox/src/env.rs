@@ -138,9 +138,30 @@ pub fn compute(
         .chain(policy.set.iter().map(|(k, v)| (k.as_str(), v.as_str())));
     for (name, value) in set {
         out.retain(|(n, _)| !n.to_string_lossy().eq_ignore_ascii_case(name));
-        out.push((name.into(), value.into()));
+        out.push((name.into(), home_expanded(value)));
     }
     out
+}
+
+/// A `set` value with a leading `~` as the home directory, as a policy's
+/// paths have it (`policy::absolute`, the same `HOME` then `USERPROFILE`):
+/// exactly `~`, or `~` then `/` or `\`. A ready-made policy can then point a
+/// tool's config at the user's own home (`CLAUDE_CONFIG_DIR = "~/.claude"`).
+/// Any other value, `~` inside it included, is kept as written.
+fn home_expanded(value: &str) -> OsString {
+    let rest = if value == "~" {
+        Some("")
+    } else {
+        value
+            .strip_prefix("~/")
+            .or_else(|| value.strip_prefix("~\\"))
+    };
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    match (rest, home) {
+        (Some(""), Some(home)) => home,
+        (Some(rest), Some(home)) => std::path::Path::new(&home).join(rest).into_os_string(),
+        _ => value.into(),
+    }
 }
 
 #[cfg(test)]
@@ -223,5 +244,23 @@ mod tests {
         );
         assert_eq!(names(&env), ["PATH", "https_proxy", "TMPDIR"]);
         assert_eq!(env.last().map(|(_, v)| v.clone()), Some("/policy".into()));
+    }
+
+    #[test]
+    fn a_set_value_starting_with_tilde_is_the_home_directory() {
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .expect("a home directory");
+        let home = std::path::PathBuf::from(home);
+        assert_eq!(home_expanded("~"), home.as_os_str());
+        assert_eq!(home_expanded("~/.claude"), home.join(".claude").as_os_str());
+        assert_eq!(
+            home_expanded("~\\.claude"),
+            home.join(".claude").as_os_str()
+        );
+        // Only a leading `~` followed by a separator (or alone) is home.
+        for kept in ["~user/x", "a~/b", "x=~/y", "~~", ""] {
+            assert_eq!(home_expanded(kept), OsString::from(kept), "{kept}");
+        }
     }
 }

@@ -1245,8 +1245,14 @@ It refuses a policy the machine cannot enforce in full instead of running
 with less. To confine a whole incode run:
 
 ```sh
-insbx run -w . -w ~/.claude -w ~/.claude.json -w ~/.incode --wall 1800 -- incode -t "…"
+insbx run -w . -w ~/.claude -w ~/.incode --set-env CLAUDE_CONFIG_DIR=~/.claude --wall 1800 -- incode -t "…"
 ```
+
+`CLAUDE_CONFIG_DIR` keeps Claude Code's `.claude.json` inside `~/.claude`:
+it saves that file by renaming a temp file into its folder, which would
+otherwise need your whole home folder writable. For Claude Code itself
+there is a ready-made policy,
+[`crates/sandbox/policies/claude-code.toml`](crates/sandbox/policies/claude-code.toml).
 
 Details, the policy format and what each OS enforces are in
 [`crates/sandbox/README.md`](crates/sandbox/README.md).

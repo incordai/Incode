@@ -368,8 +368,26 @@ impl Sandbox {
         } else {
             windows::setup::ready().as_ref().ok().cloned()
         };
+        // The program as the helper will find it (the parent's PATH, which
+        // the command's environment starts from), so the offline account
+        // may read it: see `windows::offline_reads`.
         #[cfg(windows)]
-        let lease = self.windows_lease(&roots, &temp, cwd, &helper, &mut offline)?;
+        let program_path = program.as_ref().to_str().and_then(|p| {
+            let path = std::env::var("PATH").ok();
+            let pathext = std::env::var("PATHEXT").ok();
+            let exists = |c: &str| cwd.join(c).is_file();
+            windows::resolve_program(p, path.as_deref(), pathext.as_deref(), &exists)
+                .map(|found| cwd.join(found))
+        });
+        #[cfg(windows)]
+        let lease = self.windows_lease(
+            &roots,
+            &temp,
+            cwd,
+            &helper,
+            program_path.as_deref(),
+            &mut offline,
+        )?;
         // As the offline account, the command may only reach the loopback
         // ports the setup's filter permits: the proxy listens on one.
         #[cfg(windows)]
@@ -471,6 +489,7 @@ impl Sandbox {
         temp: &TempDir,
         cwd: &Path,
         helper: &Path,
+        program: Option<&Path>,
         offline: &mut Option<windows::offline::Ready>,
     ) -> Result<Option<windows::acl::Lease>, String> {
         if self.policy.fs.mode == FsMode::Off && offline.is_none() {
@@ -488,7 +507,12 @@ impl Sandbox {
         let mut granted = grant.clone();
         granted.push(temp.path.clone());
         let account = offline.as_ref().map(|ready| {
-            let reads = windows::offline_reads(&granted, &real(cwd), &real(helper));
+            let reads = windows::offline_reads(
+                &granted,
+                &real(cwd),
+                &real(helper),
+                program.map(real).as_deref(),
+            );
             windows::acl::OfflineGrant {
                 user: ready.sid.clone(),
                 // PowerShell lists the current folder's parent to start in

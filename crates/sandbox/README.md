@@ -12,8 +12,9 @@ instead of running with less.
 # Write only in this project; network only to the package registry; 30 minutes.
 insbx run -w . --allow-host crates.io --allow-host '*.crates.io' --wall 1800 -- cargo build
 
-# An agent CLI confined to its workspace, with a folder it must not see.
-insbx run -w . -w ~/.claude -w ~/.claude.json --deny-read ../private-checks -- claude -p "fix the failing test"
+# Claude Code confined to its workspace and ~/.claude, network to the API only,
+# with a folder it must not see (the ready-made policy: policies/claude-code.toml).
+insbx run --policy policies/claude-code.toml --deny-read ../private-checks -- claude -p "fix the failing test"
 
 # What would this machine enforce?
 insbx doctor

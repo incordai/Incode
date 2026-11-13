@@ -374,6 +374,28 @@ fn absolute(path: &Path, cwd: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
+    /// The ready-made Claude Code policy (`policies/claude-code.toml`, #40)
+    /// parses and says what it was measured to need.
+    #[test]
+    fn the_claude_code_policy_parses_and_allows_only_the_api() {
+        let p = Policy::from_toml(include_str!("../policies/claude-code.toml")).expect("parses");
+        assert_eq!(p.fs.mode, FsMode::WorkspaceWrite);
+        assert_eq!(p.fs.write, [PathBuf::from("."), PathBuf::from("~/.claude")]);
+        assert_eq!(p.network.mode, NetMode::Proxy);
+        assert_eq!(p.network.allow, ["api.anthropic.com"]);
+        assert_eq!(
+            p.env.set.get("CLAUDE_CONFIG_DIR").map(String::as_str),
+            Some("~/.claude")
+        );
+        assert_eq!(
+            p.env
+                .set
+                .get("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC")
+                .map(String::as_str),
+            Some("1")
+        );
+    }
+
     #[test]
     fn the_documented_example_parses() {
         let doc = include_str!("policy.rs")

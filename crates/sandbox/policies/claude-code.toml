@@ -1,0 +1,42 @@
+# Claude Code under insbx (issue #40).
+#
+#   insbx run --policy claude-code.toml -- claude -p "fix the failing test"
+#
+# Measured on Windows 11 with Claude Code 2.1.323, network proxy, native:
+# `claude -p` answered with api.anthropic.com as the only allowed host.
+#
+# What each line is for:
+# - Writes: the project, and ~/.claude, where Claude Code keeps its
+#   credentials, settings and sessions. Not ~/.claude.json: Claude Code saves
+#   that file by writing a temp file beside it in your home folder and
+#   renaming it in, so it would need the whole home folder writable.
+#   CLAUDE_CONFIG_DIR below moves it into ~/.claude instead.
+# - CLAUDE_CONFIG_DIR: the sandboxed Claude keeps its own .claude.json
+#   (onboarding, per-project trust, user-scope MCP servers) in ~/.claude.
+#   A user-scope MCP server you added outside the sandbox must be added once
+#   more under it, or put in the project's .mcp.json.
+# - CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: no telemetry or error
+#   reporting. Without it Claude Code also calls a logging host, and the
+#   blocked calls slowed a one-line answer from 22 s to 59 s.
+# - Network: the API only. Every MCP server of yours that runs over HTTP is
+#   refused until its host is added below; each refused one also slows the
+#   start. mcp-proxy.anthropic.com is the claude.ai connectors' host.
+#
+# On Windows natively: network proxy runs the command as the insbx-offline
+# account (`insbx setup-windows`, as administrator, once). insbx lets that
+# account read the program it is asked to run, so claude.exe under your
+# profile starts without a `--read` grant. Claude Code's Bash tool (Git
+# Bash) does not start under the sandbox yet: issue #38.
+
+[fs]
+mode = "workspace-write"
+write = [".", "~/.claude"]
+
+[network]
+mode = "proxy"
+allow = ["api.anthropic.com"]
+# Your HTTP MCP servers' hosts, if Claude Code should reach them:
+# allow = ["api.anthropic.com", "mcp-proxy.anthropic.com", "api.githubcopilot.com"]
+
+[env]
+set = { CLAUDE_CONFIG_DIR = "~/.claude", CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1" }
