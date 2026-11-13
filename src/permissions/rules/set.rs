@@ -3,8 +3,6 @@
 
 use std::path::Path;
 
-use serde::Deserialize;
-
 use super::rule::{Rule, Spec};
 use super::split::{split_command, Segment};
 use super::{Effect, Layer, PathContext, RuleLists, Subject, Verdict, PROJECT_SETTINGS};
@@ -58,7 +56,7 @@ impl PermissionRules {
         match read_project(workspace) {
             Ok(Some(lists)) => rules.add(&lists, Layer::Project, home.as_deref()),
             Ok(None) => {}
-            Err(why) => rules.warnings.push(why),
+            Err(why) => rules.refuse_for_project(&why),
         }
         rules
     }
@@ -109,6 +107,28 @@ impl PermissionRules {
                 layer: Layer::Managed,
             });
         }
+    }
+
+    /// The project's settings file is there and cannot be used: fail closed,
+    /// as for a broken managed file. A deny rule in a file incode cannot read
+    /// (a top-level `"deny"` instead of `"permissions": {"deny": ...}`, a typo,
+    /// bad JSON) was silently dropped before, and the call it was written to
+    /// stop ran (measured: issue #19's own steps wrote `secret.txt`). The
+    /// reason travels in the catch-all's text, so the refusal every call gets
+    /// says what to fix, on a `-t` run too, not only under `/permissions`.
+    ///
+    /// Called by [`PermissionRules::load`] when `read_project` fails.
+    fn refuse_for_project(&mut self, why: &str) {
+        let warning =
+            format!("{why}; every tool call is refused until {PROJECT_SETTINGS} is fixed");
+        if let Ok(mut rule) = Rule::parse("*", None) {
+            rule.text = format!("*: {warning}");
+            self.deny.push(Sourced {
+                rule,
+                layer: Layer::Project,
+            });
+        }
+        self.warnings.push(warning);
     }
 
     #[must_use]
@@ -311,12 +331,14 @@ fn host_matches(url: &str, domain: &str) -> bool {
 
 /// The project's lists, from [`PROJECT_SETTINGS`]. `None` when there is no
 /// file, or no `permissions` in it.
+///
+/// # Errors
+/// When the file cannot be read, is not JSON, or holds a key incode does not
+/// know, at the top or inside `permissions`: such a key is most often a rule
+/// list in the wrong place (`{"deny": [...]}`), and ignoring it would drop the
+/// rule while the run goes on ([`PermissionRules::refuse_for_project`]).
 fn read_project(workspace: &Path) -> Result<Option<RuleLists>, String> {
-    #[derive(Deserialize)]
-    struct ProjectSettings {
-        #[serde(default)]
-        permissions: Option<RuleLists>,
-    }
+    const RIGHT_SHAPE: &str = r#"{"permissions": {"deny": [...], "ask": [...]}}"#;
     let path = workspace.join(PROJECT_SETTINGS);
     let text = match crate::text::read_authored(&path) {
         Ok(text) => text,
@@ -326,7 +348,45 @@ fn read_project(workspace: &Path) -> Result<Option<RuleLists>, String> {
     if text.trim().is_empty() {
         return Ok(None);
     }
-    serde_json::from_str::<ProjectSettings>(&text)
-        .map(|s| s.permissions)
-        .map_err(|e| format!("{} is not valid settings: {e}", path.display()))
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| format!("{} is not valid JSON: {e}", path.display()))?;
+    let unknown = |object: &serde_json::Map<String, serde_json::Value>, known: &[&str]| {
+        object
+            .keys()
+            .filter(|k| !known.contains(&k.as_str()))
+            .map(|k| format!("`{k}`"))
+            .collect::<Vec<_>>()
+    };
+    let Some(top) = value.as_object() else {
+        return Err(format!(
+            "{} must be a JSON object such as {RIGHT_SHAPE}",
+            path.display()
+        ));
+    };
+    let stray = unknown(top, &["permissions"]);
+    if !stray.is_empty() {
+        return Err(format!(
+            "{} has {} at the top level, which incode does not read (rules go under \
+             `permissions`: {RIGHT_SHAPE})",
+            path.display(),
+            stray.join(", ")
+        ));
+    }
+    let Some(permissions) = top.get("permissions") else {
+        return Ok(None);
+    };
+    if let Some(lists) = permissions.as_object() {
+        let stray = unknown(lists, &["deny", "ask", "allow"]);
+        if !stray.is_empty() {
+            return Err(format!(
+                "{}: `permissions` has {}, which incode does not read (it reads `deny`, `ask` \
+                 and `allow`)",
+                path.display(),
+                stray.join(", ")
+            ));
+        }
+    }
+    serde_json::from_value::<RuleLists>(permissions.clone())
+        .map(Some)
+        .map_err(|e| format!("{}: `permissions` is not valid: {e}", path.display()))
 }
