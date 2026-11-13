@@ -155,7 +155,13 @@ fn unzip(file: std::fs::File, into: &Path, budget: &mut Budget) -> Result<(), St
         let mut entry = archive
             .by_index(index)
             .map_err(|e| format!("entry {index} could not be read: {e}"))?;
-        let name = entry.name().to_string();
+        // zip 9 refuses a name it cannot decode instead of guessing one; so
+        // does this, since a name read two ways is how an archive hides a
+        // path (the parser-differential advisory that moved us off zip 8).
+        let name = entry
+            .name()
+            .map_err(|e| format!("entry {index} has a name that cannot be read: {e}"))?
+            .to_string();
         // Both rules: ours, and the crate's own.
         let to = destination(into, &name)?;
         if entry.enclosed_name().is_none() {

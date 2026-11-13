@@ -358,8 +358,15 @@ impl<'a> Archive<'a> {
         Ok(())
     }
 
+    /// The entries' names. A name zip 9 cannot decode is left out: callers
+    /// look for known parts (`word/document.xml`, `ppt/slides/...`), and a
+    /// garbled name is none of them.
     fn names(&self) -> Vec<String> {
-        self.zip.file_names().map(str::to_string).collect()
+        self.zip
+            .file_names()
+            .filter_map(Result::ok)
+            .map(|n| n.to_string())
+            .collect()
     }
 }
 
