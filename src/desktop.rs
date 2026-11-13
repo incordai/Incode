@@ -329,11 +329,27 @@ mod tests {
     /// **The crate's tier and incode's policy must say the same thing.** The
     /// server now runs the tier; `PermissionPolicy::for_desktop` stays as incode's
     /// statement of the same table, and this is what keeps the two from
-    /// drifting: every mode, every one of the 16 tools, the same verdict and the
+    /// drifting: every mode, every one of the 17 tools, the same verdict and the
     /// same words in a refusal.
     #[test]
     fn the_crates_tier_agrees_with_the_desktop_permission_policy() {
         use crate::permissions::{PermissionOutcome, PermissionPolicy};
+        // The tables walked below are the tools the server offers: one added
+        // to the server and to neither table would be compared with nothing.
+        let offered: Vec<String> = incord_desktop::mcp::tool_definitions()
+            .iter()
+            .filter_map(|t| t["name"].as_str().map(str::to_string))
+            .collect();
+        assert_eq!(offered.len(), 17, "{offered:?}");
+        for name in &offered {
+            assert!(
+                permission::OBSERVING.contains(&name.as_str())
+                    || permission::ACTING.contains(&name.as_str()),
+                "{name} is offered by the desktop server but has no tier"
+            );
+        }
+        // `wait_for` only looks: a read-only session may use it.
+        assert!(permission::OBSERVING.contains(&"wait_for"));
         let modes = [
             PermissionMode::ReadOnly,
             PermissionMode::WorkspaceWrite,

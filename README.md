@@ -850,7 +850,7 @@ anything runs.
 | `Screenshot` | observe | A picture of a public page or a workspace HTML/SVG file. Offered only when the headless browser is found. |
 | `RenderPdf` | change | A public page or a workspace HTML/SVG file printed to PDF. Offered only when a printer is found (below). |
 | `ConvertDocument` | change | An office document to PDF through LibreOffice. Offered only when LibreOffice is found. |
-| `screen_info` · `list_windows` · `screenshot` · `ui_tree` · `cursor_position` | observe | Look at the desktop. Offered only when `INCODE_DESKTOP=1` — see [Computer use](#computer-use). |
+| `screen_info` · `list_windows` · `screenshot` · `ui_tree` · `cursor_position` · `wait_for` | observe | Look at the desktop, or wait (bounded) for a control, a window or a change of the screen. Offered only when `INCODE_DESKTOP=1` — see [Computer use](#computer-use). |
 | `click_element` · `set_value` · `element_action` · `focus_window` · `type_text` · `paste_text` · `key` · `scroll` · `drag` · `move_mouse` · `click` | run | Act on the desktop. Same condition; refused in read-only. |
 | `Skill` | observe | Read one skill's text from the shared store. |
 | `Agent` | run | Hand a self-contained task to a sub-agent (a second headless run of the session's CLI, or the API route), with the session's mode, guards and cancel; at most 2 levels deep. Takes `agent: <name>` for a [user-defined sub-agent](#user-defined-sub-agents). |
@@ -1075,12 +1075,13 @@ plain screenshots and pixel clicks still work.
 |---|---|
 | `screen_info` | Displays, their sizes and scale, and on macOS any missing grant. |
 | `list_windows` | The open windows: `id`, title, app, pid, focused, rectangle, and `tree` (false when the window exposes no accessibility tree). A blocked app's window is listed without its title. |
-| `ui_tree` | One window's controls as `[e<id>] Role "name" (x,y,w×h)`, with `password` on secret fields. `window` picks the window (default: the focused one); `depth` limits the walk. Controls at no place on screen are counted on one line, not listed. A window with no tree is refused with a pointer to `screenshot` and `click`. |
+| `ui_tree` | One window's controls as `[e<id>] Role "name" (x,y,w×h)  sel: <selector>`, with `password` on secret fields; `sel:` names the control without its id (see [Selectors](#selectors-and-wait_for)). `window` picks the window (default: the focused one); `depth` limits the walk. Controls at no place on screen are counted on one line, not listed. A window with no tree is refused with a pointer to `screenshot` and `click`. |
 | `screenshot` | The primary display, or one `window`. The reply carries the region and origin, so a point in the picture maps back to the screen. |
 | `cursor_position` | Where the pointer is. |
-| `click_element` | Click a control by id, at its centre as it is *now*. |
-| `set_value` | Set a text field's value through the accessibility interface: no typing, no focus, no clipboard. Read back and marked `(verified)`, or `(unverified: why)`. A password field is never read back. |
-| `element_action` | Run one of a control's own actions without the mouse: `press`, `toggle`, `expand`, `collapse`, `select` and `focus` everywhere, plus what the platform adds (`scroll_into_view` on Windows; `show_menu`, `increment`, `decrement`, `confirm`, `cancel` on macOS). An action the control lacks is refused, and the refusal lists the ones it offers. |
+| `wait_for` | Wait, bounded, until a control matching a `selector` appears or goes, a window appears or closes, or the screen changes. Returns what it found, or a `timeout` reply with what it last saw. |
+| `click_element` | Click a control by id or `selector`, at its centre as it is *now*. |
+| `set_value` | Set a text field's value (by id or `selector`) through the accessibility interface: no typing, no focus, no clipboard. Read back and marked `(verified)`, or `(unverified: why)`. A password field is never read back. |
+| `element_action` | Run one of a control's own actions (by id or `selector`) without the mouse: `press`, `toggle`, `expand`, `collapse`, `select` and `focus` everywhere, plus what the platform adds (`scroll_into_view` on Windows; `show_menu`, `increment`, `decrement`, `confirm`, `cancel` on macOS). An action the control lacks is refused, and the refusal lists the ones it offers. |
 | `focus_window` | Bring a window to the front so typing reaches it. |
 | `type_text` · `key` · `paste_text` | Keystrokes, a chord (`["cmdorctrl","s"]`: Cmd on macOS, Ctrl elsewhere), or a paste. `paste_text` puts the old clipboard back after `paste_restore_delay_ms`, and refuses to paste at all when the clipboard cannot be read. |
 | `scroll` | Wheel steps (`dy` down, `dx` right) over a control by `id`, or under the pointer. |
@@ -1090,6 +1091,33 @@ plain screenshots and pixel clicks still work.
 Every acting tool also takes `window`; typing into a window that is not the
 focused one is refused rather than sent elsewhere. It also takes
 `screenshot_after`, which returns a picture once the screen has settled.
+
+### Selectors and `wait_for`
+
+An `eN` id is a position in one `ui_tree` result. A **selector** names a
+control by what it is, and is resolved against the live tree when the call is
+made, so it still means something in the next call, and after the program has
+been restarted. `ui_tree` prints one beside every element (`sel: …`) and the
+window part once at the top; `click_element`, `set_value`, `element_action`
+and `wait_for` take it as `selector` in place of `id`. It must match exactly one
+control: none, or several, is an error that says which, never a guess.
+
+```
+role=button;name=Save                      one control of the focused window
+role=edit;aid=searchBox                    by the program's own automation id
+role=button;name=Save;nth=1                the second of two look-alikes
+app=notepad;window~=Save As;role=button;name=Save    in another window
+```
+
+Keys: `app`, `window` / `window~` (exact / contains), `role`, `name` / `name~`,
+`aid` (UIA `AutomationId`, AX `AXIdentifier`, AT-SPI `AccessibleId`), `path`
+(child indices, `0.2.1`), `nth`. `;` and `\` in a value are written `\;` and
+`\\`. `wait_for` takes `condition` (`element_appears`, `element_gone`,
+`window_appears`, `window_gone`, `screen_changes`), a `selector` (window
+conditions take only `app`/`window`), `timeout_ms` (default 5000, held to
+60000) and `poll_ms` (250, 50–2000), and answers JSON whose `result` is `found`
+or `timeout`. The full grammar and what each platform supplies is in
+`docs/COMPUTER_USE.md`.
 
 ### What it will not do
 

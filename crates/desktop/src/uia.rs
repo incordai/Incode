@@ -25,7 +25,13 @@
 use serde::{Deserialize, Serialize};
 
 use super::coords::PhysicalPoint;
+use super::selector::{selectors_for, Selector, Text};
 use super::{DesktopError, Rect};
+
+/// Whether the platform names a text field by its content, so a selector must
+/// not use a field's name to find it: macOS (`describe` falls back to
+/// `AXValue`), where the name changes as the field is typed into.
+pub(crate) const NAMES_ARE_VALUES: bool = cfg!(target_os = "macos");
 
 /// How deep to walk by default.
 ///
@@ -119,6 +125,13 @@ pub struct Element {
     /// and the agent knows what it would be typing into.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub secret: bool,
+    /// The program's own name for the control, where the toolkit has one: UIA
+    /// `AutomationId`, AX `AXIdentifier`, AT-SPI `AccessibleId`. Empty when it
+    /// has none (most controls of most programs). Unlike `name` it does not
+    /// change with the language or the content, so a selector prefers it
+    /// (`selector.rs`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub automation_id: String,
 }
 
 impl Element {
@@ -222,15 +235,30 @@ impl Tree {
             out.push_str(&format!(" [window {}, app {}]", self.window, self.app));
         }
         out.push('\n');
+        if !self.window.is_empty() {
+            // The window part of a selector, once: each element's own part
+            // follows it as `sel:`. Together they name a control without
+            // an eN id, which holds only for this one tree.
+            let window_part = Selector {
+                app: Some(self.app.clone()).filter(|a| !a.is_empty()),
+                window: Some(Text::Exact(self.root_name.clone())),
+                ..Selector::default()
+            };
+            out.push_str(&format!(
+                "Selector window part: {} (control selectors: see `sel:`; `;` joins them)\n",
+                window_part.render_window_part()
+            ));
+        }
         if let Some(why) = &self.no_positions {
             out.push_str(&format!(
                 "NOTE: {why} Positions below are not real: use set_value and element_action \
                  by id; click_element, scroll and drag by id are refused.\n"
             ));
         }
-        for e in &self.elements {
+        let selectors = selectors_for(&self.elements, NAMES_ARE_VALUES);
+        for (e, selector) in self.elements.iter().zip(&selectors) {
             out.push_str(&format!(
-                "{:indent$}[e{}] {:<10} \"{}\" ({},{},{}x{}){}{}{}\n",
+                "{:indent$}[e{}] {:<10} \"{}\" ({},{},{}x{})  sel: {}{}{}{}\n",
                 "",
                 e.id,
                 format!("{:?}", e.role),
@@ -239,6 +267,9 @@ impl Tree {
                 e.rect.y,
                 e.rect.width,
                 e.rect.height,
+                // Before the flags, so a line still ends with `disabled`,
+                // `password` or `off-screen` when it has one.
+                selector.render_element_part(),
                 if e.enabled { "" } else { "  disabled" },
                 if e.secret { "  password" } else { "" },
                 if e.beyond_screens(screens) {
@@ -580,6 +611,10 @@ pub fn focus_window(window: &str) -> Result<Done, DesktopError> {
     platform::focus_window(window)
 }
 
+// Acting on a control by selector instead of by id: `resolve.rs`.
+mod resolve;
+pub use resolve::{act_on, resolve, resolve_in, set_value_on, tree_now, window_for, Resolved};
+
 #[cfg(windows)]
 #[path = "uia_windows.rs"]
 mod platform;
@@ -772,6 +807,7 @@ mod tests {
             rect,
             enabled: true,
             secret: false,
+            automation_id: String::new(),
         }
     }
 
@@ -799,6 +835,7 @@ mod tests {
             },
             enabled: true,
             secret: false,
+            automation_id: String::new(),
         }
     }
 

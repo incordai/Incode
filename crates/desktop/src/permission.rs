@@ -12,14 +12,14 @@
 //!
 //! Until the desktop became a crate of its own this was incode's
 //! `PermissionPolicy::for_desktop(PermissionMode)`. The crate cannot depend on
-//! incode, so the tier is restated here as the two rungs the 16 tools actually
+//! incode, so the tier is restated here as the two rungs the 17 tools actually
 //! use, and [`Tier::from_mode_word`] reads incode's own mode words so the argv
 //! incode has always passed (`-p read-only`) keeps meaning the same thing:
 //!
 //! | mode word | tier | reaches |
 //! |---|---|---|
-//! | `read-only` | [`Tier::Observe`] | the 5 observing tools |
-//! | `workspace-write` (the default), `danger-full-access`, `allow` | [`Tier::Act`] | all 16 |
+//! | `read-only` | [`Tier::Observe`] | the 6 observing tools |
+//! | `workspace-write` (the default), `danger-full-access`, `allow` | [`Tier::Act`] | all 17 |
 //! | `prompt` | [`Tier::Deny`] | nothing |
 //!
 //! `prompt` denies everything, and that is correct rather than unfortunate:
@@ -44,6 +44,9 @@ pub const OBSERVING: &[&str] = &[
     "screenshot",
     "ui_tree",
     "list_windows",
+    // Waits and looks: it polls the tree, the window list and the screen and
+    // changes nothing, so it is held to the same tier as the tools it is made of.
+    "wait_for",
 ];
 
 /// The tools that change the state of a machine the operator is signed into, and
@@ -157,14 +160,14 @@ mod tests {
 
     /// The tier table must be the server's tool list, or a tool is either
     /// ungoverned or unreachable. Checked against what `tools/list` offers, so a
-    /// seventeenth tool cannot be added without deciding its tier.
+    /// eighteenth tool cannot be added without deciding its tier.
     #[test]
-    fn every_listed_tool_has_a_tier_and_there_are_sixteen() {
+    fn every_listed_tool_has_a_tier_and_there_are_seventeen() {
         let listed: Vec<String> = crate::mcp::tool_definitions()
             .iter()
             .map(|t| t["name"].as_str().unwrap_or_default().to_string())
             .collect();
-        assert_eq!(listed.len(), 16, "{listed:?}");
+        assert_eq!(listed.len(), 17, "{listed:?}");
         for name in &listed {
             assert!(
                 OBSERVING.contains(&name.as_str()) ^ ACTING.contains(&name.as_str()),

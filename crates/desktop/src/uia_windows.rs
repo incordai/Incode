@@ -91,6 +91,10 @@ fn describe(element: &UIElement, id: u32, depth: u32) -> Element {
         rect: rect_of(element),
         enabled: element.is_enabled().unwrap_or(false),
         secret: element.is_password().unwrap_or(false),
+        // UIA's AutomationId: the program's own name for the control, empty
+        // for most. Read for a password field too: it names the control, it
+        // is not the content.
+        automation_id: element.get_automation_id().unwrap_or_default(),
     }
 }
 

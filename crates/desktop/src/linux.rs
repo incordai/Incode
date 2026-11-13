@@ -486,7 +486,26 @@ fn describe(bus: &Connection, node: &Node, id: u32, depth: u32) -> Element {
         rect,
         enabled: is_enabled(&states(bus, node)),
         secret: role_name == "password text",
+        automation_id: accessible_id(bus, node),
     }
+}
+
+/// The object's `AccessibleId` property (AT-SPI 2.46 and later; GTK 4 and Qt
+/// fill it from the widget's id), empty when the toolkit has none or the
+/// registry is older. UNVERIFIED against a live bus: this reads the property
+/// the same way [`name`] reads `Name`, and an error is the empty answer.
+fn accessible_id(bus: &Connection, node: &Node) -> String {
+    bus.call_method(
+        Some(node.0.as_str()),
+        node.1.as_str(),
+        Some("org.freedesktop.DBus.Properties"),
+        "Get",
+        &(ACCESSIBLE, "AccessibleId"),
+    )
+    .and_then(|reply| reply.body().deserialize::<OwnedValue>())
+    .ok()
+    .and_then(|value| String::try_from(value).ok())
+    .unwrap_or_default()
 }
 
 fn extents(bus: &Connection, node: &Node) -> Rect {
@@ -1511,6 +1530,7 @@ mod tests {
             },
             enabled: true,
             secret: false,
+            automation_id: String::new(),
         }
     }
 

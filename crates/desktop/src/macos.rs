@@ -375,6 +375,10 @@ fn describe(element: &Owned, id: u32, depth: u32) -> Element {
         // that says it is disabled is marked so.
         enabled: bool_attribute(element, "AXEnabled").unwrap_or(true),
         secret,
+        // AXIdentifier: the program's own name for the control (a Cocoa
+        // accessibilityIdentifier). Few controls set one; it names the
+        // control, it is not its content.
+        automation_id: text_attribute(element, "AXIdentifier").unwrap_or_default(),
     }
 }
 

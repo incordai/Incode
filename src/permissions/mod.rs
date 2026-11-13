@@ -196,7 +196,7 @@ impl PermissionPolicy {
         self
     }
 
-    /// The requirements for the sixteen tools of the desktop MCP server: five
+    /// The requirements for the seventeen tools of the desktop MCP server: six
     /// that observe and eleven that move something.
     ///
     /// The server is the `incord-desktop` crate now, and it runs its own
@@ -220,7 +220,7 @@ impl PermissionPolicy {
     ///
     /// # The split, and why it is only two rungs
     ///
-    /// The five observing tools need `ReadOnly`; the eleven that move something
+    /// The six observing tools need `ReadOnly`; the eleven that move something
     /// need `WorkspaceWrite`. Not `DangerFullAccess`, even though a click
     /// reaches far outside any workspace — because `workspace-write` is the
     /// default mode, and putting the desktop above it would mean the feature
@@ -245,6 +245,9 @@ impl PermissionPolicy {
             .with_tool_requirement("screenshot", PermissionMode::ReadOnly)
             .with_tool_requirement("ui_tree", PermissionMode::ReadOnly)
             .with_tool_requirement("list_windows", PermissionMode::ReadOnly)
+            // Waits for a control, a window or a change of the screen: it
+            // looks and changes nothing.
+            .with_tool_requirement("wait_for", PermissionMode::ReadOnly)
             // Acting. Each one changes the state of a machine the operator is
             // signed into.
             .with_tool_requirement("move_mouse", PermissionMode::WorkspaceWrite)

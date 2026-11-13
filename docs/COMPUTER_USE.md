@@ -2,7 +2,7 @@
 
 > **Status note, 2026-09-26.** The first line below is out of date. The Windows desktop
 > (now the `incord-desktop` crate, `crates/desktop`, binary `incu`; it was `src/desktop/`)
-> is built, and its sixteen tools (five that observe, eleven that act) are Toolbox tools
+> is built, and its seventeen tools (six that observe, eleven that act) are Toolbox tools
 > behind incode's gate, executed by `incode --desktop-mcp`, which is a thin wrapper over
 > `incu serve` (`ARCHITECTURE.md` §5b, "The desktop").
 > macOS (Phase C) is built (2026-10-01, `src/desktop/macos.rs`): monitors and capture
@@ -29,6 +29,10 @@
 > drag by element, password managers blocked (`desktop_limits.blocked_apps` adds more).
 > An element id is acted on only while the control the last `ui_tree` showed there is
 > still there; clicks and captures never land inside a blocked window's rectangle.
+>
+> **Third round, 2026-11-13: `wait_for` and stable selectors** (phase 2 of the
+> computer-use plan; the first two things a flow run later without a model needs). Both are
+> described under "Waiting and selectors" below.
 >
 > **The invariant in 4c, as built:** one coordinate space at the tool surface — physical
 > pixels on Windows and X11, **points** on macOS (the space CGEvent and AXUIElement both
@@ -206,7 +210,7 @@ Tools the MCP server exposes. Names are what the delegated agent sees.
 | `paste_text` | `text` | Sets the clipboard, sends Ctrl+V, restores the prior clipboard. **Strongly preferred over `type_text` for anything long or non-ASCII.** |
 | `key` | `keys: ["ctrl","c"]` | Chord. Presses in order, releases in reverse. |
 | `key_down` / `key_up` | `key` | For held modifiers spanning several actions. |
-| `wait_for_change` | `timeout_ms`, `region?` | Polls a hash of the region. Replaces blind sleeps. |
+| `wait_for_change` | `timeout_ms`, `region?` | Polls a hash of the region. Replaces blind sleeps. **Built as `wait_for` `screen_changes`, with more conditions: see "Waiting and selectors".** |
 
 ### Why `key` takes an array
 
@@ -248,6 +252,87 @@ and `Key` arms — is the difference between a session that runs for an hour and
 exhausts its context in ten actions. See section 8.
 
 ---
+
+### Waiting and selectors (built 2026-11-13, phase 2 of the computer-use plan)
+
+Why these two: a flow that is replayed later with no model (`.claude/temp/computer-use-plan.md`
+section 4) cannot use `screenshot_after`'s fixed sleep, and cannot use an `eN` id, which is
+a position in one `ui_tree` result. It needs to wait for a state, and to name a control by
+what it is. Replay itself is later; these are its two prerequisites, and each is useful to a
+live agent now.
+
+**Selectors.** `ui_tree` prints, beside every element, `sel: <control part>`, and once at the
+top `Selector window part: app=…;window=…`. `click_element`, `set_value`, `element_action`
+and `wait_for` take `selector` in place of `id` (both is refused). The selector is resolved
+against a fresh walk of the window **when the call is made**, and must match exactly one
+control. None, or several, is an error that says which (and lists a few look-alikes with the
+selector that would pick each). Nothing is ever taken to be the first or the nearest. `eN`
+ids work exactly as before.
+
+| key | meaning |
+|---|---|
+| `app` | the owning program, exact, case-insensitive, a trailing `.exe` ignored |
+| `window` / `window~` | window title: exact / contains (ignoring case) |
+| `role` | `button`, `edit`, `text`, `list`, `listitem`, `checkbox`, `radiobutton`, `combobox`, `menu`, `menuitem`, `tab`, `tabitem`, `link`, `image`, `window`, `pane`, `tree`, `treeitem`, `table`, `slider`, `group`, `other` |
+| `name` / `name~` | the control's name: exact / contains (ignoring case) |
+| `aid` | the program's own id for the control, exact |
+| `path` | child indices from the window down (`0.2.1`), counted among the controls `ui_tree` lists, so a wrapper it drops is not a level. A hard condition: a control that moved is not found |
+| `nth` | which of several matches, from 0, in `ui_tree` order. Out of range is an error |
+
+`key=value` pairs joined by `;`, with no spaces around the `;`; `\\`, `\;`, `\n`, `\r` escape a
+value. Unknown or repeated keys and bad numbers are refused by name. `app`/`window` pick the
+window (the one named, else `window=<id>`, else the focused one); the other keys pick the
+control. A window selector never matches a blocked application's window, and one naming a
+blocked app is refused, so a title cannot be probed for. What `ui_tree` prints is the
+**shortest** selector that is unique in that tree, in the order of what changes least:
+`role`+`aid`, else `role`+`name`, else those plus `nth`. A name longer than 60 characters is
+written as its first 60, as a "contains". On macOS an edit field's name IS its content
+(`AXValue`), so its name is never used. `selector_with_path` (for a recorder) adds the
+`path` as well.
+
+| platform | role / name | `aid` source | notes |
+|---|---|---|---|
+| Windows (UIA) | yes | `AutomationId` | measured: selector round trip over a real window's whole tree |
+| macOS (AX) | yes | `AXIdentifier` | compiled and clippy-clean for `aarch64-apple-darwin`; **not run on a Mac** |
+| Linux (AT-SPI) | yes | `AccessibleId` property (AT-SPI 2.46+; empty on older registries and toolkits that set none) | compiled for `x86_64-unknown-linux-musl`; **not run on a bus**. X11-only windows (no accessibility bridge: xterm) have no controls to select: `wait_for` can still wait on their *window* and on the *screen* |
+
+**`wait_for`** (observing tier: it looks and changes nothing, so a read-only session may use
+it). `condition` is one of:
+
+| condition | holds when |
+|---|---|
+| `element_appears` | at least one control matches the selector (`matches` > 1 is reported, not resolved) |
+| `element_gone` | none does, or its window is gone. Not satisfied by a **cut** tree: absence from a partial walk is not absence |
+| `window_appears` / `window_gone` | a window matches `app`/`window` (only those keys) |
+| `screen_changes` | a 128-bit fingerprint of the screen (or of `window`'s area) differs by more than `tolerance` bits (default 4) from `baseline`, else from how it was when the wait began. A difference hash (edges) beside a 4x4 brightness grid, so a dark-mode flip is seen as well as a dialog opening, and a blinking cursor is not |
+
+For an element condition with no window given, the window in front **when the wait begins**
+is the one watched, by id, so a change of focus is not mistaken for the control going away.
+
+*Bounds.* `timeout_ms` default 5000, held to **60000** (a longer request is held to it and the
+reply's `notes` says so); `poll_ms` default 250, held to 50 to 2000. The first look is at once;
+no look starts after the deadline, and the last starts exactly at it, so a condition that
+comes true at the deadline is caught; a look under way is not interrupted, so the call can end
+later than `timeout_ms` by one look (listing the windows takes a few hundred ms on a busy
+Windows desktop, measured). The operator's stop (stop file or `Safety`) is asked between
+looks and every 100 ms of sleeping, and ends the wait with the stop's refusal.
+
+*Reply.* JSON whose `result` is `found` or `timeout` (a timeout is a reply, not a tool error,
+so the journal does not call it a refusal): `condition`, `waited_ms`, `polls`, the bounds
+used, and for `found` an `element` (`role`, `name`, `rect`, `enabled`, a `selector` for it),
+its `window` (with the window selector part), `matches`, `unique` and `others`; for
+`screen_changes`, `hash`, `baseline`, `distance` (pass `hash` back as `baseline` to go on from
+there; a timeout returns the last `hash` too); for a `timeout`, `last_seen` in words.
+
+*Guards.* Each look goes through the same guards as the one-shot tools: a blocked
+application's window is never listed or walked, and a full capture is refused while one is on
+screen (`guard_capture`, shared with `screenshot`). The journal records a wait as
+`condition selector timeout`, and a selector with the name of a text field left out.
+
+Code: `crates/desktop/src/selector.rs` (grammar, matching, derivation; pure), `wait.rs` (the
+timing and the conditions, over an `Env` trait; tested with a scripted desktop and a virtual
+clock), `fingerprint.rs`, `uia/resolve.rs` (resolving against the live tree),
+`mcp/wait_tool.rs` (the live `Env`).
 
 ## 4. Coordinates — the section that decides whether this works
 
@@ -487,9 +572,9 @@ argv (`incu` also takes `--tier observe|act`).
 
 | Mode | The desktop it gets |
 |---|---|
-| `read-only` | `screen_info`, `cursor_position`, `screenshot`, `ui_tree`, `list_windows`. Nothing that moves. |
-| `workspace-write` (default) | all sixteen — unchanged from before |
-| `danger-full-access`, `allow` | all sixteen |
+| `read-only` | `screen_info`, `cursor_position`, `screenshot`, `ui_tree`, `list_windows`, `wait_for`. Nothing that moves. |
+| `workspace-write` (default) | all seventeen |
+| `danger-full-access`, `allow` | all seventeen |
 | `prompt` | nothing. stdin and stdout are the protocol, so there is no channel to ask a human on, and `authorize` with no prompter denies. |
 
 The acting tools require `WorkspaceWrite` rather than `DangerFullAccess`, even
