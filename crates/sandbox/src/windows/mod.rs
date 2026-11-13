@@ -439,20 +439,36 @@ pub fn fold_nested(roots: &[PathBuf]) -> Vec<PathBuf> {
 
 /// What the offline account must also be able to read for a run whose
 /// roots (writable roots, temp directory) are `roots`: the folder the
-/// command starts in, and the helper program it is started through, each
-/// unless a root already holds it (and so grants it `Modify`).
+/// command starts in, the helper program it is started through, and the
+/// program it was asked to run (`program`, as [`resolve_program`] found it,
+/// when it did), each unless a root already holds it (and so grants it
+/// `Modify`). The program is the one the caller named, so letting the
+/// account read it shows the command nothing it was not given: without it
+/// a program under the user's profile (Claude Code's `~/.local/bin/claude.exe`)
+/// could not even start, measured, unless `insbx setup-windows --read` had
+/// opened its whole folder. A file the user may not re-ACL (`cmd.exe` in
+/// System32) is left out later, by `acl::OfflineGrant::grantable`: it is
+/// readable to `Users` already.
 #[must_use]
-pub fn offline_reads(roots: &[PathBuf], cwd: &Path, helper: &Path) -> Vec<PathBuf> {
+pub fn offline_reads(
+    roots: &[PathBuf],
+    cwd: &Path,
+    helper: &Path,
+    program: Option<&Path>,
+) -> Vec<PathBuf> {
     let held = |p: &Path| {
         roots
             .iter()
             .any(|r| holds(&r.to_string_lossy(), &p.to_string_lossy()))
     };
-    [cwd, helper]
-        .into_iter()
-        .filter(|p| !held(p))
-        .map(Path::to_path_buf)
-        .collect()
+    let mut reads: Vec<PathBuf> = Vec::new();
+    for p in [Some(cwd), Some(helper), program].into_iter().flatten() {
+        let key = path_key(&p.to_string_lossy());
+        if !held(p) && !reads.iter().any(|r| path_key(&r.to_string_lossy()) == key) {
+            reads.push(p.to_path_buf());
+        }
+    }
+    reads
 }
 
 /// The folders the offline account must be able to list for the run's
@@ -1093,20 +1109,43 @@ mod tests {
         ];
         let helper = Path::new(r"C:\tools\insbx.exe");
         assert_eq!(
-            offline_reads(&roots, Path::new(r"C:\w\proj\sub"), helper),
+            offline_reads(&roots, Path::new(r"C:\w\proj\sub"), helper, None),
             [PathBuf::from(r"C:\tools\insbx.exe")]
         );
         assert_eq!(
             offline_reads(
                 &roots,
                 Path::new(r"C:\w"),
-                Path::new(r"c:\W\PROJ\target\insbx.exe")
+                Path::new(r"c:\W\PROJ\target\insbx.exe"),
+                None
             ),
             [PathBuf::from(r"C:\w")]
         );
         assert_eq!(
-            offline_reads(&[], Path::new(r"C:\w"), helper),
+            offline_reads(&[], Path::new(r"C:\w"), helper, None),
             [PathBuf::from(r"C:\w"), PathBuf::from(r"C:\tools\insbx.exe")]
+        );
+    }
+
+    #[test]
+    fn the_offline_account_also_reads_the_program_it_was_asked_to_run() {
+        let roots = [PathBuf::from(r"C:\w\proj")];
+        let helper = Path::new(r"C:\tools\insbx.exe");
+        let claude = Path::new(r"C:\Users\me\.local\bin\claude.exe");
+        assert_eq!(
+            offline_reads(&roots, Path::new(r"C:\w\proj"), helper, Some(claude)),
+            [PathBuf::from(r"C:\tools\insbx.exe"), claude.to_path_buf()]
+        );
+        // Inside a root already: nothing more to grant.
+        let built = Path::new(r"c:\W\proj\target\tool.exe");
+        assert_eq!(
+            offline_reads(&roots, Path::new(r"C:\w\proj"), helper, Some(built)),
+            [PathBuf::from(r"C:\tools\insbx.exe")]
+        );
+        // The helper itself named as the program: once.
+        assert_eq!(
+            offline_reads(&roots, Path::new(r"C:\w\proj"), helper, Some(helper)),
+            [PathBuf::from(r"C:\tools\insbx.exe")]
         );
     }
 
