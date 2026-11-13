@@ -95,7 +95,7 @@ jobs:
           # user PATH, which this already-running shell has not read.
           $links = Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Links'
           $want = $env:TAG.TrimStart('v')
-          foreach ($program in 'incode', 'sbx') {
+          foreach ($program in 'incode', 'insbx') {
             $got = & (Join-Path $links "$program.exe") --version
             Write-Output "$program --version: $got"
             if ($got -ne "$program $want") {
@@ -132,7 +132,7 @@ jobs:
         shell: pwsh
         run: |
           $want = $env:TAG.TrimStart('v')
-          foreach ($program in 'incode', 'sbx') {
+          foreach ($program in 'incode', 'insbx') {
             $got = & $program --version
             Write-Output "$program --version: $got"
             if ($got -ne "$program $want") {
@@ -171,7 +171,7 @@ jobs:
         run: |
           set -euo pipefail
           want="${TAG#v}"
-          for program in incode sbx; do
+          for program in incode insbx; do
             got="$("$(brew --prefix)/bin/$program" --version)"
             echo "$program --version: $got"
             if [ "$got" != "$program $want" ]; then

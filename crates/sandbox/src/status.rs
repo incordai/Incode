@@ -1,6 +1,6 @@
 //! What this machine enforces of a policy, part by part, before anything
 //! runs: [`enforcement`]. `Sandbox::command` refuses a policy with gaps in
-//! strict mode; `sbx check` and `sbx doctor` print the same report.
+//! strict mode; `insbx check` and `insbx doctor` print the same report.
 //!
 //! The platform answers come from `linux`, `windows` and, for macOS, the
 //! Seatbelt checks here.

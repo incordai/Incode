@@ -1,4 +1,4 @@
-//! `sbx setup-windows`: the offline account, its password, and the WFP
+//! `insbx setup-windows`: the offline account, its password, and the WFP
 //! filters that cut it off ([`super::offline`] says why each is so); and,
 //! at run time, finding them ([`ready`]) and reading the password
 //! ([`password`]).
@@ -83,7 +83,7 @@ const SYSTEM: &str = "S-1-5-18";
 const USERLIST_KEY: &str =
     r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\SpecialAccounts\UserList";
 
-const NEEDS_ELEVATION: &str = "sbx setup-windows changes the machine (a local account and \
+const NEEDS_ELEVATION: &str = "insbx setup-windows changes the machine (a local account and \
      firewall filters) and needs administrator rights: run it from an elevated prompt \
      (right-click your terminal, Run as administrator)";
 
@@ -217,7 +217,7 @@ fn blob(bytes: &[u8]) -> CRYPT_INTEGER_BLOB {
 
 // ---- Where things are. ----
 
-/// `%ProgramData%\sbx`. From the environment the parent was started with
+/// `%ProgramData%\insbx`. From the environment the parent was started with
 /// (a user who points it elsewhere only misleads their own runs).
 pub(crate) fn state_dir() -> PathBuf {
     let base = std::env::var_os("ProgramData")
@@ -388,7 +388,7 @@ pub(crate) fn password(path: &Path) -> Result<(String, Secret), String> {
 
 // ---- Setup. ----
 
-/// Run `sbx setup-windows` (or `--remove`): what it did, line by line.
+/// Run `insbx setup-windows` (or `--remove`): what it did, line by line.
 ///
 /// # Errors
 /// When not elevated, or a step fails (said which).
@@ -720,7 +720,7 @@ fn hide_from_sign_in(hide: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// `%ProgramData%\sbx` with the record's ACL, then the record in it,
+/// `%ProgramData%\insbx` with the record's ACL, then the record in it,
 /// replacing any old one.
 fn write_record(record: &Record) -> Result<(), String> {
     let dir = state_dir();
@@ -855,7 +855,7 @@ impl Engine {
         // SAFETY: a zeroed session is the documented default; a
         // NUL-terminated name that lives across the call.
         unsafe {
-            let name = wide("sbx setup-windows");
+            let name = wide("insbx setup-windows");
             let mut session: FWPM_SESSION0 = std::mem::zeroed();
             session.displayData.name = name.as_ptr().cast_mut();
             session.txnWaitTimeoutInMSec = wait_ms;
@@ -933,8 +933,8 @@ fn install_filters(account_sid: &str, ports: (u16, u16)) -> Result<(), String> {
     let user_sd_len = unsafe { GetSecurityDescriptorLength(user_sd.0) };
     let provider_key = guid(PROVIDER_KEY);
     let sublayer_key = guid(SUBLAYER_KEY);
-    let name = wide("sbx offline account");
-    let description = wide("sbx setup-windows: the sbx-offline account has no network");
+    let name = wide("insbx offline account");
+    let description = wide("insbx setup-windows: the insbx-offline account has no network");
     engine.transaction(|| {
         // SAFETY: every structure passed points at locals that outlive the
         // calls (names, keys, the descriptor blob, the range); WFP copies

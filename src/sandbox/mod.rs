@@ -67,11 +67,11 @@ use std::process::Command;
 
 use crate::tools::shell_choice::Shell;
 
+pub mod insbx;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
-pub mod sbx;
 #[cfg(windows)]
 pub mod windows;
 
@@ -83,20 +83,20 @@ pub const SANDBOX_ENV: &str = "INCODE_SANDBOX";
 /// `sandbox_network`.
 pub const SANDBOX_NETWORK_ENV: &str = "INCODE_SANDBOX_NETWORK";
 
-/// Names the engine (`builtin` or `sbx`), ahead of `admin.json`
+/// Names the engine (`builtin` or `insbx`), ahead of `admin.json`
 /// `sandbox_engine`.
 pub const SANDBOX_ENGINE_ENV: &str = "INCODE_SANDBOX_ENGINE";
 
 /// What confines the commands: incode's own code in this module, or the
-/// standalone sandbox ([`sbx`]), which adds a host allowlist, a seccomp
+/// standalone sandbox ([`insbx`]), which adds a host allowlist, a seccomp
 /// filter, `.git` protection and a scrubbed environment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SandboxEngine {
     /// This module's Landlock, Seatbelt and Windows token — the default.
     #[default]
     Builtin,
-    /// `crates/sandbox`, in-process on Linux and macOS, `sbx.exe` on Windows.
-    Sbx,
+    /// `crates/sandbox`, in-process on Linux and macOS, `insbx.exe` on Windows.
+    Insbx,
 }
 
 impl SandboxEngine {
@@ -105,7 +105,7 @@ impl SandboxEngine {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Builtin => "builtin",
-            Self::Sbx => "sbx",
+            Self::Insbx => "insbx",
         }
     }
 
@@ -114,7 +114,7 @@ impl SandboxEngine {
     pub fn parse(name: &str) -> Option<Self> {
         match name {
             "builtin" => Some(Self::Builtin),
-            "sbx" => Some(Self::Sbx),
+            "insbx" => Some(Self::Insbx),
             _ => None,
         }
     }
@@ -244,9 +244,9 @@ pub struct Sandbox {
 pub(crate) struct Wrapped {
     /// Set the working directory and the pipes, then spawn it.
     pub command: Command,
-    /// Kept until the command exits: the sbx engine's proxy, temp directory
+    /// Kept until the command exits: the insbx engine's proxy, temp directory
     /// and `.git` snapshot (nothing under the built-in engine).
-    pub keep: sbx::Keep,
+    pub keep: insbx::Keep,
 }
 
 /// What a session's sandbox holds for as long as the session lasts. Only
@@ -324,21 +324,21 @@ impl Sandbox {
     /// `shell` is the Bash tool's shell ([`crate::tools::shell_choice`]) —
     /// used unchanged when the sandbox is off or cannot apply. `env`, when
     /// given, is the whole environment the command starts with (incode's
-    /// filtered one); the sbx engine adds its own variables to it.
+    /// filtered one); the insbx engine adds its own variables to it.
     ///
     /// # Errors
     ///
-    /// Only under the sbx engine, when sbx cannot start the run. The command
+    /// Only under the insbx engine, when insbx cannot start the run. The command
     /// must then NOT run: running it unconfined is what the operator chose
-    /// sbx to prevent.
+    /// insbx to prevent.
     pub(crate) fn wrap(
         &self,
         shell: &Shell,
         command: &str,
         env: Option<&std::collections::HashMap<String, String>>,
     ) -> Result<Wrapped, String> {
-        if !self.is_off() && self.policy.engine == SandboxEngine::Sbx {
-            let (command, keep) = sbx::wrap(self.policy, &self.roots, shell, command, env)?;
+        if !self.is_off() && self.policy.engine == SandboxEngine::Insbx {
+            let (command, keep) = insbx::wrap(self.policy, &self.roots, shell, command, env)?;
             return Ok(Wrapped { command, keep });
         }
         let mut command = if self.is_off() {
@@ -352,7 +352,7 @@ impl Sandbox {
         }
         Ok(Wrapped {
             command,
-            keep: sbx::Keep::default(),
+            keep: insbx::Keep::default(),
         })
     }
 
@@ -361,8 +361,8 @@ impl Sandbox {
     /// then the network when `deny` was asked for.
     #[must_use]
     pub fn note(&self) -> String {
-        if !self.is_off() && self.policy.engine == SandboxEngine::Sbx {
-            return sbx::note(self.policy, &self.roots);
+        if !self.is_off() && self.policy.engine == SandboxEngine::Insbx {
+            return insbx::note(self.policy, &self.roots);
         }
         let mode = self.policy.mode;
         let files = if mode == SandboxMode::Off {
@@ -399,10 +399,10 @@ impl Sandbox {
     pub fn posix_shell_runs(&self) -> bool {
         #[cfg(windows)]
         {
-            if self.policy.engine == SandboxEngine::Sbx {
-                // sbx.exe's native backend restricts the token the same way;
+            if self.policy.engine == SandboxEngine::Insbx {
+                // insbx.exe's native backend restricts the token the same way;
                 // under WSL the command runs in WSL's own `sh`.
-                return self.is_off() || sbx::settings().backend.as_deref() == Some("wsl");
+                return self.is_off() || insbx::settings().backend.as_deref() == Some("wsl");
             }
             !windows::applies(self.policy, windows::needs_grant(self.policy))
         }

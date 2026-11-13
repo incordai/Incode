@@ -274,7 +274,7 @@ impl Proxy {
                     io::ErrorKind::AddrInUse,
                     format!(
                         "every port in {}-{} is taken (one per proxy run at once; \
-                         `sbx setup-windows --proxy-ports` widens the range)",
+                         `insbx setup-windows --proxy-ports` widens the range)",
                         ports.0, ports.1
                     ),
                 )
@@ -403,7 +403,7 @@ fn serve(
 
     if !allowlist.allows(&head.host, head.port) {
         let reason = "not in network.allow".to_string();
-        let _ = respond(&mut writer, 403, &format!("sbx: {target} is {reason}"));
+        let _ = respond(&mut writer, 403, &format!("insbx: {target} is {reason}"));
         return Some(Decision {
             target,
             allowed: false,
@@ -422,7 +422,7 @@ fn serve(
     let mut server = match upstream_conn {
         Ok(s) => s,
         Err(reason) => {
-            let _ = respond(&mut writer, 502, &format!("sbx: {target}: {reason}"));
+            let _ = respond(&mut writer, 502, &format!("insbx: {target}: {reason}"));
             return Some(Decision {
                 target,
                 allowed: false,
@@ -801,7 +801,7 @@ mod tests {
     }
 
     /// **A REFUSAL REACHES THE CLIENT WHILE PROCESSES ARE STARTED BESIDE
-    /// THE PROXY.** sbx starts the sandboxed command (and `icacls`) from the
+    /// THE PROXY.** insbx starts the sandboxed command (and `icacls`) from the
     /// process the proxy runs in. A socket the proxy cloned was inheritable
     /// on Windows, so a process started while a connection was open took a
     /// copy of it, and its exit reset the connection before the client had

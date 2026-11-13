@@ -5,7 +5,7 @@
 //! `windows/acl.rs`, Apache-2.0), whose authors measured it on Windows. What
 //! they measured is repeated here where it explains a choice. This crate's
 //! port is checked by `tests/escape_windows.rs` on the `windows-latest` CI
-//! runner, after `sbx setup-windows` (see the README).
+//! runner, after `insbx setup-windows` (see the README).
 //!
 //! # Writes: a write-restricted token
 //!
@@ -48,7 +48,7 @@
 //! the user's own SID would hide the path from the user everywhere, not just
 //! from the sandbox; a fully restricted token (not write-restricted) would
 //! need every file a toolchain reads granted to one of its SIDs. So
-//! `deny_read` is reported not enforced, and `SBX_BACKEND=auto` sends such a
+//! `deny_read` is reported not enforced, and `INSBX_BACKEND=auto` sends such a
 //! policy to WSL2, where Landlock enforces it.
 //!
 //! # Network: a second account the firewall cuts off ([`offline`])
@@ -57,8 +57,8 @@
 //! all working under it). Only an AppContainer without the internet
 //! capabilities does, and an AppContainer reads only what is granted to it:
 //! the workspace, the user's toolchains and profile would all need granting.
-//! Instead, once `sbx setup-windows` has run (elevated), `deny` and `proxy`
-//! run the command as a local account, `sbx-offline`, that persistent
+//! Instead, once `insbx setup-windows` has run (elevated), `deny` and `proxy`
+//! run the command as a local account, `insbx-offline`, that persistent
 //! Windows Filtering Platform filters block from the network, as OpenAI
 //! Codex's Windows sandbox does. Without that setup they are reported not
 //! enforced, and `auto` sends them to WSL2.
@@ -80,7 +80,7 @@
 //! Git Bash and every msys program fail to start under the write-restricted
 //! token: the msys runtime maps a per-user shared section the token may not
 //! map writable, and dies with `CreateFileMapping ..., Win32 error 5`
-//! (incode measured). Use `cmd` or PowerShell, or `SBX_BACKEND=wsl` for a
+//! (incode measured). Use `cmd` or PowerShell, or `INSBX_BACKEND=wsl` for a
 //! POSIX shell.
 
 // The pure parts below are compiled on every platform so their tests run in
@@ -105,7 +105,7 @@ mod token;
 #[cfg(windows)]
 pub(crate) use helper::enter;
 
-/// `sbx setup-windows` (or `--remove`): what it did, line by line.
+/// `insbx setup-windows` (or `--remove`): what it did, line by line.
 ///
 /// # Errors
 /// When not elevated, or a step fails.
@@ -164,7 +164,7 @@ pub fn default_dacl_sddl(user_sid: &str, run_sid: &str) -> String {
 /// Why `deny_read` is not enforced natively.
 pub const DENY_READ_NOT_ENFORCED: &str =
     "a write-restricted token consults its restricting SIDs only for writes, so no ACE can hide \
-     a path from the sandbox alone; use WSL2 (SBX_BACKEND=wsl, or auto), where Landlock does";
+     a path from the sandbox alone; use WSL2 (INSBX_BACKEND=wsl, or auto), where Landlock does";
 
 /// What native Windows enforces of the filesystem policy.
 #[must_use]
@@ -659,7 +659,7 @@ impl JobLimits {
 /// time, the one whose call arrives while the other's start of seclogon is
 /// still in progress is refused with this error instead of waiting for it —
 /// and its command is not run. Observed on the `windows-latest` runner
-/// (`sbx: the command could not be started as sbx-offline … Win32 error
+/// (`insbx: the command could not be started as insbx-offline … Win32 error
 /// 1056`), in the escape tests that start several network-deny runs at once
 /// right after `setup-windows`; the race is inferred from that, not
 /// reproduced on a machine where seclogon was already up.
@@ -765,7 +765,7 @@ mod tests {
             &format!("{SID_PREFIX}007"),
             &format!("{SID_PREFIX}12-5"),
             &format!("{SID_PREFIX}99999999999"),
-            // incode's own prefix: never swept or used by sbx.
+            // incode's own prefix: never swept or used by insbx.
             "S-1-5-21-1111111111-2222222222-3333333333-77",
         ] {
             assert!(!is_session_sid(bad), "{bad}");
@@ -798,7 +798,10 @@ mod tests {
             sid: session_sid(9),
             roots,
             user: Some("S-1-5-21-1-2-3-1009".into()),
-            reads: vec![PathBuf::from(r"C:\proj"), PathBuf::from(r"C:\bin\sbx.exe")],
+            reads: vec![
+                PathBuf::from(r"C:\proj"),
+                PathBuf::from(r"C:\bin\insbx.exe"),
+            ],
             parents: vec![PathBuf::from(r"C:\Users\me\src")],
         };
         assert!(offline.to_text().ends_with("parent C:\\Users\\me\\src\n"));
@@ -814,11 +817,11 @@ mod tests {
     #[test]
     fn a_record_from_before_the_parent_lines_still_parses() {
         let text = format!(
-            "sid {}\nroot C:\\w\nuser S-1-5-21-1-2-3-1009\nread C:\\bin\\sbx.exe\n",
+            "sid {}\nroot C:\\w\nuser S-1-5-21-1-2-3-1009\nread C:\\bin\\insbx.exe\n",
             session_sid(7)
         );
         let record = GrantRecord::parse(&text).expect("parses");
-        assert_eq!(record.reads, [PathBuf::from(r"C:\bin\sbx.exe")]);
+        assert_eq!(record.reads, [PathBuf::from(r"C:\bin\insbx.exe")]);
         assert!(record.parents.is_empty());
         // And written back, it is the same text: nothing new appears.
         assert_eq!(record.to_text(), text);
@@ -922,7 +925,7 @@ mod tests {
         assert!(holds(r"\\?\C:\Users\Me", r"C:\Users\me"));
         assert!(!holds(r"C:\Users\me", r"C:\Users\meta"));
         assert!(holds(r"C:\", r"C:\anything"));
-        assert_eq!(strip_verbatim(r"\\?\C:\t\sbx-1"), r"C:\t\sbx-1");
+        assert_eq!(strip_verbatim(r"\\?\C:\t\insbx-1"), r"C:\t\insbx-1");
         assert_eq!(strip_verbatim(r"\\?\UNC\srv\s\x"), r"\\srv\s\x");
         assert_eq!(strip_verbatim(r"C:\t"), r"C:\t");
     }
@@ -941,7 +944,7 @@ mod tests {
             assert!(refuse_broad(broad, profile).is_err(), "{broad}");
         }
         assert!(refuse_broad(r"C:\Users\someone\proj", profile).is_ok());
-        assert!(refuse_broad(r"\\?\C:\Users\someone\AppData\Local\Temp\sbx-1", profile).is_ok());
+        assert!(refuse_broad(r"\\?\C:\Users\someone\AppData\Local\Temp\insbx-1", profile).is_ok());
         assert!(refuse_broad(r"\\server\share\proj", profile).is_ok());
         let folded = fold_nested(&[
             PathBuf::from(r"C:\w\a\inner"),
@@ -956,24 +959,24 @@ mod tests {
     fn the_offline_account_reads_the_current_folder_and_helper_unless_granted_already() {
         let roots = [
             PathBuf::from(r"\\?\C:\w\proj"),
-            PathBuf::from(r"C:\t\sbx-1"),
+            PathBuf::from(r"C:\t\insbx-1"),
         ];
-        let helper = Path::new(r"C:\tools\sbx.exe");
+        let helper = Path::new(r"C:\tools\insbx.exe");
         assert_eq!(
             offline_reads(&roots, Path::new(r"C:\w\proj\sub"), helper),
-            [PathBuf::from(r"C:\tools\sbx.exe")]
+            [PathBuf::from(r"C:\tools\insbx.exe")]
         );
         assert_eq!(
             offline_reads(
                 &roots,
                 Path::new(r"C:\w"),
-                Path::new(r"c:\W\PROJ\target\sbx.exe")
+                Path::new(r"c:\W\PROJ\target\insbx.exe")
             ),
             [PathBuf::from(r"C:\w")]
         );
         assert_eq!(
             offline_reads(&[], Path::new(r"C:\w"), helper),
-            [PathBuf::from(r"C:\w"), PathBuf::from(r"C:\tools\sbx.exe")]
+            [PathBuf::from(r"C:\w"), PathBuf::from(r"C:\tools\insbx.exe")]
         );
     }
 
@@ -1073,7 +1076,7 @@ mod tests {
         let ready = Ok(offline::Ready {
             sid: "S-1-5-21-1-1009".into(),
             proxy_ports: offline::DEFAULT_PROXY_PORTS,
-            record: PathBuf::from(r"C:\ProgramData\sbx\offline.conf"),
+            record: PathBuf::from(r"C:\ProgramData\insbx\offline.conf"),
         });
         assert!(!net_status(NetMode::Deny, &ready).is_gap());
         assert!(!net_status(NetMode::Proxy, &ready).is_gap());

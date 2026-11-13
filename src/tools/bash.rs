@@ -55,7 +55,7 @@ pub fn execute_bash_watched(
     }
     let shell = super::shell_choice::for_sandbox(sandbox).map_err(|why| anyhow::anyhow!(why))?;
     let env = filter_env.then(super::env_filter::filtered_env);
-    // `_keep` holds what the sbx engine needs until the command exits.
+    // `_keep` holds what the insbx engine needs until the command exits.
     let crate::sandbox::Wrapped {
         command: mut child,
         keep: _keep,

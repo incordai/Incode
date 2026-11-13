@@ -1,10 +1,10 @@
-//! `sbx`: run a command under a sandbox policy.
+//! `insbx`: run a command under a sandbox policy.
 //!
 //! ```text
-//! sbx run [options] -- <command> [args...]
-//! sbx check [options]          what this machine would enforce of the policy
-//! sbx doctor                   what this machine can enforce at all
-//! sbx mcp [options]            sandboxes as an MCP server an agent drives
+//! insbx run [options] -- <command> [args...]
+//! insbx check [options]          what this machine would enforce of the policy
+//! insbx doctor                   what this machine can enforce at all
+//! insbx mcp [options]            sandboxes as an MCP server an agent drives
 //! ```
 
 use std::ffi::OsString;
@@ -16,22 +16,22 @@ use incord_sandbox::{
 };
 
 const USAGE: &str = "\
-sbx - run any command under one sandbox policy
+insbx - run any command under one sandbox policy
 
 USAGE:
-    sbx run   [OPTIONS] -- <COMMAND> [ARGS...]
-    sbx check [OPTIONS]      print what this machine enforces of the policy (JSON with --json)
-    sbx doctor               print what this machine can enforce at all
-    sbx mcp   [MCP OPTIONS]  serve sandboxes over MCP (stdio): an agent creates one,
+    insbx run   [OPTIONS] -- <COMMAND> [ARGS...]
+    insbx check [OPTIONS]      print what this machine enforces of the policy (JSON with --json)
+    insbx doctor               print what this machine can enforce at all
+    insbx mcp   [MCP OPTIONS]  serve sandboxes over MCP (stdio): an agent creates one,
                              writes scripts into it, runs them, reads the results
-    sbx setup-windows [--read <DIR>]... [--proxy-ports <LO-HI>] | --remove
+    insbx setup-windows [--read <DIR>]... [--proxy-ports <LO-HI>] | --remove
                              Windows, as administrator, once: network deny and proxy
                              natively (an offline account the firewall cuts off).
                              --read lets that account read a folder (a toolchain);
                              --remove undoes all of it
 
 MCP OPTIONS (the ceilings; an agent can ask for less, never more):
-        --root <DIR>         where sandboxes live (default: <temp>/sbx-mcp-<pid>)
+        --root <DIR>         where sandboxes live (default: <temp>/insbx-mcp-<pid>)
         --net <MODE>         most network a sandbox may have: deny (default) | proxy | allow
         --allow-host <HOST>  with --net proxy: a host sandboxes may name (repeatable)
         --max-wall <SECS>    longest one run may take (default 600)
@@ -69,7 +69,7 @@ POLICY (a file, then flags on top of it):
     -q, --quiet              no report on stderr
 
 EXIT:
-    the command's own code; 124 when --wall killed it; 125 when sbx refused or failed;
+    the command's own code; 124 when --wall killed it; 125 when insbx refused or failed;
     126/127 when the command could not be run / found.
 ";
 
@@ -85,7 +85,7 @@ fn main() -> ExitCode {
     match real_main(args) {
         Ok(code) => exit_with(code),
         Err(e) => {
-            eprintln!("sbx: {e}");
+            eprintln!("insbx: {e}");
             ExitCode::from(EXIT_SANDBOX as u8)
         }
     }
@@ -102,7 +102,7 @@ fn exit_with(code: i32) -> ExitCode {
     ExitCode::from(u8::try_from(code.clamp(0, 255)).unwrap_or(1))
 }
 
-/// `sbx.exe` on Windows: run natively, or forward to the Linux `sbx` inside
+/// `insbx.exe` on Windows: run natively, or forward to the Linux `insbx` inside
 /// WSL2, where Landlock and seccomp do the confining.
 #[cfg(windows)]
 mod windows_backend {
@@ -114,8 +114,8 @@ mod windows_backend {
     use incord_sandbox::enforcement;
     use incord_sandbox::wslpath::{to_wsl, translate_args};
 
-    /// Where the installer puts the Linux `sbx` inside WSL.
-    const IN_WSL: &str = "$HOME/.local/bin/sbx";
+    /// Where the installer puts the Linux `insbx` inside WSL.
+    const IN_WSL: &str = "$HOME/.local/bin/insbx";
 
     /// `Some(exit)` when this invocation was forwarded (or refused); `None`
     /// to run it natively.
@@ -123,7 +123,7 @@ mod windows_backend {
         let backend = match Backend::from_env(|k| std::env::var(k).ok()) {
             Ok(b) => b,
             Err(e) => {
-                eprintln!("sbx: {e}");
+                eprintln!("insbx: {e}");
                 return Some(ExitCode::from(125));
             }
         };
@@ -155,11 +155,11 @@ mod windows_backend {
             // `check` is a report: say what native enforces (exit 1 for the
             // gaps) and why WSL was not used.
             Choice::Refuse(why) if sub == "check" => {
-                eprintln!("sbx: {why}");
+                eprintln!("insbx: {why}");
                 None
             }
             Choice::Refuse(why) => {
-                eprintln!("sbx: {why}");
+                eprintln!("insbx: {why}");
                 Some(ExitCode::from(125))
             }
         }
@@ -170,7 +170,7 @@ mod windows_backend {
         PathBuf::from(root).join("System32").join("wsl.exe")
     }
 
-    /// Whether forwarding would work: `wsl.exe` exists and the Linux `sbx`
+    /// Whether forwarding would work: `wsl.exe` exists and the Linux `insbx`
     /// is installed in the distribution. Starts WSL, so asked only when it
     /// matters.
     pub fn wsl_ready() -> Result<(), String> {
@@ -179,7 +179,7 @@ mod windows_backend {
             return Err("wsl.exe was not found: WSL is not installed".into());
         }
         let mut cmd = Command::new(&exe);
-        if let Some(distro) = std::env::var_os("SBX_WSL_DISTRO") {
+        if let Some(distro) = std::env::var_os("INSBX_WSL_DISTRO") {
             cmd.arg("-d").arg(distro);
         }
         let status = cmd
@@ -191,19 +191,19 @@ mod windows_backend {
         match status {
             Ok(s) if s.success() => Ok(()),
             Ok(_) => Err(format!(
-                "the Linux sbx is not installed inside WSL at {IN_WSL}, or WSL has no Linux \
+                "the Linux insbx is not installed inside WSL at {IN_WSL}, or WSL has no Linux \
                  distribution"
             )),
             Err(e) => Err(format!("wsl.exe cannot start: {e}")),
         }
     }
 
-    /// The Windows lines of `sbx doctor`: the backend, and whether WSL2
+    /// The Windows lines of `insbx doctor`: the backend, and whether WSL2
     /// forwarding is there for what native cannot enforce.
     pub fn doctor() {
         match Backend::from_env(|k| std::env::var(k).ok()) {
             Ok(b) => println!(
-                "  [info] backend        SBX_BACKEND={}: {}",
+                "  [info] backend        INSBX_BACKEND={}: {}",
                 b.as_str(),
                 match b {
                     Backend::Auto => "native when it enforces the whole policy, else WSL2",
@@ -215,21 +215,21 @@ mod windows_backend {
         }
         match incord_sandbox::windows::offline_setup() {
             Ok(r) => println!(
-                "  [ok  ] offline user   {} and its firewall filters are set up (sbx setup-windows): \
+                "  [ok  ] offline user   {} and its firewall filters are set up (insbx setup-windows): \
                  network deny and proxy run natively (proxy ports {}-{})",
                 incord_sandbox::windows::offline::ACCOUNT,
                 r.proxy_ports.0,
                 r.proxy_ports.1
             ),
             Err(why) => println!(
-                "  [no  ] offline user   {why}; for network deny natively, run `sbx setup-windows` \
+                "  [no  ] offline user   {why}; for network deny natively, run `insbx setup-windows` \
                  as administrator"
             ),
         }
         match wsl_ready() {
             Ok(()) => println!(
                 "  [ok  ] WSL2           forwarding available: network deny/proxy and deny_read \
-                 are enforced there (run `SBX_BACKEND=wsl sbx doctor` for its report)"
+                 are enforced there (run `INSBX_BACKEND=wsl insbx doctor` for its report)"
             ),
             Err(why) => println!("  [no  ] WSL2           {why}; to have it, {WSL_SETUP}"),
         }
@@ -239,7 +239,7 @@ mod windows_backend {
         match run(args) {
             Ok(code) => super::exit_with(code),
             Err(e) => {
-                eprintln!("sbx: {e}");
+                eprintln!("insbx: {e}");
                 ExitCode::from(125)
             }
         }
@@ -263,7 +263,7 @@ mod windows_backend {
             )
         })?;
         let mut cmd = Command::new(wsl_exe());
-        if let Some(distro) = std::env::var_os("SBX_WSL_DISTRO") {
+        if let Some(distro) = std::env::var_os("INSBX_WSL_DISTRO") {
             cmd.arg("-d").arg(distro);
         }
         cmd.arg("--cd")
@@ -272,10 +272,10 @@ mod windows_backend {
             .arg("sh")
             .arg("-c")
             .arg(format!(
-                "[ -x \"{IN_WSL}\" ] || {{ echo 'sbx is not installed inside WSL' >&2; exit 126; }}; \
+                "[ -x \"{IN_WSL}\" ] || {{ echo 'insbx is not installed inside WSL' >&2; exit 126; }}; \
                  exec \"{IN_WSL}\" \"$@\""
             ))
-            .arg("sbx")
+            .arg("insbx")
             .args(&args);
         let status = cmd
             .status()
@@ -285,7 +285,7 @@ mod windows_backend {
         // command's own codes pass through.
         if code < 0 || code == 126 {
             eprintln!(
-                "sbx: forwarding to WSL2 failed; {WSL_SETUP}. Or set SBX_BACKEND=native to run \
+                "insbx: forwarding to WSL2 failed; {WSL_SETUP}. Or set INSBX_BACKEND=native to run \
                  natively (writes, environment and limits confined; network and deny_read not)."
             );
         }
@@ -313,7 +313,7 @@ fn real_main(args: Vec<OsString>) -> Result<i32, String> {
             Ok(0)
         }
         "-V" | "--version" => {
-            println!("sbx {}", env!("CARGO_PKG_VERSION"));
+            println!("insbx {}", env!("CARGO_PKG_VERSION"));
             Ok(0)
         }
         "doctor" => {
@@ -336,7 +336,7 @@ fn real_main(args: Vec<OsString>) -> Result<i32, String> {
         "run" => run(parse(&args[1..])?),
         "mcp" => mcp(&args[1..]),
         "setup-windows" => setup_windows(&args[1..]),
-        other => Err(format!("unknown command `{other}` (try `sbx --help`)")),
+        other => Err(format!("unknown command `{other}` (try `insbx --help`)")),
     }
 }
 
@@ -349,25 +349,25 @@ fn run(o: Options) -> Result<i32, String> {
     let e = sandbox.enforcement();
     if !o.quiet {
         for gap in e.gaps() {
-            eprintln!("sbx: {gap}");
+            eprintln!("insbx: {gap}");
         }
     }
     let outcome = sandbox.run(program, rest, &o.cwd)?;
     if !o.quiet {
         for d in outcome.decisions.iter().filter(|d| !d.allowed) {
-            eprintln!("sbx: network refused {} ({})", d.target, d.reason);
+            eprintln!("insbx: network refused {} ({})", d.target, d.reason);
         }
         for r in &outcome.restored {
-            eprintln!("sbx: protected path changed by the command, {r}");
+            eprintln!("insbx: protected path changed by the command, {r}");
         }
         if outcome.timed_out {
-            eprintln!("sbx: killed after the wall-clock limit");
+            eprintln!("insbx: killed after the wall-clock limit");
         }
     }
     Ok(outcome.code())
 }
 
-/// `sbx setup-windows`: see [`incord_sandbox::windows::offline`].
+/// `insbx setup-windows`: see [`incord_sandbox::windows::offline`].
 fn setup_windows(args: &[OsString]) -> Result<i32, String> {
     let args: Vec<String> = args
         .iter()
@@ -381,13 +381,13 @@ fn setup_windows(args: &[OsString]) -> Result<i32, String> {
     #[cfg(windows)]
     {
         for line in incord_sandbox::windows::setup_windows(&parsed)? {
-            println!("sbx setup-windows: {line}");
+            println!("insbx setup-windows: {line}");
         }
         if parsed.remove {
-            println!("sbx setup-windows: removed; network deny now needs WSL2 again");
+            println!("insbx setup-windows: removed; network deny now needs WSL2 again");
         } else {
             println!(
-                "sbx setup-windows: done; `sbx run --net deny ...` now runs natively (see `sbx doctor`)"
+                "insbx setup-windows: done; `insbx run --net deny ...` now runs natively (see `insbx doctor`)"
             );
         }
         Ok(0)
@@ -406,7 +406,7 @@ fn setup_windows(args: &[OsString]) -> Result<i32, String> {
 fn mcp(args: &[OsString]) -> Result<i32, String> {
     let (root, mut ceilings) = parse_mcp(args)?;
     let root = root
-        .unwrap_or_else(|| std::env::temp_dir().join(format!("sbx-mcp-{}", std::process::id())));
+        .unwrap_or_else(|| std::env::temp_dir().join(format!("insbx-mcp-{}", std::process::id())));
     std::fs::create_dir_all(&root).map_err(|e| format!("{}: {e}", root.display()))?;
     ceilings.root =
         incord_sandbox::plain_path(std::fs::canonicalize(&root).map_err(|e| e.to_string())?);
@@ -417,7 +417,7 @@ fn mcp(args: &[OsString]) -> Result<i32, String> {
     Ok(0)
 }
 
-/// `sbx mcp`'s options: the sandboxes' root (if given) and the ceilings.
+/// `insbx mcp`'s options: the sandboxes' root (if given) and the ceilings.
 fn parse_mcp(
     args: &[OsString],
 ) -> Result<(Option<PathBuf>, incord_sandbox::server::Ceilings), String> {
@@ -463,7 +463,7 @@ fn parse_mcp(
             }
             "--keep" => ceilings.keep = true,
             "--best-effort" => ceilings.best_effort = true,
-            other => return Err(format!("sbx mcp: unknown option `{other}`")),
+            other => return Err(format!("insbx mcp: unknown option `{other}`")),
         }
         i += 1;
     }
@@ -533,7 +533,7 @@ fn parse(args: &[OsString]) -> Result<Options, String> {
     })
 }
 
-/// Whether `arg` is a `sbx run`/`check` option followed by a value.
+/// Whether `arg` is an `insbx run`/`check` option followed by a value.
 fn takes_value(arg: &str) -> bool {
     matches!(
         arg,
@@ -568,7 +568,7 @@ fn apply_flag(policy: &mut Policy, flag: &str, v: String) -> Result<(), String> 
     if handled {
         Ok(())
     } else {
-        Err(format!("unknown option `{flag}` (try `sbx --help`)"))
+        Err(format!("unknown option `{flag}` (try `insbx --help`)"))
     }
 }
 
@@ -678,7 +678,7 @@ fn doctor() {
         enforcement(&p)
     };
     println!(
-        "sbx {} on {}",
+        "insbx {} on {}",
         env!("CARGO_PKG_VERSION"),
         std::env::consts::OS
     );

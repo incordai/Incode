@@ -1,5 +1,5 @@
 //! Escape tests against Seatbelt: the Linux escape tests that apply on
-//! macOS, through the real `sbx` binary.
+//! macOS, through the real `insbx` binary.
 //!
 //! They use only what a stock Mac (and the macOS CI runner) has: `sh`,
 //! `bash`, `nc`, `curl`, `ps`. Each test skips (with a note) when
@@ -14,22 +14,22 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-const SBX: &str = env!("CARGO_BIN_EXE_sbx");
+const INSBX: &str = env!("CARGO_BIN_EXE_insbx");
 
-fn sbx(args: &[&str], cwd: &Path) -> Output {
-    Command::new(SBX)
+fn insbx(args: &[&str], cwd: &Path) -> Output {
+    Command::new(INSBX)
         .args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())
         .output()
-        .expect("sbx runs")
+        .expect("insbx runs")
 }
 
 fn sh(cwd: &Path, flags: &[&str], script: &str) -> Output {
     let mut args = vec!["run"];
     args.extend_from_slice(flags);
     args.extend_from_slice(&["--", "sh", "-c", script]);
-    sbx(&args, cwd)
+    insbx(&args, cwd)
 }
 
 fn text(o: &Output) -> String {
@@ -43,7 +43,7 @@ fn text(o: &Output) -> String {
 fn enforced(flags: &[&str]) -> bool {
     let mut args = vec!["check"];
     args.extend_from_slice(flags);
-    Command::new(SBX)
+    Command::new(INSBX)
         .args(&args)
         .output()
         .expect("check")
@@ -132,7 +132,7 @@ fn symlinks_and_child_processes_do_not_escape() {
 fn temp_is_private_and_the_shared_temp_dir_is_not_writable() {
     require!(FS, "the filesystem");
     let d = dirs();
-    let marker = std::env::temp_dir().join(format!("sbx-escape-{}", std::process::id()));
+    let marker = std::env::temp_dir().join(format!("insbx-escape-{}", std::process::id()));
     let o = sh(
         &d.ws,
         &["-w", "."],
@@ -142,7 +142,7 @@ fn temp_is_private_and_the_shared_temp_dir_is_not_writable() {
         ),
     );
     let out = text(&o);
-    assert!(out.contains("sbx-"), "TMPDIR is the private one: {out}");
+    assert!(out.contains("insbx-"), "TMPDIR is the private one: {out}");
     assert!(!marker.exists(), "wrote to the shared temp dir");
 }
 
@@ -255,7 +255,7 @@ fn the_proxy_lets_through_only_the_allowlist_and_cannot_be_bypassed() {
     );
     // The test origin is on loopback, so private answers must be allowed,
     // and this process's own upstream proxy (if any) must not be used.
-    let o = Command::new(SBX)
+    let o = Command::new(INSBX)
         .args([
             "run",
             "--allow-host",
@@ -273,10 +273,10 @@ fn the_proxy_lets_through_only_the_allowlist_and_cannot_be_bypassed() {
         .env_remove("http_proxy")
         .stdin(Stdio::null())
         .output()
-        .expect("sbx");
+        .expect("insbx");
     let out = text(&o);
     assert!(out.contains("allowed=origin"), "{out}");
-    assert!(out.contains("other=sbx: 127.0.0.1"), "{out}");
+    assert!(out.contains("other=insbx: 127.0.0.1"), "{out}");
     assert!(
         out.contains("bypass=\n"),
         "the direct connection got through: {out}"
@@ -288,7 +288,7 @@ fn the_proxy_lets_through_only_the_allowlist_and_cannot_be_bypassed() {
 #[test]
 fn the_agent_session_and_git_redirects_are_stripped_and_credentials_kept() {
     let d = dirs();
-    let o = Command::new(SBX)
+    let o = Command::new(INSBX)
         .args([
             "run",
             "--",
@@ -302,17 +302,17 @@ fn the_agent_session_and_git_redirects_are_stripped_and_credentials_kept() {
         .env("GIT_DIR", "/elsewhere/.git")
         .env("ANTHROPIC_API_KEY", "key")
         .output()
-        .expect("sbx");
+        .expect("insbx");
     assert_eq!(String::from_utf8_lossy(&o.stdout).trim(), "[][][][key]");
 }
 
 #[test]
 fn the_wall_limit_kills_the_whole_group() {
     let d = dirs();
-    let tag = format!("sbx_wall_{}", std::process::id());
+    let tag = format!("insbx_wall_{}", std::process::id());
     let start = Instant::now();
     let script = format!("(exec -a {tag} sleep 30) & (exec -a {tag} sleep 30)");
-    let o = sbx(&["run", "--wall", "1", "--", "bash", "-c", &script], &d.ws);
+    let o = insbx(&["run", "--wall", "1", "--", "bash", "-c", &script], &d.ws);
     assert_eq!(o.status.code(), Some(124), "{}", text(&o));
     assert!(start.elapsed() < Duration::from_secs(10));
     std::thread::sleep(Duration::from_millis(300));
@@ -320,10 +320,10 @@ fn the_wall_limit_kills_the_whole_group() {
 }
 
 #[test]
-fn killing_sbx_with_sigkill_takes_the_command_with_it() {
+fn killing_insbx_with_sigkill_takes_the_command_with_it() {
     let d = dirs();
-    let tag = format!("sbx_orphan_{}", std::process::id());
-    let mut child = Command::new(SBX)
+    let tag = format!("insbx_orphan_{}", std::process::id());
+    let mut child = Command::new(INSBX)
         .args([
             "run",
             "--wall",
@@ -336,7 +336,7 @@ fn killing_sbx_with_sigkill_takes_the_command_with_it() {
         .current_dir(&d.ws)
         .stdin(Stdio::null())
         .spawn()
-        .expect("sbx");
+        .expect("insbx");
     let deadline = Instant::now() + Duration::from_secs(5);
     while !running(&tag) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(50));
@@ -349,7 +349,7 @@ fn killing_sbx_with_sigkill_takes_the_command_with_it() {
     while running(&tag) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(50));
     }
-    assert!(!running(&tag), "the command outlived sbx");
+    assert!(!running(&tag), "the command outlived insbx");
 }
 
 #[test]
@@ -359,9 +359,9 @@ fn limits_and_exit_codes() {
     assert_eq!(o.status.code(), Some(7));
     let o = sh(&d.ws, &[], "kill -9 $$");
     assert_eq!(o.status.code(), Some(137));
-    let o = sbx(&["run", "--", "no-such-command-sbx"], &d.ws);
+    let o = insbx(&["run", "--", "no-such-command-insbx"], &d.ws);
     assert_eq!(o.status.code(), Some(127));
-    let o = sbx(&["run", "-w", "missing-root", "--", "true"], &d.ws);
+    let o = insbx(&["run", "-w", "missing-root", "--", "true"], &d.ws);
     assert_eq!(o.status.code(), Some(125));
 }
 

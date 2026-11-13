@@ -22,7 +22,7 @@
 //!   The old one becomes `incode.exe.old`, the new one moves in, and the
 //!   `.old` is removed by the next update (it is still in use by this one).
 //!
-//! `sbx`, the standalone sandbox, ships in the same archive. It is replaced
+//! `insbx`, the standalone sandbox, ships in the same archive. It is replaced
 //! too when it sits beside `incode` — where the installers put it — and left
 //! alone otherwise.
 //!
@@ -453,13 +453,13 @@ fn install(
     }
     replace(&new_incode, exe)?;
     let mut replaced = vec![exe.to_path_buf()];
-    // sbx only where it already is: an install that never had it gets none.
-    let new_sbx = unpacked.join(format!("sbx{suffix}"));
-    let sbx = dir.join(format!("sbx{suffix}"));
-    if new_sbx.is_file() && sbx.is_file() {
-        match replace(&new_sbx, &sbx) {
-            Ok(()) => replaced.push(sbx),
-            Err(why) => return Err(format!("incode was updated, but sbx was not: {why}")),
+    // insbx only where it already is: an install that never had it gets none.
+    let new_insbx = unpacked.join(format!("insbx{suffix}"));
+    let insbx = dir.join(format!("insbx{suffix}"));
+    if new_insbx.is_file() && insbx.is_file() {
+        match replace(&new_insbx, &insbx) {
+            Ok(()) => replaced.push(insbx),
+            Err(why) => return Err(format!("incode was updated, but insbx was not: {why}")),
         }
     }
     Ok(replaced)
@@ -649,12 +649,12 @@ mod tests {
         assert!(Version::parse(env!("CARGO_PKG_VERSION")).is_some());
     }
 
-    /// **sbx SHIPS UNDER incode's VERSION.** One release tag carries both
+    /// **insbx SHIPS UNDER incode's VERSION.** One release tag carries both
     /// programs, and release.yml refuses a tag that either crate's version
     /// disagrees with; this catches the drift on a pull request instead of at
     /// release time.
     #[test]
-    fn sbx_is_versioned_with_incode() {
+    fn insbx_is_versioned_with_incode() {
         let sandbox = include_str!("../crates/sandbox/Cargo.toml");
         let version = sandbox
             .lines()

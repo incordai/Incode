@@ -118,7 +118,7 @@ def winget(tag: str, version: str, sums: dict[str, str]) -> dict[str, str]:
         + "NestedInstallerType: portable\n"
         + "NestedInstallerFiles:\n"
         + "- RelativeFilePath: incode.exe\n  PortableCommandAlias: incode\n"
-        + "- RelativeFilePath: sbx.exe\n  PortableCommandAlias: sbx\n"
+        + "- RelativeFilePath: insbx.exe\n  PortableCommandAlias: insbx\n"
         + "Installers:\n"
         + "- Architecture: x64\n"
         + f"  InstallerUrl: {url(tag, WINDOWS_X64)}\n"
@@ -150,7 +150,7 @@ def scoop(tag: str, version: str, sums: dict[str, str]) -> str:
         "architecture": {
             "64bit": {"url": url(tag, WINDOWS_X64), "hash": sums[WINDOWS_X64]},
         },
-        "bin": ["incode.exe", "sbx.exe"],
+        "bin": ["incode.exe", "insbx.exe"],
         "checkver": {"github": HOMEPAGE},
         "autoupdate": {
             "architecture": {
@@ -188,12 +188,12 @@ def homebrew(tag: str, version: str, sums: dict[str, str]) -> str:
         "  end\n"
         "\n"
         "  def install\n"
-        '    bin.install "incode", "sbx"\n'
+        '    bin.install "incode", "insbx"\n'
         "  end\n"
         "\n"
         "  test do\n"
         '    assert_equal "incode #{version}", shell_output("#{bin}/incode --version").strip\n'
-        '    assert_equal "sbx #{version}", shell_output("#{bin}/sbx --version").strip\n'
+        '    assert_equal "insbx #{version}", shell_output("#{bin}/insbx --version").strip\n'
         "  end\n"
         "end\n"
     )

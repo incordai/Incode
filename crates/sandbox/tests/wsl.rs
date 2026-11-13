@@ -10,10 +10,10 @@
 
 use std::process::{Command, Stdio};
 
-const SBX: &str = env!("CARGO_BIN_EXE_sbx");
+const INSBX: &str = env!("CARGO_BIN_EXE_insbx");
 
 fn landlock() -> bool {
-    Command::new(SBX)
+    Command::new(INSBX)
         .args(["check", "--fs", "read-only"])
         .output()
         .expect("check")
@@ -50,11 +50,11 @@ fn a_hidden_interpreter_cannot_be_executed() {
         args.push(h);
         args.push("--");
         args.extend_from_slice(argv);
-        Command::new(SBX)
+        Command::new(INSBX)
             .args(&args)
             .stdin(Stdio::null())
             .output()
-            .expect("sbx")
+            .expect("insbx")
     };
     let direct = run(&[
         hidden.join("interp").to_str().expect("utf8"),
@@ -71,7 +71,7 @@ fn a_hidden_interpreter_cannot_be_executed() {
         "ran the hidden program as a script's interpreter"
     );
     // Control: without hiding it, both run.
-    let open = Command::new(SBX)
+    let open = Command::new(INSBX)
         .args([
             "run",
             "--fs",
@@ -81,7 +81,7 @@ fn a_hidden_interpreter_cannot_be_executed() {
         ])
         .stdin(Stdio::null())
         .output()
-        .expect("sbx");
+        .expect("insbx");
     assert!(String::from_utf8_lossy(&open.stdout).contains("escaped"));
 }
 
@@ -100,11 +100,11 @@ fn inside_wsl_no_windows_program_can_be_started() {
                  powershell.exe -c 'echo ESCAPED' 2>/dev/null; \
                  echo \"[$WSL_INTEROP]\"; ls /run/WSL 2>/dev/null && echo LISTED; true";
     let open = Command::new("sh").args(["-c", tries]).output().expect("sh");
-    let confined = Command::new(SBX)
+    let confined = Command::new(INSBX)
         .args(["run", "--fs", "read-only", "--", "sh", "-c", tries])
         .stdin(Stdio::null())
         .output()
-        .expect("sbx");
+        .expect("insbx");
     let out = String::from_utf8_lossy(&confined.stdout);
     eprintln!(
         "unconfined: {}",

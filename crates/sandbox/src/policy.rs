@@ -138,7 +138,7 @@ pub struct Network {
     /// `localhost`, `127.0.0.1` or `::1` — a dev server a browser test loads,
     /// say. Only a loopback address is connected to, and nothing else private
     /// opens: `allow_private` stays as it is. The operator's setting alone:
-    /// `sbx mcp` gives an agent no way to ask for it.
+    /// `insbx mcp` gives an agent no way to ask for it.
     pub loopback_ports: Vec<u16>,
 }
 

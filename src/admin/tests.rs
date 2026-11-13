@@ -430,7 +430,7 @@ fn settings_round_trip_through_the_file() {
         pdf_renderer: Some(PdfRenderer::Browser),
         sandbox: Some("read-only".to_string()),
         sandbox_network: Some("deny".to_string()),
-        sandbox_engine: Some("sbx".to_string()),
+        sandbox_engine: Some("insbx".to_string()),
         sandbox_allow_hosts: vec!["crates.io".to_string()],
         sandbox_loopback_ports: vec![5173],
         sandbox_backend: Some("wsl".to_string()),
@@ -688,12 +688,12 @@ fn the_sandbox_engine_resolves_like_the_other_settings() {
     );
 
     let admin = AdminConfig {
-        sandbox_engine: Some("sbx".to_string()),
+        sandbox_engine: Some("insbx".to_string()),
         ..Default::default()
     };
     assert_eq!(
         admin.sandbox_policy(P::WorkspaceWrite).engine,
-        SandboxEngine::Sbx
+        SandboxEngine::Insbx
     );
     assert_eq!(admin.resolve_sandbox_engine().source, Source::AdminFile);
 

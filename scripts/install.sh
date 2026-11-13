@@ -1,5 +1,5 @@
 #!/bin/sh
-# Install incode (and sbx, the standalone sandbox) from a GitHub release.
+# Install incode (and insbx, the standalone sandbox) from a GitHub release.
 #
 #   curl -fsSL https://raw.githubusercontent.com/incordai/incode/main/scripts/install.sh | sh
 #
@@ -18,7 +18,7 @@
 # The sandbox needs no setup here and no root: Landlock and seccomp (Linux)
 # and Seatbelt (macOS) are part of the system. What this system enforces is
 # checked at the end, so a gap (an older kernel) is known at install time.
-# Windows is different: scripts/install.ps1 runs `sbx setup-windows`.
+# Windows is different: scripts/install.ps1 runs `insbx setup-windows`.
 #
 # POSIX sh on purpose: it runs from a pipe on systems where bash is not there.
 
@@ -108,7 +108,7 @@ main() {
     [ -f "$tmp/unpacked/incode" ] || die "$asset holds no incode program"
 
     mkdir -p "$INSTALL_DIR"
-    for program in incode sbx; do
+    for program in incode insbx; do
         [ -f "$tmp/unpacked/$program" ] || continue
         # Copy then rename, so a running copy is replaced whole, never
         # half-written.
@@ -145,19 +145,19 @@ tools_install() {
     printf '%s\n' "$said" | while IFS= read -r line; do say "    $line"; done
 }
 
-# `sbx check` exits 0 when this system enforces file and network confinement
+# `insbx check` exits 0 when this system enforces file and network confinement
 # natively, and otherwise prints, per part, what it cannot enforce.
 sandbox_check() {
-    sbx="$INSTALL_DIR/sbx"
+    insbx="$INSTALL_DIR/insbx"
     if [ "${INCODE_NO_SANDBOX_SETUP:-}" = "1" ]; then
         say "sandbox check skipped (INCODE_NO_SANDBOX_SETUP=1)"
         return 0
     fi
-    if [ ! -x "$sbx" ]; then
-        say "sandbox: this release has no sbx, so commands run unconfined"
+    if [ ! -x "$insbx" ]; then
+        say "sandbox: this release has no insbx, so commands run unconfined"
         return 0
     fi
-    if report="$("$sbx" check --fs workspace-write --net deny 2>&1)"; then
+    if report="$("$insbx" check --fs workspace-write --net deny 2>&1)"; then
         say "sandbox ready: this system confines files and network natively"
     else
         say "sandbox: incode works, but this system does not enforce all of it:"

@@ -1,12 +1,12 @@
-//! The `sbx` engine: the session's shell commands confined by the standalone
+//! The `insbx` engine: the session's shell commands confined by the standalone
 //! sandbox in `crates/sandbox`, chosen with `admin.json` `sandbox_engine:
-//! "sbx"` or [`super::SANDBOX_ENGINE_ENV`].
+//! "insbx"` or [`super::SANDBOX_ENGINE_ENV`].
 //!
 //! # What it adds over the built-in engine
 //!
 //! - **A host allowlist.** `sandbox_allow_hosts` (or
 //!   [`ALLOW_HOSTS_ENV`]) lets a command reach only those hosts, through a
-//!   proxy sbx runs for the command; the built-in engine can only allow or
+//!   proxy insbx runs for the command; the built-in engine can only allow or
 //!   deny the network whole. `sandbox_loopback_ports` adds this machine's own
 //!   ports (a dev server a browser test loads) without opening anything
 //!   else private.
@@ -23,16 +23,16 @@
 //!
 //! # How, per OS
 //!
-//! - **Linux, macOS** — the library, in this process. The helper sbx
-//!   re-executes is incode itself, which hands the `__sbx-enter` argument to
+//! - **Linux, macOS** — the library, in this process. The helper insbx
+//!   re-executes is incode itself, which hands the `__insbx-enter` argument to
 //!   [`incord_sandbox::enter_if_requested`] before anything else in `main`.
-//! - **Windows** — `sbx.exe`, beside `incode.exe` or on `PATH`, which runs the
+//! - **Windows** — `insbx.exe`, beside `incode.exe` or on `PATH`, which runs the
 //!   command natively (restricted token, ACL grant, job object) or inside WSL2
 //!   (Landlock and seccomp), as `sandbox_backend` (or [`BACKEND_ENV`]) says:
 //!   `native`, `wsl` or `auto`. Under `wsl` the command runs in WSL's `sh`.
 //!
 //! Best effort, never silent: what this machine cannot enforce of the policy
-//! is named by [`note`], and the command still runs with the rest. A run sbx
+//! is named by [`note`], and the command still runs with the rest. A run insbx
 //! cannot start at all (a missing root, a proxy that will not bind) is
 //! refused rather than run unconfined.
 
@@ -50,10 +50,10 @@ use super::{SandboxMode, SandboxNetwork, SandboxPolicy};
 pub const ALLOW_HOSTS_ENV: &str = "INCODE_SANDBOX_ALLOW_HOSTS";
 
 /// Windows only: `native`, `wsl` or `auto`, ahead of `admin.json`
-/// `sandbox_backend`. Handed to `sbx.exe` as `SBX_BACKEND`.
+/// `sandbox_backend`. Handed to `insbx.exe` as `INSBX_BACKEND`.
 pub const BACKEND_ENV: &str = "INCODE_SANDBOX_BACKEND";
 
-/// What the sbx engine reads beyond the mode and the network switch, once
+/// What the insbx engine reads beyond the mode and the network switch, once
 /// per process.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Settings {
@@ -61,9 +61,9 @@ pub struct Settings {
     pub allow_hosts: Vec<String>,
     /// This machine's own ports a command may reach (`admin.json`
     /// `sandbox_loopback_ports`); like hosts, they put the network behind
-    /// sbx's proxy.
+    /// insbx's proxy.
     pub loopback_ports: Vec<u16>,
-    /// Windows: where `sbx.exe` runs the command. `None` is sbx's own `auto`.
+    /// Windows: where `insbx.exe` runs the command. `None` is insbx's own `auto`.
     pub backend: Option<String>,
 }
 
@@ -87,7 +87,7 @@ impl Settings {
         }
     }
 
-    /// Whether an open network goes through sbx's proxy instead.
+    /// Whether an open network goes through insbx's proxy instead.
     fn limits_network(&self) -> bool {
         !self.allow_hosts.is_empty() || !self.loopback_ports.is_empty()
     }
@@ -108,7 +108,7 @@ fn hosts(raw: &str) -> Vec<String> {
         .collect()
 }
 
-/// The sbx policy for incode's: the same filesystem mode over the same
+/// The insbx policy for incode's: the same filesystem mode over the same
 /// roots, and the network denied, limited to the settings' hosts and this
 /// machine's ports, or open.
 #[must_use]
@@ -139,7 +139,7 @@ pub fn policy(
     out
 }
 
-/// One line for the trace and `/doctor`: what sbx confines here, and what it
+/// One line for the trace and `/doctor`: what insbx confines here, and what it
 /// cannot.
 #[must_use]
 pub fn note(policy: SandboxPolicy, roots: &[PathBuf]) -> String {
@@ -158,12 +158,12 @@ pub fn note(policy: SandboxPolicy, roots: &[PathBuf]) -> String {
         }
         SandboxNetwork::Allow => "network open".to_string(),
     };
-    let head = format!("sandbox {} by sbx; {network}", policy.mode.as_str());
+    let head = format!("sandbox {} by insbx; {network}", policy.mode.as_str());
     #[cfg(windows)]
     {
         let _ = roots;
         let backend = settings().backend.as_deref().unwrap_or("auto");
-        format!("{head}; through sbx.exe ({backend} backend), which reports its own gaps")
+        format!("{head}; through insbx.exe ({backend} backend), which reports its own gaps")
     }
     #[cfg(not(windows))]
     {
@@ -176,7 +176,7 @@ pub fn note(policy: SandboxPolicy, roots: &[PathBuf]) -> String {
     }
 }
 
-/// What a confined command needs kept alive until it exits: sbx's proxy, its
+/// What a confined command needs kept alive until it exits: insbx's proxy, its
 /// temp directory and the `.git` snapshot. Dropping it undoes any change to
 /// `.git/hooks` or `.git/config`, and traces what was undone.
 #[derive(Default)]
@@ -199,7 +199,7 @@ impl Drop for Keep {
             if !restored.is_empty() {
                 crate::trace!(
                     "sandbox",
-                    "sbx undid the command's change to {}",
+                    "insbx undid the command's change to {}",
                     restored.join(", ")
                 );
             }
@@ -213,8 +213,8 @@ impl Drop for Keep {
 ///
 /// # Errors
 ///
-/// When sbx cannot start the run: a writable root is missing, the proxy will
-/// not bind, or (Windows) `sbx.exe` cannot be found.
+/// When insbx cannot start the run: a writable root is missing, the proxy will
+/// not bind, or (Windows) `insbx.exe` cannot be found.
 #[cfg(not(windows))]
 pub(super) fn wrap(
     sandbox_policy: SandboxPolicy,
@@ -235,16 +235,16 @@ pub(super) fn wrap(
     }
     let cwd = match roots.first() {
         Some(root) => root.clone(),
-        None => std::env::current_dir().map_err(|e| format!("sbx: no working directory: {e}"))?,
+        None => std::env::current_dir().map_err(|e| format!("insbx: no working directory: {e}"))?,
     };
     let args = [OsString::from("-c"), OsString::from(command)];
     let (cmd, guard) = sandbox
         .command(shell.program(), &args, &cwd)
-        .map_err(|e| format!("sbx: {e}"))?;
+        .map_err(|e| format!("insbx: {e}"))?;
     Ok((cmd, Keep { guard: Some(guard) }))
 }
 
-/// Windows: the command run by `sbx.exe`, natively or in WSL2 — see the
+/// Windows: the command run by `insbx.exe`, natively or in WSL2 — see the
 /// module documentation.
 #[cfg(windows)]
 pub(super) fn wrap(
@@ -255,12 +255,12 @@ pub(super) fn wrap(
     env: Option<&HashMap<String, String>>,
 ) -> Result<(Command, Keep), String> {
     let settings = settings();
-    let exe = sbx_exe().ok_or(
-        "sbx: sandbox_engine is \"sbx\" but sbx.exe is neither beside incode.exe nor on PATH \
+    let exe = insbx_exe().ok_or(
+        "insbx: sandbox_engine is \"insbx\" but insbx.exe is neither beside incode.exe nor on PATH \
          (scripts/install.ps1 installs both)",
     )?;
     let mut cmd = Command::new(exe);
-    cmd.args(sbx_args(
+    cmd.args(insbx_args(
         sandbox_policy,
         roots,
         settings,
@@ -272,16 +272,16 @@ pub(super) fn wrap(
         cmd.env_clear().envs(env);
     }
     if let Some(backend) = &settings.backend {
-        cmd.env("SBX_BACKEND", backend);
+        cmd.env("INSBX_BACKEND", backend);
     }
     Ok((cmd, Keep::default()))
 }
 
-/// `sbx run` arguments for one command: the policy as flags, then the
+/// `insbx run` arguments for one command: the policy as flags, then the
 /// command — WSL's `sh` under the `wsl` backend, the session's shell
 /// otherwise.
 #[cfg_attr(not(windows), allow(dead_code))]
-fn sbx_args(
+fn insbx_args(
     policy: SandboxPolicy,
     roots: &[PathBuf],
     reach: &Settings,
@@ -325,17 +325,17 @@ fn sbx_args(
     args
 }
 
-/// `sbx.exe` beside this program, else the first on `PATH`.
+/// `insbx.exe` beside this program, else the first on `PATH`.
 #[cfg(windows)]
-fn sbx_exe() -> Option<PathBuf> {
+fn insbx_exe() -> Option<PathBuf> {
     let beside = std::env::current_exe()
         .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join("sbx.exe")))
+        .and_then(|exe| exe.parent().map(|dir| dir.join("insbx.exe")))
         .filter(|p| p.is_file());
     beside.or_else(|| {
         std::env::var_os("PATH").and_then(|path| {
             std::env::split_paths(&path)
-                .map(|dir| dir.join("sbx.exe"))
+                .map(|dir| dir.join("insbx.exe"))
                 .find(|p| p.is_file())
         })
     })
@@ -351,7 +351,7 @@ mod tests {
             mode,
             network,
             named: true,
-            engine: SandboxEngine::Sbx,
+            engine: SandboxEngine::Insbx,
         }
     }
 
@@ -433,15 +433,15 @@ mod tests {
         );
     }
 
-    /// What `sbx.exe run` is handed on Windows: the policy as flags, then the
+    /// What `insbx.exe run` is handed on Windows: the policy as flags, then the
     /// shell — or WSL's `sh` under the wsl backend.
     #[test]
-    fn sbx_exe_gets_the_policy_as_flags() {
+    fn insbx_exe_gets_the_policy_as_flags() {
         let shell = Shell::from_parts(
             PathBuf::from("bash"),
             crate::tools::shell_choice::Flavor::Posix,
         );
-        let args = sbx_args(
+        let args = insbx_args(
             incode(SandboxMode::WorkspaceWrite, SandboxNetwork::Allow),
             &[PathBuf::from("/w")],
             &reach(&["crates.io"], &[5173]),
@@ -469,7 +469,7 @@ mod tests {
                 "echo hi"
             ]
         );
-        let args = sbx_args(
+        let args = insbx_args(
             incode(SandboxMode::ReadOnly, SandboxNetwork::Deny),
             &[PathBuf::from("/w")],
             &reach(&["crates.io"], &[5173]),

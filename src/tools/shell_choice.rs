@@ -183,7 +183,7 @@ impl Shell {
     }
 
     /// The arguments that run `script` in this shell, unquoted, for a launcher
-    /// that quotes them itself (`sbx.exe`). On Windows, PowerShell gets
+    /// that quotes them itself (`insbx.exe`). On Windows, PowerShell gets
     /// `-Command` and ONE argument: it parses its command line by the C
     /// runtime's rules, so the script arrives as written (measured with
     /// quotes, backslashes, `&|<>^%` and non-ASCII). Not `-EncodedCommand`:

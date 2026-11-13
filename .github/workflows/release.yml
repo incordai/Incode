@@ -1,6 +1,6 @@
 # Release binaries for a version tag.
 #
-# Pushing `v1.2.3` builds `incode` and `sbx` for every platform below, packs
+# Pushing `v1.2.3` builds `incode` and `insbx` for every platform below, packs
 # each pair as `incode-<target>.tar.gz` (`.zip` on Windows), and publishes them
 # on a GitHub Release with a `SHA256SUMS` beside them. `scripts/install.sh`,
 # `scripts/install.ps1` and `incode update` all read exactly these names, so a
@@ -99,17 +99,17 @@ jobs:
           set -euo pipefail
           stage="$(mktemp -d)"
           bin="target/${{ matrix.target }}/release"
-          cp "$bin/incode" "$bin/sbx" LICENSE NOTICE README.md "$stage/"
+          cp "$bin/incode" "$bin/insbx" LICENSE NOTICE README.md "$stage/"
           mkdir -p dist
           tar -C "$stage" -czf "dist/incode-${{ matrix.target }}.tar.gz" \
-            incode sbx LICENSE NOTICE README.md
+            incode insbx LICENSE NOTICE README.md
       - name: Package (windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $stage = New-Item -ItemType Directory -Path (Join-Path $env:RUNNER_TEMP "stage")
           $bin = "target/${{ matrix.target }}/release"
-          Copy-Item "$bin/incode.exe", "$bin/sbx.exe", LICENSE, NOTICE, README.md $stage
+          Copy-Item "$bin/incode.exe", "$bin/insbx.exe", LICENSE, NOTICE, README.md $stage
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Compress-Archive -Path (Join-Path $stage "*") -DestinationPath "dist/incode-${{ matrix.target }}.zip"
       - uses: actions/upload-artifact@v4

@@ -196,24 +196,24 @@ pub struct AdminConfig {
     /// reports. `INCODE_SANDBOX_NETWORK` wins over it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_network: Option<String>,
-    /// What confines the commands: `builtin` (the default) or `sbx`, the
-    /// standalone sandbox — see [`crate::sandbox::sbx`].
+    /// What confines the commands: `builtin` (the default) or `insbx`, the
+    /// standalone sandbox — see [`crate::sandbox::insbx`].
     /// `INCODE_SANDBOX_ENGINE` wins over it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_engine: Option<String>,
-    /// Under the sbx engine: the only hosts a command may reach, when the
+    /// Under the insbx engine: the only hosts a command may reach, when the
     /// network is not denied. Empty leaves it open.
     /// `INCODE_SANDBOX_ALLOW_HOSTS` (comma-separated) wins over it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sandbox_allow_hosts: Vec<String>,
-    /// Under the sbx engine: this machine's own ports a command may reach
+    /// Under the insbx engine: this machine's own ports a command may reach
     /// when the network is not denied (a dev server a browser test loads),
     /// on `localhost`, `127.0.0.1` or `::1` only; nothing else private opens.
-    /// Like `sandbox_allow_hosts` it puts the network behind sbx's proxy.
+    /// Like `sandbox_allow_hosts` it puts the network behind insbx's proxy.
     /// Set here only, by the owner: no variable overrides it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sandbox_loopback_ports: Vec<u16>,
-    /// Under the sbx engine on Windows: `native`, `wsl` or `auto` (the
+    /// Under the insbx engine on Windows: `native`, `wsl` or `auto` (the
     /// default). `INCODE_SANDBOX_BACKEND` wins over it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_backend: Option<String>,

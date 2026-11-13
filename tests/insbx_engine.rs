@@ -1,8 +1,8 @@
-//! The sbx engine, live: shell commands run through
-//! `incord_code::tools::bash` under `sandbox_engine = "sbx"`.
+//! The insbx engine, live: shell commands run through
+//! `incord_code::tools::bash` under `sandbox_engine = "insbx"`.
 //!
-//! `harness = false`: sbx re-executes the CURRENT program as its helper, so
-//! this binary must hand `__sbx-enter` to sbx before anything else, as
+//! `harness = false`: insbx re-executes the CURRENT program as its helper, so
+//! this binary must hand `__insbx-enter` to insbx before anything else, as
 //! incode's `main` does. libtest would read those arguments as test filters.
 
 use std::path::{Path, PathBuf};
@@ -12,7 +12,7 @@ use incord_code::sandbox::{Sandbox, SandboxEngine, SandboxMode, SandboxNetwork, 
 fn main() {
     incord_sandbox::enter_if_requested();
     if !cfg!(target_os = "linux") {
-        println!("sbx_engine: skipped (the live checks are written for Linux)");
+        println!("insbx_engine: skipped (the live checks are written for Linux)");
         return;
     }
     // No operator settings leak in from the machine running the tests.
@@ -29,7 +29,7 @@ fn main() {
             "git redirect variables are stripped",
             git_redirects_are_stripped,
         ),
-        ("the note names sbx", note_names_sbx),
+        ("the note names insbx", note_names_insbx),
     ];
     for (name, check) in checks {
         check();
@@ -43,7 +43,7 @@ fn sandbox(mode: SandboxMode, roots: Vec<PathBuf>) -> Sandbox {
             mode,
             network: SandboxNetwork::Allow,
             named: true,
-            engine: SandboxEngine::Sbx,
+            engine: SandboxEngine::Insbx,
         },
         roots,
     )
@@ -121,8 +121,8 @@ fn git_redirects_are_stripped() {
     assert!(said.contains("git_dir=unset"), "{said}");
 }
 
-fn note_names_sbx() {
+fn note_names_insbx() {
     let sb = sandbox(SandboxMode::ReadOnly, vec![]);
     let note = sb.note();
-    assert!(note.contains("by sbx"), "{note}");
+    assert!(note.contains("by insbx"), "{note}");
 }
