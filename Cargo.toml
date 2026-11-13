@@ -129,10 +129,18 @@ tree-sitter-javascript = { version = "=0.25.0", optional = true }
 # Documents: Read returns markdown for these.
 # PDF text. It can panic on a malformed file, so every call is caught.
 pdf-extract = "=0.12.1"
-# Spreadsheets: xlsx, xls, ods.
-calamine = { version = "=0.36.1", default-features = false }
-# The archive under docx, pptx, odt (and the bomb check before calamine).
-zip = { version = "=8.6.0", default-features = false, features = ["deflate"] }
+# Spreadsheets: xlsx, xls, ods. 0.38.0 (MIT, MSRV 1.88): the first calamine
+# on zip 9, so the spreadsheet reader leaves the zip 8 the advisories below
+# name; 0.36.1 required zip ^8.6.
+calamine = { version = "=0.38.0", default-features = false }
+# The archive under docx, pptx, odt (and the bomb check before calamine), and
+# the tool archives ext_tools unpacks. 9.5.1 (MIT, MSRV 1.88, the latest
+# stable): zip 8.6.0 had GitHub advisories for a parser differential between
+# its two headers (critical), extract() writing outside the target through a
+# symlink (high), unbounded symlink targets and Shrink/Reduce/Implode sizes
+# (high, denial of service) and an AES HMAC check skipped at early EOF; all
+# fixed by 9.0.5.
+zip = { version = "=9.5.1", default-features = false, features = ["deflate"] }
 # The XML inside those archives. 0.41 is already in the lock; not bumped.
 quick-xml = { version = "=0.41.0", default-features = false }
 # Readability for an HTML article, as markdown.

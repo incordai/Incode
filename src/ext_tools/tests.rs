@@ -191,6 +191,46 @@ fn a_zip_that_reaches_outside_is_refused_and_writes_nothing_outside() {
     }
 }
 
+/// **A ZIP WHOSE TWO HEADERS DISAGREE ON A NAME WRITES NOTHING OUTSIDE**:
+/// the central directory says `fine.txt`, the entry's own local header says
+/// `../e.txt` (same length). That disagreement is the zip 8.6.0 critical
+/// advisory ("parser differential via dual-header inconsistencies"): checks
+/// read one name, extraction another. Whatever the reader does with it,
+/// `e.txt` must not appear beside the target folder. Control: the same
+/// archive, consistent, unpacks.
+#[test]
+fn a_zip_whose_headers_disagree_on_a_name_writes_nothing_outside() {
+    let dir = tempfile::tempdir().expect("dir");
+    let plain = zip_of(&[("fine.txt", b"x")]);
+    let mut cloaked = plain.clone();
+    // The first occurrence is the local header's (it precedes the data and
+    // the central directory).
+    let local = cloaked
+        .windows(8)
+        .position(|w| w == b"fine.txt")
+        .expect("the local name");
+    cloaked[local..local + 8].copy_from_slice(b"../e.txt");
+    let central = cloaked
+        .windows(8)
+        .position(|w| w == b"fine.txt")
+        .expect("the central name is unchanged");
+    assert!(central > local, "only the local header was changed");
+
+    let into = dir.path().join("cloaked");
+    let archive = dir.path().join("a.zip");
+    std::fs::write(&archive, &cloaked).expect("seed");
+    let result = unpack::unpack(&archive, "a.zip", &into);
+    assert!(
+        !dir.path().join("e.txt").exists(),
+        "the local header's name escaped the folder ({result:?})"
+    );
+
+    let control = dir.path().join("plain");
+    std::fs::write(&archive, &plain).expect("seed");
+    unpack::unpack(&archive, "a.zip", &control).expect("the plain archive unpacks");
+    assert_eq!(std::fs::read(control.join("fine.txt")).expect("file"), b"x");
+}
+
 /// **A TAR.GZ THAT REACHES OUTSIDE, OR HOLDS A LINK, IS REFUSED.**
 #[test]
 fn a_tar_gz_with_dotdot_or_a_link_is_refused() {
