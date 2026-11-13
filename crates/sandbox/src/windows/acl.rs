@@ -1,24 +1,57 @@
-//! The grant: one inheritable `Modify` ACE per writable root, for one run.
+//! The grant: one inheritable `Modify` ACE per writable root, kept across
+//! runs, and one per run on its private temp directory.
 //!
-//! Ported from incode's `sandbox::windows::acl`. incode grants once per
-//! session and keeps the roots granted across commands; `insbx` runs one
-//! command per policy, so each run gets its own SID and its own [`Lease`]:
-//! granted when the command is prepared, revoked when the lease drops after
-//! it exits. Two runs at once never share a SID, so neither can write the
-//! other's roots.
+//! Ported from incode's `sandbox::windows::acl`, which grants once per
+//! session and keeps the roots granted across commands.
+//!
+//! # Writable roots: kept, one SID per folder
+//!
+//! Granting a folder writes the ACE into every object beneath it (NTFS
+//! inheritance is stored, not computed), so it costs time linear in the tree:
+//! measured 2.3 s per walk on 17,752 objects, and a run used to walk its
+//! roots twice (grant and revoke), five to seven times under network deny.
+//! incode drives one `insbx run` per shell command, so every command paid it.
+//! Now each root has its own SID, derived from its path ([`root_sid`],
+//! [`super::root_sid_from_digest`]), and its grant is KEPT after the run:
+//! the first run on a folder walks it once, and every later run only reads
+//! the folder's own ACL to see the grant is there ([`passes_down`]). As
+//! OpenAI Codex's Windows sandbox does (`codex-rs/windows-sandbox-rs`,
+//! `cap.rs`: a capability SID per writable root, persisted).
+//!
+//! What keeps that confined: the command's token carries the SIDs of THIS
+//! run's roots only ([`Lease::root_sids`]). A kept grant on another folder
+//! names a SID the token does not hold, so it is not writable, exactly as a
+//! folder never granted. `insbx revoke <PATH>|--all` takes kept grants back
+//! ([`revoke_kept`]); `insbx grants` lists them ([`kept_folders`]).
+//!
+//! A file moved INTO a root from elsewhere keeps the ACL it had: no grant's
+//! walk re-ACLs it (measured, and so it was with the per-run grant too), so
+//! the command cannot write it (it fails closed). `icacls <FILE> /reset`
+//! gives it its folder's ACL, the root's ACE included.
+//!
+//! # The temp directory: one SID per run
+//!
+//! The run's private temp directory is new and empty, so its grant is
+//! cheap, and it stays per run: granted to the run's own SID when the
+//! command is prepared, revoked when the [`Lease`] drops after it exits. Two
+//! runs at once never share that SID, so neither can write the other's temp
+//! directory, even with the same roots.
 //!
 //! # Network deny: the offline account's share
 //!
 //! When the command runs as the offline account ([`super::offline`]), the
 //! token's normal access check is the account's, not the user's, so each root
 //! also gets an ACE for the account (`Modify`), and the current folder and
-//! the helper program one for reading. Writes still need the run's SID too
-//! (the token's restricted check), so a root granted to the account for one
-//! run is not writable by another run's command. The account's ACE on a path
-//! is one ACE however many runs granted it (a grant merges into it), so a run
-//! that ends removes it only when no other live run still lists that path,
-//! and leaves read access when another only reads it
-//! ([`super::offline::still_needed`]).
+//! the helper program one for reading. Writes still need the root's own SID
+//! too (the token's restricted check), so a root granted to the account for
+//! one run is not writable by another run's command unless that run names
+//! the same root. The account's ACEs on roots and on a current FOLDER are
+//! kept like the roots' own: a later network-deny run may READ a folder an
+//! earlier one was granted, never write it. Its ACEs on the temp directory
+//! and on a read FILE (the helper program) last the run: one ACE however
+//! many runs granted it (a grant merges into it), so a run that ends removes
+//! it only when no other live run still lists that path, and leaves read
+//! access when another only reads it ([`super::offline::still_needed`]).
 //!
 //! # Network deny: what the account creates stays the user's to re-ACL
 //!
@@ -75,6 +108,7 @@ use windows_sys::Win32::Security::Authorization::{
     EXPLICIT_ACCESS_W, GRANT_ACCESS, NO_MULTIPLE_TRUSTEE, REVOKE_ACCESS, SE_FILE_OBJECT,
     TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
 };
+use windows_sys::Win32::Security::Cryptography::{BCryptHash, BCRYPT_SHA256_ALG_HANDLE};
 use windows_sys::Win32::Security::{
     AclSizeInformation, AddAccessAllowedAceEx, AddAce, EqualSid, GetAce, GetAclInformation,
     GetLengthSid, GetSecurityDescriptorControl, InitializeAcl, InitializeSecurityDescriptor,
@@ -91,7 +125,10 @@ use windows_sys::Win32::System::Threading::{
 
 use super::offline::{still_needed, Need};
 use super::token::{current_user_sid, last_error, sid, sid_to_string, wide, LocalPtr, OwnedHandle};
-use super::{fold_nested, is_listed, is_session_sid, refuse_broad, session_sid, GrantRecord};
+use super::{
+    fold_nested, is_listed, is_session_sid, kept_text, parse_kept, path_key, refuse_broad,
+    root_sid_from_digest, session_sid, GrantRecord,
+};
 
 /// The rights granted on a root: `icacls`'s `M` (read, write, execute,
 /// delete).
@@ -179,15 +216,23 @@ fn refuse_ungrantable(roots: &[PathBuf], profile: Option<&str>) -> Result<(), St
     Ok(())
 }
 
-/// One run's grant on its roots. Dropping it revokes them.
+/// One run's grant: its roots' kept grants, checked or made, and its temp
+/// directory's own. Dropping it revokes what was the run's alone (the temp
+/// directory, a read file, a listed parent); the kept grants stay.
 pub(crate) struct Lease {
     record: GrantRecord,
     path: PathBuf,
-    /// The roots and read paths a grant was attempted on, so far: what
-    /// dropping the lease takes back.
+    /// The per-run paths a grant was attempted on, so far: what dropping the
+    /// lease takes back. The temp directory only, as a root.
     roots: Vec<PathBuf>,
     reads: Vec<PathBuf>,
     parents: Vec<PathBuf>,
+    /// The kept SIDs of this run's writable roots ([`root_sid`]), for the
+    /// command's token.
+    root_sids: Vec<String>,
+    /// The roots whose grant this lease had to make (walking their trees);
+    /// a root granted before is only read, and is not here.
+    walked: Vec<PathBuf>,
     /// The named mutex that tells a later sweep this run is alive.
     _alive: OwnedHandle,
 }
@@ -201,27 +246,36 @@ impl std::fmt::Debug for Lease {
 }
 
 impl Lease {
-    /// Grant `roots` (the writable roots and the run's temp directory) to a
-    /// new private SID, and with `offline` to the offline account as well,
-    /// after sweeping what a crashed run left.
+    /// Make sure each of `roots` (the writable roots) carries its kept grant,
+    /// granting the ones that do not yet; grant `temp` (the run's private
+    /// temp directory) to a new private SID; and with `offline`, the offline
+    /// account's share as well. The crash sweep runs first.
     ///
     /// # Errors
-    /// When a root may not or could not be granted. Nothing this call granted
-    /// is left behind on failure.
+    /// When a root may not or could not be granted. What this call granted
+    /// for the run alone is not left behind on failure; a root whose grant
+    /// failed part-way has it taken off again ([`keep_root`]), so the next
+    /// run tries again instead of trusting it.
     ///
     /// The steps: the roots are checked ([`refuse_ungrantable`]) and folded,
-    /// the account's share narrowed ([`OfflineGrant::grantable`]), the sweep
-    /// run and the grant written down, then the roots granted
-    /// ([`Lease::grant_roots`]), the account's read paths
+    /// the account's share narrowed ([`OfflineGrant::grantable`]) and its
+    /// read paths split into folders (kept) and files (this run's), the
+    /// sweep run and the run's grant written down, then the temp directory
+    /// granted ([`Lease::grant_roots`]), the roots' kept grants checked or
+    /// made ([`Lease::keep_roots`]), the account's read paths
     /// ([`Lease::grant_reads`]) and its parents ([`Lease::grant_parents`]).
     /// A step that fails returns with the lease, which drops and so takes
     /// back what the steps before it listed.
+    ///
+    /// Called by `crate::Sandbox::windows_lease` (lib.rs), once per run.
     pub(crate) fn acquire(
         roots: &[PathBuf],
+        temp: &Path,
         offline: Option<OfflineGrant>,
     ) -> Result<Self, String> {
         let profile = std::env::var("USERPROFILE").ok();
         refuse_ungrantable(roots, profile.as_deref())?;
+        refuse_state_dir(roots)?;
         let roots = fold_nested(roots);
         let offline = offline
             .map(|o| o.grantable(profile.as_deref()))
@@ -230,15 +284,18 @@ impl Lease {
             Some(o) => (Some(o.user), o.reads, o.parents),
             None => (None, Vec::new(), Vec::new()),
         };
+        let (kept_reads, reads): (Vec<PathBuf>, Vec<PathBuf>) =
+            reads.into_iter().partition(|r| r.is_dir());
         let dir = records_dir();
         std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         sweep(&dir);
 
         let (rid, alive) = claim_rid(&dir)?;
+        let temp = vec![temp.to_path_buf()];
         let mut lease = Self {
             record: GrantRecord {
                 sid: session_sid(rid),
-                roots: roots.clone(),
+                roots: temp.clone(),
                 user,
                 reads: reads.clone(),
                 parents: parents.clone(),
@@ -247,18 +304,50 @@ impl Lease {
             roots: Vec::new(),
             reads: Vec::new(),
             parents: Vec::new(),
+            root_sids: Vec::new(),
+            walked: Vec::new(),
             _alive: alive,
         };
         // Written down BEFORE anything is granted, so a crash at any point
         // after this is swept.
         std::fs::write(&lease.path, lease.record.to_text())
             .map_err(|e| format!("{}: {e}", lease.path.display()))?;
-        lease.grant_roots(&roots)?;
+        lease.grant_roots(&temp)?;
+        lease.keep_roots(&roots)?;
         if let Some(user) = lease.record.user.clone() {
+            for read in &kept_reads {
+                keep_read(read, &user).map_err(|e| {
+                    format!(
+                        "could not let the offline account read {}: {e}",
+                        read.display()
+                    )
+                })?;
+            }
             lease.grant_reads(&reads, &user)?;
             lease.grant_parents(&parents, &user);
         }
         Ok(lease)
+    }
+
+    /// Check or make each root's kept grant ([`keep_root`]), for
+    /// [`Lease::acquire`], collecting the SIDs the command's token carries.
+    /// Stops at the first that fails.
+    fn keep_roots(&mut self, roots: &[PathBuf]) -> Result<(), String> {
+        for root in roots {
+            let (sid, walked) = keep_root(root, self.record.user.as_deref())
+                .map_err(|e| format!("workspace-write could not grant {}: {e}", root.display()))?;
+            self.root_sids.push(sid);
+            if walked {
+                self.walked.push(root.clone());
+            }
+        }
+        Ok(())
+    }
+
+    /// The roots whose grant this lease made, walking their trees.
+    #[cfg(test)]
+    fn walked(&self) -> &[PathBuf] {
+        &self.walked
     }
 
     /// Grant each root in turn ([`grant_root`]), for [`Lease::acquire`],
@@ -307,9 +396,16 @@ impl Lease {
         }
     }
 
-    /// The SID the command's token is restricted to.
+    /// The run's own SID, granted on its temp directory: the token's first
+    /// restricting SID, and the one its default DACL names.
     pub(crate) fn sid(&self) -> &str {
         &self.record.sid
+    }
+
+    /// The kept SIDs of this run's writable roots: the token's other
+    /// restricting SIDs, and the only root SIDs it carries.
+    pub(crate) fn root_sids(&self) -> &[String] {
+        &self.root_sids
     }
 }
 
@@ -416,6 +512,209 @@ fn grant_root(root: &Path, sid_text: &str, user: Option<&str>) -> Result<(), Str
         keep_acl_rights(root)?;
     }
     Ok(())
+}
+
+/// The kept SID of the writable root `root`: [`super::root_sid_from_digest`]
+/// of the SHA-256 of its [`path_key`] (case and spelling folded, so
+/// `C:\W` and `c:/w/` are one root), hashed by Windows' own CNG.
+///
+/// # Errors
+/// When the hash cannot be computed.
+pub(crate) fn root_sid(root: &Path) -> Result<String, String> {
+    let key = path_key(&root.to_string_lossy());
+    let mut digest = [0u8; 32];
+    let input = key.as_bytes();
+    let len = u32::try_from(input.len()).map_err(|_| "the path is too long to hash")?;
+    // SAFETY: the SHA-256 pseudo-handle needs no open or close; the input
+    // and output buffers are valid for the lengths passed.
+    let status = unsafe {
+        BCryptHash(
+            BCRYPT_SHA256_ALG_HANDLE,
+            std::ptr::null(),
+            0,
+            input.as_ptr(),
+            len,
+            digest.as_mut_ptr(),
+            32,
+        )
+    };
+    if status != 0 {
+        return Err(format!("BCryptHash failed with status {status:#x}"));
+    }
+    Ok(root_sid_from_digest(&digest))
+}
+
+/// Make sure `root` carries its kept grant, for [`Lease::keep_roots`]:
+/// `Modify` to [`root_sid`], and with the offline account `user`, `Modify`
+/// to the account and the user's own ACL rights beneath ([`keep_acl_rights`]).
+/// Each is read off the folder's own ACL first ([`passes_down`]) and made
+/// only when missing, so a root granted before costs one ACL read, not a
+/// walk of its tree. The SID, and whether a grant had to be made (a walk).
+///
+/// A grant that fails part-way (a file beneath the user may not re-ACL) has
+/// the root's ACE taken off again, so the next run walks and reports it
+/// again instead of finding the ACE on the folder and trusting a tree only
+/// part granted. Under the ACL lock throughout, so two runs granting the
+/// same new folder do not both walk it.
+fn keep_root(root: &Path, user: Option<&str>) -> Result<(String, bool), String> {
+    let sid = root_sid(root)?;
+    let _lock = AclLock::take()?;
+    let mut walked = false;
+    if !passes_down(root, &sid, MODIFY)? {
+        walked = true;
+        if let Err(e) = change(root, &sid, Change::Grant(MODIFY)) {
+            let _ = change(root, &sid, Change::Revoke);
+            return Err(e);
+        }
+    }
+    if let Some(user) = user {
+        if !passes_down(root, user, MODIFY)? {
+            walked = true;
+            if let Err(e) = grant_account(root, user, MODIFY) {
+                let _ = change(root, user, Change::Revoke);
+                return Err(e);
+            }
+        }
+        walked |= keep_acl_rights(root)?;
+    }
+    remember_kept(root);
+    Ok((sid, walked))
+}
+
+/// Make sure the offline account `user` may read the folder `dir` (the
+/// current folder of a network-deny run), kept like a root's grant: made
+/// once, checked by one ACL read after that.
+fn keep_read(dir: &Path, user: &str) -> Result<(), String> {
+    let _lock = AclLock::take()?;
+    if !passes_down(dir, user, READ_EXECUTE)? {
+        if let Err(e) = grant_account(dir, user, READ_EXECUTE) {
+            let _ = change(dir, user, Change::Revoke);
+            return Err(e);
+        }
+    }
+    remember_kept(dir);
+    Ok(())
+}
+
+/// Refuse a root that holds insbx's own state (`%LOCALAPPDATA%\insbx`: the
+/// crash records and the kept list), for [`Lease::acquire`]: a command
+/// that could write there could forge a record for the sweep.
+fn refuse_state_dir(roots: &[PathBuf]) -> Result<(), String> {
+    let Some(state) = records_dir().parent().map(Path::to_path_buf) else {
+        return Ok(());
+    };
+    let state_key = path_key(&state.to_string_lossy());
+    for root in roots {
+        let key = path_key(&root.to_string_lossy());
+        let holds = state_key == key
+            || state_key.starts_with(&format!("{key}\\"))
+            || key.starts_with(&format!("{state_key}\\"));
+        if holds {
+            return Err(format!(
+                "workspace-write refuses {}: it holds insbx's own records ({})",
+                root.display(),
+                state.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The kept-grants list's file: `%LOCALAPPDATA%\insbx\kept`.
+fn kept_file() -> PathBuf {
+    records_dir()
+        .parent()
+        .map_or_else(|| PathBuf::from("insbx-kept"), |d| d.join("kept"))
+}
+
+/// Add `path` to the kept list, unless it is there already. Only for
+/// listing ([`super::parse_kept`]); a failure to write it is said, not
+/// fatal: the grant itself is in the folder's ACL.
+fn remember_kept(path: &Path) {
+    let file = kept_file();
+    let mut kept = std::fs::read_to_string(&file)
+        .map(|t| parse_kept(&t))
+        .unwrap_or_default();
+    let key = path_key(&path.to_string_lossy());
+    if kept.iter().any(|k| path_key(&k.to_string_lossy()) == key) {
+        return;
+    }
+    kept.push(path.to_path_buf());
+    if let Err(e) = std::fs::write(&file, kept_text(&kept)) {
+        eprintln!(
+            "insbx: could not add {} to the kept-grants list {} ({e}); `insbx grants` will \
+             not show it",
+            path.display(),
+            file.display()
+        );
+    }
+}
+
+/// One kept folder, for `insbx grants`.
+#[derive(Debug, Clone)]
+pub struct KeptFolder {
+    pub path: PathBuf,
+    /// Whether the folder still carries its root SID's grant.
+    pub granted: bool,
+}
+
+/// Every folder the kept list names that still exists, each with whether
+/// its grant is still on it. Folders that are gone are dropped from the
+/// list.
+///
+/// # Errors
+/// When the list cannot be read.
+pub fn kept_folders() -> Result<Vec<KeptFolder>, String> {
+    let _lock = AclLock::take()?;
+    let file = kept_file();
+    let text = match std::fs::read_to_string(&file) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("{}: {e}", file.display())),
+    };
+    let all = parse_kept(&text);
+    let live: Vec<PathBuf> = all.iter().filter(|p| p.exists()).cloned().collect();
+    if live.len() != all.len() {
+        let _ = std::fs::write(&file, kept_text(&live));
+    }
+    Ok(live
+        .into_iter()
+        .map(|path| {
+            let granted = root_sid(&path)
+                .and_then(|sid| passes_down(&path, &sid, MODIFY))
+                .unwrap_or(false);
+            KeptFolder { path, granted }
+        })
+        .collect())
+}
+
+/// Take `path`'s kept grants back: its root SID's ACE, and with the offline
+/// account `user`, the account's ACEs on it; then drop it from the kept
+/// list. The user's own ACL rights stay ([`keep_acl_rights`] says why). A
+/// run that is using the folder right now loses its writes there. The next
+/// run with it as a root grants the whole tree again (files moved in keep
+/// their own ACL even then; `icacls <FILE> /reset` fixes one).
+///
+/// # Errors
+/// When an ACE cannot be removed; the folder stays listed then.
+pub fn revoke_kept(path: &Path, user: Option<&str>) -> Result<(), String> {
+    let _lock = AclLock::take()?;
+    let key = path_key(&path.to_string_lossy());
+    if path.exists() {
+        change(path, &root_sid(path)?, Change::Revoke)?;
+        if let Some(user) = user {
+            change(path, user, Change::Revoke)?;
+        }
+    }
+    let file = kept_file();
+    let kept = std::fs::read_to_string(&file)
+        .map(|t| parse_kept(&t))
+        .unwrap_or_default();
+    let left: Vec<PathBuf> = kept
+        .into_iter()
+        .filter(|k| path_key(&k.to_string_lossy()) != key)
+        .collect();
+    std::fs::write(&file, kept_text(&left)).map_err(|e| format!("{}: {e}", file.display()))
 }
 
 /// Grant the account `rights` on `path`, inherited beneath a folder. A
@@ -1166,21 +1465,23 @@ mod tests {
         );
     }
 
-    /// **A GRANT THAT FAILS PART-WAY TAKES BACK WHAT IT ALREADY GRANTED**:
-    /// the first root is granted, the second refuses (its ACL may be read but
-    /// not changed: an `OWNER RIGHTS` ACE takes the owner's implicit
-    /// `WRITE_DAC` away), and the lease the failure drops revokes the first
-    /// root and what propagated beneath it. The second root's revoke fails as
-    /// its grant did, so the record is kept for the next sweep, naming that
-    /// root alone.
+    /// **A GRANT THAT FAILS PART-WAY IS NOT TRUSTED, AND THE RUN'S OWN GRANT
+    /// IS TAKEN BACK**: the first root gets its kept grant, the second
+    /// refuses (its ACL may be read but not changed: an `OWNER RIGHTS` ACE
+    /// takes the owner's implicit `WRITE_DAC` away), so the run is refused.
+    /// The first root's grant is kept, as after any run; the second carries
+    /// no root SID for a later run to trust; the lease the failure drops
+    /// revokes the run's own SID from its temp directory, and its record goes.
     #[test]
-    fn a_grant_that_fails_part_way_takes_back_what_it_granted() {
+    fn a_grant_that_fails_part_way_is_not_trusted_and_the_runs_own_is_taken_back() {
         let dir = tempfile::tempdir().expect("tempdir");
         // Folded in this order: `a-` before `b-`.
         let granted = dir.path().join("a-granted");
         let locked = dir.path().join("b-locked");
+        let temp = dir.path().join("t");
         std::fs::create_dir(&granted).expect("granted root");
         std::fs::create_dir(&locked).expect("locked root");
+        std::fs::create_dir(&temp).expect("temp");
         let beneath = granted.join("made-before.txt");
         std::fs::write(&beneath, "x").expect("write");
         // An elevated process (a CI runner) leaves explicit full-control ACEs
@@ -1205,7 +1506,7 @@ mod tests {
             String::from_utf8_lossy(&set.stdout)
         );
 
-        let err = match Lease::acquire(&[granted.clone(), locked.clone()], None) {
+        let err = match Lease::acquire(&[granted.clone(), locked.clone()], &temp, None) {
             Err(err) => err,
             Ok(_) => panic!(
                 "the locked root refused nothing (elevated: {}):\n{}",
@@ -1221,35 +1522,135 @@ mod tests {
             "{err}"
         );
 
-        let kept: Vec<(PathBuf, GrantRecord)> = std::fs::read_dir(records_dir())
+        let granted_sid = root_sid(&granted).expect("sid");
+        for path in [&granted, &beneath] {
+            let acl = acl_of(path);
+            assert!(
+                acl.contains(&granted_sid),
+                "kept: {}: {acl}",
+                path.display()
+            );
+        }
+        let locked_acl = acl_of(&locked);
+        assert!(
+            !locked_acl.contains(&root_sid(&locked).expect("sid")),
+            "no grant to trust on the locked root: {locked_acl}"
+        );
+        let temp_acl = acl_of(&temp);
+        assert!(
+            !temp_acl.contains(super::super::SID_PREFIX),
+            "the run's SID was revoked from its temp: {temp_acl}"
+        );
+        let left = std::fs::read_dir(records_dir())
             .expect("records")
             .flatten()
-            .map(|e| e.path())
-            .filter_map(|p| {
-                let record = GrantRecord::parse(&std::fs::read_to_string(&p).ok()?)?;
-                Some((p, record))
-            })
-            .filter(|(_, r)| r.roots.contains(&locked) || r.roots.contains(&granted))
-            .collect();
-        for (path, _) in &kept {
-            // This test's own record: the locked root goes with the tempdir.
-            let _ = std::fs::remove_file(path);
-        }
-        assert_eq!(kept.len(), 1, "one record kept for the next sweep");
-        let record = &kept[0].1;
+            .filter_map(|e| GrantRecord::parse(&std::fs::read_to_string(e.path()).ok()?))
+            .any(|r| r.roots.contains(&temp));
+        assert!(!left, "the run's record was removed");
+        revoke_kept(&granted, None).expect("revoke");
+    }
+
+    /// **A KEPT GRANT IS MADE ONCE, THEN ONLY READ; REVOKE TAKES IT BACK**:
+    /// the first lease walks the root (a file beneath gets the root's ACE);
+    /// the second only reads the root's ACL and walks nothing. `revoke_kept`
+    /// takes the ACE off the root and its files and drops the root from the
+    /// kept list; the next lease walks again. A file MOVED in keeps the ACL
+    /// it had through all of it (no walk re-ACLs it, kept grant or not), and
+    /// `icacls /reset` gives it the folder's.
+    #[test]
+    fn a_kept_grant_is_made_once_then_only_read_and_revoke_takes_it_back() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("root");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&root).expect("root");
+        std::fs::create_dir(&outside).expect("outside");
+        let beneath = root.join("before.txt");
+        std::fs::write(&beneath, "x").expect("write");
+        let sid = root_sid(&root).expect("sid");
+        let temp = |n: &str| {
+            let t = dir.path().join(n);
+            std::fs::create_dir(&t).expect("temp");
+            t
+        };
+
+        let first = Lease::acquire(std::slice::from_ref(&root), &temp("t1"), None).expect("first");
+        assert_eq!(first.root_sids(), std::slice::from_ref(&sid));
         assert_eq!(
-            record.roots,
-            vec![locked.clone()],
-            "the granted root was revoked"
+            first.walked(),
+            std::slice::from_ref(&root),
+            "the first walks"
+        );
+        drop(first);
+        assert!(acl_of(&root).contains(&sid), "kept on the root");
+        assert!(acl_of(&beneath).contains(&sid), "and beneath it");
+        let listed = kept_folders().expect("list");
+        assert!(
+            listed.iter().any(|k| k.path == root && k.granted),
+            "listed as granted: {listed:?}"
         );
 
-        for path in [&granted, &beneath] {
-            let acl = std::process::Command::new("icacls")
-                .arg(path)
-                .output()
-                .expect("icacls");
-            let acl = String::from_utf8_lossy(&acl.stdout);
-            assert!(!acl.contains(&record.sid), "{}: {acl}", path.display());
+        let moved = root.join("moved.txt");
+        std::fs::write(outside.join("moved.txt"), "y").expect("write");
+        std::fs::rename(outside.join("moved.txt"), &moved).expect("move in");
+        assert!(!acl_of(&moved).contains(&sid), "a moved file keeps its ACL");
+
+        let second =
+            Lease::acquire(std::slice::from_ref(&root), &temp("t2"), None).expect("second");
+        assert_eq!(second.root_sids(), std::slice::from_ref(&sid));
+        assert!(second.walked().is_empty(), "the second only reads the ACL");
+        drop(second);
+        assert!(!acl_of(&moved).contains(&sid), "{}", acl_of(&moved));
+
+        revoke_kept(&root, None).expect("revoke");
+        for path in [&root, &beneath] {
+            let acl = acl_of(path);
+            assert!(!acl.contains(&sid), "revoked: {}: {acl}", path.display());
         }
+        assert!(
+            !kept_folders().expect("list").iter().any(|k| k.path == root),
+            "no longer listed"
+        );
+
+        let third = Lease::acquire(std::slice::from_ref(&root), &temp("t3"), None).expect("third");
+        assert_eq!(
+            third.walked(),
+            std::slice::from_ref(&root),
+            "revoked: walks again"
+        );
+        drop(third);
+        assert!(
+            acl_of(&beneath).contains(&sid),
+            "granted again, the whole tree: {}",
+            acl_of(&beneath)
+        );
+        // The moved file: not reached by the walk either; `icacls /reset`
+        // rebuilds its ACL from its folder's.
+        assert!(!acl_of(&moved).contains(&sid), "{}", acl_of(&moved));
+        let reset = std::process::Command::new("icacls")
+            .arg(&moved)
+            .arg("/reset")
+            .output()
+            .expect("icacls");
+        assert!(
+            reset.status.success(),
+            "{}",
+            String::from_utf8_lossy(&reset.stdout)
+        );
+        assert!(acl_of(&moved).contains(&sid), "reset: {}", acl_of(&moved));
+        revoke_kept(&root, None).expect("cleanup");
+    }
+
+    /// **A ROOT HOLDING INSBX'S OWN RECORDS IS REFUSED**: a command that
+    /// could write there could forge a record for the sweep.
+    #[test]
+    fn a_root_holding_insbx_state_is_refused() {
+        let state = records_dir();
+        let parent = state.parent().expect("state dir").to_path_buf();
+        for root in [parent, state] {
+            let err = refuse_state_dir(std::slice::from_ref(&root)).expect_err("refused");
+            assert!(err.contains("holds insbx's own records"), "{err}");
+        }
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        assert!(refuse_state_dir(&[elsewhere.path().to_path_buf()]).is_ok());
     }
 }

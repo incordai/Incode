@@ -29,6 +29,19 @@ USAGE:
                              natively (an offline account the firewall cuts off).
                              --read lets that account read a folder (a toolchain);
                              --remove undoes all of it
+    insbx grants               Windows: the folders whose write grant is kept, and whether
+                             each still carries it
+    insbx revoke <DIR>... | --all
+                             Windows: take a folder's kept grant back; its next run grants
+                             it again
+
+KEPT GRANTS (Windows):
+    A writable root's grant is written into every file beneath it, so it is made by the
+    first run on that folder and then KEPT: later runs only check it, instead of walking
+    the tree twice per run. Each folder has its own SID, and a run's token carries only
+    its own roots' SIDs, so a kept grant lets no other run write there. A file moved into
+    a root from elsewhere keeps its old ACL (not writable to the command) until
+    `icacls <FILE> /reset` gives it its folder's.
 
 MCP OPTIONS (the ceilings; an agent can ask for less, never more):
         --root <DIR>         where sandboxes live (default: <temp>/insbx-mcp-<pid>)
@@ -131,7 +144,14 @@ mod windows_backend {
         if backend == Backend::Wsl
             && !matches!(
                 sub,
-                "" | "-h" | "--help" | "help" | "-V" | "--version" | "setup-windows"
+                "" | "-h"
+                    | "--help"
+                    | "help"
+                    | "-V"
+                    | "--version"
+                    | "setup-windows"
+                    | "grants"
+                    | "revoke"
             )
         {
             return Some(forward(args));
@@ -336,6 +356,8 @@ fn real_main(args: Vec<OsString>) -> Result<i32, String> {
         "run" => run(parse(&args[1..])?),
         "mcp" => mcp(&args[1..]),
         "setup-windows" => setup_windows(&args[1..]),
+        "grants" => grants(),
+        "revoke" => revoke(&args[1..]),
         other => Err(format!("unknown command `{other}` (try `insbx --help`)")),
     }
 }
@@ -365,6 +387,81 @@ fn run(o: Options) -> Result<i32, String> {
         }
     }
     Ok(outcome.code())
+}
+
+/// `insbx grants`: every folder whose write grant is kept
+/// (`incord_sandbox::windows::kept_folders`), one per line, `granted` or
+/// `missing` (its ACE is gone: the next run grants it again).
+fn grants() -> Result<i32, String> {
+    #[cfg(windows)]
+    {
+        let kept = incord_sandbox::windows::kept_folders()?;
+        if kept.is_empty() {
+            println!("insbx grants: none kept");
+        }
+        for k in kept {
+            let state = if k.granted { "granted" } else { "missing" };
+            println!("{state:<8} {}", strip_verbatim(&k.path));
+        }
+        Ok(0)
+    }
+    #[cfg(not(windows))]
+    {
+        Err("kept grants are Windows only: Landlock and Seatbelt grant nothing on disk".into())
+    }
+}
+
+/// `insbx revoke <DIR>... | --all`: take kept grants back
+/// (`incord_sandbox::windows::revoke_kept`), the offline account's too when
+/// it is set up. Every folder is tried; the exit code is 1 when any failed.
+fn revoke(args: &[OsString]) -> Result<i32, String> {
+    let words: Vec<&str> = args
+        .iter()
+        .map(|a| a.to_str().ok_or("an argument is not valid Unicode"))
+        .collect::<Result<_, _>>()?;
+    if words.is_empty() {
+        return Err("revoke what? give folders, or --all".into());
+    }
+    #[cfg(windows)]
+    {
+        use incord_sandbox::windows;
+        let folders: Vec<PathBuf> = if words == ["--all"] {
+            windows::kept_folders()?
+                .into_iter()
+                .map(|k| k.path)
+                .collect()
+        } else if words.contains(&"--all") {
+            return Err("--all takes no folders".into());
+        } else {
+            words
+                .iter()
+                .map(|w| std::fs::canonicalize(w).map_err(|e| format!("{w}: {e}")))
+                .collect::<Result<_, _>>()?
+        };
+        let account = windows::offline_setup().ok().map(|r| r.sid);
+        let mut failed = false;
+        for folder in folders {
+            match windows::revoke_kept(&folder, account.as_deref()) {
+                Ok(()) => println!("insbx revoke: {}", strip_verbatim(&folder)),
+                Err(e) => {
+                    eprintln!("insbx revoke: {}: {e}", strip_verbatim(&folder));
+                    failed = true;
+                }
+            }
+        }
+        Ok(i32::from(failed))
+    }
+    #[cfg(not(windows))]
+    {
+        Err("kept grants are Windows only: Landlock and Seatbelt grant nothing on disk".into())
+    }
+}
+
+/// A path as the user wrote it: `canonicalize`'s `\\?\` dropped.
+#[cfg(windows)]
+fn strip_verbatim(p: &std::path::Path) -> String {
+    let s = p.display().to_string();
+    s.strip_prefix(r"\\?\").map_or(s.clone(), str::to_string)
 }
 
 /// `insbx setup-windows`: see [`incord_sandbox::windows::offline`].

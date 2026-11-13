@@ -57,7 +57,8 @@ use super::job_flags;
 use super::offline::HELPER_PROCESS_SDDL;
 use super::token::{dacl_of, last_error, restricted, security_descriptor, wide, OwnedHandle};
 use super::{
-    batch_command_line, command_line, is_batch, is_session_sid, resolve_program, JobLimits,
+    batch_command_line, command_line, is_batch, is_root_sid, is_session_sid, resolve_program,
+    JobLimits,
 };
 use crate::policy::FsMode;
 use crate::{EnterSpec, InnerLaunch, Offline, ENTER_ARG, EXIT_SANDBOX, INNER_ARG, INNER_ENV};
@@ -388,7 +389,9 @@ fn environment_block() -> Result<Vec<u16>, String> {
     }
 }
 
-/// The token for a confined run, restricted to the run's SID.
+/// The token for a confined run, restricted to the run's SID and its roots'
+/// kept SIDs. Any SID not of either shape is refused, so a spec cannot point
+/// the token at a SID that is granted somewhere real.
 fn confining_token(spec: &EnterSpec) -> Result<OwnedHandle, String> {
     let sid = spec
         .sid
@@ -397,7 +400,10 @@ fn confining_token(spec: &EnterSpec) -> Result<OwnedHandle, String> {
     if !is_session_sid(sid) {
         return Err(format!("{sid} is not an insbx run SID"));
     }
-    restricted(sid)
+    if let Some(bad) = spec.root_sids.iter().find(|s| !is_root_sid(s)) {
+        return Err(format!("{bad} is not an insbx root SID"));
+    }
+    restricted(sid, &spec.root_sids)
 }
 
 /// A job that kills everything in it when its last handle closes, with the

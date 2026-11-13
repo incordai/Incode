@@ -206,19 +206,28 @@ Windows. This crate's port is checked by its tests
 - **Writes.** The command runs under a *write-restricted token*: it reads
   anything its user can, but writes only where the user may **and** one of
   the token's restricting SIDs is granted. Those are a private SID made for
-  this run, `Everyone` (so `> NUL` works) and the logon SID (so the command
-  can start). The run's SID is granted `Modify`, as one inheritable ACE, on
-  each writable root and on the run's private temp directory, and nowhere
-  else. `read-only` grants only the temp directory.
-- **The grant is per run.** Before the command starts, the ACE is added to
-  each root; after it exits, it is removed. NTFS writes an inherited ACE into
-  every object beneath a root, so this takes time in proportion to the tree
-  (incode measured about 2.5 s each way on 18,673 files). No file's contents
-  or modification time change, and incode found the tree's ACLs
-  byte-identical afterwards. A grant is written down first
-  (`%LOCALAPPDATA%\insbx\grants`). If `insbx` crashes, the next run removes
-  the ACE it left. A drive root and any folder holding your user profile
-  are refused as roots.
+  this run (granted `Modify` on the run's private temp directory only), the
+  SID of each of this run's writable roots (below), `Everyone` (so `> NUL`
+  works) and the logon SID (so the command can start). `read-only` grants
+  only the temp directory.
+- **A root's grant is kept.** NTFS writes an inherited ACE into every object
+  beneath a folder, so granting one takes time in proportion to its tree
+  (2.3 s per walk measured on 17,752 objects). A per-run grant walked each
+  root twice per run (grant and revoke), and five to seven times under
+  network deny: `echo` took 4.7 s, and 14-20 s with the network denied, on
+  a repository that size. So each writable root has its own SID, derived
+  from its path, and its `Modify` ACE is made by the first run on the folder
+  and then **kept**: later runs read the folder's own ACL to see it is
+  there, and walk nothing. A run's token carries the SIDs of its own roots
+  only, so a kept grant lets no other run write there. `insbx grants` lists
+  kept folders; `insbx revoke <DIR>|--all` takes their grants back. No
+  file's contents or modification time change. A drive root, any folder
+  holding your user profile, and insbx's own state folder are refused as
+  roots.
+- **The temp directory's grant is per run.** It is added before the command
+  starts and removed after it exits, and written down first
+  (`%LOCALAPPDATA%\insbx\grants`): if `insbx` crashes, the next run removes
+  the ACE it left.
 - **Everything it starts.** The command starts suspended, goes into a job
   object, and only then runs. Everything it starts is in the job too and
   cannot leave it. The job is killed when the command exits, at the
@@ -252,8 +261,11 @@ Windows. This crate's port is checked by its tests
   dies with `CreateFileMapping ..., Win32 error 5` (measured by incode).
   Use `cmd` or PowerShell natively, or `INSBX_BACKEND=wsl` for a POSIX shell.
   `insbx mcp` scripts default to PowerShell on Windows.
-- **Grants are visible.** While a run lasts, every object under a root
-  carries the run's ACE, and the grant and revoke cost time on large trees.
+- **Grants are visible, and kept.** Every object under a root that a run
+  has used carries the root's ACE until `insbx revoke`. A file moved into a
+  root from elsewhere keeps the ACL it had (no grant re-ACLs it, kept or
+  per run), so the command cannot write it until `icacls <FILE> /reset`
+  gives it its folder's ACL.
 
 ### Network natively: `insbx setup-windows`
 
@@ -323,11 +335,14 @@ What changes for the command:
   without it starts at `C:\` (so `Set-Content x.txt` wrote `C:\x.txt`). So
   during a run the command can see the names in, say, your profile folder
   and `AppData\Local\Temp` on the way to a project under them.
-- **Writes** need both the account (the token's normal check) and the run's
-  private SID (its restricted check), so each root gets an ACE for each.
-  Another run's command, also the account but with another run SID, cannot
-  write your run's roots. The account's ACE on a folder is shared by runs
-  that grant the same folder, and removed only when the last of them ends.
+- **Writes** need both the account (the token's normal check) and the
+  root's own SID (its restricted check), so each root gets an ACE for each.
+  Another run's command, also the account but without that root's SID,
+  cannot write your run's roots. The account's ACEs on roots and on the
+  folder a run starts in are kept with the roots' own, so a later
+  network-deny run may READ a folder an earlier one was given, never write
+  it; `insbx revoke` takes them back too. Its ACEs on the temp directory and
+  the `insbx` program last the run.
   With `--fs off` the command is not write-restricted but is still the
   account: it can write the folder it starts in and its temp directory, and
   what the account itself may write.
@@ -366,8 +381,8 @@ runner after `insbx setup-windows` (CI runs it; the runner is an
 administrator): TCP to a local server and to the internet refused under
 `deny` with the filesystem confined, read-only and off (and allowed without
 `deny`); UDP refused; writes confined, temp writable, exit codes and
-"not found" passed through both helpers; the account's ACE present during a
-run and gone after; two concurrent runs sharing a root (the second ending
+"not found" passed through both helpers; the account's ACE on a root kept
+after a run and gone after `insbx revoke`; two concurrent runs sharing a root (the second ending
 first leaves the first its grant, and cannot write the first's other root);
 the proxy letting through only its allowlist, a direct connection refused;
 `insbx mcp` running a deny sandbox's PowerShell script as the account.
@@ -520,7 +535,8 @@ holds the proxy and the temp directory.
   symlinks, children, read-only, `deny_read`, TCP under `deny`, the proxy,
   the environment, the wall limit);
 - on Windows (`tests/escape_windows.rs`, with only `cmd` and PowerShell):
-  writes outside the root, the grant held during the run and gone after,
+  writes outside the root, a root's grant kept and writable only to runs
+  that name it, the temp grant gone after the run, `insbx revoke`,
   read-only and its private temp, child `cmd` and PowerShell, a planted
   program in the current folder, the wall limit and killing `insbx` taking
   the whole tree, the job's memory and CPU limits, the environment, exit

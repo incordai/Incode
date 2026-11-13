@@ -71,10 +71,13 @@ pub(crate) fn sid(s: &str) -> Result<LocalPtr, String> {
 }
 
 /// A write-restricted token for one run: this process's token with every
-/// privilege but `SeChangeNotify` removed, restricted to `run_sid`,
-/// `Everyone` and the logon SID, so it writes only where one of them is
-/// granted. Its default DACL lets the command open its own process.
-pub(crate) fn restricted(run_sid: &str) -> Result<OwnedHandle, String> {
+/// privilege but `SeChangeNotify` removed, restricted to `run_sid` (the
+/// run's temp directory), `root_sids` (this run's writable roots' kept
+/// grants, `acl::root_sid`), `Everyone` and the logon SID, so it writes only
+/// where one of them is granted. Its default DACL lets the command open its
+/// own process. Called by `helper::confining_token`, which has checked every
+/// SID's shape.
+pub(crate) fn restricted(run_sid: &str, root_sids: &[String]) -> Result<OwnedHandle, String> {
     // SAFETY: Win32 handle work; each call is checked and every handle this
     // owns is closed. The SIDs and the array outlive the calls that read
     // them.
@@ -85,22 +88,20 @@ pub(crate) fn restricted(run_sid: &str) -> Result<OwnedHandle, String> {
         }
         let base = OwnedHandle(base);
         let private = sid(run_sid)?;
+        let roots = root_sids
+            .iter()
+            .map(|s| sid(s))
+            .collect::<Result<Vec<_>, _>>()?;
         let everyone = sid(EVERYONE)?;
         let logon = logon_sid(base.0)?;
-        let restricting = [
-            SID_AND_ATTRIBUTES {
-                Sid: private.0,
+        let restricting: Vec<SID_AND_ATTRIBUTES> = std::iter::once(&private)
+            .chain(&roots)
+            .chain([&everyone, &logon])
+            .map(|s| SID_AND_ATTRIBUTES {
+                Sid: s.0,
                 Attributes: 0,
-            },
-            SID_AND_ATTRIBUTES {
-                Sid: everyone.0,
-                Attributes: 0,
-            },
-            SID_AND_ATTRIBUTES {
-                Sid: logon.0,
-                Attributes: 0,
-            },
-        ];
+            })
+            .collect();
         let mut token: HANDLE = std::ptr::null_mut();
         if CreateRestrictedToken(
             base.0,
@@ -117,7 +118,8 @@ pub(crate) fn restricted(run_sid: &str) -> Result<OwnedHandle, String> {
             return Err(last_error("CreateRestrictedToken"));
         }
         let token = OwnedHandle(token);
-        drop((private, everyone, logon));
+        drop(restricting);
+        drop((private, roots, everyone, logon));
         let user = token_user_sid(base.0)?;
         set_default_dacl(token.0, &super::default_dacl_sddl(&user, run_sid))?;
         Ok(token)

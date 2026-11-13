@@ -20,7 +20,8 @@
 //!
 //! On macOS the helper runs under `sandbox-exec` with a generated Seatbelt
 //! profile instead of Landlock. On Windows, which has no `exec`, the parent
-//! grants the writable roots to a private per-run SID first, and the helper
+//! makes sure each writable root carries its own kept grant and grants the
+//! temp directory to a private per-run SID first, and the helper
 //! starts the command under a write-restricted token, in a job object, and
 //! stays to supervise it (see [`windows`]). The helper is the calling binary
 //! re-executed with a private first argument, so a program that embeds this
@@ -96,10 +97,15 @@ pub struct EnterSpec {
     /// SIGKILL, which nothing can forward) the whole group dies with it.
     #[serde(default)]
     pub supervise: bool,
-    /// Windows: the run's private SID, granted on its writable roots and
-    /// temp directory; the helper restricts the command's token to it.
+    /// Windows: the run's private SID, granted on its temp directory; the
+    /// helper restricts the command's token to it and [`Self::root_sids`].
     #[serde(default)]
     pub sid: Option<String>,
+    /// Windows: the kept SIDs of this run's writable roots
+    /// (`windows::acl::root_sid`), the token's other restricting SIDs. Only
+    /// these roots' kept grants are writable to the command.
+    #[serde(default)]
+    pub root_sids: Vec<String>,
     /// Windows: the parent's process id. The helper watches it and ends the
     /// command's job if the parent dies (there is no parent-death signal).
     #[serde(default)]
@@ -118,6 +124,7 @@ pub struct EnterSpec {
 /// and, under network deny or proxy on Windows, the offline account.
 struct RunIdentity {
     sid: Option<String>,
+    root_sids: Vec<String>,
     offline: Offline,
     offline_record: Option<PathBuf>,
 }
@@ -128,6 +135,7 @@ impl RunIdentity {
     fn caller() -> Self {
         Self {
             sid: None,
+            root_sids: Vec::new(),
             offline: Offline::No,
             offline_record: None,
         }
@@ -139,6 +147,7 @@ impl RunIdentity {
     fn of(lease: Option<&windows::acl::Lease>, offline: Option<&windows::offline::Ready>) -> Self {
         Self {
             sid: lease.map(|l| l.sid().to_string()),
+            root_sids: lease.map(|l| l.root_sids().to_vec()).unwrap_or_default(),
             offline: if offline.is_some() {
                 Offline::Launch
             } else {
@@ -390,6 +399,7 @@ impl Sandbox {
             strict: self.strict,
             supervise: own_group,
             sid: identity.sid,
+            root_sids: identity.root_sids,
             parent_pid: Some(std::process::id()),
             offline: identity.offline,
             offline_record: identity.offline_record,
@@ -473,15 +483,18 @@ impl Sandbox {
             // started in, so it can work there at all.
             grant.push(real(cwd));
         }
-        grant.push(temp.path.clone());
+        // The account's reads are what neither a root nor the temp directory
+        // already gives it.
+        let mut granted = grant.clone();
+        granted.push(temp.path.clone());
         let account = offline.as_ref().map(|ready| {
-            let reads = windows::offline_reads(&grant, &real(cwd), &real(helper));
+            let reads = windows::offline_reads(&granted, &real(cwd), &real(helper));
             windows::acl::OfflineGrant {
                 user: ready.sid.clone(),
                 // PowerShell lists the current folder's parent to start in
                 // it at all.
                 parents: windows::offline_parents(
-                    &grant,
+                    &granted,
                     &reads,
                     &real(cwd),
                     windows::profiles_dir().as_deref(),
@@ -489,7 +502,7 @@ impl Sandbox {
                 reads,
             }
         });
-        match windows::acl::Lease::acquire(&grant, account) {
+        match windows::acl::Lease::acquire(&grant, &temp.path, account) {
             Ok(lease) => Ok(Some(lease)),
             Err(e) if self.strict => Err(e),
             Err(e) => {
@@ -915,6 +928,7 @@ mod tests {
             strict: true,
             supervise: false,
             sid: None,
+            root_sids: Vec::new(),
             parent_pid: Some(7),
             offline: Offline::Launch,
             offline_record: Some(PathBuf::from(r"C:\ProgramData\insbx\offline.conf")),

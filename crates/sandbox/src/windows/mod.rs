@@ -15,9 +15,12 @@
 //! SIDs are:
 //!
 //! - a private SID made for this one run
-//!   (`S-1-5-21-1111111111-2222222222-4242424242-<random>`), granted on each
-//!   writable root and the run's private temp directory and nowhere else
-//!   ([`acl`]);
+//!   (`S-1-5-21-1111111111-2222222222-4242424242-<random>`), granted on the
+//!   run's private temp directory and nowhere else ([`acl`]);
+//! - each of this run's writable roots' own SID
+//!   (`S-1-5-21-1111111111-2222222222-4141414141-<a>-<b>-<c>-<d>`, from the
+//!   SHA-256 of its path, [`root_sid_from_digest`]), whose grant on that root
+//!   is kept across runs ([`acl`]);
 //! - `Everyone`, so `> NUL` still works;
 //! - this logon's SID, so the command can use its window station and desktop
 //!   and start at all.
@@ -36,10 +39,11 @@
 //! NTFS inheritance is written into every object beneath a root, not computed
 //! at access time, so granting a root costs time linear in its size (incode
 //! measured 2.4-2.6 s each way on 18,673 objects) and touches every object's
-//! security descriptor, though no file's contents or mtime. The revoke after
-//! the run is exact (an `icacls /save` of the tree was byte-identical before
-//! and after). A run that crashes leaves its ACE; the next run sweeps it
-//! ([`acl`]).
+//! security descriptor, though no file's contents or mtime. So a root's grant
+//! is made by the first run on it and KEPT: later runs read the root's own
+//! ACL to see it is there and walk nothing. `insbx revoke` takes it back
+//! exactly. The temp directory's grant is per run: revoked after it, and a
+//! run that crashes leaves its ACE for the next run's sweep ([`acl`]).
 //!
 //! # Reads: `deny_read` is NOT enforced
 //!
@@ -103,6 +107,8 @@ pub(crate) mod setup;
 mod token;
 
 #[cfg(windows)]
+pub use acl::{kept_folders, revoke_kept, KeptFolder};
+#[cfg(windows)]
 pub(crate) use helper::enter;
 
 /// `insbx setup-windows` (or `--remove`): what it did, line by line.
@@ -151,6 +157,76 @@ pub fn is_session_sid(sid: &str) -> bool {
         .is_some_and(|(rid, r)| rid == r.to_string())
 }
 
+/// Every writable root's own SID starts with this ([`root_sid_from_digest`]).
+/// A different domain part from [`SID_PREFIX`], so the crash sweep, which
+/// only ever revokes run SIDs, never touches a kept grant. Every part must
+/// fit in 32 bits: Windows stores a larger one as `4294967295`, and the ACE
+/// would then name a different SID from the token's.
+pub const ROOT_SID_PREFIX: &str = "S-1-5-21-1111111111-2222222222-4141414141-";
+
+/// A writable root's SID, from the SHA-256 of its [`path_key`] (`acl::root_sid`
+/// computes the digest): the prefix and the digest's first 16 bytes as four
+/// decimal sub-authorities. The same folder always gets the same SID, so its
+/// grant can be kept across runs and checked with one read of the folder's
+/// own ACL instead of re-made by walking every file beneath it.
+///
+/// Not a secret, as a run SID is not: a confined command cannot add a SID to
+/// its own token (`CreateRestrictedToken` on a restricted token intersects
+/// the restricting SIDs), and only insbx's helper builds tokens, with the SIDs
+/// of the run's own roots and no others ([`is_root_sid`]).
+#[must_use]
+pub fn root_sid_from_digest(digest: &[u8; 32]) -> String {
+    let part =
+        |i: usize| u32::from_le_bytes([digest[i], digest[i + 1], digest[i + 2], digest[i + 3]]);
+    format!(
+        "{ROOT_SID_PREFIX}{}-{}-{}-{}",
+        part(0),
+        part(4),
+        part(8),
+        part(12)
+    )
+}
+
+/// Whether `sid` has the shape of a root SID: the prefix and exactly four
+/// decimal sub-authorities, written as Windows writes them. The helper
+/// refuses any other in a spec's `root_sids`.
+#[must_use]
+pub fn is_root_sid(sid: &str) -> bool {
+    let Some(rest) = sid.strip_prefix(ROOT_SID_PREFIX) else {
+        return false;
+    };
+    let parts: Vec<&str> = rest.split('-').collect();
+    parts.len() == 4
+        && parts
+            .iter()
+            .all(|p| p.parse::<u32>().is_ok_and(|n| n.to_string() == *p))
+}
+
+/// The kept-grants list (`%LOCALAPPDATA%\insbx\kept`): one folder per line,
+/// for `insbx grants` and `insbx revoke --all`. Only a listing: whether a
+/// folder is granted is read from its own ACL, never from here, so an edited
+/// list can neither grant nor hide a grant. Blank lines and a second spelling
+/// of the same folder ([`path_key`]) are dropped.
+#[must_use]
+pub fn parse_kept(text: &str) -> Vec<PathBuf> {
+    let mut seen = Vec::new();
+    let mut out = Vec::new();
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let key = path_key(line);
+        if !seen.contains(&key) {
+            seen.push(key);
+            out.push(PathBuf::from(line));
+        }
+    }
+    out
+}
+
+/// [`parse_kept`]'s file, written back.
+#[must_use]
+pub fn kept_text(paths: &[PathBuf]) -> String {
+    paths.iter().map(|p| format!("{}\n", p.display())).collect()
+}
+
 /// The restricted token's default DACL, in SDDL: the user, SYSTEM and the
 /// run's SID, all full access. Objects the command creates without a
 /// descriptor of their own (its own process and threads) get this, and
@@ -183,8 +259,9 @@ pub fn fs_status(fs: &Fs) -> Status {
         _ => "writes only beneath the writable roots and the run's private temp directory",
     };
     Status::Enforced(format!(
-        "write-restricted token: reads anywhere, {writes} (each granted to a private per-run \
-         SID, revoked after the run), the null device, and anywhere Everyone may write"
+        "write-restricted token: reads anywhere, {writes} (each root granted to its own SID, \
+         kept for later runs until `insbx revoke`; the temp directory to a per-run SID, revoked \
+         after the run), the null device, and anywhere Everyone may write"
     ))
 }
 
@@ -770,6 +847,59 @@ mod tests {
         ] {
             assert!(!is_session_sid(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_root_sid_is_four_sub_authorities_from_the_digest_and_nothing_else_passes() {
+        let mut digest = [0u8; 32];
+        digest[0] = 1; // 1 little-endian
+        digest[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+        digest[12] = 7;
+        digest[31] = 0xff; // past the 16 bytes used: no effect
+        let sid = root_sid_from_digest(&digest);
+        assert_eq!(sid, format!("{ROOT_SID_PREFIX}1-4294967295-0-7"));
+        assert!(is_root_sid(&sid));
+        assert!(!is_session_sid(&sid), "a root SID is never a run SID");
+        for bad in [
+            ROOT_SID_PREFIX.to_string(),
+            format!("{ROOT_SID_PREFIX}1-2-3"),
+            format!("{ROOT_SID_PREFIX}1-2-3-4-5"),
+            format!("{ROOT_SID_PREFIX}1-2-3-04"),
+            format!("{ROOT_SID_PREFIX}1-2-3-4294967296"),
+            format!("{ROOT_SID_PREFIX}1-2-3-x"),
+            session_sid(77),
+            "S-1-1-0".to_string(),
+            "S-1-5-21-1111111111-2222222222-3333333333-1-2-3-4".to_string(),
+        ] {
+            assert!(!is_root_sid(&bad), "{bad}");
+        }
+        // Different digests, different SIDs.
+        digest[8] = 1;
+        assert_ne!(root_sid_from_digest(&digest), sid);
+    }
+
+    /// Windows stores a sub-authority above `u32::MAX` as `4294967295`, so a
+    /// prefix with one would name a different SID on disk than in the token
+    /// (it did: `4343434343`).
+    #[test]
+    fn every_part_of_both_sid_prefixes_fits_in_32_bits() {
+        for prefix in [SID_PREFIX, ROOT_SID_PREFIX] {
+            for part in prefix.trim_end_matches('-').split('-').skip(1) {
+                assert!(part.parse::<u32>().is_ok(), "{prefix}: {part}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_kept_list_drops_blank_lines_and_second_spellings() {
+        let text = "C:\\w\\a\n\n  \nc:/W/A/\nD:\\b c\n";
+        let kept = parse_kept(text);
+        assert_eq!(
+            kept,
+            vec![PathBuf::from(r"C:\w\a"), PathBuf::from(r"D:\b c")]
+        );
+        assert_eq!(parse_kept(&kept_text(&kept)), kept);
+        assert!(parse_kept("").is_empty());
     }
 
     #[test]
