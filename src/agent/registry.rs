@@ -827,7 +827,9 @@ mod tests {
     /// measured on Windows 11: npm's folder first on `PATH`, holding `codex`
     /// (a shell script) and `codex.cmd`; the Codex desktop app's `codex.exe`
     /// further down. A spawn of `codex` starts the desktop app's `.exe`, so
-    /// that is the one named, probed and run.
+    /// that is the one named, probed and run. Windows only: the paths are
+    /// Windows paths, and only a Windows build resolves through it.
+    #[cfg(windows)]
     #[test]
     fn the_program_found_is_the_exe_a_spawn_starts() {
         let files = [
