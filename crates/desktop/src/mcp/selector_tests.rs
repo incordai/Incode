@@ -160,6 +160,111 @@ fn the_journal_names_the_selector_but_never_a_text_fields_name() {
     assert!(!bad.contains("hunter2"), "{bad}");
 }
 
+fn window(app: &str, title: &str) -> crate::uia::WindowInfo {
+    crate::uia::WindowInfo {
+        id: "9".to_string(),
+        title: title.to_string(),
+        app: app.to_string(),
+        pid: 1,
+        focused: false,
+        rect: crate::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        },
+        has_tree: true,
+    }
+}
+
+/// **A blocked application's window, named by id with a selector, is refused
+/// by the same words the id path gives — before the selector is read.** The
+/// guard here is the real `refuse_blocked` that `click_element`, `set_value`
+/// and `element_action` hand to `window_for`.
+#[test]
+fn a_blocked_window_named_by_id_is_refused_as_the_id_path_refuses_it() {
+    use super::guard::refuse_blocked;
+    let keepass = || window("KeePassXC", "Bank login - entry");
+    let the_id_path = refuse_blocked(&keepass()).unwrap_err();
+    assert!(!the_id_path.contains("Bank login"), "{the_id_path}");
+    for selector in [
+        "window=x;role=button",
+        "window~=bank;role=button",
+        "app=notepad;role=button",
+        "role=button;name=Save",
+    ] {
+        let selector = crate::selector::Selector::parse(selector).unwrap();
+        let said = crate::uia::confirm_window(keepass(), &selector, &refuse_blocked)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(said, the_id_path, "`{}`", selector.render());
+    }
+    // And a window that is not blocked still reaches the selector's check.
+    let selector = crate::selector::Selector::parse("window=x;role=button").unwrap();
+    let said = crate::uia::confirm_window(window("notepad", "notes"), &selector, &refuse_blocked)
+        .unwrap_err()
+        .to_string();
+    assert!(said.contains("does not name"), "{said}");
+}
+
+#[test]
+fn what_a_selector_error_says_is_never_what_was_typed() {
+    // The tool's own arguments: a stray word with no `=` is the case a
+    // secret typed into the wrong field would come in as.
+    for raw in [
+        "role=edit;hunter2",
+        "hunter2=1",
+        "name=hunter2;nth=zz",
+        "role=hunter2",
+    ] {
+        let why = element_target(&json!({"selector": raw})).unwrap_err();
+        assert!(!why.contains("hunter2"), "`{raw}` was quoted: {why}");
+    }
+    // A selector that parses but names no control: shown redacted.
+    let why = element_target(&json!({"selector": "name=hunter2;nth=1;app=notes"}))
+        .map(|_| String::new())
+        .unwrap_or_else(|e| e);
+    assert!(!why.contains("hunter2"), "{why}");
+}
+
+/// The "is disabled" refusal is journalled word for word.
+#[test]
+fn a_disabled_control_is_refused_without_naming_a_selected_text_field() {
+    use super::tools::disabled_error;
+    use crate::uia::{Element, Role};
+    let element = |role, name: &str| Element {
+        id: 7,
+        depth: 1,
+        role,
+        name: name.to_string(),
+        rect: crate::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        },
+        enabled: false,
+        secret: false,
+        automation_id: String::new(),
+    };
+    // By id, the message is what it always was.
+    assert_eq!(
+        disabled_error(&Target::Id(7), &element(Role::Button, "Save")),
+        "e7 \"Save\" is disabled; clicking it would do nothing"
+    );
+    // By selector: redacted, and the control's own name is not repeated.
+    let typed = crate::selector::Selector::parse("role=edit;name=hunter2").unwrap();
+    let why = disabled_error(&Target::Selector(typed), &element(Role::Edit, "hunter2"));
+    assert!(!why.contains("hunter2"), "{why}");
+    assert!(why.contains("is disabled"), "{why}");
+    let untyped = crate::selector::Selector::parse("name=hunter2").unwrap();
+    let why = disabled_error(&Target::Selector(untyped), &element(Role::Edit, "hunter2"));
+    assert!(!why.contains("hunter2"), "{why}");
+    let button = crate::selector::Selector::parse("role=button;name=Save").unwrap();
+    let why = disabled_error(&Target::Selector(button), &element(Role::Button, "Save"));
+    assert!(why.contains("role=button;name=Save"), "{why}");
+}
+
 #[test]
 fn wait_for_is_journalled_by_condition_selector_and_timeout() {
     let said = Server::describe(
@@ -378,7 +483,7 @@ mod live {
         if crate::limits::get().blocked(&tree.app).is_some() {
             return;
         }
-        let selectors = crate::selector::selectors_for(&tree.elements, uia::NAMES_ARE_VALUES);
+        let selectors = crate::selector::selectors_for(&tree.elements, uia::NAMES_ARE_VALUES, None);
         for (e, s) in tree.elements.iter().zip(&selectors) {
             let again = crate::selector::Selector::parse(&s.render()).unwrap_or_else(|why| {
                 panic!("`{}` for {e:?} does not read back: {why}", s.render())

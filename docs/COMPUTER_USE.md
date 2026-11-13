@@ -278,12 +278,18 @@ ids work exactly as before.
 | `aid` | the program's own id for the control, exact |
 | `path` | child indices from the window down (`0.2.1`), counted among the controls `ui_tree` lists, so a wrapper it drops is not a level. A hard condition: a control that moved is not found |
 | `nth` | which of several matches, from 0, in `ui_tree` order. Out of range is an error |
+| `depth` | how deep the window is walked to find the control (default 12, held to 4x that). `nth` and `path` count the controls of a walk, so the walk that prints a selector and the one that resolves it must be the same: `ui_tree` writes `depth=N` into every selector when it was asked for a depth other than the default, and the resolver walks as deep as the selector says, else to the default. Not a control part on its own |
 
 `key=value` pairs joined by `;`, with no spaces around the `;`; `\\`, `\;`, `\n`, `\r` escape a
 value. Unknown or repeated keys and bad numbers are refused by name. `app`/`window` pick the
 window (the one named, else `window=<id>`, else the focused one); the other keys pick the
 control. A window selector never matches a blocked application's window, and one naming a
-blocked app is refused, so a title cannot be probed for. What `ui_tree` prints is the
+blocked app is refused, so a title cannot be probed for; a blocked window named by `window=<id>`
+is refused with the id path's own words BEFORE the selector's window part is compared with it,
+so neither its title nor whether a `window~=` matched can be learned from the error. Errors are
+journalled word for word, so none quotes what it was given: a parse error names the item by its
+position (`item 2 is not key=value`), and a selector shown in any other error is redacted (a
+text field's name is left out, and a list of look-alikes names a text field by its place). What `ui_tree` prints is the
 **shortest** selector that is unique in that tree, in the order of what changes least:
 `role`+`aid`, else `role`+`name`, else those plus `nth`. A name longer than 60 characters is
 written as its first 60, as a "contains". On macOS an edit field's name IS its content

@@ -100,7 +100,11 @@ pub trait Env {
     /// The window keystrokes go to now.
     fn focused_window(&mut self) -> Result<WindowInfo, String>;
     /// A fresh walk of one window.
-    fn tree(&mut self, window: &str) -> Result<Tree, String>;
+    ///
+    /// `depth` is how deep, when the selector gave one; else the default one.
+    /// The selector's `nth` and `path` count the controls of that walk
+    /// (`uia::resolve`).
+    fn tree(&mut self, window: &str, depth: Option<u32>) -> Result<Tree, String>;
     /// The fingerprint of the screen, or of one window's area.
     fn screen(&mut self, window: Option<&str>) -> Result<Fingerprint, String>;
 }
@@ -319,7 +323,7 @@ fn look(env: &mut impl Env, target: &Target, selector: &Selector) -> Result<Look
     let Some(window) = window else {
         return Ok(Look::NoWindow);
     };
-    let tree = match env.tree(&window.id) {
+    let tree = match env.tree(&window.id, selector.depth) {
         Ok(tree) => tree,
         Err(why) => {
             // A window that closes while it is being walked fails the walk:
@@ -347,16 +351,26 @@ fn cut_note(tree: &Tree) -> String {
     }
 }
 
-fn found_element(window: WindowInfo, tree: Tree, hits: &[usize]) -> Found {
+/// `depth` is the walk's, as the wait's selector gave it: the selectors written
+/// for what was found are counted in that walk, so they carry it (see
+/// [`Selector::depth`]).
+fn found_element(window: WindowInfo, tree: Tree, hits: &[usize], depth: Option<u32>) -> Found {
     let first = hits[0];
+    let written = |i: usize| {
+        Selector {
+            depth,
+            ..selector_for(&tree.elements, i, NAMES_ARE_VALUES)
+        }
+        .render_element_part()
+    };
     let others = hits
         .iter()
         .skip(1)
         .take(OTHERS)
-        .map(|&i| selector_for(&tree.elements, i, NAMES_ARE_VALUES).render_element_part())
+        .map(|&i| written(i))
         .collect();
     Found::Element {
-        selector: selector_for(&tree.elements, first, NAMES_ARE_VALUES).render_element_part(),
+        selector: written(first),
         element: Box::new(tree.elements[first].clone()),
         matches: hits.len(),
         others,
@@ -386,7 +400,7 @@ fn element_check(
                     cut_note(&tree)
                 ))
             } else {
-                Poll::Ready(found_element(window, tree, &hits))
+                Poll::Ready(found_element(window, tree, &hits, selector.depth))
             }
         }
         (Look::Seen(seen), false) => {
@@ -724,7 +738,7 @@ mod tests {
                 .find(|w| w.focused)
                 .ok_or_else(|| "nothing has focus".to_string())
         }
-        fn tree(&mut self, window: &str) -> Result<Tree, String> {
+        fn tree(&mut self, window: &str, _: Option<u32>) -> Result<Tree, String> {
             self.trees += 1;
             if self.tree_fails_from.is_some_and(|t| self.now >= t) {
                 return Err("no desktop element: Unspecified error".to_string());

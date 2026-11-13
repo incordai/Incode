@@ -249,9 +249,12 @@ fn ui_tree(args: &Value) -> Result<Vec<Value>, String> {
     // With no displays readable the tree is still shown, unmarked:
     // reading it is harmless, and every action re-checks its point.
     let screens = screen_rects().unwrap_or_default();
+    // The depth the walk really went to (held to its bound), because the
+    // selectors printed are counted in that walk and say so when it is not
+    // the default one.
     Ok(vec![text(format!(
         "{}\n{UNTRUSTED}",
-        tree.render_on(&screens)
+        tree.render_at(&screens, uia::bounded(depth))
     ))])
 }
 
@@ -270,36 +273,34 @@ fn click_element(input: &InputThread, args: &Value) -> Result<Vec<Value>, String
     // A selector is resolved against the live tree here, the same way: its
     // one match (or an error saying none or several) is the control as it is
     // now.
-    let (element, by, label, cut) = match target {
+    let (element, label, cut) = match &target {
         Target::Id(id) => {
             let info = uia::window_info(window.as_deref()).map_err(|e| e.to_string())?;
             refuse_blocked(&info)?;
-            let element = live_element(&info, id)?;
+            let element = live_element(&info, *id)?;
             let label = element.label();
-            (element, format!("e{id}"), label, String::new())
+            (element, label, String::new())
         }
         Target::Selector(selector) => {
-            let found = resolve_selector(window.as_deref(), &selector)?;
+            let found = resolve_selector(window.as_deref(), selector)?;
             if let Some(why) = &found.no_positions {
                 return Err(format!(
                     "{why} so the control cannot be found on screen; use element_action or \
                      set_value on it"
                 ));
             }
-            let by = format!("selector `{}`", selector.render());
             let label = format!(
-                "{by} (\"{}\", {:?})",
-                found.element.name, found.element.role
+                "selector `{}` (\"{}\", {:?})",
+                selector.render_redacted(),
+                found.element.name,
+                found.element.role
             );
             let cut = with_cut_note(String::new(), &found);
-            (found.element, by, label, cut)
+            (found.element, label, cut)
         }
     };
     if !element.enabled {
-        return Err(format!(
-            "{by} \"{}\" is disabled; clicking it would do nothing",
-            element.name
-        ));
+        return Err(disabled_error(&target, &element));
     }
 
     let at = element.click_point();
@@ -572,10 +573,33 @@ pub(super) fn element_target(args: &Value) -> Result<Target, String> {
 /// The one control `selector` names, in the window it names (or `window`, or
 /// the focused one), refused before anything is read when that window is a
 /// blocked application's.
+///
+/// The blocked-application refusal is the window guard handed to
+/// `uia::window_for`, so it comes BEFORE the selector's window part is
+/// compared with a window named by id: a mismatch error describes the window,
+/// and for a blocked one that is its title, and a match and a mismatch would
+/// be told apart.
 fn resolve_selector(window: Option<&str>, selector: &Selector) -> Result<uia::Resolved, String> {
-    let info = uia::window_for(window, selector).map_err(|e| e.to_string())?;
-    refuse_blocked(&info)?;
+    let info = uia::window_for(window, selector, &refuse_blocked).map_err(|e| e.to_string())?;
     uia::resolve_in(info, selector).map_err(|e| e.to_string())
+}
+
+/// Why clicking a disabled control is refused. The id path names the control
+/// as it always has. A selector is named redacted and the control is not named
+/// at all: this error is journalled word for word, and a text field's name is
+/// what was typed in it.
+pub(super) fn disabled_error(target: &Target, element: &uia::Element) -> String {
+    match target {
+        Target::Id(id) => format!(
+            "e{id} \"{}\" is disabled; clicking it would do nothing",
+            element.name
+        ),
+        Target::Selector(selector) => format!(
+            "selector `{}` ({:?}) is disabled; clicking it would do nothing",
+            selector.render_redacted(),
+            element.role
+        ),
+    }
 }
 
 /// `done`, with what only a selector adds: its `eN` numbers this call's own

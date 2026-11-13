@@ -229,6 +229,15 @@ impl Tree {
     ///
     /// Called by `mcp.rs`'s `ui_tree` with the displays `screen_info` reports.
     pub fn render_on(&self, screens: &[super::Rect]) -> String {
+        self.render_at(screens, super::limits::get().tree_depth)
+    }
+
+    /// [`Self::render_on`] for a tree walked to `depth`. A selector printed
+    /// beside an element counts its `nth` and `path` in THIS walk, so when the
+    /// walk was not the default depth the selector says so (`depth=N`), and the
+    /// resolver then walks as deep (`resolve::resolve_depth`): otherwise it
+    /// would count different controls and `nth=1` could be another one.
+    pub fn render_at(&self, screens: &[super::Rect], depth: u32) -> String {
         let mut out = String::new();
         out.push_str(&format!("Window \"{}\"", self.root_name));
         if !self.window.is_empty() {
@@ -255,7 +264,8 @@ impl Tree {
                  by id; click_element, scroll and drag by id are refused.\n"
             ));
         }
-        let selectors = selectors_for(&self.elements, NAMES_ARE_VALUES);
+        let stamp = (depth != super::limits::get().tree_depth).then_some(depth);
+        let selectors = selectors_for(&self.elements, NAMES_ARE_VALUES, stamp);
         for (e, selector) in self.elements.iter().zip(&selectors) {
             out.push_str(&format!(
                 "{:indent$}[e{}] {:<10} \"{}\" ({},{},{}x{})  sel: {}{}{}{}\n",
@@ -445,7 +455,7 @@ pub(crate) fn gone(id: u32, window: &WindowInfo) -> DesktopError {
 }
 
 /// The depth a caller asked for, held to four times the configured default.
-fn bounded(depth: u32) -> u32 {
+pub(crate) fn bounded(depth: u32) -> u32 {
     depth.min(super::limits::get().tree_depth.saturating_mul(4))
 }
 
@@ -613,7 +623,11 @@ pub fn focus_window(window: &str) -> Result<Done, DesktopError> {
 
 // Acting on a control by selector instead of by id: `resolve.rs`.
 mod resolve;
-pub use resolve::{act_on, resolve, resolve_in, set_value_on, tree_now, window_for, Resolved};
+pub use resolve::{act_on, resolve_in, set_value_on, tree_now, window_for, Resolved, WindowGuard};
+// The window check `window_for` makes, on a window already in hand: for the
+// tests of `mcp::tools`, which hand it the real blocked-application guard.
+#[cfg(test)]
+pub(crate) use resolve::confirm_window;
 
 #[cfg(windows)]
 #[path = "uia_windows.rs"]

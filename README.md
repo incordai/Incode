@@ -1111,7 +1111,9 @@ app=notepad;window~=Save As;role=button;name=Save    in another window
 
 Keys: `app`, `window` / `window~` (exact / contains), `role`, `name` / `name~`,
 `aid` (UIA `AutomationId`, AX `AXIdentifier`, AT-SPI `AccessibleId`), `path`
-(child indices, `0.2.1`), `nth`. `;` and `\` in a value are written `\;` and
+(child indices, `0.2.1`), `nth`, `depth` (how deep to walk; `ui_tree` writes it
+when asked for a depth other than the default, so `nth` counts the same
+controls when resolved). `;` and `\` in a value are written `\;` and
 `\\`. `wait_for` takes `condition` (`element_appears`, `element_gone`,
 `window_appears`, `window_gone`, `screen_changes`), a `selector` (window
 conditions take only `app`/`window`), `timeout_ms` (default 5000, held to

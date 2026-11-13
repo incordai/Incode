@@ -63,10 +63,10 @@ impl Env for Live {
         Ok(window)
     }
 
-    fn tree(&mut self, window: &str) -> Result<Tree, String> {
+    fn tree(&mut self, window: &str, depth: Option<u32>) -> Result<Tree, String> {
         let info = uia::window_info(Some(window)).map_err(text_of)?;
         refuse_blocked(&info)?;
-        let tree = uia::tree_now(window).map_err(text_of)?;
+        let tree = uia::tree_now(window, depth).map_err(text_of)?;
         // Walked in this process, and discarded unread when blocked.
         refuse_app(&tree.app)?;
         Ok(tree)

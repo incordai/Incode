@@ -29,6 +29,7 @@
 //! | `aid` | the automation id: UIA `AutomationId`, AX `AXIdentifier`, AT-SPI `AccessibleId` |
 //! | `path` | child indices from the window down, dot separated (`0.2.1`), among the controls `ui_tree` lists |
 //! | `nth` | which of several matches, from 0, in `ui_tree` order |
+//! | `depth` | how deep the window is walked (default 12). `ui_tree` writes it into each selector when it was asked for another depth, so `nth` and `path` count the same controls when resolved |
 //!
 //! A value escapes `\` as `\\`, `;` as `\;` and a line break as `\n` / `\r`.
 //! `app` and `window` choose the WINDOW; the rest choose the CONTROL inside it.
@@ -95,11 +96,24 @@ pub enum Text {
     Contains(String),
 }
 
+/// `text` with case ignored, one character at a time.
+///
+/// Not `str::to_lowercase`: that reads the text around a character, and a
+/// capital sigma becomes `ς` at the end of a word and `σ` elsewhere. A name
+/// cut off at a sigma (a derived selector keeps only the first
+/// [`LONGEST_NAME`] characters) would then lowercase differently from the same
+/// letters inside the whole name, and the selector would miss its own element.
+/// Folding each character on its own gives the same letters wherever the text
+/// is cut.
+fn fold(text: &str) -> String {
+    text.chars().flat_map(char::to_lowercase).collect()
+}
+
 impl Text {
     fn matches(&self, actual: &str) -> bool {
         match self {
             Text::Exact(want) => actual == want,
-            Text::Contains(part) => actual.to_lowercase().contains(&part.to_lowercase()),
+            Text::Contains(part) => fold(actual).contains(&fold(part)),
         }
     }
 }
@@ -114,6 +128,13 @@ pub struct Selector {
     pub automation_id: Option<String>,
     pub path: Option<Vec<u32>>,
     pub nth: Option<u32>,
+    /// How deep the window's tree is walked to find the control. `nth` and
+    /// `path` count the controls of THAT walk, so a selector derived from a
+    /// walk of one depth must be resolved by a walk of the same depth, or
+    /// `nth=1` is a different control. Absent: the default depth
+    /// (`desktop_limits.tree_depth`, 12). `ui_tree` writes it into each
+    /// selector when it was asked for another depth.
+    pub depth: Option<u32>,
 }
 
 /// Names longer than this are written into a derived selector as their first
@@ -184,12 +205,12 @@ fn unescape(raw: &str) -> Result<String, String> {
             Some(';') => out.push(';'),
             Some('n') => out.push('\n'),
             Some('r') => out.push('\r'),
-            Some(other) => {
-                return Err(format!(
-                    "unknown escape `\\{other}` (only `\\\\`, `\\;`, `\\n` and `\\r` exist)"
-                ))
+            Some(_) => {
+                return Err(
+                    "has an unknown escape (only `\\\\`, `\\;`, `\\n` and `\\r` exist)".to_string(),
+                )
             }
-            None => return Err("a value ends in a lone `\\`".to_string()),
+            None => return Err("ends in a lone `\\`".to_string()),
         }
     }
     Ok(out)
@@ -228,21 +249,26 @@ fn once<T>(slot: &mut Option<T>, key: &str, value: T) -> Result<(), String> {
 
 impl Selector {
     /// Read the text form. Strict: an unknown key, a repeated one, a bad number
-    /// or role is an error that names it, never skipped.
+    /// or role is an error, never skipped.
+    ///
+    /// **An error never quotes what it was given.** It names the item by its
+    /// position (`item 2`) and says what is wrong with it, because the text of
+    /// a selector may be a typed value (`role=edit;hunter2`), and an error is
+    /// journalled word for word (`mcp/gate.rs`, `record_call`). Only the
+    /// fixed names of this grammar appear in one.
     pub fn parse(raw: &str) -> Result<Selector, String> {
+        const KEYS: &str = "app, window, window~, role, name, name~, aid, path, nth, depth";
         let mut s = Selector::default();
-        for piece in split_pairs(raw) {
-            if piece.trim().is_empty() {
-                continue;
-            }
+        let items = split_pairs(raw)
+            .into_iter()
+            .filter(|piece| !piece.trim().is_empty());
+        for (at, piece) in items.enumerate() {
+            let item = at + 1;
             let Some((key, value)) = piece.split_once('=') else {
-                return Err(format!(
-                    "`{piece}` is not key=value (keys: app, window, window~, role, name, \
-                     name~, aid, path, nth)"
-                ));
+                return Err(format!("item {item} is not key=value (keys: {KEYS})"));
             };
             let key = key.trim();
-            let value = unescape(value).map_err(|e| format!("in `{key}`: {e}"))?;
+            let value = unescape(value).map_err(|e| format!("item {item}: the value {e}"))?;
             match key {
                 "app" => once(&mut s.app, key, value)?,
                 "window" => once(&mut s.window, key, Text::Exact(value))?,
@@ -250,7 +276,7 @@ impl Selector {
                 "role" => {
                     let role = Role::from_word(&value).ok_or_else(|| {
                         format!(
-                            "unknown role `{value}` (roles: {})",
+                            "item {item}: the role is not one of {}",
                             ROLES.iter().map(|(w, _)| *w).collect::<Vec<_>>().join(", ")
                         )
                     })?;
@@ -264,22 +290,26 @@ impl Selector {
                         .split('.')
                         .map(|n| n.trim().parse::<u32>())
                         .collect::<Result<Vec<_>, _>>()
-                        .map_err(|_| format!("path `{value}` must be child indices like 0.2.1"))?;
+                        .map_err(|_| {
+                            format!("item {item}: path must be child indices like 0.2.1")
+                        })?;
                     once(&mut s.path, key, path)?;
                 }
                 "nth" => {
                     let nth = value
                         .trim()
                         .parse::<u32>()
-                        .map_err(|_| format!("nth `{value}` must be a whole number from 0"))?;
+                        .map_err(|_| format!("item {item}: nth must be a whole number from 0"))?;
                     once(&mut s.nth, key, nth)?;
                 }
-                other => {
-                    return Err(format!(
-                        "unknown key `{other}` (keys: app, window, window~, role, name, \
-                         name~, aid, path, nth)"
-                    ))
+                "depth" => {
+                    let depth = value
+                        .trim()
+                        .parse::<u32>()
+                        .map_err(|_| format!("item {item}: depth must be a whole number"))?;
+                    once(&mut s.depth, key, depth)?;
                 }
+                _ => return Err(format!("item {item} has an unknown key (keys: {KEYS})")),
             }
         }
         if s == Selector::default() {
@@ -345,6 +375,9 @@ impl Selector {
         if let Some(nth) = self.nth {
             parts.push(format!("nth={nth}"));
         }
+        if let Some(depth) = self.depth {
+            parts.push(format!("depth={depth}"));
+        }
     }
 
     /// The selector as a journal may carry it. A control's name is left out
@@ -380,13 +413,16 @@ impl Selector {
 
     /// Fit for acting on a control: it names one. `nth` alone is "the third of
     /// anything", which is a guess.
+    ///
+    /// These errors, like every one that carries a selector, show it as
+    /// [`Self::render_redacted`]: an error is journalled word for word.
     pub fn require_element(&self) -> Result<(), String> {
         if self.has_element_part() {
             Ok(())
         } else {
             Err(format!(
                 "selector `{}` names no control: give at least one of role, name, aid, path",
-                self.render()
+                self.render_redacted()
             ))
         }
     }
@@ -396,14 +432,14 @@ impl Selector {
         if !self.has_window_part() {
             return Err(format!(
                 "selector `{}` names no window: give app and/or window (or window~)",
-                self.render()
+                self.render_redacted()
             ));
         }
-        if self.has_element_part() || self.nth.is_some() {
+        if self.has_element_part() || self.nth.is_some() || self.depth.is_some() {
             return Err(format!(
                 "selector `{}` names a control too, but this asks about a window: use only \
                  app and window",
-                self.render()
+                self.render_redacted()
             ));
         }
         Ok(())
@@ -470,10 +506,14 @@ impl Selector {
             (0, _) => return Err(SelectError::Missing),
             (1, None) => found[0],
             (count, None) => {
+                // The examples are in an error, which is journalled, so a text
+                // field is written by its place and never by its name: on
+                // macOS the name IS what was typed there (`names_are_values`,
+                // here on every platform because an example costs nothing).
                 let examples = found
                     .iter()
                     .take(EXAMPLES)
-                    .map(|&i| selector_for(elements, i, false).render_element_part())
+                    .map(|&i| selector_for(elements, i, true).render_element_part())
                     .collect();
                 return Err(SelectError::Ambiguous { count, examples });
             }
@@ -591,10 +631,22 @@ impl Selector {
 }
 
 /// [`selector_for`] every element: what `ui_tree` prints beside each.
+///
+/// `depth` is how deep the walk that produced `elements` went, when that is
+/// not the default one: it is written into every selector, because `nth` and
+/// `path` count the controls of that walk and the resolver must walk as deep
+/// to count the same ones (see [`Selector::depth`]).
 #[must_use]
-pub fn selectors_for(elements: &[Element], names_are_values: bool) -> Vec<Selector> {
+pub fn selectors_for(
+    elements: &[Element],
+    names_are_values: bool,
+    depth: Option<u32>,
+) -> Vec<Selector> {
     (0..elements.len())
-        .map(|i| selector_for(elements, i, names_are_values))
+        .map(|i| Selector {
+            depth,
+            ..selector_for(elements, i, names_are_values)
+        })
         .collect()
 }
 
@@ -717,15 +769,117 @@ mod tests {
         let bad = |t: &str| Selector::parse(t).unwrap_err();
         assert!(bad("").contains("empty"));
         assert!(bad(";;").contains("empty"));
-        assert!(bad("colour=red").contains("unknown key `colour`"));
-        assert!(bad("role=gizmo").contains("unknown role `gizmo`"));
+        assert!(bad("colour=red").contains("item 1 has an unknown key"));
+        assert!(bad("role=gizmo").contains("item 1: the role is not one of"));
         assert!(bad("role=button;role=edit").contains("twice"));
         assert!(bad("name=a;name~=b").contains("twice"));
         assert!(bad("nth=-1").contains("nth"));
         assert!(bad("path=1..2").contains("path"));
-        assert!(bad("justaword").contains("not key=value"));
+        assert!(bad("depth=deep").contains("depth"));
+        assert!(bad("justaword").contains("item 1 is not key=value"));
         assert!(bad("name=a\\qb").contains("unknown escape"));
         assert!(bad("name=a\\").contains("lone"));
+    }
+
+    /// **An error never quotes what it was given.** A selector may carry a
+    /// typed value, and an error is journalled word for word.
+    #[test]
+    fn a_parse_error_names_the_position_and_never_quotes_the_text() {
+        for raw in [
+            "role=edit;hunter2",
+            "hunter2=1",
+            "role=hunter2",
+            "nth=hunter2",
+            "path=hunter2",
+            "depth=hunter2",
+            "name=a\\hunter2",
+            "name=hunter2\\",
+            "role=edit;name=hunter2;name=hunter2",
+        ] {
+            let why = Selector::parse(raw).unwrap_err();
+            assert!(!why.contains("hunter2"), "`{raw}` was quoted: {why}");
+        }
+        let why = Selector::parse("role=edit;hunter2").unwrap_err();
+        assert!(why.contains("item 2"), "{why}");
+    }
+
+    #[test]
+    fn the_requirement_errors_show_the_selector_redacted() {
+        let s = Selector::parse("role=edit;name=hunter2;nth=0;depth=3").unwrap();
+        let none = Selector::parse("app=x;nth=1").unwrap();
+        assert!(none.require_element().unwrap_err().contains("app=x"));
+        let why = s.require_window_only().unwrap_err();
+        assert!(!why.contains("hunter2"), "{why}");
+        let typed = Selector::parse("name=hunter2;nth=0").unwrap();
+        let why = typed.require_window_only().unwrap_err();
+        assert!(!why.contains("hunter2"), "{why}");
+    }
+
+    #[test]
+    fn an_ambiguity_error_lists_a_text_field_by_its_place_and_never_its_name() {
+        let tree = vec![
+            el(1, 1, Role::Edit, "hunter2"),
+            el(2, 1, Role::Edit, "hunter3"),
+            el(3, 1, Role::Button, "OK"),
+            el(4, 1, Role::Button, "OK"),
+        ];
+        let why = Selector::parse("role=edit")
+            .unwrap()
+            .resolve_in(&tree)
+            .unwrap_err()
+            .to_string();
+        assert!(why.contains("matches 2 elements"), "{why}");
+        assert!(!why.contains("hunter"), "{why}");
+        assert!(why.contains("role=edit;nth=1"), "{why}");
+        // A button's name is not content, and is still shown.
+        let why = Selector::parse("role=button")
+            .unwrap()
+            .resolve_in(&tree)
+            .unwrap_err()
+            .to_string();
+        assert!(why.contains("name=OK"), "{why}");
+    }
+
+    #[test]
+    fn depth_is_part_of_the_text_form_and_not_a_control_part() {
+        let s = Selector::parse("role=button;name=OK;nth=1;depth=20").unwrap();
+        assert_eq!(s.depth, Some(20));
+        assert_eq!(s.render(), "role=button;name=OK;nth=1;depth=20");
+        // It narrows nothing by itself.
+        assert!(Selector::parse("depth=20")
+            .unwrap()
+            .require_element()
+            .is_err());
+        assert!(Selector::parse("role=button;depth=20")
+            .unwrap()
+            .require_window_only()
+            .is_err());
+        let stamped = selectors_for(&dialog(), false, Some(20));
+        assert!(stamped.iter().all(|s| s.depth == Some(20)));
+        let plain = selectors_for(&dialog(), false, None);
+        assert!(plain.iter().all(|s| s.depth.is_none()));
+    }
+
+    /// A name cut off at a capital sigma lowercases to a different letter than
+    /// the same sigma inside the whole name: `ς` at the end of a word, `σ`
+    /// elsewhere. The derived selector must still find its own element.
+    #[test]
+    fn a_name_cut_at_a_sigma_still_finds_its_own_element() {
+        let name = format!("{}Σ{}", "a".repeat(LONGEST_NAME - 1), "bcdef");
+        assert_eq!(name.chars().nth(LONGEST_NAME - 1), Some('Σ'));
+        let tree = vec![
+            el(1, 1, Role::Text, &name),
+            el(2, 1, Role::Text, "something else"),
+        ];
+        let s = selector_for(&tree, 0, false);
+        assert!(matches!(s.name, Some(Text::Contains(_))), "{s:?}");
+        assert_eq!(s.resolve_in(&tree).unwrap().id, 1, "{}", s.render());
+        // Through the text form an agent would copy.
+        let again = Selector::parse(&s.render()).unwrap();
+        assert_eq!(again.resolve_in(&tree).unwrap().id, 1);
+        // And case is still ignored for the rest.
+        let upper = Selector::parse("name~=SOMETHING").unwrap();
+        assert_eq!(upper.resolve_in(&tree).unwrap().id, 2);
     }
 
     #[test]
