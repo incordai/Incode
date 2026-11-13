@@ -844,6 +844,8 @@ fn bridged_overrides(exe: &str) -> Vec<String> {
         "features.image_generation=false".to_string(),
         "sandbox_mode=\"read-only\"".to_string(),
         "approval_policy=\"never\"".to_string(),
+        "include_permissions_instructions=false".to_string(),
+        super::argv::WRITE_THROUGH_INCODE.to_string(),
         format!("mcp_servers.incode.command=\"{exe}\""),
         "mcp_servers.incode.args=[\"--tool-server\"]".to_string(),
         "mcp_servers.incode.env_vars=[\"INCODE_TOOL_BRIDGE\",\"INCODE_TOOL_TOKEN\"]".to_string(),
@@ -888,7 +890,7 @@ fn the_bridged_command_escapes_a_windows_server_path() {
 }
 
 #[test]
-fn the_model_only_overrides_are_the_fourteen() {
+fn the_model_only_overrides_are_the_sixteen() {
     assert_eq!(
         MODEL_ONLY_OVERRIDES,
         [
@@ -906,6 +908,8 @@ fn the_model_only_overrides_are_the_fourteen() {
             "features.image_generation=false",
             "sandbox_mode=\"read-only\"",
             "approval_policy=\"never\"",
+            "include_permissions_instructions=false",
+            super::argv::WRITE_THROUGH_INCODE,
         ]
     );
 }

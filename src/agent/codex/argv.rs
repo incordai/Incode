@@ -47,7 +47,17 @@ const HOOKS_OFF: [&str; 2] = ["--disable", "hooks"];
 ///   codex's own reach writes nothing — `apply_patch` is rejected before it
 ///   runs (see the notes on [`crate::agent::codex`]) — and nothing waits on
 ///   a person.
-pub const MODEL_ONLY_OVERRIDES: [&str; 14] = [
+/// - `include_permissions_instructions=false`: codex does not describe that
+///   sandbox to the model. It told the model, in a `<permissions
+///   instructions>` block, that `sandbox_mode` is `read-only`, and the model
+///   then refused writes outright: measured on 0.167.0 with gpt-5.6-terra,
+///   it tried codex's own `apply_patch`, got "patch rejected: writing is
+///   blocked by read-only sandbox" and answered that the filesystem was
+///   read-only, never trying incode's `Write` (the session file in
+///   `~/.codex/sessions` shows both). The sandbox stays read-only; only the
+///   misleading description goes.
+/// - [`WRITE_THROUGH_INCODE`]: says, in its place, where changes are made.
+pub const MODEL_ONLY_OVERRIDES: [&str; 16] = [
     "features.shell_tool=false",
     "features.view_image=false",
     "web_search=\"disabled\"",
@@ -62,7 +72,20 @@ pub const MODEL_ONLY_OVERRIDES: [&str; 14] = [
     "features.image_generation=false",
     "sandbox_mode=\"read-only\"",
     "approval_policy=\"never\"",
+    "include_permissions_instructions=false",
+    WRITE_THROUGH_INCODE,
 ];
+
+/// The developer instructions on the bridged route: changes and commands go
+/// through incode's tools, and codex's own `apply_patch`, which the read-only
+/// sandbox always rejects, is not the way. One TOML basic string (no `"` or
+/// `\` inside), so `-c` parses it as written.
+pub const WRITE_THROUGH_INCODE: &str = "developer_instructions=\"Every file change and \
+command in this session goes through the incode tools (Write, Edit, MultiEdit, ApplyPatch, \
+Bash, Read and the others served by the incode MCP server), which incode runs with its own \
+permissions. Codex's own apply_patch is switched off here and is always rejected: never use \
+it, and never decline a change because of codex's sandbox. Make every change with the \
+incode tools; if incode refuses one, say what it said.\"";
 
 /// Codex's user config (`$CODEX_HOME/config.toml`) is not read on the
 /// bridged route — the counterpart of the Claude route's
