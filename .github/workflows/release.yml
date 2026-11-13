@@ -23,17 +23,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Tag matches both crates' versions
+      - name: Tag matches all three crates' versions
         env:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           want="${TAG#v}"
           cargo metadata --no-deps --format-version 1 \
-            | jq -r '.packages[] | select(.name == "incord-code" or .name == "incord-sandbox") | "\(.name) \(.version)"' \
+            | jq -r '.packages[] | select(.name == "incord-code" or .name == "incord-sandbox" or .name == "incord-desktop") | "\(.name) \(.version)"' \
             > versions.txt
           cat versions.txt
-          test "$(wc -l < versions.txt)" -eq 2
+          test "$(wc -l < versions.txt)" -eq 3
           while read -r name version; do
             if [ "$version" != "$want" ]; then
               echo "::error::tag $TAG names version $want, but $name is $version in its Cargo.toml"

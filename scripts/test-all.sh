@@ -44,6 +44,9 @@ if wants rust; then
         # Runs real commands under the insbx engine (Linux; it says it skipped
         # elsewhere).
         step rust cargo test --test insbx_engine
+        # The computer-use crate (`incu`); `--lib` above is incode's alone.
+        [ -n "${QUICK:-}" ] || step rust cargo clippy -p incord-desktop --all-targets -- -D warnings
+        step rust cargo test -p incord-desktop
     else
         skipped="$skipped rust(cargo)"
     fi

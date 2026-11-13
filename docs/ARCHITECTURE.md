@@ -1059,7 +1059,7 @@ was not probed.
   `team_read` are toolbox tools (`toolbox::team`, over `team_mcp::Server`), and the
   separate server is no longer handed to a bridged model. It is kept for codex, which
   still reaches the channel through `mcp_overrides_for`.
-- The desktop: **fixed (phase 6b)** — its twelve tools are toolbox tools, reached
+- The desktop: **fixed (phase 6b)** — its sixteen tools are toolbox tools, reached
   through the bridge; `incode --desktop-mcp` is now only their executor, started by the
   toolbox. No desktop server is handed to the CLI. See §5b, "The desktop".
 - The engine's session-capture hooks: **fixed (phase 4)** — incode fires them itself on
@@ -1290,7 +1290,7 @@ code names it.
 
 ### The desktop (phase 6b)
 
-The twelve desktop tools are toolbox tools when the desktop is switched on
+The sixteen desktop tools are toolbox tools when the desktop is switched on
 (`INCODE_DESKTOP`; `cli::desktop_setup_for` → `Toolbox::enable_desktop`, on the bridged
 claude route and the API route). They are offered, schema-checked, held to the mode and
 the engine, and drawn as incode's own calls like every other tool, and no desktop server

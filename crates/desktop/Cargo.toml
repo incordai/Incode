@@ -1,0 +1,101 @@
+[package]
+name = "incord-desktop"
+# Released beside incode, under the same tag: kept equal to its version.
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "Apache-2.0"
+description = "Computer use for an agent: screenshots, accessibility trees, mouse and keyboard, as a 16-tool MCP server with a kill switch and a watch journal"
+repository = "https://github.com/incordai/Incode"
+keywords = ["computer-use", "mcp", "accessibility", "agents", "automation"]
+categories = ["command-line-utilities", "accessibility"]
+
+[lib]
+name = "incord_desktop"
+path = "src/lib.rs"
+
+[[bin]]
+name = "incu"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = "0.4"
+# Screenshots travel to the client as base64 image blocks.
+base64 = "0.22"
+# The operator's hook `matcher` (`src/hooks.rs`).
+regex = "1"
+
+# Moved here from incode with the code that uses them, at the same pins; the
+# reasoning for each choice is recorded in incode's Cargo.toml history and in
+# docs/COMPUTER_USE.md.
+#
+# `default-features = false` is the point: image defaults to FIFTEEN codecs
+# (avif, exr, webp, tiff, dds, ...) and screenshots need png + jpeg only.
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
+enigo = { version = "0.6.1", default-features = false }
+
+# Screen capture on Windows and macOS (`src/capture.rs`), optional behind the
+# `desktop-capture` feature (on by default).
+#
+# NOT on Linux, where the screen is read from the X server with x11rb instead
+# (`src/capture/x11.rs`). xcap 0.9.8 has no feature to leave out its Linux
+# Wayland backend: it always builds libwayshot-xcap (wayland-client, GBM, EGL)
+# and PipeWire (pipewire 0.10.1 -> libspa 0.10.1, through bindgen, so libclang
+# too), none of which this crate uses -- Linux computer use is X11 only
+# (docs/COMPUTER_USE.md decision 5). That backend is what broke the release
+# build: libspa 0.10 expects newer PipeWire headers than Ubuntu 22.04 (the
+# release runner, chosen for its older glibc) ships, and fails to compile
+# there. No 0.9.x release offers a way out, so on Linux the dependency is gone.
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+xcap = { version = "0.9.8", default-features = false, optional = true }
+
+# Windows: UI Automation, the clipboard and the Win32 display calls.
+#
+# The rest of incode splits windows / not(windows), which is NOT good enough
+# here: three platforms need three arms, and `not(windows)` must never be read
+# as Linux.
+#
+# windows-sys is the same 0.61.2 incode itself resolves; the features are the
+# smallest set that answers "where are the displays and how is this one
+# scaled" (HiDpi for the process awareness call and the per-monitor DPI query,
+# Gdi for the enumeration, Foundation for RECT and HWND, WindowsAndMessaging
+# for the primary-display flag and the window calls) plus Threading for the
+# owning program's name of a window (`uia_windows`).
+[target.'cfg(windows)'.dependencies]
+clipboard-win = "5.4.1"
+uiautomation = "0.25.1"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Threading",
+    "Win32_UI_HiDpi",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+# `prctl` for the private Xvfb (`src/linux.rs`), and the process group a hook
+# command is killed through (`src/hooks.rs`).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Computer use on Linux, on an X11 display (docs/COMPUTER_USE.md decision 5).
+#   - enigo's `x11rb` backend: without it enigo on Linux has no backend at all
+#     and every action fails.
+#   - zbus for the AT-SPI2 accessibility tree, with its default features,
+#     which include the blocking API used here.
+#   - x11rb, named directly to ask the X server which window keystrokes reach
+#     (`linux::keyboard_pid`) and to capture the screen (`capture::x11`);
+#     `randr` is for the display list (RandR 1.5 GetMonitors).
+[target.'cfg(target_os = "linux")'.dependencies]
+enigo = { version = "0.6.1", default-features = false, features = ["x11rb"] }
+x11rb = { version = "0.13.2", default-features = false, features = ["randr"] }
+zbus = "5.19"
+
+[features]
+default = ["desktop-capture"]
+# Screenshots and the display list, on every OS. Without it every capture is
+# refused by name. On Windows and macOS it builds xcap; on Linux it needs no
+# extra crate (the X server is read with x11rb, which input already links), so
+# `dep:xcap` names nothing there.
+desktop-capture = ["dep:xcap"]

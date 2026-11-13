@@ -19,13 +19,13 @@
 //!   `set_value`, `element_action`, `move_mouse`, `click`, `ui_tree`,
 //!   `click_element`, `type_text`, `paste_text`, `key`, `scroll`, `drag`,
 //!   and the screenshot path `shoot`).
-//! - **Calls** [`crate::desktop::limits::get`] for the blocked applications,
-//!   [`crate::desktop::uia`] for the focused window and the window list, and
-//!   [`crate::desktop::screen_info`] for the displays.
+//! - **Calls** [`crate::limits::get`] for the blocked applications,
+//!   [`crate::uia`] for the focused window and the window list, and
+//!   [`crate::screen_info`] for the displays.
 
-use crate::desktop::coords::PhysicalPoint;
-use crate::desktop::uia::{self, WindowInfo};
-use crate::desktop::Rect;
+use crate::coords::PhysicalPoint;
+use crate::uia::{self, WindowInfo};
+use crate::Rect;
 
 /// Refuse a window that belongs to a blocked application (a password
 /// manager, or one admin.json names). Checked BEFORE anything is read from
@@ -37,8 +37,8 @@ pub(super) fn refuse_blocked(info: &WindowInfo) -> Result<(), String> {
 /// Refuse an application by name; [`refuse_blocked`] for a window, and
 /// called directly by `ui_tree` for the application a walked tree names.
 pub(super) fn refuse_app(app: &str) -> Result<(), String> {
-    match crate::desktop::limits::get().blocked(app) {
-        Some(entry) if entry == crate::desktop::limits::UNNAMED_APP => Err(
+    match crate::limits::get().blocked(app) {
+        Some(entry) if entry == crate::limits::UNNAMED_APP => Err(
             "refused: the application that owns that window could not be named, so it cannot be \
              told apart from a password manager; incode does not read or act on it."
                 .to_string(),
@@ -104,7 +104,7 @@ pub(super) fn off_every_screen(at: PhysicalPoint, screens: &[Rect]) -> Option<St
 ///
 /// Called by [`refuse_point`] and by `ui_tree` (to mark off-screen elements).
 pub(super) fn screen_rects() -> Result<Vec<Rect>, String> {
-    let info = crate::desktop::screen_info().map_err(|e| {
+    let info = crate::screen_info().map_err(|e| {
         format!(
             "refused: the displays could not be read ({e}), so this cannot be checked to be on \
              one"
@@ -125,7 +125,7 @@ pub(super) fn blocked_windows() -> Result<Vec<WindowInfo>, String> {
     })?;
     Ok(windows
         .into_iter()
-        .filter(|w| crate::desktop::limits::get().blocked(&w.app).is_some())
+        .filter(|w| crate::limits::get().blocked(&w.app).is_some())
         .collect())
 }
 

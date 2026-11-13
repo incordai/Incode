@@ -62,7 +62,12 @@ use std::path::{Component, Path, PathBuf};
 /// guarded one `use`, and it read split-out test files as production callers.
 /// Seeing again found `toolbox::Toolbox::set_permission_rules` and
 /// `ClaudeCodeBackend::{with_session, with_models}`, each reached only by tests.
-pub const MAX_UNWIRED: usize = 41;
+///
+/// It fell from 41 to 38 when the desktop moved to `crates/desktop`: this scan
+/// reads incode's `src/` only, so the three uncalled items that were in
+/// `src/desktop/` are no longer in what it counts. They were not wired by the
+/// move. (The `Supervisor` entry below names one of them.)
+pub const MAX_UNWIRED: usize = 38;
 
 /// A `pub` item nothing outside its own file calls.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]

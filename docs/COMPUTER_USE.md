@@ -1,8 +1,10 @@
 # incode — Computer Use
 
 > **Status note, 2026-09-26.** The first line below is out of date. The Windows desktop
-> (`src/desktop/`) is built, and its twelve tools are Toolbox tools behind incode's
-> gate, executed by `incode --desktop-mcp` (`ARCHITECTURE.md` §5b, "The desktop").
+> (now the `incord-desktop` crate, `crates/desktop`, binary `incu`; it was `src/desktop/`)
+> is built, and its sixteen tools (five that observe, eleven that act) are Toolbox tools
+> behind incode's gate, executed by `incode --desktop-mcp`, which is a thin wrapper over
+> `incu serve` (`ARCHITECTURE.md` §5b, "The desktop").
 > macOS (Phase C) is built (2026-10-01, `src/desktop/macos.rs`): monitors and capture
 > through xcap in POINTS, the accessibility tree through AXUIElement, the clipboard
 > through `pbcopy`, and the two TCC grants probed before every action and reported by
@@ -477,15 +479,17 @@ state of the code. What it correctly identified is that a policy is worth nothin
 where nobody calls it; what it could not say is where it *should* be called.
 
 That place is point 1 below — the desktop MCP server, which this section already
-names as "the only one this crate fully controls". `desktop::mcp::call_tool` now
-asks `PermissionPolicy::for_desktop(mode)` before every tool, and the session's
-`-p` reaches that separate process on its argv.
+names as "the only one this crate fully controls". `desktop::mcp::Server::call_tool` now
+asks the server's permission tier before every tool (`incord_desktop::permission::Tier`;
+`PermissionPolicy::for_desktop(mode)` is incode's statement of the same table, and a
+test keeps the two equal), and the session's `-p` reaches that separate process on its
+argv (`incu` also takes `--tier observe|act`).
 
 | Mode | The desktop it gets |
 |---|---|
-| `read-only` | `screen_info`, `cursor_position`, `screenshot`, `ui_tree`. Nothing that moves. |
-| `workspace-write` (default) | all twelve — unchanged from before |
-| `danger-full-access`, `allow` | all twelve |
+| `read-only` | `screen_info`, `cursor_position`, `screenshot`, `ui_tree`, `list_windows`. Nothing that moves. |
+| `workspace-write` (default) | all sixteen — unchanged from before |
+| `danger-full-access`, `allow` | all sixteen |
 | `prompt` | nothing. stdin and stdout are the protocol, so there is no channel to ask a human on, and `authorize` with no prompter denies. |
 
 The acting tools require `WorkspaceWrite` rather than `DangerFullAccess`, even

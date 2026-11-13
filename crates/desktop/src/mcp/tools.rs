@@ -20,18 +20,18 @@
 //! - **Called by** `Server::call_tool` in [`super`], through
 //!   [`Server::run_and_look`], once the gates in [`super::gate`] have let
 //!   the call through; [`window_arg`] also by `Server::describe`.
-//! - **Calls** [`crate::desktop::thread::InputThread`] for the mouse and the
-//!   keyboard, [`crate::desktop::uia`] for windows and elements,
-//!   [`crate::desktop::capture`] for pictures, and [`super::guard`] before
+//! - **Calls** [`crate::thread::InputThread`] for the mouse and the
+//!   keyboard, [`crate::uia`] for windows and elements,
+//!   [`crate::capture`] for pictures, and [`super::guard`] before
 //!   each of them.
 
 use base64::Engine as _;
 use serde_json::{json, Value};
 
-use crate::desktop::capture::{self, CaptureOptions, ShotFormat};
-use crate::desktop::coords::PhysicalPoint;
-use crate::desktop::thread::{InputThread, MouseButton};
-use crate::desktop::uia::{self, WindowInfo};
+use crate::capture::{self, CaptureOptions, ShotFormat};
+use crate::coords::PhysicalPoint;
+use crate::thread::{InputThread, MouseButton};
+use crate::uia::{self, WindowInfo};
 
 use super::guard::{
     blocked_windows, guard_focus, refuse_app, refuse_blocked, refuse_point, refuse_region,
@@ -83,7 +83,7 @@ impl Server {
 
 /// `screen_info`: every display. Called by [`Server::run_tool`].
 fn screen_info() -> Result<Vec<Value>, String> {
-    let info = crate::desktop::screen_info().map_err(|e| e.to_string())?;
+    let info = crate::screen_info().map_err(|e| e.to_string())?;
     Ok(vec![text(
         serde_json::to_string_pretty(&info).unwrap_or_default(),
     )])
@@ -119,7 +119,7 @@ fn list_windows() -> Result<Vec<Value>, String> {
     let windows = uia::list_windows().map_err(|e| e.to_string())?;
     let listed: Vec<Value> = windows
         .iter()
-        .map(|w| match crate::desktop::limits::get().blocked(&w.app) {
+        .map(|w| match crate::limits::get().blocked(&w.app) {
             // Listed so the agent knows it is there and not to
             // try, with the area every click and capture keeps
             // off; its title (often an entry's name) is not.
@@ -214,7 +214,7 @@ fn ui_tree(args: &Value) -> Result<Vec<Value>, String> {
     let depth = args
         .get("depth")
         .and_then(Value::as_u64)
-        .unwrap_or(u64::from(crate::desktop::limits::get().tree_depth)) as u32;
+        .unwrap_or(u64::from(crate::limits::get().tree_depth)) as u32;
     let tree = uia::window_tree(window_arg(args).as_deref(), depth).map_err(|e| e.to_string())?;
     // Walked in this process, and discarded unread when blocked.
     refuse_app(&tree.app)?;
@@ -437,7 +437,7 @@ fn scroll_steps(args: &Value, key: &str) -> Result<i32, String> {
     let Some(raw) = args.get(key) else {
         return Ok(0);
     };
-    let max = i64::from(crate::desktop::limits::get().max_scroll_steps);
+    let max = i64::from(crate::limits::get().max_scroll_steps);
     match raw.as_i64() {
         Some(n) if n.abs() <= max => Ok(n as i32),
         Some(n) => Err(format!(
@@ -551,7 +551,7 @@ fn shoot(window: Option<&str>, options: CaptureOptions) -> Result<Vec<Value>, St
 /// to change. A failure is reported beside the action's result rather than
 /// replacing it — the action itself already happened.
 fn after_shot(args: &Value) -> Vec<Value> {
-    std::thread::sleep(crate::desktop::limits::get().settle);
+    std::thread::sleep(crate::limits::get().settle);
     let window = window_arg(args).or_else(|| uia::foreground().ok().flatten().map(|w| w.id));
     match shoot(window.as_deref(), CaptureOptions::default()) {
         Ok(content) => content,

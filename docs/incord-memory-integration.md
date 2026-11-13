@@ -90,7 +90,7 @@ may hear a session twice — once from incode, once from the CLI under the CLI's
 (Closed for codex in phase 8: it runs with `--disable hooks`. Still true for agy.)
 
 **Phase 6b (2026-09-25).** Three more kinds of call now pass the engine's pre-tool hook,
-because they are Toolbox tools: the desktop's twelve tools (previously run in
+because they are Toolbox tools: the desktop's sixteen tools (previously run in
 `incode --desktop-mcp` with only the desktop's own hooks, which still run there as a
 second line), `Screenshot` (observe, fail open) and `RenderPdf` (change, fail closed;
 its OUTPUT path is in `tool_input.paths` and is reported to `code-edit` once written). A

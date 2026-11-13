@@ -15,7 +15,8 @@
 //!
 //! - **Called by** `tools/list` in [`super::transport`], and by the toolbox
 //!   (`toolbox::desktop`) through [`tool_definitions`], which [`super`]
-//!   re-exports as `desktop::mcp::tool_definitions`.
+//!   re-exports as `mcp::tool_definitions` (public, since incode is a
+//!   separate crate now).
 //! - **Calls** nothing; reads [`super::ACTING`] and [`super::UNTRUSTED`].
 
 use serde_json::{json, Value};
@@ -24,7 +25,7 @@ use super::{ACTING, UNTRUSTED};
 
 /// Every desktop tool, in MCP's shape. The toolbox offers these same
 /// definitions to a model (`toolbox::desktop`), so they are written once.
-pub(crate) fn tool_definitions() -> Vec<Value> {
+pub fn tool_definitions() -> Vec<Value> {
     /// The tools that take a `window` from list_windows.
     const WINDOWED: &[&str] = &[
         "screenshot",

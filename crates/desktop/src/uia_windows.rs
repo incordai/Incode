@@ -24,7 +24,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::{find, walk, Done, Element, Role, Tree, Want, WindowInfo};
-use crate::desktop::{DesktopError, Rect};
+use crate::{DesktopError, Rect};
 
 /// The actions [`act`] knows, in the shared vocabulary.
 const ACTIONS: &[&str] = &[

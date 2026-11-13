@@ -4,8 +4,9 @@
 //!
 //! `docs/COMPUTER_USE.md` section 1: the harness owns no model loop, so the only
 //! way a delegated agent gains a capability is over MCP. Decision 4 makes this a
-//! SEPARATE PROCESS — `incode desktop-mcp --stdio` — so the Windows DPI call
-//! owns its own startup and a crash here cannot take down a live session.
+//! SEPARATE PROCESS — `incu serve`, or incode's `--desktop-mcp` wrapper of it —
+//! so the Windows DPI call owns its own startup and a crash here cannot take
+//! down a live session.
 //!
 //! # The protocol was measured, not remembered
 //!
@@ -37,34 +38,37 @@
 //! 1,000), `run_tool` at 315 lines and `call_tool` at 131 (threshold 100),
 //! because one file held the JSON-RPC transport, the tool definitions, the
 //! per-call gates, sixteen tools in one `match`, the screen guards and the
-//! tests. This file keeps the server itself, the one function every tool
-//! call passes ([`Server::call_tool`], now its gates as named steps) and the
-//! client registration; the rest moved unchanged, each part to its own file:
+//! tests. This file keeps the server itself and the one function every tool
+//! call passes ([`Server::call_tool`], now its gates as named steps); the
+//! rest moved unchanged, each part to its own file. (The client registration,
+//! `client_config` and `codex_config_overrides`, names incode's flags and so
+//! stayed in incode, in `desktop.rs`.)
 //!
 //! - [`transport`]: `handle_line`, the method table, the error envelope and
 //!   [`run_stdio`].
 //! - [`definitions`]: [`tool_definitions`], what a client is told.
-//! - [`gate`]: the stop file, the permission mode, the hooks and the journal
+//! - [`gate`]: the stop file, the permission tier, the hooks and the journal
 //!   — the steps `call_tool` runs, in its order.
 //! - [`tools`]: `run_tool` and one step per tool.
 //! - [`guard`]: the blocked-application, focus, point and region refusals a
 //!   tool asks before it acts.
-//! - `tests`: the tests, at their old path `desktop::mcp::tests`.
+//! - `tests`: the tests, at their old path `mcp::tests`.
 //!
 //! # Wired to
 //!
-//! - **Called by** `main.rs` (`Parsed::DesktopMcp`), which builds a
-//!   [`Server`] and hands it to [`run_stdio`]; `toolbox::desktop`, through
-//!   [`tool_definitions`]; and `cli` / `agent::codex`, through
-//!   [`client_config_json`] and [`codex_config_overrides`].
-//! - **Calls** the desktop layer in [`super`] (`thread`, `uia`, `capture`,
-//!   `safety`, `journal`, `limits`), [`crate::permissions`] and
-//!   [`crate::hooks`], through the modules above.
+//! - **Called by** [`crate::cli::serve`], which builds a [`Server`] and hands
+//!   it to [`run_stdio`] (for `incu serve` and for incode's `--desktop-mcp`);
+//!   and, in incode, `toolbox::desktop`, through [`tool_definitions`].
+//! - **Calls** the desktop layer (`thread`, `uia`, `capture`, `safety`,
+//!   `journal`, `limits`), [`crate::permission`] and [`crate::hooks`], through
+//!   the modules above.
 
 use serde_json::{json, Value};
 
 use super::safety::Safety;
 use super::thread::InputThread;
+use crate::hooks::{HookConfig, Hooks, ShellHooks};
+use crate::permission::Tier;
 
 mod definitions;
 mod gate;
@@ -75,26 +79,15 @@ mod transport;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use definitions::tool_definitions;
+pub use definitions::tool_definitions;
 pub use transport::run_stdio;
 
 use transport::{code, Failure};
 
-/// The tools that change the machine and so may end with a screenshot
-/// (`screenshot_after`).
-const ACTING: &[&str] = &[
-    "click_element",
-    "set_value",
-    "element_action",
-    "focus_window",
-    "type_text",
-    "paste_text",
-    "key",
-    "scroll",
-    "drag",
-    "move_mouse",
-    "click",
-];
+// The tools that change the machine and so may end with a screenshot
+// (`screenshot_after`): the table the tier is checked against, so the two
+// cannot disagree.
+use crate::permission::ACTING;
 
 /// What every tool description carries, and why.
 ///
@@ -119,16 +112,16 @@ pub struct Server {
     ///
     /// Not optional, because "no policy" would mean an ungoverned desktop and
     /// the whole point is that there is always an answer. The default is the
-    /// mode a session runs in unless told otherwise, so registering this
+    /// tier a session runs in unless told otherwise, so registering this
     /// server by hand does not silently produce something more capable than
     /// the harness would have launched.
-    permissions: crate::permissions::PermissionPolicy,
+    tier: Tier,
     /// The operator's own commands, run around every call.
     ///
     /// `None` is the ordinary case and costs nothing. See [`crate::hooks`] for
     /// the contract, and for why a hook sees the real input rather than the
     /// redacted description the journal gets.
-    hooks: Option<crate::hooks::HookRunner>,
+    hooks: Option<Box<dyn Hooks>>,
 }
 
 impl Server {
@@ -141,9 +134,7 @@ impl Server {
             initialised: false,
             journal: None,
             stop_file: None,
-            permissions: crate::permissions::PermissionPolicy::for_desktop(
-                crate::permissions::PermissionMode::WorkspaceWrite,
-            ),
+            tier: Tier::Act,
             hooks: None,
         }
     }
@@ -153,21 +144,36 @@ impl Server {
     /// An empty config is dropped rather than stored, so the ordinary case
     /// costs one `is_empty` at startup instead of two process spawns per
     /// click.
+    ///
+    /// Runs them with [`ShellHooks`]; a caller with a hook engine of its own
+    /// (incode's `--desktop-mcp`) hands it over with
+    /// [`Server::with_hook_runner`].
     #[must_use]
-    pub fn with_hooks(mut self, config: crate::hooks::HookConfig) -> Self {
-        self.hooks = (!config.is_empty()).then(|| crate::hooks::HookRunner::new(config));
+    pub fn with_hooks(mut self, config: HookConfig) -> Self {
+        self.hooks =
+            (!config.is_empty()).then(|| Box::new(ShellHooks::new(config)) as Box<dyn Hooks>);
         self
     }
 
-    /// Run this desktop under a session's permission mode.
+    /// Run the operator's commands with `hooks`, an engine the caller owns.
+    ///
+    /// Called by [`crate::cli::serve`], with either [`ShellHooks`] or whatever
+    /// the embedding program supplied.
+    #[must_use]
+    pub fn with_hook_runner(mut self, hooks: Box<dyn Hooks>) -> Self {
+        self.hooks = Some(hooks);
+        self
+    }
+
+    /// Run this desktop under a permission tier.
     ///
     /// The launcher passes what the operator asked for; see
-    /// [`crate::permissions::PermissionPolicy::for_desktop`] for which tools
-    /// each mode reaches. A server built without this keeps the default mode,
-    /// which is what a session gets when no flag is given.
+    /// [`crate::permission::Tier`] for which tools each tier reaches. A server
+    /// built without this keeps [`Tier::Act`], which is what a session gets
+    /// when no flag is given.
     #[must_use]
-    pub fn with_permission_mode(mut self, mode: crate::permissions::PermissionMode) -> Self {
-        self.permissions = crate::permissions::PermissionPolicy::for_desktop(mode);
+    pub fn with_tier(mut self, tier: Tier) -> Self {
+        self.tier = tier;
         self
     }
 
@@ -216,7 +222,7 @@ impl Server {
         // click look like a broken server, and the agent would retry the
         // transport rather than read the reason.
         self.catch_stop_file();
-        let permitted = self.authorise(name, &args);
+        let permitted = self.authorise(name);
         let raw_args = args.to_string();
         let vetoed = self.hook_veto(&permitted, name, &raw_args);
         let outcome = self.outcome(&permitted, vetoed, name, &args);
@@ -231,93 +237,4 @@ impl Server {
             }),
         })
     }
-}
-
-/// The name a client will see this server under.
-pub const CLIENT_KEY: &str = "desktop";
-
-/// The MCP configuration a client needs in order to launch this server.
-///
-/// Verified against the installed Claude CLI 2.1.273: `--mcp-config <configs...>`
-/// takes JSON, and `--strict-mcp-config` confines the agent to only what is
-/// passed there. Codex takes the same information as
-/// `-c mcp_servers.<key>.…` instead (`src/agent/codex/argv.rs`), which is why
-/// this returns the SHAPE rather than a command line — each backend spells it
-/// differently, and the thing they agree on is what to launch.
-///
-/// `exe` is the path to this binary. Taken as an argument rather than read from
-/// [`std::env::current_exe`] inside, so it is testable and so a caller can
-/// register a server it is not itself running.
-/// `journal` is where the launched server should record what it did, so
-/// `--serve` can stream it (`COMPUTER_USE.md` 14c). `None` means nobody is
-/// watching and the server writes nowhere.
-pub fn client_config(
-    exe: &std::path::Path,
-    journal: Option<&std::path::Path>,
-    mode: crate::permissions::PermissionMode,
-) -> Value {
-    let mut args = vec!["--desktop-mcp".to_string()];
-    if let Some(path) = journal {
-        args.push("--desktop-journal".to_string());
-        args.push(path.to_string_lossy().to_string());
-    }
-    // ALWAYS PASSED, never omitted when it happens to be the default. This
-    // server is a separate process and cannot see the flag the session was
-    // started with; leaving it off would mean the operator's `-p read-only`
-    // stopped at the process boundary, which is exactly the bug that made a
-    // read-only session able to type.
-    args.push("-p".to_string());
-    args.push(mode.as_str().to_string());
-    json!({
-        "mcpServers": {
-            CLIENT_KEY: {
-                "command": exe.to_string_lossy(),
-                "args": args,
-            }
-        }
-    })
-}
-
-/// [`client_config`] as the compact JSON string a `--mcp-config` flag takes.
-pub fn client_config_json(
-    exe: &std::path::Path,
-    journal: Option<&std::path::Path>,
-    mode: crate::permissions::PermissionMode,
-) -> String {
-    client_config(exe, journal, mode).to_string()
-}
-
-/// The same registration as `-c key=value` overrides, which is how Codex takes
-/// it.
-///
-/// Verified against the installed CLI: `codex mcp add --help` documents `-c`
-/// as "Override a configuration value… The `value` portion is parsed as TOML",
-/// and its own example passes an array —
-/// `-c 'sandbox_permissions=["disk-full-read-access"]'` — so the `args` list
-/// below is TOML, not JSON, and not a guess.
-///
-/// Returned as pairs rather than a command line because the caller knows how
-/// its own `Command` wants them.
-pub fn codex_config_overrides(
-    exe: &std::path::Path,
-    journal: Option<&std::path::Path>,
-    mode: crate::permissions::PermissionMode,
-) -> Vec<String> {
-    // TOML basic strings take backslash escapes, so a Windows path must have
-    // its separators doubled or `C:\Users\…` becomes an invalid escape. This
-    // applies to the JOURNAL path too, which is also a Windows path — the
-    // exe is not a special case, the string syntax is.
-    let toml = |p: &std::path::Path| p.to_string_lossy().replace('\\', "\\\\");
-    let args = match journal {
-        Some(path) => format!(
-            "[\"--desktop-mcp\",\"--desktop-journal\",\"{}\",\"-p\",\"{}\"]",
-            toml(path),
-            mode.as_str()
-        ),
-        None => format!("[\"--desktop-mcp\",\"-p\",\"{}\"]", mode.as_str()),
-    };
-    vec![
-        format!("mcp_servers.{CLIENT_KEY}.command=\"{}\"", toml(exe)),
-        format!("mcp_servers.{CLIENT_KEY}.args={args}"),
-    ]
 }

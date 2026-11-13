@@ -40,7 +40,7 @@ use serde::{Deserialize, Serialize};
 /// How much journal to keep before the oldest records are dropped.
 ///
 /// The input thread caps the agent at 120 actions per minute by default
-/// ([`crate::desktop::limits`]), so an agent driving flat out writes on the
+/// ([`crate::limits`]), so an agent driving flat out writes on the
 /// order of 30 KB a minute. A quarter of a megabyte is therefore several
 /// minutes of the most recent activity, which is what an operator asking
 /// "what is it doing right now" actually wants, and it bounds the cost of the
@@ -50,7 +50,7 @@ pub const MAX_BYTES: u64 = super::limits::DEFAULT_JOURNAL_MAX_BYTES;
 
 /// Where the journal lives inside a workspace.
 ///
-/// In `.incode/`, with the transcripts (`crate::transcript::DIR`), rather than
+/// In `.incode/`, with incode's transcripts, rather than
 /// in a new top-level directory: it is the same kind of artefact — a record of
 /// what an agent did — and `.incode/` is already the harness's own space.
 pub const FILE: &str = ".incode/desktop.jsonl";
@@ -157,7 +157,11 @@ impl Journal {
         self.trim()?;
 
         if let Some(parent) = self.path.parent() {
-            crate::folders::create_dir_all(parent)?;
+            // Plain `create_dir_all`: the project's `.incode/.gitignore` that
+            // incode writes beside a fresh `.incode/` is incode's concern, and
+            // its `--desktop-mcp` wrapper creates the folder that way before
+            // this server starts. See `crate::cli`.
+            std::fs::create_dir_all(parent)?;
         }
         let mut file = std::fs::OpenOptions::new()
             .create(true)

@@ -172,7 +172,7 @@ unsafe extern "system" fn collect_one(
 
 #[cfg(test)]
 mod tests {
-    use crate::desktop::{screen_info, ScreenInfo};
+    use crate::{screen_info, ScreenInfo};
 
     fn live() -> ScreenInfo {
         screen_info().expect("a Windows session must be able to describe its own displays")
