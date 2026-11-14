@@ -633,6 +633,21 @@ pub fn act(window: Option<&str>, id: u32, action: &str) -> Result<Done, DesktopE
     platform::act(Some(&info.id), &want, depth, action)
 }
 
+/// Whether the window with this id still exists, when that can be told from
+/// the window manager alone, without asking the window anything: `Some(false)`
+/// is a window that has been destroyed. Windows only (`IsWindow`); `None`
+/// elsewhere, where the window list is the only way to tell.
+#[must_use]
+pub fn window_exists(window: &str) -> Option<bool> {
+    #[cfg(windows)]
+    return platform::window_exists(window);
+    #[cfg(not(windows))]
+    {
+        let _ = window;
+        None
+    }
+}
+
 /// Bring a window to the front, so keystrokes go to it.
 pub fn focus_window(window: &str) -> Result<Done, DesktopError> {
     platform::focus_window(window)

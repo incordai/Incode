@@ -89,6 +89,14 @@ impl Budget {
     }
 }
 
+/// What an [`Env`] call's error begins with when the desktop did not answer in
+/// time (a look given up on at its limit, see `mcp::wait_tool`).
+///
+/// It is not a failure of the wait: it is a look that saw nothing. The wait
+/// goes on to its deadline, or ends there, as `timeout` with this as
+/// `last_seen`, instead of ending as an error the moment one look is lost.
+pub const UNANSWERED: &str = "the desktop did not answer";
+
 /// What a wait touches. See the module header.
 pub trait Env {
     /// Milliseconds since some fixed moment of this wait's own.
@@ -97,6 +105,17 @@ pub trait Env {
     /// The windows there are to look at: those of blocked applications are not
     /// among them.
     fn windows(&mut self) -> Result<Vec<WindowInfo>, String>;
+    /// Whether the window with this id still exists, when that can be told
+    /// without asking the window anything (Windows: `IsWindow`): `Some(false)`
+    /// is a window that has been destroyed, which no later look is made of.
+    /// `None` when it cannot be told that way.
+    ///
+    /// A window that is closing is the one a look can block on: the
+    /// accessibility layer asks the program that owns it, and that program is
+    /// going away. So this is asked first and costs no such question.
+    fn window_alive(&mut self, _id: &str) -> Option<bool> {
+        None
+    }
     /// The window keystrokes go to now.
     fn focused_window(&mut self) -> Result<WindowInfo, String>;
     /// A fresh walk of one window.
@@ -223,9 +242,12 @@ fn wait_until<E: Env, T>(
             return Ok(Waited::Stopped(env.now_ms() - start));
         }
         polls += 1;
-        let last = match check(env)? {
-            Poll::Ready(found) => return Ok(Waited::Met(found, env.now_ms() - start, polls)),
-            Poll::Pending(seen) => seen,
+        let last = match check(env) {
+            Ok(Poll::Ready(found)) => return Ok(Waited::Met(found, env.now_ms() - start, polls)),
+            Ok(Poll::Pending(seen)) => seen,
+            // A look the desktop did not answer is a look that saw nothing.
+            Err(why) if why.starts_with(UNANSWERED) => why,
+            Err(why) => return Err(why),
         };
         let elapsed = env.now_ms() - start;
         if elapsed >= budget.timeout_ms {
@@ -272,25 +294,44 @@ fn windows_named(env: &mut impl Env, selector: &Selector) -> Result<Vec<WindowIn
 }
 
 /// The window the wait watches, decided once at the start.
+///
+/// A window named by id that is not there is an error for `appears` (nothing
+/// can appear in a window that does not exist) and an answer for `gone`: a
+/// pinned window that has closed is exactly what its control being gone looks
+/// like, and the id of one that closed a moment before the call is the usual
+/// case (the click that closed it was the last call).
 fn target_of(
     env: &mut impl Env,
     selector: &Selector,
     window: Option<&str>,
+    appears: bool,
 ) -> Result<Target, String> {
     if let Some(id) = window {
-        let all = env.windows()?;
-        let Some(w) = all.iter().find(|w| w.id == id) else {
-            return Err(format!(
-                "no window has the id {id}; take one from list_windows"
-            ));
+        let alive = env.window_alive(id);
+        // Asked of nothing when the window is known to be destroyed.
+        let listed = if alive == Some(false) {
+            None
+        } else {
+            env.windows()?.into_iter().find(|w| w.id == id)
         };
-        if selector.has_window_part() && !selector.matches_window(w) {
-            return Err(format!(
-                "window {id} is \"{}\" ({}), which the selector's window part `{}` does not name",
-                w.title,
-                w.app,
-                selector.render_window_part()
-            ));
+        let there = listed.is_some() || alive == Some(true);
+        if !there {
+            if appears {
+                return Err(format!(
+                    "no window has the id {id}; take one from list_windows"
+                ));
+            }
+            return Ok(Target::Pinned(id.to_string()));
+        }
+        if let Some(w) = &listed {
+            if selector.has_window_part() && !selector.matches_window(w) {
+                return Err(format!(
+                    "window {id} is \"{}\" ({}), which the selector's window part `{}` does not name",
+                    w.title,
+                    w.app,
+                    selector.render_window_part()
+                ));
+            }
         }
         return Ok(Target::Pinned(id.to_string()));
     }
@@ -304,7 +345,14 @@ fn target_of(
 
 fn look(env: &mut impl Env, target: &Target, selector: &Selector) -> Result<Look, String> {
     let window = match target {
-        Target::Pinned(id) => env.windows()?.into_iter().find(|w| &w.id == id),
+        Target::Pinned(id) => {
+            // Destroyed: nothing to ask. This is the cheap, certain answer
+            // that ends an `element_gone` wait on a window that closed.
+            if env.window_alive(id) == Some(false) {
+                return Ok(Look::NoWindow);
+            }
+            env.windows()?.into_iter().find(|w| &w.id == id)
+        }
         Target::Named => {
             let mut named = windows_named(env, selector)?;
             match named.len() {
@@ -325,10 +373,16 @@ fn look(env: &mut impl Env, target: &Target, selector: &Selector) -> Result<Look
     };
     let tree = match env.tree(&window.id, selector.depth) {
         Ok(tree) => tree,
+        // Nothing was seen, and asking again would only wait for the same
+        // answer: let the wait decide (`wait_until`).
+        Err(why) if why.starts_with(UNANSWERED) => return Err(why),
         Err(why) => {
             // A window that closes while it is being walked fails the walk:
             // that is the window going away, which is an answer, not a
             // failure. Only a window that is still there makes it an error.
+            if env.window_alive(&window.id) == Some(false) {
+                return Ok(Look::NoWindow);
+            }
             let still_there = env.windows()?.iter().any(|w| w.id == window.id);
             if still_there {
                 return Err(why);
@@ -474,7 +528,7 @@ pub fn run<E: Env>(
             appears,
         } => {
             selector.require_element()?;
-            let target = target_of(env, selector, window.as_deref())?;
+            let target = target_of(env, selector, window.as_deref(), *appears)?;
             let waited = wait_until(env, budget, stopped, |env| {
                 element_check(env, &target, selector, *appears)
             })?;
@@ -700,6 +754,11 @@ mod tests {
         truncated: bool,
         /// From this time on a walk fails, as one does of a closing window.
         tree_fails_from: Option<u64>,
+        /// Whether the window exists, by time, for a desktop that can tell.
+        alive: Option<At<bool>>,
+        /// A walk that blocks this many virtual ms and is then given up on.
+        tree_blocks_ms: Option<u64>,
+        windows_calls: u32,
         screen: At<u128>,
         sleeps: Vec<u64>,
         trees: u32,
@@ -714,6 +773,9 @@ mod tests {
                 elements: Box::new(|_| Vec::new()),
                 truncated: false,
                 tree_fails_from: None,
+                alive: None,
+                tree_blocks_ms: None,
+                windows_calls: 0,
                 screen: Box::new(|_| 0),
                 sleeps: Vec::new(),
                 trees: 0,
@@ -730,7 +792,11 @@ mod tests {
             self.now += ms;
         }
         fn windows(&mut self) -> Result<Vec<WindowInfo>, String> {
+            self.windows_calls += 1;
             Ok((self.windows)(self.now))
+        }
+        fn window_alive(&mut self, _: &str) -> Option<bool> {
+            self.alive.as_ref().map(|alive| alive(self.now))
         }
         fn focused_window(&mut self) -> Result<WindowInfo, String> {
             (self.windows)(self.now)
@@ -740,6 +806,12 @@ mod tests {
         }
         fn tree(&mut self, window: &str, _: Option<u32>) -> Result<Tree, String> {
             self.trees += 1;
+            if let Some(blocked) = self.tree_blocks_ms {
+                self.now += blocked;
+                return Err(format!(
+                    "{UNANSWERED} to walk the window within {blocked} ms"
+                ));
+            }
             if self.tree_fails_from.is_some_and(|t| self.now >= t) {
                 return Err("no desktop element: Unspecified error".to_string());
             }
@@ -1141,6 +1213,134 @@ mod tests {
         env.tree_fails_from = Some(0);
         let err = run(&mut env, &gone("name=OK"), &budget(5_000, 250), &never).unwrap_err();
         assert!(err.contains("Unspecified error"), "{err}");
+    }
+
+    /// **The window the caller pinned is destroyed mid-wait: `element_gone`
+    /// is found at once.** The look that met a closing window is where the
+    /// live wait hung: no look is made of a window known to be destroyed.
+    #[test]
+    fn a_pinned_window_destroyed_mid_wait_ends_element_gone_without_another_look() {
+        let mut env = Fake::new();
+        env.elements = Box::new(|_| vec![button(1, "Don't save")]);
+        env.alive = Some(Box::new(|t| t < 300));
+        let c = Condition::Element {
+            selector: sel("role=button;name=Don't save"),
+            window: Some("1".to_string()),
+            appears: false,
+        };
+        let out = run(&mut env, &c, &budget(4_000, 250), &never).unwrap();
+        match out {
+            Outcome::Met {
+                found: Found::ElementGone { why },
+                waited_ms,
+                ..
+            } => {
+                assert!(why.contains("window"), "{why}");
+                assert_eq!(waited_ms, 500, "found at the first look after it closed");
+            }
+            other => panic!("{other:?}"),
+        }
+        let trees_before_it_closed = env.trees;
+        assert!(trees_before_it_closed <= 2, "{trees_before_it_closed}");
+    }
+
+    #[test]
+    fn a_pinned_window_already_destroyed_is_gone_at_once_and_nothing_can_appear_in_it() {
+        let mut env = Fake::new();
+        env.alive = Some(Box::new(|_| false));
+        env.windows = Box::new(|_| vec![]);
+        let gone_c = Condition::Element {
+            selector: sel("role=button;name=OK"),
+            window: Some("1".to_string()),
+            appears: false,
+        };
+        let out = run(&mut env, &gone_c, &budget(4_000, 250), &never).unwrap();
+        assert!(
+            matches!(
+                out,
+                Outcome::Met {
+                    found: Found::ElementGone { .. },
+                    waited_ms: 0,
+                    polls: 1,
+                    ..
+                }
+            ),
+            "{out:?}"
+        );
+        assert_eq!(env.trees, 0, "no walk of a window that is not there");
+        assert_eq!(env.windows_calls, 0, "and not even a listing");
+        // The same id, waiting for something to appear in it, is an error.
+        let appears_c = Condition::Element {
+            selector: sel("role=button;name=OK"),
+            window: Some("1".to_string()),
+            appears: true,
+        };
+        let err = run(&mut env, &appears_c, &budget(4_000, 250), &never).unwrap_err();
+        assert!(err.contains("no window has the id"), "{err}");
+    }
+
+    /// An id that is not listed, on a desktop that cannot tell, is gone for
+    /// `element_gone` as well: a closed window is not in the list.
+    #[test]
+    fn an_unlisted_pinned_window_is_gone_for_element_gone() {
+        let mut env = Fake::new();
+        env.windows = Box::new(|_| vec![window("2", "app", "Other", true)]);
+        let c = Condition::Element {
+            selector: sel("role=button;name=OK"),
+            window: Some("1".to_string()),
+            appears: false,
+        };
+        let out = run(&mut env, &c, &budget(4_000, 250), &never).unwrap();
+        assert!(matches!(
+            out,
+            Outcome::Met {
+                found: Found::ElementGone { .. },
+                ..
+            }
+        ));
+    }
+
+    /// **A look that blocks cannot keep the wait past its deadline.** The
+    /// desktop gives up on such a look at its limit (`mcp::wait_tool`) and the
+    /// wait treats it as a look that saw nothing: no second look is started
+    /// after the deadline, and the reply is a timeout that says why.
+    #[test]
+    fn a_look_the_desktop_did_not_answer_is_a_timeout_not_a_hang_or_an_error() {
+        let mut env = Fake::new();
+        env.elements = Box::new(|_| vec![button(1, "OK")]);
+        // Every walk takes 3 s of virtual time and is given up on.
+        env.tree_blocks_ms = Some(3_000);
+        let c = appears("name=OK");
+        let out = run(&mut env, &c, &budget(4_000, 250), &never).unwrap();
+        match out {
+            Outcome::TimedOut {
+                waited_ms,
+                polls,
+                last,
+                ..
+            } => {
+                assert!(last.starts_with(UNANSWERED), "{last}");
+                // Looks start at 0, 3250 (after its poll interval) and no
+                // later: the one at 3250 ends at 6250, past the deadline,
+                // and no third is begun.
+                assert_eq!(polls, 2, "no look started after the deadline");
+                assert_eq!(env.trees, 2);
+                assert!(waited_ms < 4_000 + 3_000, "{waited_ms}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_look_that_is_never_answered_does_not_turn_an_element_gone_wait_into_gone() {
+        let mut env = Fake::new();
+        env.elements = Box::new(|_| vec![]);
+        env.tree_blocks_ms = Some(500);
+        let out = run(&mut env, &gone("name=OK"), &budget(1_000, 250), &never).unwrap();
+        assert!(
+            matches!(out, Outcome::TimedOut { .. }),
+            "an unanswered look proves nothing: {out:?}"
+        );
     }
 
     #[test]

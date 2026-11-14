@@ -20,7 +20,7 @@ use windows_sys::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE,
+    GetForegroundWindow, IsIconic, IsWindow, SetForegroundWindow, ShowWindow, SW_RESTORE,
 };
 
 use super::{find, walk, Done, Element, Role, Tree, Want, WindowInfo};
@@ -116,6 +116,17 @@ fn parse_id(window: &str) -> Result<isize, DesktopError> {
                 "\"{window}\" is not a window id; take one from list_windows"
             ))
         })
+}
+
+/// Whether the window `window` names still exists (`IsWindow`), asked of the
+/// window manager and of nothing else: no accessibility call, which for a
+/// window that is closing is the one that can block on the program going away.
+/// `None` for something that is not a window id.
+pub(super) fn window_exists(window: &str) -> Option<bool> {
+    let hwnd = parse_id(window).ok()?;
+    // SAFETY: IsWindow takes any handle value and only answers whether it
+    // names a window.
+    Some(unsafe { IsWindow(hwnd as HWND) } != 0)
 }
 
 fn foreground_hwnd() -> isize {
