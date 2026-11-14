@@ -8,7 +8,7 @@
 //!
 //! - **This is offered to a DELEGATED agent over MCP.** It is not dispatched by
 //!   a loop, because there is no such loop: the agent runs in its own process
-//!   and reaches the screen only through the 16 tools of [`mcp`].
+//!   and reaches the screen only through the 17 tools of [`mcp`].
 //!
 //! - **This crate does not depend on incode.** It began as a module of incode
 //!   (`src/desktop/`) and moved out whole. What it used to take from the rest
@@ -45,14 +45,17 @@ pub mod cli;
 pub mod config;
 pub mod coords;
 pub mod dpi;
+pub mod fingerprint;
 pub mod hooks;
 pub mod journal;
 pub mod limits;
 pub mod mcp;
 pub mod permission;
 pub mod safety;
+pub mod selector;
 pub mod thread;
 pub mod uia;
+pub mod wait;
 
 #[cfg(target_os = "linux")]
 pub mod linux;

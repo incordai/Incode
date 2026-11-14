@@ -1059,7 +1059,7 @@ was not probed.
   `team_read` are toolbox tools (`toolbox::team`, over `team_mcp::Server`), and the
   separate server is no longer handed to a bridged model. It is kept for codex, which
   still reaches the channel through `mcp_overrides_for`.
-- The desktop: **fixed (phase 6b)** — its sixteen tools are toolbox tools, reached
+- The desktop: **fixed (phase 6b)** — its seventeen tools are toolbox tools, reached
   through the bridge; `incode --desktop-mcp` is now only their executor, started by the
   toolbox. No desktop server is handed to the CLI. See §5b, "The desktop".
 - The engine's session-capture hooks: **fixed (phase 4)** — incode fires them itself on
@@ -1117,7 +1117,7 @@ for a patch). The ACP kind is `acp_agent::present::tool_kind`.
 | `WebFetch` | observe | fetch | 20 s, 512 KiB read, 20 000 chars shown; rendered: 20 s + 10 s kill grace, 2 MiB read | private addresses refused by name and by resolution; carries no credential; an HTML answer becomes markdown through Read's HTML conversion (readability when the page reads as an article, the whole page less nav/scripts otherwise), anything else is returned as sent. Where the headless browser is found: `render_js` runs the page's script first, and a page that comes back as an app shell (script, under 200 characters of text) is rendered on its own; `render_js` is not advertised where there is no browser |
 | `Screenshot` | observe | other | `PAGE_DEADLINE` 60 s, load 30 s, settle 3 s; viewport 200–3840 x 200–2160 CSS px; the image bounds below | OFFERED ONLY when the headless browser is found. A public `url` (WebFetch's address rules) or an HTML/SVG `path` in the workspace; `width`/`height`, `scale` 1 or 2, `full_page` (clipped at `MAX_IMAGE_EDGE` px tall, said so). The answer is an image block. See "The headless browser" below |
 | `RenderPdf` | change | edit | `PDF_DEADLINE` 120 s, whole-tree kill | OFFERED ONLY when a printer is found (`pdf_renderer`, below). A public `url` or a workspace HTML/SVG `path`, to `output` (must end `.pdf`); the guards and the checkpoint see `output`; the engine's `code-edit` is told it. Printed in a private temp profile and copied into place only when it exists |
-| `screen_info`, `screenshot`, `ui_tree`, `cursor_position` | observe | other | a call 120 s; the image bounds | OFFERED ONLY when the desktop is switched on (`INCODE_DESKTOP`). Executed by the desktop child — see "The desktop" below. `screenshot` answers with an image block |
+| `screen_info`, `screenshot`, `ui_tree`, `cursor_position`, `wait_for` | observe | other | a call 120 s; the image bounds | OFFERED ONLY when the desktop is switched on (`INCODE_DESKTOP`). Executed by the desktop child — see "The desktop" below. `screenshot` answers with an image block |
 | `click_element`, `type_text`, `paste_text`, `key`, `scroll`, `drag`, `move_mouse`, `click` | run | other | a call 120 s | the same; refused read-only, asked under prompt, refused when the engine cannot decide |
 | `WebSearch` | observe | fetch | 15 s, 512 KiB, 8 results | provider from `admin.json` `web_search` — contract in `web::search_with` |
 | `Skill` | observe | other | — | |
@@ -1290,7 +1290,7 @@ code names it.
 
 ### The desktop (phase 6b)
 
-The sixteen desktop tools are toolbox tools when the desktop is switched on
+The seventeen desktop tools are toolbox tools when the desktop is switched on
 (`INCODE_DESKTOP`; `cli::desktop_setup_for` → `Toolbox::enable_desktop`, on the bridged
 claude route and the API route). They are offered, schema-checked, held to the mode and
 the engine, and drawn as incode's own calls like every other tool, and no desktop server

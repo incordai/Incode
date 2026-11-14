@@ -52,6 +52,8 @@
 //! - [`tools`]: `run_tool` and one step per tool.
 //! - [`guard`]: the blocked-application, focus, point and region refusals a
 //!   tool asks before it acts.
+//! - `wait_tool`: `wait_for`, the one tool that polls: its arguments and the
+//!   live desktop, over the timing rules in [`crate::wait`].
 //! - `tests`: the tests, at their old path `mcp::tests`.
 //!
 //! # Wired to
@@ -75,9 +77,13 @@ mod gate;
 mod guard;
 mod tools;
 mod transport;
+mod wait_tool;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod selector_tests;
 
 pub use definitions::tool_definitions;
 pub use transport::run_stdio;

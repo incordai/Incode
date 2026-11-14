@@ -375,6 +375,10 @@ fn describe(element: &Owned, id: u32, depth: u32) -> Element {
         // that says it is disabled is marked so.
         enabled: bool_attribute(element, "AXEnabled").unwrap_or(true),
         secret,
+        // AXIdentifier: the program's own name for the control (a Cocoa
+        // accessibilityIdentifier). Few controls set one; it names the
+        // control, it is not its content.
+        automation_id: text_attribute(element, "AXIdentifier").unwrap_or_default(),
     }
 }
 
@@ -675,9 +679,13 @@ pub(crate) fn window_info(window: Option<&str>) -> Result<WindowInfo, DesktopErr
     Ok(target(window)?.1)
 }
 
-pub(crate) fn tree(window: Option<&str>, max_depth: u32) -> Result<Tree, DesktopError> {
+pub(crate) fn tree(
+    window: Option<&str>,
+    max_depth: u32,
+    keep: usize,
+) -> Result<Tree, DesktopError> {
     let (root, info) = target(window)?;
-    let walked = walk(&root, max_depth, &describe, &children);
+    let walked = walk(&root, max_depth, keep, &describe, &children);
     Ok(Tree {
         root_name: info.title,
         window: info.id,
@@ -709,27 +717,39 @@ pub(crate) fn set_value(
     let what = described.label();
     let text =
         cf_string(value).ok_or_else(|| DesktopError::Os("could not hold the value".to_string()))?;
+    // What it held before (never a secure field's), to tell a field that
+    // ignored the set from one whose read-back is unreliable.
+    let before = (!described.secret)
+        .then(|| text_attribute(&element, "AXValue"))
+        .flatten();
     if !set_attribute(&element, "AXValue", text.0) {
         return Err(DesktopError::Os(format!(
             "{what} has no value to set; click_element it and use type_text instead"
         )));
     }
     let did = described.set_to(value);
+    let tried = described.tried_to_set(value);
     if described.secret {
-        return Ok(Done::unverified(did, "a password field is never read back"));
+        return Ok(Done::unverified(
+            tried,
+            "a password field is never read back",
+        ));
     }
-    Ok(match text_attribute(&element, "AXValue") {
-        Some(now) if now == value.trim() => Done::verified(did),
-        Some(now) => Done::unverified(
-            did,
-            &format!(
-                "it reads back as {} characters, not the {} sent",
-                now.chars().count(),
-                value.chars().count()
-            ),
-        ),
-        None => Done::unverified(did, "its value could not be read back"),
-    })
+    // `text_attribute` trims and drops an empty value, so the sent text is
+    // trimmed too and an empty read-back is `None`.
+    // `None` is an empty value or a failed read: neither is a proof.
+    let now = text_attribute(&element, "AXValue");
+    Ok(
+        match super::uia::judge_optional(value, before.as_deref(), now.as_deref(), true) {
+            super::uia::ReadBack::Same => Done::verified(did),
+            super::uia::ReadBack::Unverified(why) => Done::unverified(tried, &why),
+            super::uia::ReadBack::Differs(why) => {
+                return Err(DesktopError::Os(format!(
+                    "{what} did not take the value: {why}"
+                )))
+            }
+        },
+    )
 }
 
 /// The `AX…` action for one of the shared vocabulary's names. Pure.

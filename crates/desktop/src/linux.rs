@@ -486,7 +486,26 @@ fn describe(bus: &Connection, node: &Node, id: u32, depth: u32) -> Element {
         rect,
         enabled: is_enabled(&states(bus, node)),
         secret: role_name == "password text",
+        automation_id: accessible_id(bus, node),
     }
+}
+
+/// The object's `AccessibleId` property (AT-SPI 2.46 and later; GTK 4 and Qt
+/// fill it from the widget's id), empty when the toolkit has none or the
+/// registry is older. UNVERIFIED against a live bus: this reads the property
+/// the same way [`name`] reads `Name`, and an error is the empty answer.
+fn accessible_id(bus: &Connection, node: &Node) -> String {
+    bus.call_method(
+        Some(node.0.as_str()),
+        node.1.as_str(),
+        Some("org.freedesktop.DBus.Properties"),
+        "Get",
+        &(ACCESSIBLE, "AccessibleId"),
+    )
+    .and_then(|reply| reply.body().deserialize::<OwnedValue>())
+    .ok()
+    .and_then(|value| String::try_from(value).ok())
+    .unwrap_or_default()
 }
 
 fn extents(bus: &Connection, node: &Node) -> Rect {
@@ -1124,13 +1143,18 @@ pub(crate) fn window_info(window: Option<&str>) -> Result<WindowInfo, DesktopErr
     Ok(target(&desktop, window)?.info.clone())
 }
 
-pub(crate) fn tree(window: Option<&str>, max_depth: u32) -> Result<Tree, DesktopError> {
+pub(crate) fn tree(
+    window: Option<&str>,
+    max_depth: u32,
+    keep: usize,
+) -> Result<Tree, DesktopError> {
     let desktop = desktop()?;
     let listed = target(&desktop, window)?;
     let (bus, window) = accessible(&desktop, listed)?;
     let walked = uia::walk(
         window,
         max_depth,
+        keep,
         &|node: &Node, id, depth| describe(bus, node, id, depth),
         &|node: &Node| children(bus, node),
     );
@@ -1207,6 +1231,13 @@ pub(crate) fn set_value(
     let desktop = desktop()?;
     let (bus, node, described) = control(&desktop, window, want, max_depth)?;
     let what = described.label();
+    // What it held before (never a password field's), to tell a field that
+    // ignored the set from one whose read-back is unreliable.
+    let before = (!described.secret)
+        .then(|| {
+            ask::<String, _>(bus, &node, "org.a11y.atspi.Text", "GetText", &(0i32, -1i32)).ok()
+        })
+        .flatten();
     let set: bool = ask(
         bus,
         &node,
@@ -1223,21 +1254,25 @@ pub(crate) fn set_value(
         return Err(DesktopError::Os(format!("{what} refused the new text")));
     }
     let did = described.set_to(value);
+    let tried = described.tried_to_set(value);
     if described.secret {
-        return Ok(Done::unverified(did, "a password field is never read back"));
+        return Ok(Done::unverified(
+            tried,
+            "a password field is never read back",
+        ));
     }
     Ok(
         match ask::<String, _>(bus, &node, "org.a11y.atspi.Text", "GetText", &(0i32, -1i32)) {
-            Ok(now) if now == value => Done::verified(did),
-            Ok(now) => Done::unverified(
-                did,
-                &format!(
-                    "it reads back as {} characters, not the {} sent",
-                    now.chars().count(),
-                    value.chars().count()
-                ),
-            ),
-            Err(_) => Done::unverified(did, "its text could not be read back"),
+            Ok(now) => match uia::judge(value, before.as_deref(), &now, false) {
+                uia::ReadBack::Same => Done::verified(did),
+                uia::ReadBack::Unverified(why) => Done::unverified(tried, &why),
+                uia::ReadBack::Differs(why) => {
+                    return Err(DesktopError::Os(format!(
+                        "{what} did not take the value: {why}"
+                    )))
+                }
+            },
+            Err(_) => Done::unverified(tried, "its text could not be read back"),
         },
     )
 }
@@ -1511,6 +1546,7 @@ mod tests {
             },
             enabled: true,
             secret: false,
+            automation_id: String::new(),
         }
     }
 

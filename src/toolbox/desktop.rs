@@ -40,6 +40,9 @@ pub(super) const OBSERVING: &[&str] = &[
     "ui_tree",
     "cursor_position",
     "list_windows",
+    // Polls up to its own cap of 60 s (`incord_desktop::wait`), well inside
+    // `CALL_BOUND`.
+    "wait_for",
 ];
 /// The desktop tools that act on the machine.
 pub(super) const ACTING: &[&str] = &[

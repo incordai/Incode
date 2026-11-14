@@ -31,6 +31,33 @@ use serde_json::Value;
 
 use super::tools::window_arg;
 use super::Server;
+use crate::selector::Selector;
+
+/// The selector of a call as the journal may carry it: see
+/// [`Selector::render_redacted`]. Empty when the call has none.
+fn selector_ref(args: &Value) -> String {
+    match args.get("selector").and_then(Value::as_str) {
+        None => String::new(),
+        Some(raw) => match Selector::parse(raw) {
+            Ok(selector) => format!("selector {}", selector.render_redacted()),
+            // Not journalled as given: a malformed one may be anything.
+            Err(_) => "selector (unreadable)".to_string(),
+        },
+    }
+}
+
+/// Which control an element tool was aimed at: its selector when it had one,
+/// else the `ui_tree` number, which is all that call carries.
+fn element_ref(args: &Value) -> String {
+    if args.get("selector").is_some() {
+        selector_ref(args)
+    } else {
+        format!(
+            "element e{}",
+            args.get("id").and_then(Value::as_i64).unwrap_or_default()
+        )
+    }
+}
 
 impl Server {
     /// The operator's stop file, turned into a stop of this server.
@@ -219,14 +246,23 @@ impl Server {
             // schema is `{id, button}`. The element's role and name live in the
             // `ui_tree` the agent read to get the id, which is itself a
             // journalled call, so an operator can follow `e16` back to it.
-            "click_element" => format!("element e{}", n("id")),
+            "click_element" => element_ref(args),
             // LENGTH ONLY, like typing: a value set may be a password.
             "set_value" => format!(
-                "element e{}, {} characters",
-                n("id"),
+                "{}, {} characters",
+                element_ref(args),
                 s("value").chars().count()
             ),
-            "element_action" => format!("element e{} {}", n("id"), s("action")),
+            "element_action" => format!("{} {}", element_ref(args), s("action")),
+            // The condition and the selector as `Selector::render_redacted`
+            // has it (no text field's name), and how long it may wait.
+            "wait_for" => format!(
+                "{} {} timeout {}",
+                s("condition"),
+                selector_ref(args),
+                args.get("timeout_ms")
+                    .map_or("default".to_string(), |ms| format!("{ms} ms"))
+            ),
             "focus_window" => format!("window {}", window_arg(args).unwrap_or_default()),
             "click" | "move_mouse" => format!("({}, {})", n("x"), n("y")),
             "drag" => format!(

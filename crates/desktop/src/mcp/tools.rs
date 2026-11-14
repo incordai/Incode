@@ -30,6 +30,7 @@ use serde_json::{json, Value};
 
 use crate::capture::{self, CaptureOptions, ShotFormat};
 use crate::coords::PhysicalPoint;
+use crate::selector::Selector;
 use crate::thread::{InputThread, MouseButton};
 use crate::uia::{self, WindowInfo};
 
@@ -76,6 +77,15 @@ impl Server {
             "key" => key(input, args),
             "scroll" => scroll(input, args),
             "drag" => drag(input, args),
+            "wait_for" => {
+                // Asked between polls and between sleeps, so the operator's
+                // stop ends a wait within a fraction of a second.
+                let stopped = || {
+                    self.catch_stop_file();
+                    self.safety.is_stopped()
+                };
+                super::wait_tool::wait_for(args, &stopped)
+            }
             other => Err(format!("no tool named '{other}'")),
         }
     }
@@ -157,30 +167,48 @@ fn focus_window(args: &Value) -> Result<Vec<Value>, String> {
 /// Called by [`Server::run_tool`].
 fn set_value(args: &Value) -> Result<Vec<Value>, String> {
     let window = window_arg(args);
-    let id = element_id(args)?;
+    let target = element_target(args)?;
     let value = args
         .get("value")
         .and_then(Value::as_str)
         .ok_or("value is required")?;
-    let info = uia::window_info(window.as_deref()).map_err(|e| e.to_string())?;
-    refuse_blocked(&info)?;
-    let done = uia::set_value(Some(&info.id), id, value).map_err(|e| e.to_string())?;
-    Ok(vec![text(done.render())])
+    match target {
+        Target::Id(id) => {
+            let info = uia::window_info(window.as_deref()).map_err(|e| e.to_string())?;
+            refuse_blocked(&info)?;
+            let done = uia::set_value(Some(&info.id), id, value).map_err(|e| e.to_string())?;
+            Ok(vec![text(done.render())])
+        }
+        Target::Selector(selector) => {
+            let found = resolve_selector(window.as_deref(), &selector)?;
+            let done = uia::set_value_on(&found, value).map_err(|e| e.to_string())?;
+            Ok(vec![text(by_selector(done.render(), &found))])
+        }
+    }
 }
 
 /// `element_action`: run an element's own action, without the mouse.
 /// Called by [`Server::run_tool`].
 fn element_action(args: &Value) -> Result<Vec<Value>, String> {
     let window = window_arg(args);
-    let id = element_id(args)?;
+    let target = element_target(args)?;
     let action = args
         .get("action")
         .and_then(Value::as_str)
         .ok_or("action is required, e.g. \"press\"")?;
-    let info = uia::window_info(window.as_deref()).map_err(|e| e.to_string())?;
-    refuse_blocked(&info)?;
-    let done = uia::act(Some(&info.id), id, action).map_err(|e| e.to_string())?;
-    Ok(vec![text(done.render())])
+    match target {
+        Target::Id(id) => {
+            let info = uia::window_info(window.as_deref()).map_err(|e| e.to_string())?;
+            refuse_blocked(&info)?;
+            let done = uia::act(Some(&info.id), id, action).map_err(|e| e.to_string())?;
+            Ok(vec![text(done.render())])
+        }
+        Target::Selector(selector) => {
+            let found = resolve_selector(window.as_deref(), &selector)?;
+            let done = uia::act_on(&found, action).map_err(|e| e.to_string())?;
+            Ok(vec![text(by_selector(done.render(), &found))])
+        }
+    }
 }
 
 /// `move_mouse`: move the pointer, the focused window checked first.
@@ -221,9 +249,12 @@ fn ui_tree(args: &Value) -> Result<Vec<Value>, String> {
     // With no displays readable the tree is still shown, unmarked:
     // reading it is harmless, and every action re-checks its point.
     let screens = screen_rects().unwrap_or_default();
+    // The depth the walk really went to (held to its bound), because the
+    // selectors printed are counted in that walk and say so when it is not
+    // the default one.
     Ok(vec![text(format!(
         "{}\n{UNTRUSTED}",
-        tree.render_on(&screens)
+        tree.render_at(&screens, uia::bounded(depth))
     ))])
 }
 
@@ -231,21 +262,51 @@ fn ui_tree(args: &Value) -> Result<Vec<Value>, String> {
 /// now. Called by [`Server::run_tool`].
 fn click_element(input: &InputThread, args: &Value) -> Result<Vec<Value>, String> {
     let window = window_arg(args);
-    let id = element_id(args)?;
+    let target = element_target(args)?;
     let button = mouse_button(args);
-    let info = uia::window_info(window.as_deref()).map_err(|e| e.to_string())?;
-    refuse_blocked(&info)?;
 
     // RE-READ, never trust the id's remembered rectangle. Between
     // the agent reading a tree and acting on it a list can scroll
     // or a dialog can move, and clicking the old position would hit
     // whatever took its place — silently, and on the wrong control.
-    let element = live_element(&info, id)?;
+    //
+    // A selector is resolved against the live tree here, the same way: its
+    // one match (or an error saying none or several) is the control as it is
+    // now.
+    let (element, label, cut) = match &target {
+        Target::Id(id) => {
+            let info = uia::window_info(window.as_deref()).map_err(|e| e.to_string())?;
+            refuse_blocked(&info)?;
+            let element = live_element(&info, *id)?;
+            let label = element.label();
+            (element, label, String::new())
+        }
+        Target::Selector(selector) => {
+            let found = resolve_selector(window.as_deref(), selector)?;
+            if let Some(why) = &found.no_positions {
+                return Err(format!(
+                    "{why} so the control cannot be found on screen; use element_action or \
+                     set_value on it"
+                ));
+            }
+            let label = match found.element.name_for_messages() {
+                Some(name) => format!(
+                    "selector `{}` (\"{name}\", {:?})",
+                    selector.render_redacted(),
+                    found.element.role
+                ),
+                None => format!(
+                    "selector `{}` ({:?})",
+                    selector.render_redacted(),
+                    found.element.role
+                ),
+            };
+            let cut = with_cut_note(String::new(), &found);
+            (found.element, label, cut)
+        }
+    };
     if !element.enabled {
-        return Err(format!(
-            "e{id} \"{}\" is disabled; clicking it would do nothing",
-            element.name
-        ));
+        return Err(disabled_error(&target, &element));
     }
 
     let at = element.click_point();
@@ -255,11 +316,9 @@ fn click_element(input: &InputThread, args: &Value) -> Result<Vec<Value>, String
     input.click(at, button, 1).map_err(|e| e.to_string())?;
 
     Ok(vec![text(format!(
-        "clicked {} at {},{} (unverified: a click has no state to read back; look \
-         at the result)",
-        element.label(),
-        at.x,
-        at.y
+        "clicked {label} at {},{} (unverified: a click has no state to read back; look \
+         at the result){cut}",
+        at.x, at.y
     ))])
 }
 
@@ -489,40 +548,131 @@ fn live_element(window: &WindowInfo, id: u32) -> Result<uia::Element, String> {
         })
 }
 
+/// How a call names a control: the number of the last `ui_tree`, or a selector
+/// (`crate::selector`) resolved against the live tree.
+#[derive(Debug)]
+pub(super) enum Target {
+    Id(u32),
+    Selector(Selector),
+}
+
+/// The `id` or the `selector` of an element tool, one of them and not both.
+pub(super) fn element_target(args: &Value) -> Result<Target, String> {
+    match (args.get("id"), args.get("selector")) {
+        (Some(_), Some(_)) => Err("give `id` or `selector`, not both".to_string()),
+        (None, Some(raw)) => {
+            let raw = raw
+                .as_str()
+                .ok_or("selector must be text like role=button;name=Save")?;
+            let selector = Selector::parse(raw).map_err(|e| format!("selector: {e}"))?;
+            selector.require_element()?;
+            Ok(Target::Selector(selector))
+        }
+        _ => element_id(args).map(Target::Id).map_err(|_| {
+            "id (the eN number from ui_tree) or selector (as ui_tree prints it, \
+             e.g. role=button;name=Save) is required"
+                .to_string()
+        }),
+    }
+}
+
+/// The one control `selector` names, in the window it names (or `window`, or
+/// the focused one), refused before anything is read when that window is a
+/// blocked application's.
+///
+/// The blocked-application refusal is the window guard handed to
+/// `uia::window_for`, so it comes BEFORE the selector's window part is
+/// compared with a window named by id: a mismatch error describes the window,
+/// and for a blocked one that is its title, and a match and a mismatch would
+/// be told apart.
+fn resolve_selector(window: Option<&str>, selector: &Selector) -> Result<uia::Resolved, String> {
+    let info = uia::window_for(window, selector, &refuse_blocked).map_err(|e| e.to_string())?;
+    uia::resolve_in(info, selector).map_err(|e| e.to_string())
+}
+
+/// Why clicking a disabled control is refused. The id path names the control
+/// as it always has, except that an edit or text field is not named
+/// ([`uia::Element::name_for_messages`]). A selector is named redacted and the
+/// control is not named at all: this error is journalled word for word, and a
+/// text field's name is what was typed in it.
+pub(super) fn disabled_error(target: &Target, element: &uia::Element) -> String {
+    match target {
+        Target::Id(id) => match element.name_for_messages() {
+            Some(name) => format!("e{id} \"{name}\" is disabled; clicking it would do nothing"),
+            None => format!("e{id} is disabled; clicking it would do nothing"),
+        },
+        Target::Selector(selector) => format!(
+            "selector `{}` ({:?}) is disabled; clicking it would do nothing",
+            selector.render_redacted(),
+            element.role
+        ),
+    }
+}
+
+/// `done`, with what only a selector adds: its `eN` numbers this call's own
+/// walk and not the agent's last `ui_tree`, and a cut tree cannot rule out a
+/// second match.
+fn by_selector(done: String, found: &uia::Resolved) -> String {
+    format!(
+        "{done} (found by selector; any eN here numbers this call's own walk, not your last \
+         ui_tree){}",
+        with_cut_note(String::new(), found)
+    )
+}
+
+/// `base`, and the warning that the tree was cut when it was.
+fn with_cut_note(base: String, found: &uia::Resolved) -> String {
+    if found.truncated {
+        format!(
+            "{base} (the walk was cut at its bound of {} nodes visited, so a second control \
+             that fits the selector may lie beyond it)",
+            crate::limits::get().tree_max_visited
+        )
+    } else {
+        base
+    }
+}
+
+/// What must hold before the screen, or one window of it, is captured:
+/// refused when that window is a blocked application's, when its position is
+/// not known, or when a blocked window is in what the picture would show. The
+/// window it is, when one was named. Called by [`shoot`] and `wait_for`'s
+/// screen condition, so both are held to the same rule.
+pub(super) fn guard_capture(window: Option<&str>) -> Result<Option<WindowInfo>, String> {
+    let Some(id) = window else {
+        // Every window on screen is in a full capture, so every one is
+        // checked — and a desktop that cannot list them is refused.
+        if let Some(blocked) = blocked_windows()?.first() {
+            return Err(format!(
+                "refused: a window of \"{}\" is on screen, and it is blocked; a full \
+                 screenshot would show it. Pass `window` to capture one window, or close \
+                 or minimise it.",
+                blocked.app
+            ));
+        }
+        return Ok(None);
+    };
+    let info = uia::window_info(Some(id)).map_err(|e| e.to_string())?;
+    refuse_blocked(&info)?;
+    if let Some(why) = uia::window_position_unknown(&info) {
+        return Err(format!(
+            "{why} so that window's area cannot be cut out of the screen; take a \
+             screenshot without `window`"
+        ));
+    }
+    refuse_region(info.rect)?;
+    Ok(Some(info))
+}
+
 /// A screenshot of one window, or of the primary display — refused when a
 /// blocked application's window is in what would be captured.
 fn shoot(window: Option<&str>, options: CaptureOptions) -> Result<Vec<Value>, String> {
-    let (shot, of) = match window {
-        Some(id) => {
-            let info = uia::window_info(Some(id)).map_err(|e| e.to_string())?;
-            refuse_blocked(&info)?;
-            if let Some(why) = uia::window_position_unknown(&info) {
-                return Err(format!(
-                    "{why} so that window's area cannot be cut out of the screen; take a \
-                     screenshot without `window`"
-                ));
-            }
-            refuse_region(info.rect)?;
-            let shot = capture::capture_region(info.rect, options).map_err(|e| e.to_string())?;
-            (shot, Some(info))
-        }
-        None => {
-            // Every window on screen is in a full capture, so every one is
-            // checked — and a desktop that cannot list them is refused.
-            if let Some(blocked) = blocked_windows()?.first() {
-                return Err(format!(
-                    "refused: a window of \"{}\" is on screen, and it is blocked; a full \
-                     screenshot would show it. Pass `window` to capture one window, or close \
-                     or minimise it.",
-                    blocked.app
-                ));
-            }
-            (
-                capture::capture_primary(options).map_err(|e| e.to_string())?,
-                None,
-            )
-        }
-    };
+    let of = guard_capture(window)?;
+    let shot = match &of {
+        Some(info) => capture::capture_region(info.rect, options),
+        None => capture::capture_primary(options),
+    }
+    .map_err(|e| e.to_string())?;
     let (width, height) = shot.model_size();
     let t = shot.transform;
     Ok(vec![
@@ -560,7 +710,7 @@ fn after_shot(args: &Value) -> Vec<Value> {
 }
 
 /// A text content block.
-fn text(body: String) -> Value {
+pub(super) fn text(body: String) -> Value {
     json!({"type": "text", "text": body})
 }
 

@@ -90,7 +90,7 @@ agent-client-protocol-schema = { version = "=1.9.1", default-features = false }
 # no new package; it adds the seccomp filter, the host-allowlist proxy and the
 # `.git` protection the built-in engine lacks.
 incord-sandbox = { path = "crates/sandbox" }
-# Computer use (`crates/desktop`, binary `incu`): the 16-tool MCP server that
+# Computer use (`crates/desktop`, binary `incu`): the 17-tool MCP server that
 # `incode --desktop-mcp` wraps, and the journal/stop-file/capture code the run
 # server and the toolbox call. A path dependency, so no new package: it carries
 # the screen-capture, accessibility and input dependencies that used to be

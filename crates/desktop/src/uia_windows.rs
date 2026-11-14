@@ -20,7 +20,7 @@ use windows_sys::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE,
+    GetForegroundWindow, IsIconic, IsWindow, SetForegroundWindow, ShowWindow, SW_RESTORE,
 };
 
 use super::{find, walk, Done, Element, Role, Tree, Want, WindowInfo};
@@ -91,6 +91,10 @@ fn describe(element: &UIElement, id: u32, depth: u32) -> Element {
         rect: rect_of(element),
         enabled: element.is_enabled().unwrap_or(false),
         secret: element.is_password().unwrap_or(false),
+        // UIA's AutomationId: the program's own name for the control, empty
+        // for most. Read for a password field too: it names the control, it
+        // is not the content.
+        automation_id: element.get_automation_id().unwrap_or_default(),
     }
 }
 
@@ -112,6 +116,17 @@ fn parse_id(window: &str) -> Result<isize, DesktopError> {
                 "\"{window}\" is not a window id; take one from list_windows"
             ))
         })
+}
+
+/// Whether the window `window` names still exists (`IsWindow`), asked of the
+/// window manager and of nothing else: no accessibility call, which for a
+/// window that is closing is the one that can block on the program going away.
+/// `None` for something that is not a window id.
+pub(super) fn window_exists(window: &str) -> Option<bool> {
+    let hwnd = parse_id(window).ok()?;
+    // SAFETY: IsWindow takes any handle value and only answers whether it
+    // names a window.
+    Some(unsafe { IsWindow(hwnd as HWND) } != 0)
 }
 
 fn foreground_hwnd() -> isize {
@@ -245,13 +260,17 @@ pub(super) fn window_info(window: Option<&str>) -> Result<WindowInfo, DesktopErr
     Ok(target(&automation, window)?.1)
 }
 
-pub(super) fn tree(window: Option<&str>, max_depth: u32) -> Result<Tree, DesktopError> {
+pub(super) fn tree(
+    window: Option<&str>,
+    max_depth: u32,
+    keep: usize,
+) -> Result<Tree, DesktopError> {
     let automation = automation()?;
     let (root, info) = target(&automation, window)?;
     let walker = automation
         .create_tree_walker()
         .map_err(|e| DesktopError::Os(format!("could not walk the tree: {e}")))?;
-    let walked = walk(&root, max_depth, &describe, &|e: &UIElement| {
+    let walked = walk(&root, max_depth, keep, &describe, &|e: &UIElement| {
         children_of(&walker, e)
     });
     Ok(Tree {
@@ -293,34 +312,63 @@ pub(super) fn set_value(
     max_depth: u32,
     value: &str,
 ) -> Result<Done, DesktopError> {
-    let (element, described, _) = control(window, want, max_depth)?;
+    let (element, described, info) = control(window, want, max_depth)?;
     let what = described.label();
     let did = described.set_to(value);
+    let tried = described.tried_to_set(value);
     if let Ok(pattern) = element.get_pattern::<UIValuePattern>() {
+        // What it held before, so a field that ignored the set can be told
+        // from one whose read-back is just unreliable. Never a password's.
+        let before = (!described.secret)
+            .then(|| pattern.get_value().ok())
+            .flatten();
+        let in_front_before = foreground_hwnd();
         pattern
             .set_value(value)
             .map_err(|e| DesktopError::Os(format!("could not set {what}: {e}")))?;
+        // `set_value` is documented as needing no focus. Some programs take it
+        // themselves when a value is set (Notepad does: measured with a plain
+        // .NET UIA client, no incu involved), and the reply says so.
+        let came_to_front = in_front_before != foreground_hwnd()
+            && info.id.parse::<isize>().ok() == Some(foreground_hwnd());
+        let said = |done: Done| {
+            if came_to_front {
+                Done {
+                    detail: format!(
+                        "{}; the program brought its window to the front when its value was set",
+                        done.detail
+                    ),
+                    ..done
+                }
+            } else {
+                done
+            }
+        };
         if described.secret {
-            return Ok(Done::unverified(did, "a password field is never read back"));
+            return Ok(said(Done::unverified(
+                tried,
+                "a password field is never read back",
+            )));
         }
-        return Ok(match pattern.get_value() {
-            Ok(now) if now == value => Done::verified(did),
-            Ok(now) => Done::unverified(
-                did,
-                &format!(
-                    "it reads back as {} characters, not the {} sent",
-                    now.chars().count(),
-                    value.chars().count()
-                ),
-            ),
-            Err(_) => Done::unverified(did, "its value could not be read back"),
-        });
+        return match pattern.get_value() {
+            Ok(now) => match super::judge(value, before.as_deref(), &now, false) {
+                super::ReadBack::Same => Ok(said(Done::verified(did))),
+                super::ReadBack::Unverified(why) => Ok(said(Done::unverified(tried, &why))),
+                super::ReadBack::Differs(why) => Err(DesktopError::Os(format!(
+                    "{what} did not take the value: {why}"
+                ))),
+            },
+            Err(_) => Ok(said(Done::unverified(
+                tried,
+                "its value could not be read back",
+            ))),
+        };
     }
     if let Ok(pattern) = element.get_pattern::<UILegacyIAccessiblePattern>() {
         if pattern.set_value(value).is_ok() {
             return Ok(Done::unverified(
-                did,
-                "set through the legacy accessibility interface, which cannot be read back",
+                tried,
+                "sent through the legacy accessibility interface, which cannot be read back",
             ));
         }
     }
