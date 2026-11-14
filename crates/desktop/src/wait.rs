@@ -43,6 +43,21 @@ pub const DEFAULT_POLL_MS: u64 = 250;
 /// The fastest and slowest checking interval a call may ask for.
 pub const MIN_POLL_MS: u64 = 50;
 pub const MAX_POLL_MS: u64 = 2_000;
+/// How long a `watch` waits when the call gives no time: one hour.
+pub const DEFAULT_WATCH_MS: u64 = 60 * 60 * 1000;
+/// The longest one `watch` may run: 24 hours. Longer is several watches.
+pub const MAX_WATCH_MS: u64 = 24 * 60 * 60 * 1000;
+/// How often a `watch` looks when the call does not say.
+pub const DEFAULT_WATCH_POLL_MS: u64 = 1_000;
+/// How often a `watch` of the SCREEN looks when the call does not say. A look
+/// at the screen is a capture and a hash of every pixel of it, which costs far
+/// more than asking whether a window exists; for hours, once in five seconds is
+/// the price a background watch should pay.
+pub const DEFAULT_WATCH_SCREEN_POLL_MS: u64 = 5_000;
+/// The fastest and slowest a `watch` may look. A watch is not waiting for a
+/// dialog to settle, so it is held to a slower floor than `wait_for`'s.
+pub const MIN_WATCH_POLL_MS: u64 = 250;
+pub const MAX_WATCH_POLL_MS: u64 = 10_000;
 /// Bits of the 128 that may differ before the screen counts as changed.
 pub const DEFAULT_TOLERANCE: u32 = 4;
 /// Sleeps are cut into slices this long so a stop is noticed within one.
@@ -59,26 +74,81 @@ pub struct Budget {
     pub notes: Vec<String>,
 }
 
+/// The limits a kind of wait holds a request to.
+struct Bounds {
+    default_timeout: u64,
+    max_timeout: u64,
+    default_poll: u64,
+    min_poll: u64,
+    max_poll: u64,
+}
+
+/// `wait_for`: a few seconds, polled often.
+const WAIT_BOUNDS: Bounds = Bounds {
+    default_timeout: DEFAULT_TIMEOUT_MS,
+    max_timeout: MAX_TIMEOUT_MS,
+    default_poll: DEFAULT_POLL_MS,
+    min_poll: MIN_POLL_MS,
+    max_poll: MAX_POLL_MS,
+};
+
+/// `watch`: hours, polled gently, because nothing is waiting on the answer but
+/// the person who asked to be told.
+const WATCH_BOUNDS: Bounds = Bounds {
+    default_timeout: DEFAULT_WATCH_MS,
+    max_timeout: MAX_WATCH_MS,
+    default_poll: DEFAULT_WATCH_POLL_MS,
+    min_poll: MIN_WATCH_POLL_MS,
+    max_poll: MAX_WATCH_POLL_MS,
+};
+
+/// `watch` of the screen: as [`WATCH_BOUNDS`], looking every
+/// [`DEFAULT_WATCH_SCREEN_POLL_MS`] unless told otherwise.
+const WATCH_SCREEN_BOUNDS: Bounds = Bounds {
+    default_poll: DEFAULT_WATCH_SCREEN_POLL_MS,
+    ..WATCH_BOUNDS
+};
+
 impl Budget {
     /// `timeout_ms` and `poll_ms` as the call gave them (or did not), held to
     /// the bounds.
     #[must_use]
     pub fn new(timeout_ms: Option<u64>, poll_ms: Option<u64>) -> Budget {
+        Self::within(&WAIT_BOUNDS, timeout_ms, poll_ms)
+    }
+
+    /// A `watch` of the screen (`screen_changes`): the same bounds as
+    /// [`Budget::watch`], looking every [`DEFAULT_WATCH_SCREEN_POLL_MS`] unless
+    /// told otherwise.
+    #[must_use]
+    pub fn watch_screen(timeout_ms: Option<u64>, poll_ms: Option<u64>) -> Budget {
+        Self::within(&WATCH_SCREEN_BOUNDS, timeout_ms, poll_ms)
+    }
+
+    /// The same for a `watch`: up to [`MAX_WATCH_MS`], looking every
+    /// [`DEFAULT_WATCH_POLL_MS`] unless told otherwise.
+    #[must_use]
+    pub fn watch(timeout_ms: Option<u64>, poll_ms: Option<u64>) -> Budget {
+        Self::within(&WATCH_BOUNDS, timeout_ms, poll_ms)
+    }
+
+    fn within(bounds: &Bounds, timeout_ms: Option<u64>, poll_ms: Option<u64>) -> Budget {
+        let (max, min_poll, max_poll) = (bounds.max_timeout, bounds.min_poll, bounds.max_poll);
         let mut notes = Vec::new();
-        let asked = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
-        let timeout_ms = if asked > MAX_TIMEOUT_MS {
+        let asked = timeout_ms.unwrap_or(bounds.default_timeout);
+        let timeout_ms = if asked > max {
             notes.push(format!(
-                "timeout_ms {asked} is over the cap; waited at most {MAX_TIMEOUT_MS} ms"
+                "timeout_ms {asked} is over the cap; waited at most {max} ms"
             ));
-            MAX_TIMEOUT_MS
+            max
         } else {
             asked
         };
-        let wanted = poll_ms.unwrap_or(DEFAULT_POLL_MS);
-        let poll = wanted.clamp(MIN_POLL_MS, MAX_POLL_MS);
+        let wanted = poll_ms.unwrap_or(bounds.default_poll);
+        let poll = wanted.clamp(min_poll, max_poll);
         if poll != wanted {
             notes.push(format!(
-                "poll_ms {wanted} is outside {MIN_POLL_MS}..={MAX_POLL_MS}; polled every {poll} ms"
+                "poll_ms {wanted} is outside {min_poll}..={max_poll}; polled every {poll} ms"
             ));
         }
         Budget {
@@ -920,6 +990,82 @@ mod tests {
         assert_eq!(Budget::new(None, Some(1_000_000)).poll_ms, MAX_POLL_MS);
         assert_eq!(Budget::new(None, Some(500)).poll_ms, 500);
         assert_eq!(Budget::new(None, Some(1)).notes.len(), 1);
+    }
+
+    #[test]
+    fn a_watch_defaults_to_an_hour_every_second_and_is_held_to_a_day() {
+        let b = Budget::watch(None, None);
+        assert_eq!(
+            (b.timeout_ms, b.poll_ms),
+            (DEFAULT_WATCH_MS, DEFAULT_WATCH_POLL_MS)
+        );
+        assert!(b.notes.is_empty());
+        let long = Budget::watch(Some(MAX_WATCH_MS * 7), None);
+        assert_eq!(long.timeout_ms, MAX_WATCH_MS);
+        assert!(long.notes[0].contains("over the cap"), "{:?}", long.notes);
+        assert_eq!(Budget::watch(Some(MAX_WATCH_MS), None).notes.len(), 0);
+        assert_eq!(Budget::watch(None, Some(1)).poll_ms, MIN_WATCH_POLL_MS);
+        assert_eq!(
+            Budget::watch(None, Some(u64::MAX)).poll_ms,
+            MAX_WATCH_POLL_MS
+        );
+        // The one-shot wait is untouched by any of it.
+        assert_eq!(Budget::new(Some(u64::MAX), None).timeout_ms, MAX_TIMEOUT_MS);
+    }
+
+    #[test]
+    fn a_long_watch_catches_a_window_that_appears_hours_later() {
+        let two_hours = 2 * 60 * 60 * 1000;
+        let mut env = Fake::new();
+        env.windows = Box::new(move |t| {
+            let mut all = vec![window("1", "app", "Doc", true)];
+            if t >= two_hours {
+                all.push(window("2", "mail", "Reminder", false));
+            }
+            all
+        });
+        let condition = Condition::Window {
+            selector: sel("window~=Reminder"),
+            appears: true,
+        };
+        let budget = Budget::watch(Some(3 * 60 * 60 * 1000), None);
+        let outcome = run(&mut env, &condition, &budget, &never).unwrap();
+        match outcome {
+            Outcome::Met {
+                waited_ms, polls, ..
+            } => {
+                assert_eq!(waited_ms, two_hours);
+                // Once a second, not every 250 ms: 7201 looks, not 28801.
+                assert!((7_000..7_400).contains(&polls), "{polls} looks");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            env.sleeps.iter().all(|ms| *ms <= SLICE_MS),
+            "a stop is still noticed within one slice"
+        );
+    }
+
+    #[test]
+    fn a_stop_ends_a_long_watch_at_once() {
+        let mut env = Fake::new();
+        let condition = Condition::Window {
+            selector: sel("window~=Never"),
+            appears: true,
+        };
+        let polled = Cell::new(0u32);
+        let stopped = || {
+            polled.set(polled.get() + 1);
+            polled.get() > 50
+        };
+        let budget = Budget::watch(Some(MAX_WATCH_MS), None);
+        let outcome = run(&mut env, &condition, &budget, &stopped).unwrap();
+        assert!(matches!(outcome, Outcome::Stopped { .. }), "{outcome:?}");
+        assert!(
+            env.now < 60_000,
+            "stopped within a minute of virtual time: {}",
+            env.now
+        );
     }
 
     // ---- the loop ----

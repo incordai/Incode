@@ -43,6 +43,11 @@ pub(super) const OBSERVING: &[&str] = &[
     // Polls up to its own cap of 60 s (`incord_desktop::wait`), well inside
     // `CALL_BOUND`.
     "wait_for",
+    // Holds the call open for up to a day: it has its own bound
+    // ([`call_bound`]), not `CALL_BOUND`.
+    "watch",
+    "routine_list",
+    "routine_match",
 ];
 /// The desktop tools that act on the machine.
 pub(super) const ACTING: &[&str] = &[
@@ -57,10 +62,31 @@ pub(super) const ACTING: &[&str] = &[
     "drag",
     "move_mouse",
     "click",
+    "routine_save",
+    // Replays every step of a routine: it has its own bound ([`call_bound`]).
+    "routine_run",
+    "routine_forget",
 ];
 /// How long one desktop call may take. A UI tree of a large window is the
 /// slowest thing it does.
 const CALL_BOUND: Duration = Duration::from_secs(120);
+/// How long a replayed routine may take: up to a hundred steps, each of which
+/// can wait for the screen, and a pause after each.
+const ROUTINE_BOUND: Duration = Duration::from_secs(10 * 60);
+
+/// How long the call to `name` may take. A `watch` is bounded by its own
+/// ceiling plus a minute, so the bound is never what ends a watch that is still
+/// within its time; a `routine_run` by [`ROUTINE_BOUND`]; the rest by
+/// [`CALL_BOUND`].
+fn call_bound(name: &str) -> Duration {
+    match name {
+        "watch" => {
+            Duration::from_millis(incord_desktop::wait::MAX_WATCH_MS) + Duration::from_secs(60)
+        }
+        "routine_run" => ROUTINE_BOUND,
+        _ => CALL_BOUND,
+    }
+}
 /// How long the child has to answer `initialize`.
 const START_BOUND: Duration = Duration::from_secs(20);
 /// What the desktop child is called in what it causes to be said.
@@ -142,7 +168,7 @@ impl DesktopClient {
 
     /// Run one desktop tool. A tool's own refusal is an `Err` with its words.
     pub(super) fn call(&mut self, name: &str, args: &Value) -> Result<ToolOutput, String> {
-        self.client.call(name, args, CALL_BOUND, &|| false)
+        self.client.call(name, args, call_bound(name), &|| false)
     }
 }
 

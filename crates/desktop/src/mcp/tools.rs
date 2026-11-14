@@ -48,7 +48,7 @@ impl Server {
     pub(super) fn run_and_look(&mut self, name: &str, args: &Value) -> Result<Vec<Value>, String> {
         self.run_tool(name, args).map(|mut content| {
             let wanted = args.get("screenshot_after").and_then(Value::as_bool) == Some(true);
-            if wanted && ACTING.contains(&name) {
+            if wanted && looks_after(name) {
                 content.extend(after_shot(args));
             }
             content
@@ -86,9 +86,43 @@ impl Server {
                 };
                 super::wait_tool::wait_for(args, &stopped)
             }
+            "watch" => {
+                self.journal_note("watch", &Self::describe("watch", args));
+                // The same stop, asked as often, for a wait of hours. Nothing
+                // else ends it early: end of input does not (a watch that was
+                // the last request sent is still wanted), so an orphaned watch
+                // lasts until its deadline or `incu stop`.
+                let stopped = || {
+                    self.catch_stop_file();
+                    self.safety.is_stopped()
+                };
+                super::wait_tool::watch(args, &stopped)
+            }
+            "routine_save" | "routine_run" | "routine_forget" | "routine_list"
+            | "routine_match" => self.routine_tool(name, args),
             other => Err(format!("no tool named '{other}'")),
         }
     }
+}
+
+/// Whether a call to `name` may end with the screenshot `screenshot_after` asks
+/// for: an [`ACTING`] tool that does something on the screen. Saving or
+/// forgetting a routine changes a file, not the screen, so there is nothing to
+/// look at afterwards. Also read by `definitions`, so the schema offers the
+/// argument exactly where it is honoured.
+pub(super) fn looks_after(name: &str) -> bool {
+    ACTING.contains(&name) && !matches!(name, "routine_save" | "routine_forget")
+}
+
+/// The text of a tool's answer: its text blocks, joined by newlines. An image
+/// block has no text and is left out.
+pub(super) fn text_of(content: &[Value]) -> String {
+    content
+        .iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|block| block.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// `screen_info`: every display. Called by [`Server::run_tool`].
@@ -585,7 +619,10 @@ pub(super) fn element_target(args: &Value) -> Result<Target, String> {
 /// compared with a window named by id: a mismatch error describes the window,
 /// and for a blocked one that is its title, and a match and a mismatch would
 /// be told apart.
-fn resolve_selector(window: Option<&str>, selector: &Selector) -> Result<uia::Resolved, String> {
+pub(super) fn resolve_selector(
+    window: Option<&str>,
+    selector: &Selector,
+) -> Result<uia::Resolved, String> {
     let info = uia::window_for(window, selector, &refuse_blocked).map_err(|e| e.to_string())?;
     uia::resolve_in(info, selector).map_err(|e| e.to_string())
 }
@@ -607,6 +644,18 @@ pub(super) fn disabled_error(target: &Target, element: &uia::Element) -> String 
             element.role
         ),
     }
+}
+
+/// The id of the one window a window-only `selector` names, now: how a replayed
+/// routine's keyboard step (`in_window`) becomes the `window` the tool checks
+/// the focus against. Refused, as everything else is, when that window is a
+/// blocked application's (the guard is handed to `uia::window_for`, as for every
+/// other selector).
+///
+/// Called by `routine_tool`'s replay.
+pub(super) fn window_id_for(selector: &Selector) -> Result<String, String> {
+    let info = uia::window_for(None, selector, &refuse_blocked).map_err(|e| e.to_string())?;
+    Ok(info.id)
 }
 
 /// `done`, with what only a selector adds: its `eN` numbers this call's own
@@ -664,15 +713,29 @@ pub(super) fn guard_capture(window: Option<&str>) -> Result<Option<WindowInfo>, 
     Ok(Some(info))
 }
 
-/// A screenshot of one window, or of the primary display — refused when a
-/// blocked application's window is in what would be captured.
-fn shoot(window: Option<&str>, options: CaptureOptions) -> Result<Vec<Value>, String> {
+/// The capture of one window, or of the primary display, under
+/// [`guard_capture`]'s rule: refused when a blocked application's window is in
+/// what would be captured. The window it was of, when one was named.
+///
+/// Called by [`shoot`] and by a routine replay's before and after pictures, so
+/// both are held to the one guard.
+pub(super) fn capture(
+    window: Option<&str>,
+    options: CaptureOptions,
+) -> Result<(capture::Screenshot, Option<WindowInfo>), String> {
     let of = guard_capture(window)?;
     let shot = match &of {
         Some(info) => capture::capture_region(info.rect, options),
         None => capture::capture_primary(options),
     }
     .map_err(|e| e.to_string())?;
+    Ok((shot, of))
+}
+
+/// A screenshot of one window, or of the primary display — refused when a
+/// blocked application's window is in what would be captured.
+fn shoot(window: Option<&str>, options: CaptureOptions) -> Result<Vec<Value>, String> {
+    let (shot, of) = capture(window, options)?;
     let (width, height) = shot.model_size();
     let t = shot.transform;
     Ok(vec![

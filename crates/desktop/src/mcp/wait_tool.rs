@@ -433,12 +433,85 @@ fn condition_of(args: &Value) -> Result<Condition, String> {
 pub(super) fn wait_for(args: &Value, stopped: &dyn Fn() -> bool) -> Result<Vec<Value>, String> {
     let condition = condition_of(args)?;
     let budget = Budget::new(whole(args, "timeout_ms")?, whole(args, "poll_ms")?);
-    let mut env = Live::new(&budget, stopped);
-    let outcome = wait::run(&mut env, &condition, &budget, stopped)?;
+    look_until(&condition, &budget, stopped, None)
+}
+
+/// `watch`: the same look, for hours, with a note for the operator's hook.
+///
+/// **Why a tool of its own and not an option of `wait_for`.** `wait_for` is held
+/// to 60 seconds, polled every 50 ms to 2 s, and that bound is a safety property
+/// its tests pin: a call that is supposed to return in moments. A watch is the
+/// opposite promise (it holds the call open until something happens, up to a
+/// day, and looks gently), so it takes its own limits ([`Budget::watch`]) and
+/// its own description, which says plainly that it blocks. The look itself is
+/// the same code ([`look_until`]).
+///
+/// `message` is carried into the reply and so into the operator's post-tool
+/// hook, which is how a watch notifies: see `Server::tell_post_hooks`.
+///
+/// A watch of the SCREEN (`screen_changes`) looks every five seconds unless told
+/// otherwise ([`Budget::watch_screen`]), not every second: each look is a capture
+/// and a hash of the whole screen.
+///
+/// **A watch holds the server for its whole duration.** The server answers one
+/// call at a time on one thread, so while a watch runs no other call is served;
+/// it ends when the condition holds, its time runs out, or the operator stops
+/// the desktop (`incu stop`). **Nothing else ends it**: end of input on stdin does
+/// not (a watch that was the last request a client sent is still wanted), so a
+/// watch whose client has gone lasts until its deadline (1 hour unless asked for
+/// more, 24 at most) or `incu stop`.
+///
+/// Called by `Server::run_tool`.
+pub(super) fn watch(args: &Value, stopped: &dyn Fn() -> bool) -> Result<Vec<Value>, String> {
+    let condition = condition_of(args)?;
+    let budget = watch_budget(
+        &condition,
+        whole(args, "timeout_ms")?,
+        whole(args, "poll_ms")?,
+    );
+    let message = message_arg(args)?;
+    look_until(&condition, &budget, stopped, message)
+}
+
+/// How long a `watch` of `condition` may run and how often it looks: a look at
+/// the screen is the slow one, so it is the one given the slower default.
+fn watch_budget(condition: &Condition, timeout: Option<u64>, poll: Option<u64>) -> Budget {
+    match condition {
+        Condition::Screen { .. } => Budget::watch_screen(timeout, poll),
+        _ => Budget::watch(timeout, poll),
+    }
+}
+
+/// The most of a `watch` message that is kept, in characters.
+const MAX_MESSAGE_CHARS: usize = 200;
+
+/// What the watch is to say when it fires, if the call gave one.
+fn message_arg(args: &Value) -> Result<Option<String>, String> {
+    match args.get("message") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(m)) if m.chars().count() <= MAX_MESSAGE_CHARS => Ok(Some(m.clone())),
+        Some(Value::String(_)) => Err(format!("message is over {MAX_MESSAGE_CHARS} characters")),
+        Some(_) => Err("message must be text".to_string()),
+    }
+}
+
+/// Look for `condition` on the live desktop within `budget` and render the
+/// reply. A stop is a refusal, not a reply.
+fn look_until(
+    condition: &Condition,
+    budget: &Budget,
+    stopped: &dyn Fn() -> bool,
+    message: Option<String>,
+) -> Result<Vec<Value>, String> {
+    let mut env = Live::new(budget, stopped);
+    let outcome = wait::run(&mut env, condition, budget, stopped)?;
     if matches!(outcome, Outcome::Stopped { .. }) {
         return Err(crate::safety::Refusal::Stopped.message());
     }
-    let reply = outcome.to_json(&condition, &budget);
+    let mut reply = outcome.to_json(condition, budget);
+    if let Some(message) = message {
+        reply["message"] = serde_json::json!(message);
+    }
     Ok(vec![text(format!(
         "{}\n{}",
         serde_json::to_string_pretty(&reply).unwrap_or_default(),
@@ -450,6 +523,30 @@ pub(super) fn wait_for(args: &Value, stopped: &dyn Fn() -> bool) -> Result<Vec<V
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A watch of the screen looks every five seconds, not every second, and
+    /// anything else keeps its second; a poll the caller gives is still theirs.
+    #[test]
+    fn a_watch_of_the_screen_polls_every_five_seconds_by_default() {
+        let screen = condition_of(&json!({"condition": "screen_changes"})).unwrap();
+        let window =
+            condition_of(&json!({"condition": "window_gone", "selector": "app=zz;window=none"}))
+                .unwrap();
+        assert_eq!(watch_budget(&screen, None, None).poll_ms, 5_000);
+        assert_eq!(watch_budget(&window, None, None).poll_ms, 1_000);
+        assert_eq!(watch_budget(&screen, None, Some(2_000)).poll_ms, 2_000);
+        // The same bounds otherwise: an hour by default, a day at most.
+        assert_eq!(
+            watch_budget(&screen, None, None).timeout_ms,
+            wait::DEFAULT_WATCH_MS
+        );
+        assert_eq!(
+            watch_budget(&screen, Some(u64::MAX), None).timeout_ms,
+            wait::MAX_WATCH_MS
+        );
+        // And wait_for is not touched: still 250 ms.
+        assert_eq!(Budget::new(None, None).poll_ms, wait::DEFAULT_POLL_MS);
+    }
 
     /// **A look that blocks cannot outlive its limit.** The live hang was a
     /// call that did not return for minutes; here the work sleeps far longer

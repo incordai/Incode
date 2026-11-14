@@ -146,16 +146,40 @@ pub(super) fn error_response(id: Value, code: i64, message: &str) -> String {
 /// When the agent process dies its end of the pipe closes, `read_line` returns
 /// zero bytes, and no timer can fake that. So the loop stops the desktop on EOF
 /// rather than relying on a heartbeat that could keep beating into the void.
-pub fn run_stdio(mut server: Server) -> std::io::Result<()> {
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout();
-    let mut line = String::new();
+pub fn run_stdio(server: Server) -> std::io::Result<()> {
+    run_lines(server, std::io::stdin(), std::io::stdout())
+}
 
+/// [`run_stdio`] over any reader and writer.
+///
+/// # EOF does not end a call that is running
+///
+/// The server answers one line at a time, in order, and reads the next only when
+/// the last is answered. So the end of input is seen only after every line before
+/// it has been answered, and **a `watch` or a `routine_run` that was the last
+/// line sent completes normally**: a client that pipelined its requests and closed
+/// its end is waiting for those answers, and EOF is not evidence that it has gone.
+/// An earlier version read stdin on a thread and ended a waiting call at EOF; that
+/// cut off the last pipelined request, and it is gone. A `watch` or a replay ends
+/// by its own deadline, the stop file (`incu stop`), or an error writing its
+/// answer to stdout, and an orphaned `watch` lasts until one of them.
+///
+/// # Errors
+///
+/// Reading or writing failed.
+pub(crate) fn run_lines<R, W>(mut server: Server, input: R, mut out: W) -> std::io::Result<()>
+where
+    R: std::io::Read,
+    W: Write,
+{
+    let mut reader = std::io::BufReader::new(input);
+    let mut line = String::new();
     loop {
         line.clear();
-        match stdin.lock().read_line(&mut line) {
-            // EOF: the client is gone. Halt the desktop before returning, so a
-            // slow in-flight action cannot outlive the thing that asked for it.
+        match reader.read_line(&mut line) {
+            // EOF: every line before it is answered. Halt the desktop before
+            // returning, so a slow in-flight action cannot outlive the thing that
+            // asked for it.
             Ok(0) => {
                 server.safety().stop();
                 return Ok(());
@@ -165,8 +189,8 @@ pub fn run_stdio(mut server: Server) -> std::io::Result<()> {
                 server.safety().heartbeat();
 
                 if let Some(reply) = server.handle_line(&line) {
-                    writeln!(stdout, "{reply}")?;
-                    stdout.flush()?;
+                    writeln!(out, "{reply}")?;
+                    out.flush()?;
                 }
             }
             Err(e) => {
