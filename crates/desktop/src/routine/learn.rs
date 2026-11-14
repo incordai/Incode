@@ -318,10 +318,99 @@ pub fn check_step(step: &Step, n: usize) -> Result<(), Refusal> {
             ));
         }
     }
+    if tool == "key" {
+        check_key(args.get("keys")).map_err(refuse)?;
+    }
     if KEYBOARD.contains(&tool) {
         check_in_window(args.get(IN_WINDOW)).map_err(refuse)?;
     }
     Ok(())
+}
+
+/// The keys that act on the keyboard without typing a character: named keys.
+const NAMED_KEYS: &[&str] = &[
+    "enter",
+    "return",
+    "tab",
+    "escape",
+    "esc",
+    "up",
+    "down",
+    "left",
+    "right",
+    "arrowup",
+    "arrowdown",
+    "arrowleft",
+    "arrowright",
+    "up_arrow",
+    "down_arrow",
+    "left_arrow",
+    "right_arrow",
+    "home",
+    "end",
+    "pageup",
+    "pagedown",
+    "page_up",
+    "page_down",
+    "pgup",
+    "pgdn",
+    "backspace",
+    "delete",
+    "del",
+    "space",
+];
+
+/// The keys that make a chord a command and not typing: with one of these held,
+/// a letter is a shortcut (Ctrl+S), not a character put in a field.
+const MODIFIER_KEYS: &[&str] = &[
+    "ctrl", "control", "alt", "option", "cmd", "command", "win", "windows", "super", "meta",
+];
+
+/// Whether `key` is an F-key (F1 to F24).
+fn is_f_key(key: &str) -> bool {
+    key.strip_prefix('f')
+        .and_then(|n| n.parse::<u8>().ok())
+        .is_some_and(|n| (1..=24).contains(&n))
+}
+
+/// A `key` step may hold only named keys and chords of them: Enter, Tab, Escape,
+/// the arrows, F-keys, Home, End, Page Up and Down, Backspace, Delete, Space, and
+/// any chord that has ctrl, alt, cmd, win or meta in it. A step that presses a
+/// lone printable character (a letter, a digit, a symbol, with or without shift)
+/// is TYPING, and a PIN typed as `{"keys": ["4"]}` presses would be stored as
+/// they are, past the screen that every typed text goes through
+/// ([`super::params`]); so it is refused.
+fn check_key(keys: Option<&Value>) -> Result<(), String> {
+    let named: Vec<String> = match keys {
+        Some(Value::Array(list)) => list
+            .iter()
+            .filter_map(Value::as_str)
+            .map(|k| k.trim().to_lowercase())
+            .collect(),
+        Some(Value::String(chord)) => chord.split('+').map(|k| k.trim().to_lowercase()).collect(),
+        _ => Vec::new(),
+    };
+    if named.is_empty() || named.iter().any(String::is_empty) {
+        return Err("has no keys to press".to_string());
+    }
+    let command = named.iter().any(|k| MODIFIER_KEYS.contains(&k.as_str()));
+    let only_named = named
+        .iter()
+        .all(|k| k == "shift" || NAMED_KEYS.contains(&k.as_str()) || is_f_key(k));
+    let some_named = named
+        .iter()
+        .any(|k| NAMED_KEYS.contains(&k.as_str()) || is_f_key(k));
+    if command || (only_named && some_named) {
+        return Ok(());
+    }
+    Err(
+        "presses a printable character as a key (a letter, digit or symbol, with or without \
+         shift), which is typing and would be stored as it is; write a typing step \
+         (`type_text`) on a named field instead. Only named keys (Enter, Tab, Escape, the \
+         arrows, F-keys, Home, End, Page Up/Down, Backspace, Delete, Space) and chords with \
+         ctrl, alt, cmd, win or meta can be a `key` step"
+            .to_string(),
+    )
 }
 
 /// The selector argument. When the tool needs one it must be text that parses
@@ -997,6 +1086,88 @@ mod tests {
             learn_with("search for rust", &[no_window], &plain),
             Err(Refusal::NotReplayable { .. })
         ));
+    }
+
+    /// A PIN typed as key presses is typing, past every screen on typed text.
+    #[test]
+    fn a_pin_typed_as_key_presses_refuses_the_whole_learn() {
+        let press = |key: &str| Call::ok("key", json!({"keys": [key], "in_window": IN}));
+        let calls = [
+            sel_click("role=edit;name=Code"),
+            press("4"),
+            press("2"),
+            press("7"),
+            press("1"),
+            press("enter"),
+        ];
+        let why = learn(&calls).unwrap_err();
+        match &why {
+            Refusal::NotReplayable { step, tool, why } => {
+                assert_eq!((*step, tool.as_str()), (2, "key"));
+                assert!(why.contains("printable character"), "{why}");
+                assert!(why.contains("type_text"), "{why}");
+            }
+            other => panic!("{other:?}"),
+        }
+        // Whatever the character: a letter, a symbol, with shift or without.
+        for keys in [
+            json!(["a"]),
+            json!(["A"]),
+            json!(["shift", "a"]),
+            json!(["shift", "4"]),
+            json!(["!"]),
+            json!(["-"]),
+            json!("shift+9"),
+            json!(["numpad4"]),
+            json!([]),
+        ] {
+            let step = Call::ok("key", json!({"keys": keys, "in_window": IN}));
+            assert!(
+                matches!(learn(&[step]), Err(Refusal::NotReplayable { .. })),
+                "{keys}"
+            );
+        }
+    }
+
+    #[test]
+    fn named_keys_and_command_chords_are_kept_as_key_steps() {
+        for keys in [
+            json!(["enter"]),
+            json!(["Return"]),
+            json!(["tab"]),
+            json!(["shift", "tab"]),
+            json!(["escape"]),
+            json!(["Esc"]),
+            json!(["up"]),
+            json!(["Down"]),
+            json!(["left"]),
+            json!(["right"]),
+            json!(["f1"]),
+            json!(["F5"]),
+            json!(["f24"]),
+            json!(["home"]),
+            json!(["end"]),
+            json!(["pageup"]),
+            json!(["PageDown"]),
+            json!(["page_down"]),
+            json!(["backspace"]),
+            json!(["delete"]),
+            json!(["space"]),
+            json!(["ctrl", "a"]),
+            json!(["control", "shift", "t"]),
+            json!(["alt", "f4"]),
+            json!(["cmd", "c"]),
+            json!(["win", "e"]),
+            json!(["meta", "l"]),
+            json!("ctrl+s"),
+            json!("shift+tab"),
+        ] {
+            let step = Call::ok("key", json!({"keys": keys, "in_window": IN}));
+            assert!(learn(&[step]).is_ok(), "{keys}");
+        }
+        // F25 is no F-key.
+        let f25 = Call::ok("key", json!({"keys": ["f25"], "in_window": IN}));
+        assert!(learn(&[f25]).is_err());
     }
 
     #[test]

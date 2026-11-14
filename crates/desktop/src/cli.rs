@@ -49,7 +49,11 @@ USAGE:
                               read a routine's secret {PARAM} from the
                               environment variable ENV_VAR (named INCU_PARAM_...)
                               of incu's own environment, for the steps as they are
-                              now. Only you bind; the variable's NAME is stored
+                              now. Only you bind; the variable's NAME is stored.
+                              Binding stops accidental or stale use. It does NOT
+                              stop an agent that can write your app-data folder or
+                              run incu itself: run agents sandboxed (insbx), where
+                              that folder and the incu binary are out of reach.
     incu routine unbind <WORDS> <PARAM>   remove that binding
     incu --help | --version
 
@@ -940,6 +944,25 @@ mod tests {
         let again = run_routine(args(RoutineAction::Unbind, "password", "")).unwrap_err();
         assert!(again.contains("no binding"), "{again}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What binding is and is not, said where the person reads about the command.
+    #[test]
+    fn the_bind_help_says_it_is_not_a_boundary_against_an_agent_that_can_write_files() {
+        let help = USAGE.split("OPTIONS for serve").next().unwrap();
+        let bind = help.split("incu routine bind").nth(1).unwrap();
+        let bind = bind.split("incu routine unbind").next().unwrap();
+        for said in [
+            "stops accidental or stale use",
+            "does NOT",
+            "app-data folder",
+            "insbx",
+        ] {
+            assert!(
+                bind.contains(said),
+                "the bind help does not say {said:?}: {bind}"
+            );
+        }
     }
 
     /// The usage must name every flag the parser takes, or an operator cannot

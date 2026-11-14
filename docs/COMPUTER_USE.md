@@ -540,7 +540,12 @@ taken before the folder is made**, so no run's folder ever exists unmarked for a
 cleanup to find and delete (a folder made first and marked after had that window). The mark is
 beside the folder, not inside it, so nothing has to be renamed into place (on Windows a folder
 with an open file in it cannot be renamed). With two runs at once both folders stand until a
-later run finds them finished. Nothing else in `last-replay/` is touched. A run's folder is held to 48 MiB (each run its own) by deleting
+later run finds them finished. Nothing else in `last-replay/` is touched. **A mark is never
+deleted young:** a mark with no folder is deleted only when it is older than 10 minutes and
+can be taken (a run between its mark and its folder looks exactly like that, and a mark that
+went then would leave the folder it goes on to make with no mark for good). And **a `run-*`
+folder with no mark that is older than one day is deleted**, so a mark deleted by hand or by
+a cleaner cannot leave its folder for ever; a younger unmarked folder is left alone. A run's folder is held to 48 MiB (each run its own) by deleting
 the oldest pictures first, so the failed step's, the newest, always survive; one picture over
 4 MiB is not kept. A failure names the failed step's two pictures by path; the success reply
 gives the folder and how many were kept. A screen that cannot be captured (headless, a
@@ -585,7 +590,12 @@ that opens a sign-in dialog, a first-step sudo or KeePass prompt, Ctrl+L, Alt+D 
 address bar), and no list of such moves is complete, so no tracking of focus is done. **The
 price:** a routine saved from a recording, whose `type_text` calls carry no selector, has a
 parameter for ALL its typing. Write the steps yourself with a selector on each typing step
-to keep literal text. (A `key` that types a password one letter at a time is not looked at.)
+to keep literal text. **A `key` step cannot type.** It may hold only named keys (Enter, Tab,
+Escape, the arrows, F1 to F24, Home, End, Page Up/Down, Backspace, Delete, Space) and chords
+that contain ctrl, alt, cmd, win or meta; one that presses a lone printable character (a
+letter, digit or symbol, with or without shift: a PIN as `{"keys": ["4"]}` presses) refuses
+the whole learn, and a stored one refuses the replay, with a message saying to write a typing
+step on a named field instead.
 At most 16 parameters (more is refused when saving and when running). `routine_save` lists
 the parameters it made, `routine_list` shows `params_needed`, which are bound
 (`params_bound`) and which are not (`params_unbound`).
@@ -602,7 +612,13 @@ incu routine unbind <the words> <param>
 ```
 
 `bind` stores **only the variable's NAME** in `routines.json`, with a SHA-256 digest of the
-routine's steps at the time. The variable must be named `INCU_PARAM_<NAME>` (capitals,
+routine's steps at the time. **Be plain about what that digest is: it is not a boundary.** It
+is unkeyed and sits in the same file as the steps, so an agent that can write the file can
+change the steps and write the matching digest. It catches a stale binding and an accidental
+edit; it does not stop **an agent that can write the user's app-data folder, or run `incu`
+itself**. No cryptography is added to pretend otherwise. The real boundary is **running agents
+sandboxed** (`insbx`), where `%APPDATA%` (or `~/Library/Application Support`, `~/.local/share`)
+and the `incu` binary are out of reach. The same is said in `incu --help`, under `routine bind`. The variable must be named `INCU_PARAM_<NAME>` (capitals,
 digits, `_`), so a parameter can never be bound to `PATH` or an API key of the person's that
 incu inherited; the prefix is checked again when the file is read. The person sets the
 variable in the environment incu is launched with (for example the MCP server's `env`).

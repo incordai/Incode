@@ -57,7 +57,7 @@ use std::collections::VecDeque;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use super::oslock::OsLock;
 
@@ -142,7 +142,7 @@ impl Pictures {
         between();
         let dir = root.join(id);
         make_private_dir(&dir)?;
-        clear_finished(&root, id)?;
+        clear_finished(&root, id, SystemTime::now())?;
         Ok(Self {
             dir,
             kept: VecDeque::new(),
@@ -217,7 +217,7 @@ fn run_id() -> String {
 /// Delete what an earlier run left under `root`, except the folder `keep` and
 /// the folder of any run still going. Only what this module makes is touched: a
 /// folder named `run-*`, and (from an earlier layout) loose `step-*` pictures.
-fn clear_finished(root: &Path, keep: &str) -> Result<(), String> {
+fn clear_finished(root: &Path, keep: &str, now: SystemTime) -> Result<(), String> {
     let entries =
         std::fs::read_dir(root).map_err(|e| format!("cannot read {}: {e}", root.display()))?;
     for entry in entries.flatten() {
@@ -229,23 +229,51 @@ fn clear_finished(root: &Path, keep: &str) -> Result<(), String> {
         if is_loose_picture(&name) && path.is_file() {
             std::fs::remove_file(&path)
                 .map_err(|e| format!("cannot clear {}: {e}", path.display()))?;
-        } else if name.starts_with("run-") && path.is_dir() && run_is_over(root, &name) {
-            // Best effort: a folder that will not go is left for the next run.
-            if std::fs::remove_dir_all(&path).is_ok() {
-                let _ = std::fs::remove_file(mark_of(root, &name));
+        } else if name.starts_with("run-") && path.is_dir() {
+            let marked = mark_of(root, &name).exists();
+            // Over (its mark can be taken), or UNMARKED for a day: its mark was
+            // deleted (by hand, or by a cleaner), and with it the only way this
+            // ever learned the folder was finished. A folder with no mark is
+            // never deleted young: a run between marking and making it has one,
+            // but a folder is only ever made after its mark, so an unmarked young
+            // one is somebody's, and a day is longer than any replay.
+            let abandoned = !marked && older_than(&path, UNMARKED_FOLDER_AGE, now);
+            if (marked && run_is_over(root, &name)) || abandoned {
+                // Best effort: a folder that will not go is left for the next run.
+                if std::fs::remove_dir_all(&path).is_ok() {
+                    let _ = std::fs::remove_file(mark_of(root, &name));
+                }
             }
         } else if name.starts_with("run-") && name.ends_with(MARK_END) && path.is_file() {
-            // A mark with no folder: the run that made it died between marking
-            // and making the folder, or its folder was cleared and the mark was
-            // not. Taken only when nobody holds it (a run between the two steps
-            // does).
+            // A mark with no folder. Never deleted young: a run that has marked
+            // and not yet made its folder looks exactly like this (and holds the
+            // lock, which is checked too), and a mark that goes while a run is
+            // between the two steps leaves the folder it then makes with no mark
+            // at all, for good. Old enough, and free, it is a leftover.
             let run = name.trim_end_matches(MARK_END);
-            if !root.join(run).exists() && is_free(&path) {
+            if !root.join(run).exists() && older_than(&path, ORPHAN_MARK_AGE, now) && is_free(&path)
+            {
                 let _ = std::fs::remove_file(&path);
             }
         }
     }
     Ok(())
+}
+
+/// How old a mark with no folder must be before cleanup deletes it.
+const ORPHAN_MARK_AGE: Duration = Duration::from_secs(10 * 60);
+
+/// How old a run folder with no mark must be before cleanup deletes it.
+const UNMARKED_FOLDER_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Whether `path` was last changed more than `age` before `now`. A time that
+/// cannot be read, or that is after `now`, is not old.
+fn older_than(path: &Path, age: Duration, now: SystemTime) -> bool {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|changed| now.duration_since(changed).ok())
+        .is_some_and(|since| since > age)
 }
 
 /// The mark of the run `id` under `root`: a file beside its folder, never inside
@@ -408,13 +436,14 @@ mod tests {
         std::fs::create_dir_all(&dead).unwrap();
         std::fs::write(dead.join("step-001-after.jpg"), "x").unwrap();
         std::fs::write(mark_of(&root, "run-000000000000001-99999-0"), "").unwrap();
-        // A mark whose folder is gone, and nobody holds it: tidied too.
-        let orphan = mark_of(&root, "run-000000000000002-99999-0");
-        std::fs::write(&orphan, "").unwrap();
+        // A young mark whose folder is gone is NOT tidied: a run between marking
+        // and making its folder looks like that (see the test for old ones).
+        let young = mark_of(&root, "run-000000000000002-99999-0");
+        std::fs::write(&young, "").unwrap();
         let _live = Pictures::begin(root.clone()).unwrap();
         assert!(!dead.exists());
         assert!(!mark_of(&root, "run-000000000000001-99999-0").exists());
-        assert!(!orphan.exists());
+        assert!(young.exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -472,6 +501,64 @@ mod tests {
             seen.get(),
             "the folder existed, or the mark was not held, first"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A mark deleted while its run is between marking and making the folder
+    /// would leave that folder unmarked for good; so a mark with no folder is
+    /// never deleted young, whoever holds it, and only when it can be taken.
+    #[test]
+    fn a_mark_with_no_folder_is_deleted_only_when_it_is_old_and_free() {
+        let root = folder("orphan-mark");
+        std::fs::create_dir_all(&root).unwrap();
+        let mark = mark_of(&root, "run-000000000000009-1-0");
+        std::fs::write(&mark, "").unwrap();
+        let now = SystemTime::now();
+        // Young: kept.
+        clear_finished(&root, "run-none", now).unwrap();
+        assert!(mark.exists(), "a young mark was deleted");
+        clear_finished(&root, "run-none", now + Duration::from_secs(9 * 60)).unwrap();
+        assert!(mark.exists(), "a mark under ten minutes old was deleted");
+        // Old but held by a run: kept.
+        let mut held = OsLock::new(File::options().read(true).write(true).open(&mark).unwrap());
+        assert!(held.try_acquire().unwrap());
+        clear_finished(&root, "run-none", now + Duration::from_secs(60 * 60)).unwrap();
+        assert!(mark.exists(), "a held mark was deleted");
+        drop(held);
+        // Old and free: a leftover, deleted.
+        clear_finished(&root, "run-none", now + Duration::from_secs(11 * 60)).unwrap();
+        assert!(!mark.exists(), "an old free mark was kept");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A mark deleted by hand (or by a cleaner) must not leave its folder for ever.
+    #[test]
+    fn a_run_folder_with_no_mark_is_deleted_once_it_is_a_day_old() {
+        let root = folder("unmarked-old");
+        let stray = root.join("run-000000000000004-1-0");
+        std::fs::create_dir_all(&stray).unwrap();
+        std::fs::write(stray.join("step-001-after.jpg"), "x").unwrap();
+        let now = SystemTime::now();
+        // Young, or nearly a day: kept.
+        clear_finished(&root, "run-none", now).unwrap();
+        clear_finished(&root, "run-none", now + Duration::from_secs(23 * 60 * 60)).unwrap();
+        assert!(
+            stray.join("step-001-after.jpg").exists(),
+            "deleted too young"
+        );
+        // Over a day: deleted, however it came to have no mark.
+        clear_finished(&root, "run-none", now + Duration::from_secs(25 * 60 * 60)).unwrap();
+        assert!(!stray.exists(), "an unmarked folder a day old was kept");
+        // A marked folder that is held is never deleted, however old.
+        let held_dir = root.join("run-000000000000005-1-0");
+        std::fs::create_dir_all(&held_dir).unwrap();
+        let mark = mark_of(&root, "run-000000000000005-1-0");
+        std::fs::write(&mark, "").unwrap();
+        let mut held = OsLock::new(File::options().read(true).write(true).open(&mark).unwrap());
+        assert!(held.try_acquire().unwrap());
+        clear_finished(&root, "run-none", now + Duration::from_secs(48 * 60 * 60)).unwrap();
+        assert!(held_dir.exists(), "a run that is going was deleted");
+        drop(held);
         let _ = std::fs::remove_dir_all(&root);
     }
 

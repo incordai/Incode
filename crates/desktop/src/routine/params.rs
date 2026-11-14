@@ -357,6 +357,13 @@ pub fn check_env_name(var: &str) -> Result<(), String> {
 /// A digest of a routine's steps: SHA-256 of their JSON, in hex. Stored with a
 /// routine's bindings, so a binding is only honoured for the steps it was made
 /// for.
+///
+/// **Not a boundary.** It is unkeyed and lives in the same file as the steps, so
+/// whatever can write the file can write the steps and their digest together. It
+/// catches a stale binding and an accidental edit, and nothing more: an agent that
+/// can write the user's app-data folder, or run `incu`, is not stopped by it. The
+/// boundary is running agents sandboxed, where that folder and the binary are out
+/// of reach. No cryptography is added to look like one.
 #[must_use]
 pub fn digest(steps: &[Step]) -> String {
     use sha2::{Digest, Sha256};
