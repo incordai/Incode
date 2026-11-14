@@ -82,9 +82,59 @@ pub(crate) fn judge(sent: &str, before: Option<&str>, now: &str, trim: bool) -> 
     ))
 }
 
+/// [`judge`] for a platform whose read-back is `None` both when the value is
+/// empty and when it could not be read at all (macOS `text_attribute` trims,
+/// and drops an empty value and a failed call alike). Nothing read is nothing
+/// proven: never `Same`, even when an empty value was sent, since a failed
+/// read cannot be told from an emptied field.
+#[cfg(any(target_os = "macos", test))]
+#[must_use]
+pub(crate) fn judge_optional(
+    sent: &str,
+    before: Option<&str>,
+    now: Option<&str>,
+    trim: bool,
+) -> ReadBack {
+    match now {
+        Some(now) => judge(sent, before, now, trim),
+        None if lines(sent).trim().is_empty() => ReadBack::Unverified(
+            "its value could not be read back (an empty value and an unreadable one look \
+             the same), so it is not known to be empty"
+                .to_string(),
+        ),
+        None => judge(sent, before, "", trim),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// macOS gives `None` for an empty value AND for a failed read, so neither
+    /// is "verified": an empty value sent and nothing read back is unverified.
+    #[test]
+    fn nothing_read_back_is_never_verified() {
+        for sent in ["", "   ", "\n"] {
+            match judge_optional(sent, None, None, true) {
+                ReadBack::Unverified(why) => assert!(why.contains("could not be read"), "{why}"),
+                other => panic!("{sent:?}: {other:?}"),
+            }
+        }
+        // Text sent and nothing read: the browser case, unverified too.
+        assert!(matches!(
+            judge_optional("hello", None, None, true),
+            ReadBack::Unverified(_)
+        ));
+        // A value that was read is judged as before.
+        assert_eq!(
+            judge_optional("hello", None, Some("hello"), true),
+            ReadBack::Same
+        );
+        assert!(matches!(
+            judge_optional("hello", Some("old"), Some("old"), true),
+            ReadBack::Differs(_)
+        ));
+    }
 
     #[test]
     fn line_endings_are_not_differences() {

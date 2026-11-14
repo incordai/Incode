@@ -25,7 +25,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::coords::PhysicalPoint;
-use super::selector::{selectors_for, Selector, Text};
+use super::selector::{selectors_for_first, Selector, Text};
 use super::{DesktopError, Rect};
 
 /// Whether the platform names a text field by its content, so a selector must
@@ -62,8 +62,12 @@ fn max_elements() -> usize {
 /// print cap (an operator who raises that cap is not lowered below it).
 ///
 /// The walk order is the same, so a control within the first 400 has the same
-/// id, `nth` and `path` whichever cap walked: a selector `ui_tree` printed
-/// still means the same control.
+/// id and `path` whichever cap walked. A selector's uniqueness and `nth` are
+/// NOT the same, though: another control past the 400th can match what was
+/// unique among the printed ones. So `ui_tree` walks with this cap too, prints
+/// the first 400 and makes each printed selector unique among the whole walk
+/// ([`Tree::printed`], `selector::selectors_for_first`): what it prints is
+/// what the resolver resolves.
 pub(crate) fn resolve_max_elements() -> usize {
     let limits = super::limits::get();
     limits
@@ -106,6 +110,26 @@ pub enum Role {
 }
 
 impl Role {
+    /// Whether the control holds text the user types or picks, so that its
+    /// name, on a platform that names it by its value (macOS), changes as it
+    /// is used and is no way to find it.
+    pub(crate) fn holds_typed_text(self) -> bool {
+        matches!(self, Role::Edit | Role::ComboBox)
+    }
+
+    /// Whether the control's NAME may be its content, and so may have been
+    /// typed. On macOS `describe` names a control by its `AXValue` when it has
+    /// no title or description, and that is true of any role whose value is
+    /// content: a text field, an editable combo box, static text, a slider, or
+    /// one whose role is not known. Messages and journals never carry such a
+    /// name.
+    pub(crate) fn name_may_be_content(self) -> bool {
+        matches!(
+            self,
+            Role::Edit | Role::Text | Role::ComboBox | Role::Slider | Role::Other
+        )
+    }
+
     /// Whether clicking this is a normal thing for an agent to want.
     ///
     /// Used to filter the noise out of a tree: a window full of anonymous
@@ -298,8 +322,11 @@ impl Tree {
             ));
         }
         let stamp = (depth != super::limits::get().tree_depth).then_some(depth);
-        let selectors = selectors_for(&self.elements, NAMES_ARE_VALUES, stamp);
-        for (e, selector) in self.elements.iter().zip(&selectors) {
+        // Printed up to the print cap, but each selector unique among the
+        // whole walk: the resolver sees all of it (`resolve_max_elements`).
+        let printed = self.printed();
+        let selectors = selectors_for_first(&self.elements, printed.len(), NAMES_ARE_VALUES, stamp);
+        for (e, selector) in printed.iter().zip(&selectors) {
             out.push_str(&format!(
                 "{:indent$}[e{}] {:<10} \"{}\" ({},{},{}x{})  sel: {}{}{}{}\n",
                 "",
@@ -329,13 +356,20 @@ impl Tree {
                 self.offscreen
             ));
         }
-        if self.truncated {
+        if self.truncated || printed.len() < self.elements.len() {
             out.push_str(&format!(
                 "\n… stopped at {} elements. Narrow the request.\n",
-                max_elements()
+                printed.len()
             ));
         }
         out
+    }
+
+    /// The elements `ui_tree` prints and an id may name: the first
+    /// [`max_elements`] of the walk. `elements` holds the whole walk, which can
+    /// be longer (see [`resolve_max_elements`]).
+    pub fn printed(&self) -> &[Element] {
+        &self.elements[..self.elements.len().min(max_elements())]
     }
 
     /// The element with this id, if the walk produced one.
@@ -468,16 +502,18 @@ impl Done {
 }
 
 impl Element {
-    /// The name as a message may say it: `None` for an edit or a text field.
+    /// The name as a message may say it: `None` for an edit field, a combo box,
+    /// static text, a slider or an unknown role ([`Role::name_may_be_content`]).
     ///
     /// Messages go to the operator's journal word for word (an error is
     /// recorded as it was returned), and on macOS the name of such a field IS
     /// what is in it (`AXValue`, the fallback of `describe`), which may have
     /// been typed. So no message names one, on any platform.
     pub(crate) fn name_for_messages(&self) -> Option<&str> {
-        match self.role {
-            Role::Edit | Role::Text => None,
-            _ => Some(&self.name),
+        if self.role.name_may_be_content() {
+            None
+        } else {
+            Some(&self.name)
         }
     }
 
@@ -541,7 +577,10 @@ pub fn window_position_unknown(window: &WindowInfo) -> Option<String> {
 /// the focused window.
 pub fn window_tree(window: Option<&str>, depth: u32) -> Result<Tree, DesktopError> {
     let depth = bounded(depth);
-    let tree = platform::tree(window, depth, max_elements())?;
+    // The whole walk the resolver would make, so a selector printed for one of
+    // the first elements is unique among all of them; only the first
+    // `max_elements()` are printed and remembered as shown ([`Tree::printed`]).
+    let tree = platform::tree(window, depth, resolve_max_elements())?;
     remember_shown(&tree, depth);
     Ok(tree)
 }
@@ -578,7 +617,7 @@ fn remember_shown(tree: &Tree, depth: u32) {
     shown.push(Shown {
         window: tree.window.clone(),
         depth,
-        elements: tree.elements.clone(),
+        elements: tree.printed().to_vec(),
     });
 }
 
@@ -688,11 +727,16 @@ pub fn focus_window(window: &str) -> Result<Done, DesktopError> {
 
 // What reading a field back after `set_value` can honestly say: `readback.rs`.
 mod readback;
+#[cfg(target_os = "macos")]
+pub(crate) use readback::judge_optional;
+// macOS judges an optional read-back (`judge_optional`); the others a string.
+#[cfg(any(windows, target_os = "linux"))]
+pub(crate) use readback::judge;
 #[cfg_attr(
     not(any(windows, target_os = "macos", target_os = "linux")),
     allow(unused_imports)
 )]
-pub(crate) use readback::{judge, ReadBack};
+pub(crate) use readback::ReadBack;
 
 // Acting on a control by selector instead of by id: `resolve.rs`.
 mod resolve;
@@ -1134,6 +1178,27 @@ mod tests {
         assert!(!said.contains("\"\""), "{said}");
     }
 
+    /// A message never names a control whose name can be its typed value.
+    #[test]
+    fn a_message_names_no_control_whose_name_may_be_its_value() {
+        let rect = Rect::from_edges(0, 0, 10, 10);
+        for role in [
+            Role::Edit,
+            Role::Text,
+            Role::ComboBox,
+            Role::Slider,
+            Role::Other,
+        ] {
+            let said = element(5, role, "typed secret", rect).label();
+            assert!(!said.contains("typed secret"), "{role:?}: {said}");
+            assert!(said.contains("e5"), "{said}");
+        }
+        for role in [Role::Button, Role::MenuItem, Role::Link, Role::TabItem] {
+            let said = element(5, role, "Save", rect).label();
+            assert!(said.contains("\"Save\""), "{role:?}: {said}");
+        }
+    }
+
     /// The walk stops at [`MAX_ELEMENTS`] and says so.
     #[test]
     fn a_huge_tree_is_cut_and_reported_as_cut() {
@@ -1168,6 +1233,57 @@ mod tests {
         let low = &found.elements[MAX_ELEMENTS + 10];
         let (_, again) = find(&tree, 4, &node, &children, &want(low)).expect("past the cap");
         assert_eq!(again.id, low.id);
+    }
+
+    /// **What `ui_tree` prints is what the resolver resolves.** A page with a
+    /// "Privacy policy" link in its header and another at element 1500: the
+    /// first is unique among the 400 printed, but the resolver walks all of the
+    /// page and would find two. The printed selector must carry the `nth` that
+    /// tells them apart, and must resolve to its own element in the whole walk.
+    #[test]
+    fn a_printed_selector_stays_unique_when_a_twin_lies_past_the_print_cap() {
+        let rect = Rect::from_edges(0, 0, 10, 10);
+        let mut elements: Vec<Element> = (0..1600)
+            .map(|i| element(i, Role::Link, &format!("link{i}"), rect))
+            .collect();
+        elements[3].name = "Privacy policy".to_string();
+        elements[1500].name = "Privacy policy".to_string();
+        let tree = Tree {
+            root_name: "Page".to_string(),
+            window: "long-page".to_string(),
+            app: "chrome".to_string(),
+            no_positions: None,
+            elements,
+            truncated: false,
+            offscreen: 0,
+        };
+        assert_eq!(tree.printed().len(), MAX_ELEMENTS);
+        let text = tree.render();
+        assert!(!text.contains("[e1500]"), "only the print cap is printed");
+        assert!(text.contains("stopped at 400 elements"), "{text}");
+        let line = text
+            .lines()
+            .find(|l| l.contains("[e3]"))
+            .expect("the header link is printed");
+        let written = line.split("sel: ").nth(1).expect("a selector").trim();
+        assert!(written.contains("nth=0"), "{written}");
+        // Pasted back as an agent would, it resolves, over the whole walk, to
+        // the control it was printed for and not to "matches 2".
+        let s = Selector::parse(written).expect("it reads back");
+        assert_eq!(s.resolve_in(&tree.elements).expect("resolves").id, 3);
+        // A control with no twin keeps its short selector.
+        let plain = text.lines().find(|l| l.contains("[e4]")).expect("e4");
+        assert!(!plain.contains("nth="), "{plain}");
+        // And only the printed part is remembered as shown.
+        remember_shown(&tree, 12);
+        let shown = SHOWN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mine = shown
+            .iter()
+            .find(|s| s.window == "long-page")
+            .expect("remembered");
+        assert_eq!(mine.elements.len(), MAX_ELEMENTS);
     }
 
     /// macOS roles map onto the same vocabulary as Windows; a tab is a radio
@@ -1400,7 +1516,7 @@ mod tests {
             };
 
             assert!(
-                tree.elements.len() <= MAX_ELEMENTS,
+                tree.elements.len() <= resolve_max_elements(),
                 "the walk ran past its own bound: {}",
                 tree.elements.len()
             );

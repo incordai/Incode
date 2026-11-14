@@ -388,12 +388,14 @@ impl Selector {
     }
 
     /// The selector as a journal may carry it. A control's name is left out
-    /// when it might be what the user typed: an edit field's (on macOS the
-    /// name of a text field IS its value), or any control whose role is not
-    /// given. Everything else is the same as [`Self::render`].
+    /// when it might be what the user typed: that of an edit field, a combo
+    /// box, static text or any role whose name can come from its value
+    /// ([`Role::name_may_be_content`]: on macOS an unlabelled control is named by
+    /// its `AXValue`), or of any control whose role is not given. Everything
+    /// else is the same as [`Self::render`].
     #[must_use]
     pub fn render_redacted(&self) -> String {
-        let keep_name = self.role.is_some_and(|r| r != Role::Edit);
+        let keep_name = self.role.is_some_and(|r| !r.name_may_be_content());
         let mut parts = Vec::new();
         self.push_window_parts(&mut parts);
         self.push_element_parts(&mut parts, keep_name);
@@ -527,7 +529,7 @@ impl Selector {
                         // the same ones (see [`Selector::depth`]).
                         Selector {
                             depth: self.depth,
-                            ..selector_for(elements, i, true)
+                            ..selector_hiding(elements, i, Role::name_may_be_content)
                         }
                         .render_element_part()
                     })
@@ -604,8 +606,23 @@ fn name_text(name: &str) -> Text {
 /// which changes as it is typed in, so the field's name is not used.
 #[must_use]
 pub fn selector_for(elements: &[Element], index: usize, names_are_values: bool) -> Selector {
+    selector_hiding(elements, index, |role| {
+        names_are_values && role.holds_typed_text()
+    })
+}
+
+/// [`selector_for`] that never writes the name of a control whose role `hide`
+/// picks. An example in an error is journalled word for word, so it hides every
+/// role whose name may be a value ([`Role::name_may_be_content`]), on every
+/// platform; what `ui_tree` prints hides only what changes as it is typed in.
+#[must_use]
+pub fn selector_hiding(
+    elements: &[Element],
+    index: usize,
+    hide: impl Fn(Role) -> bool,
+) -> Selector {
     let e = &elements[index];
-    let name = if (names_are_values && e.role == Role::Edit) || e.name.trim().is_empty() {
+    let name = if hide(e.role) || e.name.trim().is_empty() {
         None
     } else {
         Some(name_text(&e.name))
@@ -659,7 +676,22 @@ pub fn selectors_for(
     names_are_values: bool,
     depth: Option<u32>,
 ) -> Vec<Selector> {
-    (0..elements.len())
+    selectors_for_first(elements, elements.len(), names_are_values, depth)
+}
+
+/// [`selectors_for`] the first `count` of `elements` only, each made unique
+/// among ALL of `elements`. `ui_tree` prints a part of what the resolver
+/// walks (see `uia::resolve_max_elements`); a selector made unique among the
+/// part would match two controls once the resolver sees the rest of the page,
+/// so uniqueness and `nth` are counted over the whole walk.
+#[must_use]
+pub fn selectors_for_first(
+    elements: &[Element],
+    count: usize,
+    names_are_values: bool,
+    depth: Option<u32>,
+) -> Vec<Selector> {
+    (0..count.min(elements.len()))
         .map(|i| Selector {
             depth,
             ..selector_for(elements, i, names_are_values)
@@ -1177,6 +1209,46 @@ mod tests {
         assert!(!said.contains("hunter2"), "{said}");
         let no_role = Selector::parse("name=hunter2").unwrap();
         assert!(!no_role.render_redacted().contains("hunter2"));
+    }
+
+    /// On macOS a combo box with no title is named by its `AXValue`, which is
+    /// text somebody typed. Every journalled form of a selector hides the name
+    /// of every role whose name can come from its value.
+    #[test]
+    fn a_combo_boxs_name_is_never_journalled_either() {
+        for role in ["combobox", "text", "edit", "slider", "other"] {
+            let s = Selector::parse(&format!("role={role};name=typed secret")).unwrap();
+            let said = s.render_redacted();
+            assert!(!said.contains("typed secret"), "{role}: {said}");
+        }
+        let button = Selector::parse("role=menuitem;name=Open").unwrap();
+        assert_eq!(button.render_redacted(), "role=menuitem;name=Open");
+
+        // The look-alikes of an ambiguity error are journalled too.
+        let twins = vec![
+            el(1, 1, Role::ComboBox, "typed secret"),
+            el(2, 1, Role::ComboBox, "typed secret"),
+            el(3, 1, Role::Text, "typed secret"),
+            el(4, 1, Role::Text, "typed secret"),
+        ];
+        for query in [
+            "role=combobox;name=typed secret",
+            "role=text;name=typed secret",
+        ] {
+            let err = Selector::parse(query)
+                .unwrap()
+                .resolve_in(&twins)
+                .unwrap_err();
+            let said = err.to_string();
+            assert!(!said.contains("typed secret"), "{query}: {said}");
+            assert!(said.contains("nth="), "an example still says which: {said}");
+        }
+        // And what `ui_tree` prints on macOS does not name a combo box by
+        // what is in it (it changes as it is used).
+        let printed = selector_for(&twins, 0, true).render_element_part();
+        assert!(!printed.contains("typed secret"), "{printed}");
+        let elsewhere = selector_for(&twins, 0, false).render_element_part();
+        assert!(elsewhere.contains("typed secret"), "{elsewhere}");
     }
 
     #[test]

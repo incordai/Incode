@@ -283,9 +283,10 @@ ids work exactly as before.
 *Resolution's own bound.* `ui_tree` stops printing at 400 elements (what fits in a reply). A
 selector is resolved against its **own** walk, which is bounded by the number of nodes
 visited (`desktop_limits.tree_max_visited`, default 4000: the limit on time and cost every walk
-already had) and not by the print cap, so a link far down a long article is found. The walk
-order is the same, so a control within the first 400 has the same id, `nth` and `path` in
-both. When even the larger bound cuts the walk, an error or result says so and that a second
+already had) and not by the print cap, so a link far down a long article is found. `ui_tree`
+walks the same way, prints the first 400 and makes each printed selector unique among the
+**whole** walk, so a selector it printed (`nth` included, when a twin lies past the 400th
+element) resolves to its own control. When even the larger bound cuts the walk, an error or result says so and that a second
 match may lie beyond it. *Browsers.* A browser exposes a page only after a client asks for it,
 so its first walk can hold just its own controls. A selector that matches nothing in a
 browser window (chrome, msedge, firefox, brave, vivaldi, opera, chromium) is walked once more
@@ -334,7 +335,10 @@ comes true at the deadline is caught. Each look runs on a thread of its own and 
 until the deadline plus 1 s: a look the desktop does not answer by then (a program that
 hangs, a window that closed under the walk) counts as a look that saw nothing, and the wait
 ends as a `timeout` whose `last_seen` says so, never as `gone`. So the call ends no later
-than `timeout_ms` plus that second. A pinned window that no
+than `timeout_ms` plus that second. The operator's stop is asked every 100 ms while a look is
+waited for, and before the deadline, so a stop is `Stopped`, not a timeout. Looks given up on
+are counted per window (4 still blocked at one window and no more are started at it; a safety
+net of 24 over all windows), so one hung program does not stop a wait on another. A pinned window that no
 longer exists is `element_gone` at once. The operator's stop (stop file or `Safety`) is asked between
 looks and every 100 ms of sleeping, and ends the wait with the stop's refusal.
 

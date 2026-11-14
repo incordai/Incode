@@ -737,8 +737,10 @@ pub(crate) fn set_value(
     }
     // `text_attribute` trims and drops an empty value, so the sent text is
     // trimmed too and an empty read-back is `None`.
-    Ok(match text_attribute(&element, "AXValue") {
-        Some(now) => match super::uia::judge(value, before.as_deref(), &now, true) {
+    // `None` is an empty value or a failed read: neither is a proof.
+    let now = text_attribute(&element, "AXValue");
+    Ok(
+        match super::uia::judge_optional(value, before.as_deref(), now.as_deref(), true) {
             super::uia::ReadBack::Same => Done::verified(did),
             super::uia::ReadBack::Unverified(why) => Done::unverified(tried, &why),
             super::uia::ReadBack::Differs(why) => {
@@ -747,13 +749,7 @@ pub(crate) fn set_value(
                 )))
             }
         },
-        None if value.trim().is_empty() => Done::verified(did),
-        None => Done::unverified(
-            tried,
-            "it reads back empty, which a browser or custom control does when it does not \
-             report its value, so the text may be there; look at the result",
-        ),
-    })
+    )
 }
 
 /// The `AX…` action for one of the shared vocabulary's names. Pure.
