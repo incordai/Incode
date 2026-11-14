@@ -46,7 +46,7 @@ use std::fmt;
 
 use serde_json::Value;
 
-use super::params::{parameterise, Made};
+use super::params::{names, parameterise, Made, MAX_PARAMS};
 use super::source::{Call, Record};
 use super::words::{is_deictic, word_set};
 use super::{Step, MAX_STEPS, MAX_STEP_BYTES};
@@ -122,6 +122,8 @@ pub enum Refusal {
     NoSteps,
     /// More steps than a routine may hold.
     TooLong(usize),
+    /// More parameters than a routine may take.
+    TooManyParams(usize),
 }
 
 impl fmt::Display for Refusal {
@@ -156,6 +158,12 @@ impl fmt::Display for Refusal {
                 f,
                 "not learned: no desktop action is left once looking-only calls \
                  (ui_tree, screenshot, list_windows, ...) are dropped"
+            ),
+            Refusal::TooManyParams(n) => write!(
+                f,
+                "not learned: {n} parameters (secrets and redacted texts the routine would \
+                 have to be given) is more than a routine may take ({MAX_PARAMS}); \
+                 save a shorter task"
             ),
             Refusal::TooLong(n) => write!(
                 f,
@@ -472,6 +480,10 @@ pub fn learn_with(
     // After every step is known replayable, and last: the text of a secure field
     // or a redacted recording is taken out of the steps before they go anywhere.
     let parameters = parameterise(&mut steps, is_secret);
+    let taken = names(&steps).len();
+    if taken > MAX_PARAMS {
+        return Err(Refusal::TooManyParams(taken));
+    }
     Ok(Cleaned {
         steps,
         dropped,
@@ -891,6 +903,40 @@ mod tests {
         .unwrap();
         assert_eq!(cleaned.steps.len(), 1);
         assert_eq!(cleaned.skipped, ["mcp__remote_desktop__key"]);
+    }
+
+    /// click username, type "alice", Tab, type "hunter2", Enter.
+    #[test]
+    fn a_password_typed_after_tab_is_never_learned_as_text() {
+        let cleaned = learn(&[
+            sel_click("role=edit;name=Username"),
+            Call::ok("type_text", json!({"text": "alice", "in_window": IN})),
+            Call::ok("key", json!({"keys": ["Tab"], "in_window": IN})),
+            Call::ok("type_text", json!({"text": "hunter2", "in_window": IN})),
+            Call::ok("key", json!({"keys": ["Enter"], "in_window": IN})),
+        ])
+        .unwrap();
+        assert_eq!(cleaned.parameters.len(), 1);
+        assert_eq!(cleaned.steps[3].args["text"], "{{text}}");
+        assert_eq!(cleaned.steps[1].args["text"], "alice");
+        assert!(!format!("{cleaned:?}").contains("hunter2"));
+    }
+
+    #[test]
+    fn a_routine_that_would_take_too_many_parameters_is_refused() {
+        let mut calls = vec![sel_click("role=edit;name=Username")];
+        for i in 0..=MAX_PARAMS {
+            calls.push(Call::ok(
+                "type_text",
+                json!({"text": format!("{{{{mine{i}}}}}"), "in_window": IN}),
+            ));
+        }
+        let why = learn(&calls).unwrap_err();
+        assert_eq!(why, Refusal::TooManyParams(MAX_PARAMS + 1));
+        assert!(
+            why.to_string().contains("more than a routine may take"),
+            "{why}"
+        );
     }
 
     #[test]

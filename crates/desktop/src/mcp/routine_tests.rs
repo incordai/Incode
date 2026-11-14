@@ -15,6 +15,7 @@ use serde_json::{json, Value};
 use super::*;
 use crate::hooks::HookOutcome;
 use crate::permission::OBSERVING;
+use crate::routine::params::Values;
 use crate::routine::source::{Call, MemorySource, NoSource, Record, StepSource};
 use crate::routine::store::{Routines, Store};
 use crate::routine::{Routine, Step};
@@ -103,6 +104,8 @@ struct Recording {
     post: Post,
     /// Written to after the first `wait_for`, to stop the desktop mid-routine.
     stop_after_wait: Option<PathBuf>,
+    /// The arguments each pre-tool hook was shown, by tool.
+    inputs: Post,
 }
 
 impl Recording {
@@ -115,6 +118,7 @@ impl Recording {
                 pre: pre.clone(),
                 post: post.clone(),
                 stop_after_wait: None,
+                inputs: Arc::new(Mutex::new(Vec::new())),
             },
             pre,
             post,
@@ -123,7 +127,11 @@ impl Recording {
 }
 
 impl Hooks for Recording {
-    fn run_pre_tool_use(&self, tool_name: &str, _input: &str) -> HookOutcome {
+    fn run_pre_tool_use(&self, tool_name: &str, input: &str) -> HookOutcome {
+        self.inputs
+            .lock()
+            .unwrap()
+            .push((tool_name.to_string(), input.to_string()));
         self.pre.lock().unwrap().push(tool_name.to_string());
         if self.veto == Some(tool_name) {
             HookOutcome::deny(vec![format!("the operator does not allow {tool_name}")])
@@ -635,6 +643,10 @@ fn a_secret_typed_into_a_password_field_is_a_parameter_and_never_stored_or_journ
     let dir = folder("secret");
     let journal = dir.join("desktop.jsonl");
     let (hooks, pre, _post) = Recording::new(None);
+    let hook_inputs = hooks.inputs.clone();
+    // Where the person keeps the secret: incu's own environment.
+    std::env::set_var("INCU_PARAM_TEST_VAULT_PASSWORD", "hunter2-secret");
+    let reference = json!({"env": "INCU_PARAM_TEST_VAULT_PASSWORD"});
     let mut s = server(&dir)
         .with_journal(journal.clone())
         .with_hook_runner(Box::new(hooks));
@@ -673,25 +685,45 @@ fn a_secret_typed_into_a_password_field_is_a_parameter_and_never_stored_or_journ
     let wrong = call(
         &mut s,
         "routine_run",
-        json!({"phrase": "vault unlock", "params": {"pasword": "x"}}),
+        json!({"phrase": "vault unlock", "params": {"pasword": reference}}),
     );
     assert!(
         refused(&wrong) && said(&wrong).contains("takes: password"),
         "{wrong}"
     );
-    assert_eq!(
-        *pre.lock().unwrap(),
-        ["routine_save", "routine_list", "routine_run", "routine_run"],
-        "not even the first step was tried"
-    );
-
-    // Given, it is accepted and the run starts: it goes as far as it can on the
-    // test desktop (the first step passes, the second finds no such window) and
-    // whatever it says, the value is nowhere.
-    let ran = call(
+    // The secret itself is refused: it would be in the caller's transcript.
+    let literal = call(
         &mut s,
         "routine_run",
         json!({"phrase": "vault unlock", "params": {"password": "hunter2-secret"}}),
+    );
+    assert!(refused(&literal), "{literal}");
+    assert!(said(&literal).contains("REFERENCE"), "{}", said(&literal));
+    assert!(
+        said(&literal).contains("INCU_PARAM_PASSWORD"),
+        "{}",
+        said(&literal)
+    );
+    assert!(!said(&literal).contains("hunter2"), "{}", said(&literal));
+    assert_eq!(
+        *pre.lock().unwrap(),
+        [
+            "routine_save",
+            "routine_list",
+            "routine_run",
+            "routine_run",
+            "routine_run"
+        ],
+        "not even the first step was tried"
+    );
+
+    // Given a reference, it is accepted and the run starts: it goes as far as it
+    // can on the test desktop (the first step passes, the second finds no such
+    // window) and whatever it says, the value is nowhere.
+    let ran = call(
+        &mut s,
+        "routine_run",
+        json!({"phrase": "vault unlock", "params": {"password": reference}}),
     );
     assert!(refused(&ran), "{ran}");
     assert!(
@@ -700,6 +732,33 @@ fn a_secret_typed_into_a_password_field_is_a_parameter_and_never_stored_or_journ
         said(&ran)
     );
     assert!(!said(&ran).contains("hunter2"), "{}", said(&ran));
+    // The hooks were shown the call with every param value hidden, and no hook
+    // was shown the secret.
+    let shown = hook_inputs.lock().unwrap().clone();
+    let run_inputs: Vec<&String> = shown
+        .iter()
+        .filter(|(tool, _)| tool == "routine_run")
+        .map(|(_, input)| input)
+        .collect();
+    assert!(run_inputs.len() >= 3);
+    for input in &run_inputs {
+        assert!(!input.contains("hunter2"), "{input}");
+        assert!(!input.contains("INCU_PARAM_TEST"), "{input}");
+    }
+    assert!(
+        run_inputs
+            .last()
+            .unwrap()
+            .contains("\"password\":\"<param>\""),
+        "{}",
+        run_inputs.last().unwrap()
+    );
+    // No call of the replay (the steps) was shown it either. (What the agent
+    // wrote into `routine_save` itself is its own, and in its own transcript.)
+    assert!(shown
+        .iter()
+        .filter(|(tool, _)| tool != "routine_save")
+        .all(|(_, input)| !input.contains("hunter2")));
     let lines = std::fs::read_to_string(&journal).unwrap();
     assert!(!lines.contains("hunter2"), "{lines}");
     let file = std::fs::read_to_string(dir.join("routines.json")).unwrap();
@@ -904,40 +963,46 @@ fn a_replay_leaves_a_folder_of_pictures_and_only_the_last_runs() {
         "check the windows",
         vec![step(gone()), step(gone())],
     ));
-    // Left by an earlier run: must be cleared.
-    let shots = dir.join("last-replay");
-    std::fs::create_dir_all(&shots).unwrap();
-    std::fs::write(shots.join("step-099-after.jpg"), "old").unwrap();
-    std::fs::write(shots.join("keep-me.txt"), "mine").unwrap();
+    // Left by earlier runs: a finished run's folder and a loose picture of an
+    // older layout must be cleared; a file that is not ours must not.
+    let root = dir.join("last-replay");
+    let old_run = root.join("run-000000000000001-1-0");
+    std::fs::create_dir_all(&old_run).unwrap();
+    std::fs::write(old_run.join("step-001-after.jpg"), "old").unwrap();
+    std::fs::write(root.join("step-099-after.jpg"), "older").unwrap();
+    std::fs::write(root.join("keep-me.txt"), "mine").unwrap();
     let ran = answer(&call(
         &mut s,
         "routine_run",
         json!({"phrase": "windows check"}),
     ));
-    assert_eq!(
-        ran["pictures"]["folder"],
-        shots.display().to_string(),
-        "{ran}"
-    );
+    // This run's own folder, under the root.
+    let mine = PathBuf::from(ran["pictures"]["folder"].as_str().unwrap());
+    assert_eq!(mine.parent().unwrap(), root, "{ran}");
+    assert!(mine
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .starts_with("run-"));
+    assert!(!old_run.exists(), "a finished run's pictures remain");
+    assert!(!root.join("step-099-after.jpg").exists());
     assert!(
-        !shots.join("step-099-after.jpg").exists(),
-        "the last run's pictures remain"
-    );
-    assert!(
-        shots.join("keep-me.txt").exists(),
+        root.join("keep-me.txt").exists(),
         "a file that is not ours was deleted"
     );
-    // Whether the screen could be captured here or not, the run says which.
     // One before and one after each of the two steps, and no more.
     assert_eq!(ran["pictures"]["kept"], 4, "{ran}");
-    let mut named: Vec<String> = std::fs::read_dir(&shots)
-        .unwrap()
-        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
-        .filter(|n| n.starts_with("step-"))
-        .collect();
-    named.sort();
+    let named = |dir: &Path| {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with("step-"))
+            .collect();
+        names.sort();
+        names
+    };
     assert_eq!(
-        named,
+        named(&mine),
         [
             "step-001-after.jpg",
             "step-001-before.jpg",
@@ -945,25 +1010,16 @@ fn a_replay_leaves_a_folder_of_pictures_and_only_the_last_runs() {
             "step-002-before.jpg"
         ]
     );
-    // A second run starts again: only it is kept.
-    answer(&call(
+    // A second run starts again, in a folder of its own: only it is kept.
+    let again = answer(&call(
         &mut s,
         "routine_run",
         json!({"phrase": "windows check"}),
     ));
-    assert_eq!(
-        std::fs::read_dir(&shots)
-            .unwrap()
-            .filter(|e| {
-                e.as_ref()
-                    .unwrap()
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with("step-")
-            })
-            .count(),
-        4
-    );
+    let second = PathBuf::from(again["pictures"]["folder"].as_str().unwrap());
+    assert_ne!(second, mine);
+    assert!(!mine.exists(), "the first run's folder was kept");
+    assert_eq!(named(&second).len(), 4);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1003,18 +1059,20 @@ fn a_failed_replay_names_the_pictures_of_the_failed_step() {
     let reply = call(&mut s, "routine_run", json!({"phrase": "three waits"}));
     assert!(refused(&reply), "{reply}");
     let said = said(&reply);
-    let shots = dir.join("last-replay");
-    // The failed step's two pictures are named, by full path, and exist.
-    let (before, after) = (
-        shots.join("step-002-before.jpg"),
-        shots.join("step-002-after.jpg"),
-    );
+    // The failed step's two pictures are named, by full path, in this run's own
+    // folder, and exist.
     assert!(said.contains("Pictures of step 2"), "{said}");
-    assert!(said.contains(&before.display().to_string()), "{said}");
+    let start = said.find("before: ").expect("the before picture") + "before: ".len();
+    let end = said[start..].find(".jpg").unwrap() + start + ".jpg".len();
+    let before = PathBuf::from(&said[start..end]);
+    let run = before.parent().unwrap().to_path_buf();
+    assert_eq!(run.parent().unwrap(), dir.join("last-replay"), "{said}");
+    assert!(before.ends_with("step-002-before.jpg"), "{before:?}");
+    let after = run.join("step-002-after.jpg");
     assert!(said.contains(&after.display().to_string()), "{said}");
     assert!(before.exists() && after.exists());
     assert!(
-        !shots.join("step-003-before.jpg").exists(),
+        !run.join("step-003-before.jpg").exists(),
         "step 3 never ran"
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -1132,6 +1190,299 @@ fn a_watch_ends_when_the_client_goes_away_instead_of_running_for_a_day() {
     // It answered (refused: stopped) before returning, and did not hang.
     let reply = String::from_utf8(out).unwrap();
     assert!(reply.contains("\"isError\":true"), "{reply}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The client has sent three requests and closed its end: it is still waiting
+/// for three answers, so a watch among them is NOT cut short by the EOF.
+#[test]
+fn a_watch_is_not_cut_short_by_an_end_of_input_that_has_lines_still_to_answer() {
+    let dir = folder("eof-pipelined");
+    let (to_server, from_client) = std::sync::mpsc::channel::<Vec<u8>>();
+    let watch = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "watch", "arguments": {
+            "condition": "window_appears", "selector": NO_SUCH_WINDOW,
+            "timeout_ms": 600, "poll_ms": 250
+        }}
+    });
+    to_server.send(format!("{watch}\n").into_bytes()).unwrap();
+    to_server
+        .send(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n".to_vec())
+        .unwrap();
+    drop(to_server);
+    let mut out = Vec::new();
+    super::transport::run_lines(server(&dir), Wire(from_client, Vec::new()), &mut out).unwrap();
+    let replies: Vec<Value> = String::from_utf8(out)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(replies.len(), 2, "{replies:?}");
+    // The watch ran its whole 600 ms and answered: not "stopped".
+    assert_eq!(replies[0]["result"]["isError"], false, "{}", replies[0]);
+    assert!(
+        replies[0]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("\"result\": \"timeout\""),
+        "{}",
+        replies[0]
+    );
+    assert_eq!(replies[1]["id"], 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// "Gone" is end of input AND nothing the client sent left to be answered.
+#[test]
+fn the_client_is_gone_only_at_the_end_of_input_with_every_line_taken_up() {
+    let link = ClientLink::default();
+    assert!(!link.gone(), "nothing has happened");
+    link.line_read();
+    link.line_read();
+    assert!(!link.gone());
+    link.input_ended();
+    assert!(!link.gone(), "two lines are still to be answered");
+    link.line_taken();
+    assert!(!link.gone(), "one is");
+    link.line_taken();
+    assert!(link.gone(), "the end of input, and nothing left to answer");
+    // No end of input: never gone, however many are taken.
+    let open = ClientLink::default();
+    open.line_read();
+    open.line_taken();
+    assert!(!open.gone());
+}
+
+/// A replay does not go on for a client that has gone away.
+#[test]
+fn a_replay_stops_between_steps_when_the_client_has_gone() {
+    let dir = folder("client-gone");
+    let (hooks, pre, _post) = Recording::new(None);
+    let link = std::sync::Arc::new(ClientLink::default());
+    let mut s = server(&dir)
+        .with_hook_runner(Box::new(hooks))
+        .with_client_link(link.clone());
+    answer(&save_steps(
+        &mut s,
+        "three waits",
+        vec![step(gone()), step(gone()), step(gone())],
+    ));
+    // The client is there: the routine runs.
+    answer(&call(
+        &mut s,
+        "routine_run",
+        json!({"phrase": "three waits"}),
+    ));
+    pre.lock().unwrap().clear();
+    // Gone before it starts: not one step is run.
+    link.input_ended();
+    let reply = call(&mut s, "routine_run", json!({"phrase": "three waits"}));
+    assert!(refused(&reply), "{reply}");
+    assert!(
+        said(&reply).contains("client went away"),
+        "{}",
+        said(&reply)
+    );
+    assert!(
+        said(&reply).contains("failed at step 1 of 3"),
+        "{}",
+        said(&reply)
+    );
+    assert_eq!(*pre.lock().unwrap(), ["routine_run"], "a step was run");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A picture is a `screenshot`: a hook that refuses it refuses the picture.
+#[test]
+fn a_hook_that_refuses_screenshot_refuses_the_replays_pictures_and_they_are_asked_of_it() {
+    let dir = folder("screenshot-veto");
+    let (hooks, pre, _post) = Recording::new(Some("screenshot"));
+    // No `with_shooter`: the real path, through the gates.
+    let mut s = Server::new(InputThread::start().expect("input thread"))
+        .with_routines(RoutineKit::new(
+            Store::at(dir.join("routines.json")),
+            Box::new(NoSource),
+        ))
+        .with_journal(dir.join("desktop.jsonl"))
+        .with_hook_runner(Box::new(hooks));
+    answer(&save_steps(&mut s, "check the window", vec![step(gone())]));
+    let ran = answer(&call(
+        &mut s,
+        "routine_run",
+        json!({"phrase": "check the window"}),
+    ));
+    // The routine ran; the pictures were asked of the hook and refused.
+    assert_eq!(ran["steps_run"], 1, "{ran}");
+    assert_eq!(ran["pictures"]["kept"], 0, "{ran}");
+    let trouble = ran["pictures"]["trouble"].as_str().unwrap();
+    assert!(trouble.contains("does not allow screenshot"), "{trouble}");
+    let asked: Vec<String> = pre.lock().unwrap().clone();
+    assert!(
+        asked.iter().filter(|t| *t == "screenshot").count() >= 2,
+        "a picture before and after were not asked of the gate: {asked:?}"
+    );
+    // And the journal has them: not a side door.
+    let lines = std::fs::read_to_string(dir.join("desktop.jsonl")).unwrap();
+    assert!(
+        lines.contains("screenshot: refused by a hook"),
+        "the refused pictures are not in the journal: {lines}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// No picture after a step that typed a secret, nor before the one after it.
+#[test]
+fn no_picture_is_taken_after_a_step_that_typed_a_secret_or_before_the_next() {
+    use super::routine_tool::Live;
+    use crate::routine::params::Target;
+    use crate::routine::pictures::When;
+    use crate::routine::replay::Runner;
+    let dir = folder("secret-pictures");
+    let taken: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let log = taken.clone();
+    let kit = RoutineKit::new(Store::at(dir.join("routines.json")), Box::new(NoSource))
+        .with_shooter(Box::new(move |step| {
+            log.lock().unwrap().push(step.args.to_string());
+            Ok(b"a picture".to_vec())
+        }));
+    let mut s = Server::new(InputThread::start().expect("input thread")).with_routines(kit);
+    let wait = Step::new("wait_for", gone());
+    let secret = Step::new(
+        "type_text",
+        json!({"text": "{{password}}", "in_window": TYPING_WINDOW}),
+    );
+    let mut live = Live::new(&mut s, Values::default());
+    // wait (1), the secret (2), a wait (3), and a wait again (4).
+    for (n, step) in [(1, &wait), (2, &secret), (3, &wait), (4, &wait)] {
+        live.look(n, step, When::Before);
+        live.look(n, step, When::After);
+    }
+    let note = live.pictures_note();
+    // Taken: 1 before, 1 after, 2 before, 3 after, 4 before, 4 after.
+    assert_eq!(note["kept"], 6, "{note}");
+    let skipped: Vec<&str> = note["skipped"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(skipped.len(), 2, "{skipped:?}");
+    assert!(
+        skipped[0].starts_with("step 2: no picture after"),
+        "{skipped:?}"
+    );
+    assert!(
+        skipped[1].starts_with("step 3: no picture before"),
+        "{skipped:?}"
+    );
+    assert!(skipped[0].contains("secret") && skipped[1].contains("secret"));
+    assert_eq!(taken.lock().unwrap().len(), 6);
+
+    // Plain text into a field whose NAME says secret is a secret too, and so is
+    // text typed where focus may have moved.
+    let plain = Step::new(
+        "type_text",
+        json!({"text": "words", "in_window": TYPING_WINDOW}),
+    );
+    for target in [
+        Target::Known("app=login;window=Sign in;role=edit;name=Password".to_string()),
+        Target::Unknown,
+    ] {
+        let mut s = Server::new(InputThread::start().expect("input thread")).with_routines(
+            RoutineKit::new(Store::at(dir.join("other.json")), Box::new(NoSource))
+                .with_shooter(Box::new(|_| Ok(b"x".to_vec()))),
+        );
+        let mut live = Live::new(&mut s, Values::default());
+        live.before_target = target.clone();
+        assert_eq!(live.look(1, &plain, When::After), None, "{target:?}");
+        assert_eq!(live.pictures_note()["skipped"].as_array().unwrap().len(), 1);
+    }
+    // A plain field is photographed.
+    let mut s = Server::new(InputThread::start().expect("input thread")).with_routines(
+        RoutineKit::new(Store::at(dir.join("third.json")), Box::new(NoSource))
+            .with_shooter(Box::new(|_| Ok(b"x".to_vec()))),
+    );
+    let mut live = Live::new(&mut s, Values::default());
+    live.before_target =
+        Target::Known("app=login;window=Sign in;role=edit;name=Username".to_string());
+    assert!(live.look(1, &plain, When::After).is_some());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// What a hook is shown of a step that has a parameter is the `{{name}}`, never
+/// what the name stands for; and of `routine_run`, every `params` value hidden.
+#[test]
+fn the_hooks_are_not_shown_a_parameters_value_or_a_params_entry() {
+    use super::routine_tool::{hidden_params, hook_view};
+    let stored = Step::new(
+        "type_text",
+        json!({"text": "{{password}}", "in_window": "x"}),
+    );
+    let real = json!({"text": "hunter2-secret", "window": "w1"});
+    let seen = hidden_params(&real, &stored);
+    assert_eq!(seen, json!({"text": "{{password}}", "window": "w1"}));
+    // A step with none is shown as it is.
+    let plain = Step::new("type_text", json!({"text": "hello", "in_window": "x"}));
+    assert_eq!(
+        hidden_params(&json!({"text": "hello", "window": "w1"}), &plain),
+        json!({"text": "hello", "window": "w1"})
+    );
+    let run = json!({"phrase": "unlock the vault", "params": {
+        "password": {"env": "INCU_PARAM_PASSWORD"}, "pin": "1234"
+    }});
+    assert_eq!(
+        hook_view("routine_run", &run),
+        json!({"phrase": "unlock the vault", "params": {"password": "<param>", "pin": "<param>"}})
+    );
+    assert_eq!(
+        hook_view("routine_run", &json!({"phrase": "x", "params": "hunter2"})),
+        json!({"phrase": "x", "params": "<param>"})
+    );
+    // Other tools, and a routine_run with no params, are as they were.
+    assert_eq!(hook_view("type_text", &real), real);
+    assert_eq!(
+        hook_view("routine_run", &json!({"phrase": "x"})),
+        json!({"phrase": "x"})
+    );
+}
+
+/// The person's "kept" is for what they read: other steps saved over it are not
+/// kept, and the reply says so.
+#[test]
+fn saving_other_steps_over_a_kept_routine_un_keeps_it_and_says_so() {
+    let dir = folder("unkept");
+    let mut s = server(&dir);
+    answer(&save_steps(&mut s, "check the window", vec![step(gone())]));
+    // The person keeps it, at a terminal.
+    let store = Store::at(dir.join("routines.json"));
+    store
+        .update(|file| {
+            assert!(file.set_taught("check the window", true, crate::routine::now_ms()));
+            Ok(())
+        })
+        .unwrap();
+    // The same steps: still kept, nothing to say.
+    let same = answer(&save_steps(&mut s, "check the window", vec![step(gone())]));
+    assert_eq!(same["taught"], true, "{same}");
+    assert!(same.get("kept_flag_dropped").is_none());
+    // Other steps: not kept, and told.
+    let other = answer(&save_steps(
+        &mut s,
+        "check the window",
+        vec![step(gone()), step(never_appears())],
+    ));
+    assert_eq!(other["taught"], false, "{other}");
+    assert!(
+        other["kept_flag_dropped"]
+            .as_str()
+            .unwrap()
+            .contains("incu routine keep"),
+        "{other}"
+    );
+    let listed = answer(&call(&mut s, "routine_list", json!({})));
+    assert_eq!(listed["routines"][0]["taught"], false);
+    assert_eq!(listed["routines"][0]["expires_in_days"], 30);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

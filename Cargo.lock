@@ -2055,6 +2055,7 @@ dependencies = [
  "chrono",
  "clipboard-win",
  "enigo",
+ "fd-lock",
  "image",
  "libc",
  "regex",

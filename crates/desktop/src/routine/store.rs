@@ -40,16 +40,19 @@
 //!
 //! # Two servers, one file
 //!
-//! A change is load, change, save. [`Store::update`] holds a lock file beside the
-//! routines file across all three, so two servers (or `incu routine keep`) that
-//! change it at once each keep the other's change instead of the later save
-//! writing over the earlier.
+//! A change is load, change, save. [`Store::update`] holds an exclusive OS lock
+//! ([`super::oslock`], on a lock file beside the routines file) across all three,
+//! so two servers (or
+//! `incu routine keep`) that change it at once each keep the other's change
+//! instead of the later save writing over the earlier. The OS releases the lock
+//! when its holder exits or crashes, so there is no stale lock to take over.
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use super::oslock::OsLock;
 use super::words::{key, word_set};
 use super::{day_of, Routine, Step, MAX_ROUTINES, MAX_ROUTINE_BYTES};
 
@@ -60,10 +63,6 @@ pub const ROUTINES_ENV: &str = "INCU_ROUTINES";
 /// The most of a routines file that is read or written, in bytes. A file over
 /// this was not written by this crate.
 pub const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
-
-/// How long a lock file may stand before it is taken to be left by a process
-/// that died. A change holds it for milliseconds.
-const STALE_LOCK: Duration = Duration::from_secs(30);
 
 /// How long a change waits for another's lock before giving up.
 const LOCK_WAIT: Duration = Duration::from_secs(10);
@@ -91,8 +90,12 @@ impl Default for Routines {
 pub struct Saved {
     /// A routine with the same request was there and was replaced.
     pub replaced: bool,
-    /// The replaced routine had been taught by name, and the new one keeps that.
+    /// The saved routine is kept by the person (it never expires).
     pub taught: bool,
+    /// The replaced routine HAD been kept and the new one, with other steps, is
+    /// not: what the person reviewed and kept is not what is saved now, so it
+    /// has to be reviewed and kept again.
+    pub unkept: bool,
 }
 
 impl Routines {
@@ -144,8 +147,12 @@ impl Routines {
 
     /// Learn `steps` under `phrase`, replacing the routine that asks the same.
     ///
-    /// A redo after a failed replay replaces the old routine and keeps it
-    /// taught if it was (Atticus keeps what the user taught it as).
+    /// A redo after a failed replay replaces the old routine. **It does not
+    /// keep the person's "kept" flag unless the steps are the same ones**: the
+    /// person kept what they had read, and a replacement with other steps is
+    /// something nobody has read. It is un-kept and `Saved::unkept` says so; only
+    /// `incu routine keep` sets the flag again. (`taught` is for the person's own
+    /// code and tests: no tool passes it.)
     ///
     /// # Errors
     ///
@@ -161,6 +168,8 @@ impl Routines {
         let wanted = key(phrase);
         let at = self.routines.iter().position(|r| key(&r.phrase) == wanted);
         let was_taught = at.is_some_and(|i| self.routines[i].taught);
+        let same_steps = at.is_some_and(|i| self.routines[i].steps == steps);
+        let keeps = was_taught && same_steps;
         if at.is_none() && self.routines.len() >= MAX_ROUTINES {
             return Err(format!(
                 "the routines file holds {MAX_ROUTINES} routines already; routine_forget \
@@ -172,7 +181,7 @@ impl Routines {
             steps,
             date: day_of(now_ms),
             last_used_ms: now_ms,
-            taught: taught || was_taught,
+            taught: taught || keeps,
         };
         let size = routine.size_bytes();
         if size > MAX_ROUTINE_BYTES {
@@ -189,6 +198,7 @@ impl Routines {
         Ok(Saved {
             replaced: at.is_some(),
             taught,
+            unkept: was_taught && !taught,
         })
     }
 
@@ -273,60 +283,40 @@ impl Store {
         self.path.with_file_name(name)
     }
 
-    /// Take the lock: an exclusive create of the lock file, retried until
-    /// [`LOCK_WAIT`], a file older than [`STALE_LOCK`] taken to be left by a
-    /// process that died and removed.
+    /// Take the lock: an exclusive OS lock on the lock file, waited for up to
+    /// [`LOCK_WAIT`].
+    ///
+    /// **An OS lock and not the existence of a file**, because a file that
+    /// exists says nothing about whether its maker is alive: the old scheme had
+    /// to guess at a dead holder by the age of its file, and a holder merely
+    /// slower than the guess was robbed, letting two writers in. The OS holds
+    /// this lock for exactly as long as the holder's handle is open, and releases
+    /// it the instant the holder exits or dies, so there is nothing to take over
+    /// and no clock to read. The file itself is never deleted (deleting it would
+    /// let two processes lock two different files of one name).
     fn lock(&self) -> Result<Lock, String> {
         let path = self.lock_path();
         if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(dir)
                 .map_err(|e| format!("cannot make the folder for {}: {e}", path.display()))?;
         }
-        let started = Instant::now();
-        loop {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(mut file) => {
-                    use std::io::Write;
-                    let _ = write!(file, "{}", std::process::id());
-                    return Ok(Lock { path });
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if lock_is_stale(&path) {
-                        // Another waiter may remove it first; that is as good.
-                        let _ = std::fs::remove_file(&path);
-                        continue;
-                    }
-                    if started.elapsed() >= LOCK_WAIT {
-                        return Err(format!(
-                            "another change to the routines is in progress ({} is held); \
-                             try again in a moment",
-                            path.display()
-                        ));
-                    }
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                // Windows answers "access denied" to an exclusive create of a
-                // file another process is deleting at that moment (its release):
-                // a lock being let go of, which is waited for like a held one.
-                Err(e)
-                    if cfg!(windows)
-                        && e.kind() == std::io::ErrorKind::PermissionDenied
-                        && started.elapsed() < LOCK_WAIT =>
-                {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(e) => {
-                    return Err(format!(
-                        "cannot lock the routines ({}): {e}",
-                        path.display()
-                    ));
-                }
-            }
-        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|e| format!("cannot open the lock {}: {e}", path.display()))?;
+        let mut held = OsLock::new(file);
+        held.acquire_within(LOCK_WAIT).map_err(|e| match e {
+            None => format!(
+                "another change to the routines is in progress ({} is held); try again in a \
+                 moment",
+                path.display()
+            ),
+            Some(e) => format!("cannot lock the routines ({}): {e}", path.display()),
+        })?;
+        Ok(Lock { _held: held })
     }
 
     /// The default path: `$INCU_ROUTINES`, else the per-user data folder.
@@ -423,25 +413,10 @@ impl Store {
     }
 }
 
-/// The lock, held until it is dropped.
+/// The lock, held until it is dropped (its file closes, and the OS lets go), or
+/// the process ends, which the OS counts the same.
 struct Lock {
-    path: PathBuf,
-}
-
-impl Drop for Lock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-/// Whether the lock file at `path` has stood longer than [`STALE_LOCK`]. A file
-/// whose age cannot be read is not stale: waiting is the safe way to be wrong.
-fn lock_is_stale(path: &Path) -> bool {
-    std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| SystemTime::now().duration_since(t).ok())
-        .is_some_and(|age| age > STALE_LOCK)
+    _held: OsLock,
 }
 
 /// Write and flush a new file readable by its owner only (on Unix).
@@ -485,6 +460,7 @@ mod tests {
     use super::*;
     use crate::routine::DAY_MS;
     use serde_json::json;
+    use std::time::Instant;
 
     fn steps() -> Vec<Step> {
         vec![Step::new("key", json!({"keys": ["ctrl", "n"]}))]
@@ -498,18 +474,30 @@ mod tests {
     }
 
     #[test]
-    fn learning_a_phrase_twice_replaces_the_routine_and_keeps_it_taught() {
+    fn learning_a_phrase_twice_replaces_the_routine_and_only_the_same_steps_stay_kept() {
         let mut file = Routines::default();
         let first = file.learn("open notes", steps(), true, 1_000).unwrap();
         assert_eq!(
             first,
             Saved {
                 replaced: false,
-                taught: true
+                taught: true,
+                unkept: false
+            }
+        );
+        // The same steps again (nothing the person has not read): still kept.
+        let again = file.learn("Notes, open", steps(), false, 1_500).unwrap();
+        assert_eq!(
+            again,
+            Saved {
+                replaced: true,
+                taught: true,
+                unkept: false
             }
         );
         let newer = vec![Step::new("key", json!({"keys": ["ctrl", "t"]}))];
-        // The same words in another order are the same request.
+        // The same words in another order are the same request. Other steps are
+        // not what the person kept: the replacement is not kept, and says so.
         let second = file
             .learn("Notes, open", newer.clone(), false, 2_000)
             .unwrap();
@@ -517,12 +505,16 @@ mod tests {
             second,
             Saved {
                 replaced: true,
-                taught: true
+                taught: false,
+                unkept: true
             }
         );
         assert_eq!(file.routines.len(), 1);
         assert_eq!(file.routines[0].steps, newer);
+        assert!(!file.routines[0].taught);
         assert_eq!(file.routines[0].last_used_ms, 2_000);
+        // And it expires like any other now.
+        assert!(file.matching("open notes", 40 * DAY_MS).is_none());
     }
 
     #[test]
@@ -763,10 +755,45 @@ mod tests {
         }
         let kept = Store::at(path).load().unwrap().routines.len();
         assert_eq!(kept, 40, "a save overwrote another's routine");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two writers can never be in the change at the same time, however slow
+    /// the first is: a holder is never taken to be dead because it is slow.
+    #[test]
+    fn a_slow_holder_is_waited_for_and_never_robbed() {
+        let dir = folder("slow-holder");
+        let path = dir.join("routines.json");
+        let inside = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let overlapped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let workers: Vec<_> = (0..4)
+            .map(|w| {
+                let (path, inside, overlapped) = (path.clone(), inside.clone(), overlapped.clone());
+                std::thread::spawn(move || {
+                    Store::at(path)
+                        .update(|file| {
+                            use std::sync::atomic::Ordering::SeqCst;
+                            if inside.fetch_add(1, SeqCst) != 0 {
+                                overlapped.store(true, SeqCst);
+                            }
+                            // Slow, and in the middle of the change.
+                            std::thread::sleep(Duration::from_millis(150));
+                            let kept = file.learn(&format!("task w{w}"), steps(), false, 0);
+                            inside.fetch_sub(1, SeqCst);
+                            kept.map(|_| ())
+                        })
+                        .unwrap();
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
         assert!(
-            !dir.join("routines.json.lock").exists(),
-            "the lock was left behind"
+            !overlapped.load(std::sync::atomic::Ordering::SeqCst),
+            "two writers were inside a change at once"
         );
+        assert_eq!(Store::at(path).load().unwrap().routines.len(), 4);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -779,42 +806,77 @@ mod tests {
             .unwrap_err();
         assert_eq!(why, "no such routine");
         assert!(!dir.join("routines.json").exists());
-        assert!(!dir.join("routines.json.lock").exists());
+        // The lock is free again: another change goes straight in.
+        store
+            .update(|file| file.learn("open notes", steps(), false, 0).map(|_| ()))
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The lock a holder left when it crashed is released by the OS with its
+    /// handle: no file is "stale", nothing is taken over, nothing is waited for.
+    #[test]
+    fn a_holder_that_crashed_without_unlocking_frees_the_lock_at_once() {
+        let dir = folder("crashed-holder");
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::at(dir.join("routines.json"));
+        let lock = dir.join("routines.json.lock");
+        let mut holder = OsLock::new(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&lock)
+                .unwrap(),
+        );
+        assert!(holder.try_acquire().unwrap());
+        // The holder "crashes": its handle goes, with no unlock. Nothing about
+        // the file says it is dead; the OS drops the lock with the handle.
+        drop(holder);
+        let started = Instant::now();
+        store
+            .update(|file| file.learn("open notes", steps(), false, 0).map(|_| ()))
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "waited {:?} for a lock nobody holds",
+            started.elapsed()
+        );
+        assert_eq!(store.load().unwrap().routines.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn a_lock_left_by_a_process_that_died_is_taken_over_and_a_live_one_is_waited_for() {
-        let dir = folder("stale-lock");
+    fn a_lock_held_by_another_handle_is_waited_for_until_it_is_let_go() {
+        let dir = folder("held-lock");
+        std::fs::create_dir_all(&dir).unwrap();
         let store = Store::at(dir.join("routines.json"));
-        let lock = dir.join("routines.json.lock");
-        // Left long ago: taken over.
-        std::fs::write(&lock, "4242").unwrap();
-        let old = SystemTime::now() - Duration::from_secs(120);
-        std::fs::File::options()
-            .write(true)
-            .open(&lock)
-            .unwrap()
-            .set_modified(old)
-            .unwrap();
-        store
-            .update(|file| file.learn("open notes", steps(), false, 0).map(|_| ()))
-            .unwrap();
-        assert_eq!(store.load().unwrap().routines.len(), 1);
-        // Held just now: not taken over (it is released here after a moment).
-        std::fs::write(&lock, "4243").unwrap();
-        let release = lock.clone();
+        let mut holder = OsLock::new(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(dir.join("routines.json.lock"))
+                .unwrap(),
+        );
+        assert!(holder.try_acquire().unwrap());
         let releaser = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(300));
-            std::fs::remove_file(release).unwrap();
+            std::thread::sleep(Duration::from_millis(400));
+            drop(holder);
         });
         let started = Instant::now();
         store
             .update(|file| file.learn("open mail", steps(), false, 0).map(|_| ()))
             .unwrap();
-        assert!(started.elapsed() >= Duration::from_millis(250));
+        assert!(
+            started.elapsed() >= Duration::from_millis(300),
+            "went in while it was held: {:?}",
+            started.elapsed()
+        );
         releaser.join().unwrap();
-        assert_eq!(store.load().unwrap().routines.len(), 2);
+        assert_eq!(store.load().unwrap().routines.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -48,6 +48,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub mod learn;
+pub mod oslock;
 pub mod params;
 pub mod pictures;
 pub mod replay;

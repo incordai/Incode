@@ -152,11 +152,13 @@ fn routine_save_definition() -> Value {
              person can read it, EXCEPT text typed into a password or other secure \
              field, and text a recording kept only as a placeholder or a digest: those \
              steps are stored as a parameter, `{{{{name}}}}`, listed in the reply, and \
-             `routine_run` must be given every one as `params` or it refuses before \
-             step 1. You may write `{{{{name}}}}` in a typed text yourself to make \
-             one. A routine unused for 30 days is forgotten; only the person can \
-             keep one for good (`incu routine keep`), so there is no argument for it. \
-             {UNTRUSTED}"
+             `routine_run` must be given a reference for every one as `params` or it \
+             refuses before step 1. So are texts typed where focus may have moved (after \
+             Tab, Enter or an arrow), which could be a password field. You may write \
+             `{{{{name}}}}` in a typed text yourself to make one. A routine unused for 30 \
+             days is forgotten; only the person can keep one for good (`incu routine \
+             keep`), so there is no argument for it, and saving other steps over a kept \
+             routine un-keeps it. {UNTRUSTED}"
         ),
         "inputSchema": {
             "type": "object",
@@ -203,11 +205,16 @@ fn routine_run_definition() -> Value {
              yourself, from the screen as it is, and routine_save it under the same \
              phrase to replace the routine (or routine_forget it). A picture of the \
              window each step is for (else the screen) is taken before and after the \
-             step, kept for the last run only, and the paths of the failed step's two \
-             pictures are in the failure. A routine whose list shows `params_needed` \
-             needs every one of them in `params` (secrets it does not keep): without \
-             them it refuses before step 1. A value is used in memory for that run \
-             only. The routine moves the mouse and keyboard of the machine the \
+             step through the same gates as `screenshot` (a hook that refuses \
+             `screenshot` refuses them), kept for the last run only, and the paths of the \
+             failed step's two pictures are in the failure; none is taken after a step \
+             that typed a secret or before the next. A routine whose list shows \
+             `params_needed` needs every one of them in `params` (secrets it does not \
+             keep): without them it refuses before step 1. `params` take REFERENCES, never \
+             the value (your transcript would keep it): {{\"password\": {{\"env\": \
+             \"INCU_PARAM_PASSWORD\"}}}}, naming a variable the person set in incu's own \
+             environment; a literal value is refused. The value is used in memory for that \
+             run only. The routine moves the mouse and keyboard of the machine the \
              operator is using. {UNTRUSTED}"
         ),
         "inputSchema": {
@@ -216,10 +223,18 @@ fn routine_run_definition() -> Value {
                 "phrase": phrase_property("The words that ask for the routine."),
                 "params": {
                     "type": "object",
-                    "additionalProperties": {"type": "string"},
-                    "description": "Values for the routine's parameters, by name, e.g. \
-                                    {\"password\": \"...\"}: every name in the routine's \
-                                    `params_needed` and no other.",
+                    "additionalProperties": {
+                        "type": "object",
+                        "properties": {"env": {"type": "string"}},
+                        "required": ["env"],
+                    },
+                    "description": "A REFERENCE for each of the routine's parameters, by \
+                                    name: {\"password\": {\"env\": \"INCU_PARAM_PASSWORD\"}}, \
+                                    the variable (INCU_PARAM_...) the person set in the \
+                                    environment of the incu process. Never the value \
+                                    itself (refused). Every name in the routine's \
+                                    `params_needed` and no other. (A keyring reference is \
+                                    not available in this build.)",
                 },
             },
             "required": ["phrase"],

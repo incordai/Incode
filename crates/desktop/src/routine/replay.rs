@@ -197,33 +197,37 @@ pub fn replay(routine: &Routine, runner: &mut dyn Runner) -> Result<Report, Box<
     Ok(Report { ran })
 }
 
-/// The steps whose "unverified" is a reason to stop: the ones that SET A VALUE,
-/// where "unverified" means the value may not have taken (`set_value`, and the
-/// `element_action`s that set one, [`sets_a_value`]).
+/// The steps whose "unverified" is a reason to stop: `set_value`, and every
+/// `element_action` that changes a state it can read back (`toggle`, `select`,
+/// `expand`, `collapse`, `increment`, `decrement`, `focus`...), where
+/// "unverified" means the state did not change as asked: a checkbox that did not
+/// toggle, then Submit, submits the wrong form. That holds on every platform.
 ///
-/// NOT a click, an `invoke`, a `press` or a `scroll_into_view`: those always
-/// answer "unverified" (live, on Windows, every one of them), because a button
-/// press has no state to read back. Stopping on it would stop every routine that
-/// presses a button; the next step's own selector, or a `wait_for`, is what
-/// checks one.
+/// NOT a click, and not the `element_action`s that only press: `invoke`,
+/// `press` (and its alias `click`) and `scroll_into_view`. Those always answer
+/// "unverified" (live, on Windows, every one of them), because a button press has
+/// no state to read back. Stopping on them would stop every routine that presses
+/// a button; the next step's own selector, or a `wait_for`, is what checks one.
+///
+/// On macOS an `element_action toggle` is performed as a press (`AXPress`) and
+/// always answers "unverified: an action has no state to read back", so a
+/// routine that toggles there and acts on the result stops at the toggle. That
+/// is the cost of a toggle that cannot be confirmed; put a `wait_for` after it.
 fn reads_back(step: &Step) -> bool {
-    step.tool == "set_value" || sets_a_value(step)
+    step.tool == "set_value" || changes_a_state(step)
 }
 
-/// Whether `step` is an `element_action` that sets a value (a spinner's
-/// `increment` or `decrement`), as opposed to pressing, invoking or scrolling.
-fn sets_a_value(step: &Step) -> bool {
+/// The `element_action`s that only press, invoke or scroll: no state to confirm.
+const PRESSES: &[&str] = &["invoke", "press", "click", "scroll_into_view"];
+
+/// Whether `step` is an `element_action` that is not one of the [`PRESSES`].
+fn changes_a_state(step: &Step) -> bool {
     step.tool == "element_action"
         && step
             .args
             .get("action")
             .and_then(serde_json::Value::as_str)
-            .is_some_and(|a| {
-                matches!(
-                    a.trim().to_ascii_lowercase().as_str(),
-                    "increment" | "decrement"
-                )
-            })
+            .is_some_and(|a| !PRESSES.contains(&a.trim().to_ascii_lowercase().as_str()))
 }
 
 /// The steps that act on what the step before them did.
@@ -539,6 +543,52 @@ mod tests {
             let report = replay(&routine, &mut desk)
                 .unwrap_or_else(|f| panic!("{action} stopped the replay: {f}"));
             assert_eq!(report.ran.len(), 2, "{action}");
+        }
+    }
+
+    /// A checkbox that did not toggle, then Submit: stop before Submit.
+    #[test]
+    fn a_toggle_that_did_not_take_stops_the_replay_before_submit() {
+        let toggle = |action: &str| {
+            Step::new(
+                "element_action",
+                json!({"selector": "app=form;window=Sign up;role=checkbox;name=Subscribe", "action": action}),
+            )
+        };
+        let submit = Step::new(
+            "click_element",
+            json!({"selector": "app=form;window=Sign up;role=button;name=Submit"}),
+        );
+        for action in [
+            "toggle",
+            "select",
+            "expand",
+            "collapse",
+            "increment",
+            "decrement",
+            "focus",
+        ] {
+            let mut desk = Script::answering(vec![Ok(format!(
+                "{action}d Subscribe (unverified: its state did not change)"
+            ))]);
+            let failed =
+                replay(&routine(vec![toggle(action), submit.clone()]), &mut desk).unwrap_err();
+            assert_eq!(failed.step, 1, "{action}");
+            assert_eq!(desk.calls, ["1:element_action"], "{action}: Submit ran");
+            assert!(failed.why.contains("click_element"), "{}", failed.why);
+        }
+        // Confirmed, the same step goes on to Submit.
+        let mut desk = Script::answering(vec![Ok("toggled Subscribe (on)".to_string())]);
+        let report = replay(&routine(vec![toggle("toggle"), submit.clone()]), &mut desk).unwrap();
+        assert_eq!(report.ran.len(), 2);
+        // And a press, however it is spelled, still does not stop it.
+        for press in ["invoke", "press", "click", "scroll_into_view", " Invoke "] {
+            let mut desk =
+                Script::answering(vec![Ok("did it (unverified: nothing to read)".to_string())]);
+            assert!(
+                replay(&routine(vec![toggle(press), submit.clone()]), &mut desk).is_ok(),
+                "{press}"
+            );
         }
     }
 

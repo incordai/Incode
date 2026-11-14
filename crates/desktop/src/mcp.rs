@@ -140,10 +140,54 @@ pub struct Server {
     /// The routines file and where records come from. `None` until
     /// [`Server::with_routines`]; the routine tools refuse by name without it.
     routines: Option<RoutineKit>,
-    /// Set by the stdio reader when the client's end of the pipe closes, so a
-    /// call that waits (`watch`, `wait_for`) ends instead of running on for
-    /// nobody. `None` when nothing reads stdin (a test).
-    client_gone: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// What the stdio reader knows of the client's end of the pipe, so a call
+    /// that waits (`watch`, `wait_for`) or repeats (`routine_run`) ends instead
+    /// of running on for nobody. `None` when nothing reads stdin (a test).
+    client: Option<std::sync::Arc<ClientLink>>,
+}
+
+/// Whether the client is still there, as the stdio reader sees it.
+///
+/// The client is gone when its end of the pipe has reached end of input AND
+/// every line it sent before has been taken up to be answered. Not at the end of
+/// input alone: a client that sent three requests and closed its end is still
+/// waiting for three answers, and ending a call because of that EOF would answer
+/// them with refusals.
+#[derive(Debug, Default)]
+pub struct ClientLink {
+    /// Stdin has reached its end.
+    eof: std::sync::atomic::AtomicBool,
+    /// Lines read and not yet taken up by the server loop.
+    queued: std::sync::atomic::AtomicUsize,
+}
+
+impl ClientLink {
+    /// A line was read: counted before it is passed on, so the count is never
+    /// behind a line that is on its way.
+    pub(crate) fn line_read(&self) {
+        self.queued
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The server loop took a line up.
+    pub(crate) fn line_taken(&self) {
+        self.queued
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Stdin reached its end.
+    pub(crate) fn input_ended(&self) {
+        self.eof.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether the client has gone: end of input, and nothing it sent left to
+    /// answer.
+    #[must_use]
+    pub fn gone(&self) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        // `eof` first: a line counted after it was read cannot be missed.
+        self.eof.load(SeqCst) && self.queued.load(SeqCst) == 0
+    }
 }
 
 impl Server {
@@ -159,23 +203,21 @@ impl Server {
             tier: Tier::Act,
             hooks: None,
             routines: None,
-            client_gone: None,
+            client: None,
         }
     }
 
-    /// End a waiting call when `gone` is set: the flag the stdio reader raises at
-    /// end of input. See [`transport::run_lines`].
+    /// End a waiting or repeating call when the client has gone: see
+    /// [`ClientLink::gone`] and [`transport::run_lines`], which raises it.
     #[must_use]
-    pub fn with_client_gone(mut self, gone: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
-        self.client_gone = Some(gone);
+    pub fn with_client_link(mut self, link: std::sync::Arc<ClientLink>) -> Self {
+        self.client = Some(link);
         self
     }
 
     /// Whether the client has gone away.
     fn client_gone(&self) -> bool {
-        self.client_gone
-            .as_ref()
-            .is_some_and(|gone| gone.load(std::sync::atomic::Ordering::SeqCst))
+        self.client.as_ref().is_some_and(|link| link.gone())
     }
 
     /// Run the operator's own commands around every tool call.

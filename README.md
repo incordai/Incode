@@ -1145,9 +1145,10 @@ list; the engine is optional.
   `scroll` is never replayable. A replay invokes links and buttons through
   `element_action invoke` (no mouse, no focus) and falls back to the recorded
   click only when the invoke was refused before it did anything (the control
-  does not offer it), and it stops when a `set_value` (or an
-  increment/decrement) answers "unverified" and the next step acts on it; a
-  button press always says "unverified" and never stops it.
+  does not offer it), and it stops when a `set_value` or an `element_action`
+  that changes a state (toggle, select, expand, collapse, increment, ...)
+  answers "unverified" and the next step acts on it; a button press (`invoke`,
+  `press`, `scroll_into_view`) always says "unverified" and never stops it.
 - A phrase matches by its **words in any order, ignoring filler words**, except
   that the words on each side of `to`, `from`, `into`, `onto`, `over`, `under`,
   `before` or `after` stay on that side ("copy a to b" is not "copy b to a"); a
@@ -1155,12 +1156,16 @@ list; the engine is optional.
 - A replay runs every step through the same checks as a live call (blocked apps,
   hooks, stop file, journal) and **stops at the first failure**, saying which
   step and why, with the paths of that step's before and after pictures (one of
-  each is taken for every step, of the last run only, beside `routines.json`;
-  never sent to OCR). There is no repair: do the task yourself and
-  `routine_save` it under the same phrase to replace the routine.
+  each is taken for every step, through the same gates as `screenshot`, in a
+  folder of its own for each run beside `routines.json`, only the last run kept;
+  none is taken of a step that typed a secret; never sent to OCR). There is no
+  repair: do the task yourself and `routine_save` it under the same phrase to
+  replace the routine.
 - A routine unused for 30 days is forgotten. Only **you** can keep one for good:
   `incu routine keep <words>` (and `unkeep`, `list`) at a terminal; no tool has
-  an argument for it.
+  an argument for it, and saving other steps over a kept routine un-keeps it.
+  That is a convenience, not a security boundary: an agent with a shell can run
+  the command too.
 - The file is `routines.json` in the per-user data folder
   (`%APPDATA%\incord-desktop`, `~/Library/Application Support/incord-desktop`,
   or `$XDG_DATA_HOME`/`~/.local/share/incord-desktop`), overridden by
@@ -1168,9 +1173,14 @@ list; the engine is optional.
   `routine_save`, `routine_list` and `routine_match` show every step's full
   text so you can read what a routine will type. **Text typed into a password or
   other secure field, and text a recording kept only as a placeholder, is never
-  stored**: that step is a parameter (`{{password}}`) and `routine_run` refuses
-  to start unless it is given `params`. Changes to the file take a lock, so two
-  servers do not lose each other's saves.
+  stored**, and neither is text typed where focus may have moved (after Tab,
+  Enter or an arrow): that step is a parameter (`{{password}}`) and
+  `routine_run` refuses to start unless `params` gives a **reference** for each,
+  `{"password": {"env": "INCU_PARAM_PASSWORD"}}`, a variable you set in incu's
+  environment (a literal value is refused: it would be in the agent's
+  transcript; there is no keyring reference in this build). The hooks are never
+  shown a value. Changes to the file take an OS file lock, so two servers do not
+  lose each other's saves.
 
 `watch` is `wait_for` with a long deadline (default 1 hour, at most 24, looked
 at every second, every five for `screen_changes`): it blocks until the condition

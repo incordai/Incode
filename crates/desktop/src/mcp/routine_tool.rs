@@ -27,9 +27,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use crate::capture::{CaptureOptions, ShotFormat};
 use crate::routine::learn::{check_phrase, check_record, learn_with, Cleaned, IN_WINDOW};
-use crate::routine::params::{self, Values, Why};
+use crate::routine::params::{self, types_a_secret, Target, Values, Why};
 use crate::routine::pictures::{Pictures, When};
 use crate::routine::replay::{replay, Runner};
 use crate::routine::source::{Call, Record, StepSource};
@@ -39,7 +38,7 @@ use crate::routine::{now_ms, Routine, Step};
 
 use crate::selector::Selector;
 
-use super::tools::{capture, resolve_selector, text, text_of, window_id_for};
+use super::tools::{resolve_selector, text, text_of, window_id_for};
 use super::Server;
 
 /// The most record ids one `routine_save` reads.
@@ -276,9 +275,22 @@ impl Server {
     /// each step of a replay: one path, so a step can never be let through by a
     /// door a live call does not have.
     pub(super) fn gated_call(&mut self, name: &str, args: &Value) -> Result<Vec<Value>, String> {
+        let seen = hook_view(name, args);
+        self.gated_call_as(name, args, &seen)
+    }
+
+    /// [`Server::gated_call`] with `seen` as the arguments the operator's hooks
+    /// are shown, which may differ from `args` (the call's real arguments) only
+    /// by having secrets taken out: see [`hook_view`] and the replay's parameters.
+    pub(super) fn gated_call_as(
+        &mut self,
+        name: &str,
+        args: &Value,
+        seen: &Value,
+    ) -> Result<Vec<Value>, String> {
         self.catch_stop_file();
         let permitted = self.authorise(name);
-        let raw_args = args.to_string();
+        let raw_args = seen.to_string();
         let vetoed = self.hook_veto(&permitted, name, &raw_args);
         let outcome = self.outcome(&permitted, vetoed, name, args);
         self.tell_post_hooks(name, &raw_args, &outcome);
@@ -287,8 +299,30 @@ impl Server {
     }
 }
 
+/// What the operator's hooks are shown of a call's arguments: all of them, except
+/// that every value in `routine_run`'s `params` is `"<param>"`.
+///
+/// A hook sees the real arguments of a call (it is the operator's own, and a
+/// pre-tool hook can only judge what it can read), but a hook is also how
+/// Watchman and other recorders see calls, so nothing the caller passed to name
+/// a secret is handed on. A `params` entry is only a reference to where the
+/// person keeps the value, never the value, and still it is not repeated.
+pub(super) fn hook_view(name: &str, args: &Value) -> Value {
+    let mut seen = args.clone();
+    if name == "routine_run" {
+        if let Some(params) = seen.get_mut("params").and_then(Value::as_object_mut) {
+            for value in params.values_mut() {
+                *value = json!("<param>");
+            }
+        } else if seen.get("params").is_some_and(|p| !p.is_null()) {
+            seen["params"] = json!("<param>");
+        }
+    }
+    seen
+}
+
 /// The live desktop as a [`Runner`]: every step through the server's gates.
-struct Live<'a> {
+pub(super) struct Live<'a> {
     server: &'a mut Server,
     /// What the caller gave for the routine's parameters. In memory only.
     values: Values,
@@ -296,12 +330,20 @@ struct Live<'a> {
     pictures: Option<Pictures>,
     /// Why there are no pictures, or fewer: the first thing that went wrong.
     picture_trouble: Option<String>,
+    /// Where the typing target is as the steps run (see [`Target`]), and where it
+    /// was before the step now running.
+    pub(super) target: Target,
+    pub(super) before_target: Target,
+    /// The step just run typed a secret: the picture before the next is skipped.
+    skip_next_before: bool,
+    /// The pictures that were not taken because a secret was on screen.
+    skipped: Vec<String>,
 }
 
 impl<'a> Live<'a> {
-    /// A run over `server`, with the parameters `values` and a fresh folder for
-    /// its pictures (the last run's are cleared).
-    fn new(server: &'a mut Server, values: Values) -> Self {
+    /// A run over `server`, with the parameters `values` and a folder of its own
+    /// for its pictures (the finished runs' are cleared).
+    pub(super) fn new(server: &'a mut Server, values: Values) -> Self {
         let (pictures, picture_trouble) = match server
             .kit()
             .map(|kit| kit.store.pictures_dir())
@@ -315,44 +357,75 @@ impl<'a> Live<'a> {
             values,
             pictures,
             picture_trouble,
+            target: Target::Nothing,
+            before_target: Target::Nothing,
+            skip_next_before: false,
+            skipped: Vec::new(),
         }
     }
 
     /// What the reply says of the pictures: where they are and how many, or why
-    /// there are none.
-    fn pictures_note(&self) -> Value {
-        match &self.pictures {
-            Some(pictures) => {
-                let mut note = json!({
-                    "folder": pictures.dir().display().to_string(),
-                    "kept": pictures.count(),
-                    "note": "one picture before and one after each step, of the last run only",
-                });
-                if let Some(trouble) = &self.picture_trouble {
-                    note["trouble"] = json!(trouble);
-                }
-                note
-            }
-            None => json!({"kept": 0, "trouble": self.picture_trouble}),
+    /// there are none, and which were left untaken because a secret was on screen.
+    pub(super) fn pictures_note(&self) -> Value {
+        let mut note = match &self.pictures {
+            Some(pictures) => json!({
+                "folder": pictures.dir().display().to_string(),
+                "kept": pictures.count(),
+                "note": "one picture before and one after each step, of the last run only",
+            }),
+            None => json!({"kept": 0}),
+        };
+        if let Some(trouble) = &self.picture_trouble {
+            note["trouble"] = json!(trouble);
         }
+        if !self.skipped.is_empty() {
+            note["skipped"] = json!(self.skipped);
+        }
+        note
     }
 
-    /// One step, as the live desktop runs it (see [`Runner::run`]).
-    fn step(&mut self, step: &Step) -> Result<String, String> {
-        let args = live_args(step)?;
+    /// One step, as the live desktop runs it (see [`Runner::run`]). `stored` is
+    /// the step as saved, `filled` the same with its parameters in.
+    fn step(&mut self, stored: &Step, filled: &Step) -> Result<String, String> {
+        // The client went away: the person who asked is not there to be told how
+        // it ended, and nothing more is done for them.
+        if self.server.client_gone() {
+            return Err("the client went away; the replay stopped here".to_string());
+        }
+        let args = live_args(filled)?;
+        // What the hooks are shown: the step's real arguments with each
+        // parameter's value left as its `{{name}}`.
+        let seen = hidden_params(&args, stored);
         // A link or a button is invoked through its own pattern when it has one:
         // that needs no mouse, works for a control scrolled out of view and takes
         // no focus. The recorded click runs INSTEAD only when the invoke was
         // refused before it did anything; see [`after_invoke`].
-        if let Some(invoke) = invoke_for(step) {
+        if let Some(invoke) = invoke_for(filled) {
             match after_invoke(self.server.gated_call("element_action", &invoke)) {
                 AfterInvoke::Done(answer) => return answer,
                 AfterInvoke::ClickAsRecorded => {}
             }
         }
         self.server
-            .gated_call(&step.tool, &args)
+            .gated_call_as(&filled.tool, &args, &seen)
             .map(|content| text_of(&content))
+    }
+
+    /// The picture of the window `step` is for (else the screen), taken THROUGH
+    /// the gates a `screenshot` call passes: its tier, the operator's pre-tool
+    /// hook (a hook that refuses `screenshot` refuses these), the
+    /// blocked-application guards, the stop file, the post-tool hook and the
+    /// journal. Not a side door to the screen. Tests replace it ([`Shooter`]).
+    fn take(&mut self, step: &Step) -> Result<Vec<u8>, String> {
+        if let Some(shooter) = self.server.kit().ok().and_then(|kit| kit.shooter.as_ref()) {
+            return shooter(step);
+        }
+        let mut args = json!({"format": "jpeg"});
+        if let Some(window) = step_window(step).and_then(|s| window_id_for(&s).ok()) {
+            args["window"] = json!(window);
+        }
+        let content = self.server.gated_call("screenshot", &args)?;
+        image_bytes(&content)
     }
 }
 
@@ -361,9 +434,13 @@ impl Runner for Live<'_> {
         // The parameters go into the arguments of this one call, in memory, and
         // come out of whatever it answers.
         let filled = self.values.fill(step);
-        self.step(&filled)
+        self.before_target = self.target.clone();
+        let answer = self
+            .step(step, &filled)
             .map(|answer| self.values.scrub(&answer))
-            .map_err(|why| self.values.scrub(&why))
+            .map_err(|why| self.values.scrub(&why));
+        self.target.after(step);
+        answer
     }
 
     fn settle(&mut self) {
@@ -371,36 +448,67 @@ impl Runner for Live<'_> {
     }
 
     fn look(&mut self, n: usize, step: &Step, when: When) -> Option<PathBuf> {
-        let Live {
-            server,
-            pictures,
-            picture_trouble,
-            ..
-        } = self;
-        let pictures = pictures.as_mut()?;
-        // A stop is a stop: nothing more is read off the screen either.
-        server.catch_stop_file();
-        if server.safety.is_stopped() {
-            return None;
+        self.pictures.as_ref()?;
+        // A picture is of a screen with a password on it: not when this step has
+        // just typed a secret (its field is filled in, and may show), nor before
+        // the one after it (it is still there).
+        match when {
+            When::Before if std::mem::take(&mut self.skip_next_before) => {
+                self.skipped.push(format!(
+                    "step {n}: no picture before: the step before it typed a secret"
+                ));
+                return None;
+            }
+            When::After if types_a_secret(step, &self.before_target) => {
+                self.skip_next_before = true;
+                self.skipped.push(format!(
+                    "step {n}: no picture after: it typed a secret (a parameter, or text \
+                     into a field that is, or may be, a password field)"
+                ));
+                return None;
+            }
+            _ => {}
         }
-        let mut note = |why: String| {
-            picture_trouble.get_or_insert(why);
-        };
-        let taken = match server.kit().ok().and_then(|kit| kit.shooter.as_ref()) {
-            Some(shooter) => shooter(step),
-            None => picture_of(step),
-        };
-        match taken {
-            Ok(bytes) => pictures
-                .keep(n, when, "jpg", &bytes)
-                .map_err(|why| note(format!("step {n}: {why}")))
-                .ok(),
+        let taken = self.take(step);
+        let pictures = self.pictures.as_mut()?;
+        match taken.and_then(|bytes| pictures.keep(n, when, "jpg", &bytes)) {
+            Ok(path) => Some(path),
             Err(why) => {
-                note(format!("step {n}: no picture: {why}"));
+                self.picture_trouble
+                    .get_or_insert(format!("step {n}: no picture: {why}"));
                 None
             }
         }
     }
+}
+
+/// `args` (a step's real arguments for the tool) with the typed text of a step
+/// that has parameters put back to the stored `{{name}}` form, for the hooks.
+pub(super) fn hidden_params(args: &Value, stored: &Step) -> Value {
+    if params::names_of(stored).is_empty() {
+        return args.clone();
+    }
+    let mut seen = args.clone();
+    for key in ["text", "value"] {
+        if let (Some(template), Some(slot)) = (stored.args.get(key), seen.get_mut(key)) {
+            *slot = template.clone();
+        }
+    }
+    seen
+}
+
+/// The bytes of the image in a tool's answer.
+fn image_bytes(content: &[Value]) -> Result<Vec<u8>, String> {
+    use base64::Engine;
+    let data = content
+        .iter()
+        .find(|block| block.get("type").and_then(Value::as_str) == Some("image"))
+        .and_then(|block| block.get("data"))
+        .and_then(Value::as_str)
+        .ok_or("the screenshot answered no image")?;
+    base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .map_err(|e| format!("the screenshot's image is not base64: {e}"))
 }
 
 /// What to do after the `element_action invoke` tried in place of a recorded
@@ -454,23 +562,6 @@ fn step_window(step: &Step) -> Option<Selector> {
     whole
         .has_window_part()
         .then(|| Selector::parse(&whole.render_window_part()).ok())?
-}
-
-/// A picture of the window `step` is for, else of the screen: incu's own capture,
-/// under the same guards as `screenshot` (a blocked application's window is never
-/// captured). A window that cannot be found (it may be what failed) is the
-/// screen.
-///
-/// JPEG at a middling quality: the pictures are for a person and a model to look
-/// at, and many of them are kept.
-fn picture_of(step: &Step) -> Result<Vec<u8>, String> {
-    let window = step_window(step).and_then(|selector| window_id_for(&selector).ok());
-    let options = CaptureOptions {
-        format: ShotFormat::Jpeg,
-        jpeg_quality: 70,
-        ..CaptureOptions::default()
-    };
-    capture(window.as_deref(), options).map(|(shot, _)| shot.bytes)
 }
 
 /// Whether the desktop says the control `raw` names is a password field, now.
@@ -611,6 +702,13 @@ fn saved_reply(
         "looking_steps_dropped": cleaned.dropped,
         "file": file.display().to_string(),
     });
+    if saved.unkept {
+        reply["kept_flag_dropped"] = json!(
+            "the routine this replaced had been kept by the person, and these steps are not \
+             the ones they kept, so it is NOT kept now and will expire after 30 days unused. \
+             Only the person can keep it again, after reading it: `incu routine keep`"
+        );
+    }
     if !cleaned.parameters.is_empty() {
         reply["parameters"] = json!(cleaned
             .parameters
@@ -621,14 +719,20 @@ fn saved_reply(
                 "why": match p.why {
                     Why::SecureField => "typed into a password or other secure field",
                     Why::Redacted => "the recording kept only a placeholder for the text",
+                    Why::UnknownField => {
+                        "typed after a key that can move focus (Tab, Enter, an arrow), so \
+                         the field is not known and may be a password field"
+                    }
                 },
             }))
             .collect::<Vec<_>>());
         reply["parameters_note"] = json!(
             "those steps are NOT stored with their text. routine_run refuses to start \
-             unless it is given every one, as params: {\"name\": \"...\"}. The value is \
-             used in memory for that run only and is never written to the routines file \
-             or the journal"
+             unless it is given a REFERENCE for every one, as params: {\"name\": {\"env\": \
+             \"INCU_PARAM_NAME\"}}: the person sets that variable in the environment of the \
+             incu process, so the value never passes through you or your transcript (a \
+             literal value is refused). It is used in memory for that run only and is \
+             never written to the routines file, the journal or what the hooks are shown"
         );
     }
     if cleaned.inferred_window > 0 {

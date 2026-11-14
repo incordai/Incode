@@ -158,10 +158,13 @@ pub fn run_stdio(server: Server) -> std::io::Result<()> {
 /// call for up to a day. With the read inline, a client that went away in the
 /// middle of one would not be noticed until the call returned: the pipe's EOF
 /// sat unread behind it. So a reader thread takes the lines and the EOF, passes
-/// the lines on, and raises the server's `client_gone` flag at EOF, which the
-/// waiting calls look at as often as they look at the stop file. The EOF is
-/// still only ACTED on here, after every line before it has been answered,
-/// exactly as it always was.
+/// the lines on, and tells the server ([`super::ClientLink`]) when the client has
+/// gone, which the waiting calls look at as often as they look at the stop file.
+/// "Gone" is end of input AND every line sent before it taken up to be answered
+/// (a count kept beside the channel), so a client that pipelined requests and
+/// closed its end is not mistaken for one that left. The EOF is still only ACTED
+/// on here, after every line before it has been answered, exactly as it always
+/// was.
 ///
 /// # Errors
 ///
@@ -171,12 +174,12 @@ where
     R: std::io::Read + Send + 'static,
     W: Write,
 {
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{mpsc, Arc};
 
-    let gone = Arc::new(AtomicBool::new(false));
-    let server = server.with_client_gone(gone.clone());
+    let link = Arc::new(super::ClientLink::default());
+    let server = server.with_client_link(link.clone());
     let (lines, queued) = mpsc::channel::<std::io::Result<String>>();
+    let reader_link = link.clone();
     std::thread::Builder::new()
         .name("incode-desktop-stdin".to_string())
         .spawn(move || {
@@ -185,16 +188,19 @@ where
                 let mut line = String::new();
                 match reader.read_line(&mut line) {
                     Ok(0) => {
-                        gone.store(true, Ordering::SeqCst);
+                        reader_link.input_ended();
                         return;
                     }
                     Ok(_) => {
+                        // Counted before it is sent, so the count is never behind
+                        // a line that is on its way to the server loop.
+                        reader_link.line_read();
                         if lines.send(Ok(line)).is_err() {
                             return;
                         }
                     }
                     Err(e) => {
-                        gone.store(true, Ordering::SeqCst);
+                        reader_link.input_ended();
                         let _ = lines.send(Err(e));
                         return;
                     }
@@ -205,6 +211,8 @@ where
     loop {
         match queued.recv() {
             Ok(Ok(line)) => {
+                // Taken up: from here it is being answered, not waiting to be.
+                link.line_taken();
                 // Every request received is evidence the client is alive.
                 server.safety().heartbeat();
 
