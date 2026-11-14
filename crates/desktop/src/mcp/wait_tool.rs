@@ -128,6 +128,29 @@ fn bounded<T: Send + 'static>(
     stopped: &dyn Fn() -> bool,
     work: impl FnOnce() -> Result<T, String> + Send + 'static,
 ) -> Result<T, String> {
+    bounded_with(what, key, limit, stuck, stopped, &|_| {}, work)
+}
+
+/// A point in giving up on a look, where a test may let the look return.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gap {
+    /// The wait has decided to give up and has not yet settled with the look.
+    Before,
+    /// The look is settled as given up on and counted.
+    After,
+}
+
+/// [`bounded`], with `gap` called at each [`Gap`]: production passes nothing;
+/// a test makes the look return exactly there.
+fn bounded_with<T: Send + 'static>(
+    what: &str,
+    key: &str,
+    limit: Duration,
+    stuck: &'static Stuck,
+    stopped: &dyn Fn() -> bool,
+    gap: &dyn Fn(Gap),
+    work: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
     let (here, everywhere) = (stuck.of(key), stuck.all());
     if here >= MAX_ABANDONED_PER_KEY || everywhere >= MAX_ABANDONED_IN_ALL {
         return Err(format!(
@@ -177,14 +200,24 @@ fn bounded<T: Send + 'static>(
         } else {
             continue;
         };
+        gap(Gap::Before);
+        // COUNT FIRST, then settle with the look, and undo the count if the look
+        // had returned. The look's thread takes itself off the count only
+        // after it has seen the settlement, so its removal always follows this
+        // addition: counting after the settlement let a thread returning in
+        // between remove what was not yet added, and the entry then stayed
+        // for the life of the process.
+        stuck.add(key);
         return if state
             .compare_exchange(0, 2, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
         {
-            stuck.add(key);
+            gap(Gap::After);
             Err(format!("{UNANSWERED} to {what}: {why}"))
         } else {
-            // It returned in the instant between the timeout and this.
+            // It returned in the instant between the timeout and this, and
+            // took no part in the count.
+            stuck.remove(key);
             receive
                 .recv()
                 .unwrap_or_else(|_| Err(format!("the look to {what} ended without an answer")))
@@ -500,6 +533,93 @@ mod tests {
             assert!(Instant::now() < until, "the count was never given back");
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// Block (up to 5 s) until `flag` is set, then give the look's thread a
+    /// moment to finish what it does after `work` returns.
+    fn until_returned(flag: &std::sync::atomic::AtomicBool) {
+        let by = Instant::now() + Duration::from_secs(5);
+        while !flag.load(Ordering::SeqCst) {
+            assert!(Instant::now() < by, "the look never returned");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+
+    /// **A look that returns just as it is given up on leaves no entry behind.**
+    /// The look returns AFTER the wait has settled with it as given up on (its
+    /// thread then removes itself from the count) but before the wait would,
+    /// in the old order, have added it: the removal then found nothing, the
+    /// addition followed, and the entry stayed for good.
+    #[test]
+    fn a_look_returning_just_after_it_is_given_up_on_leaves_no_entry() {
+        static STUCK: Stuck = Stuck::new();
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (mine, theirs) = (Arc::clone(&done), Arc::clone(&done));
+        let answer = bounded_with(
+            "walk",
+            "w1",
+            Duration::from_millis(20),
+            &STUCK,
+            &|| false,
+            &move |at| {
+                if at == Gap::After {
+                    until_returned(&mine);
+                }
+            },
+            move || {
+                std::thread::sleep(Duration::from_millis(100));
+                theirs.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        );
+        assert!(answer.unwrap_err().starts_with(UNANSWERED));
+        assert_eq!(STUCK.all(), 0, "{:?}", STUCK.held());
+    }
+
+    /// And a look that returns after the wait decided to give up but before it
+    /// settled: its answer is returned, and nothing is left counted.
+    #[test]
+    fn a_look_returning_just_before_it_is_settled_gives_its_answer_and_no_entry() {
+        static STUCK: Stuck = Stuck::new();
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (mine, theirs) = (Arc::clone(&done), Arc::clone(&done));
+        let answer = bounded_with(
+            "walk",
+            "w1",
+            Duration::from_millis(20),
+            &STUCK,
+            &|| false,
+            &move |at| {
+                if at == Gap::Before {
+                    until_returned(&mine);
+                }
+            },
+            move || {
+                std::thread::sleep(Duration::from_millis(100));
+                theirs.store(true, Ordering::SeqCst);
+                Ok(7)
+            },
+        );
+        assert_eq!(answer.unwrap(), 7);
+        assert_eq!(STUCK.all(), 0, "{:?}", STUCK.held());
+    }
+
+    /// Entries of one window are not taken off by another's look returning.
+    #[test]
+    fn a_returning_look_takes_off_only_its_own_windows_entry() {
+        static STUCK: Stuck = Stuck::new();
+        STUCK.add("other");
+        let answer: Result<(), String> = bounded(
+            "walk",
+            "w1",
+            Duration::from_secs(5),
+            &STUCK,
+            &|| false,
+            || Ok(()),
+        );
+        assert!(answer.is_ok());
+        assert_eq!((STUCK.of("other"), STUCK.of("w1")), (1, 0));
     }
 
     #[test]

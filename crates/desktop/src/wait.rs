@@ -534,7 +534,18 @@ pub fn run<E: Env>(
             appears,
         } => {
             selector.require_element()?;
-            let target = target_of(env, selector, window.as_deref(), *appears)?;
+            let began = env.now_ms();
+            let target = match target_of(env, selector, window.as_deref(), *appears) {
+                Ok(target) => target,
+                // A stop that ended the look which picks the window is the
+                // stop, the same refusal as one during the polling.
+                Err(why) if why.starts_with(UNANSWERED) && stopped() => {
+                    return Ok(Outcome::Stopped {
+                        waited_ms: env.now_ms() - began,
+                    })
+                }
+                Err(why) => return Err(why),
+            };
             let waited = wait_until(env, budget, stopped, |env| {
                 element_check(env, &target, selector, *appears)
             })?;
@@ -766,6 +777,8 @@ mod tests {
         tree_blocks_ms: Option<u64>,
         /// Set when a walk blocks: the operator's stop arrives during it.
         stop_during_block: Option<std::rc::Rc<std::cell::Cell<bool>>>,
+        /// The window list is given up on, with the stop arriving during it.
+        listing_stopped: Option<std::rc::Rc<std::cell::Cell<bool>>>,
         windows_calls: u32,
         screen: At<u128>,
         sleeps: Vec<u64>,
@@ -784,6 +797,7 @@ mod tests {
                 alive: None,
                 tree_blocks_ms: None,
                 stop_during_block: None,
+                listing_stopped: None,
                 windows_calls: 0,
                 screen: Box::new(|_| 0),
                 sleeps: Vec::new(),
@@ -802,6 +816,12 @@ mod tests {
         }
         fn windows(&mut self) -> Result<Vec<WindowInfo>, String> {
             self.windows_calls += 1;
+            if let Some(stop) = &self.listing_stopped {
+                stop.set(true);
+                return Err(format!(
+                    "{UNANSWERED} to list the windows: the wait was stopped"
+                ));
+            }
             Ok((self.windows)(self.now))
         }
         fn window_alive(&mut self, _: &str) -> Option<bool> {
@@ -1329,6 +1349,30 @@ mod tests {
         let out = run(&mut env, &c, &budget(2_000, 250), &move || flag.get()).unwrap();
         assert!(matches!(out, Outcome::Stopped { .. }), "{out:?}");
         assert_eq!(env.trees, 1, "no look after the stop");
+    }
+
+    /// A stop during the look that picks the window is the stop, not a plain
+    /// error; an unanswered look with no stop is still not one.
+    #[test]
+    fn a_stop_during_the_window_picking_look_is_stopped_not_an_error() {
+        let stop = std::rc::Rc::new(std::cell::Cell::new(false));
+        let mut env = Fake::new();
+        env.listing_stopped = Some(std::rc::Rc::clone(&stop));
+        let flag = std::rc::Rc::clone(&stop);
+        // Pinned to a window id: picking it lists the windows.
+        let c = Condition::Element {
+            selector: sel("name=OK"),
+            window: Some("1".to_string()),
+            appears: true,
+        };
+        let out = run(&mut env, &c, &budget(5_000, 250), &move || flag.get()).unwrap();
+        assert!(matches!(out, Outcome::Stopped { .. }), "{out:?}");
+
+        // The same look unanswered, with no stop: an error, as before.
+        let mut env = Fake::new();
+        env.listing_stopped = Some(std::rc::Rc::new(std::cell::Cell::new(false)));
+        let err = run(&mut env, &c, &budget(5_000, 250), &never).unwrap_err();
+        assert!(err.starts_with(UNANSWERED), "{err}");
     }
 
     /// **A look that blocks cannot keep the wait past its deadline.** The
