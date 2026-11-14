@@ -146,32 +146,84 @@ pub(super) fn error_response(id: Value, code: i64, message: &str) -> String {
 /// When the agent process dies its end of the pipe closes, `read_line` returns
 /// zero bytes, and no timer can fake that. So the loop stops the desktop on EOF
 /// rather than relying on a heartbeat that could keep beating into the void.
-pub fn run_stdio(mut server: Server) -> std::io::Result<()> {
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout();
-    let mut line = String::new();
+pub fn run_stdio(server: Server) -> std::io::Result<()> {
+    run_lines(server, std::io::stdin(), std::io::stdout())
+}
 
-    loop {
-        line.clear();
-        match stdin.lock().read_line(&mut line) {
-            // EOF: the client is gone. Halt the desktop before returning, so a
-            // slow in-flight action cannot outlive the thing that asked for it.
-            Ok(0) => {
-                server.safety().stop();
-                return Ok(());
+/// [`run_stdio`] over any reader and writer.
+///
+/// # Why input is read on a thread of its own
+///
+/// The server handles one call at a time on this thread, and a `watch` holds the
+/// call for up to a day. With the read inline, a client that went away in the
+/// middle of one would not be noticed until the call returned: the pipe's EOF
+/// sat unread behind it. So a reader thread takes the lines and the EOF, passes
+/// the lines on, and raises the server's `client_gone` flag at EOF, which the
+/// waiting calls look at as often as they look at the stop file. The EOF is
+/// still only ACTED on here, after every line before it has been answered,
+/// exactly as it always was.
+///
+/// # Errors
+///
+/// Reading or writing failed.
+pub(crate) fn run_lines<R, W>(server: Server, input: R, mut out: W) -> std::io::Result<()>
+where
+    R: std::io::Read + Send + 'static,
+    W: Write,
+{
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc, Arc};
+
+    let gone = Arc::new(AtomicBool::new(false));
+    let server = server.with_client_gone(gone.clone());
+    let (lines, queued) = mpsc::channel::<std::io::Result<String>>();
+    std::thread::Builder::new()
+        .name("incode-desktop-stdin".to_string())
+        .spawn(move || {
+            let mut reader = std::io::BufReader::new(input);
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) => {
+                        gone.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                    Ok(_) => {
+                        if lines.send(Ok(line)).is_err() {
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        gone.store(true, Ordering::SeqCst);
+                        let _ = lines.send(Err(e));
+                        return;
+                    }
+                }
             }
-            Ok(_) => {
+        })?;
+    let mut server = server;
+    loop {
+        match queued.recv() {
+            Ok(Ok(line)) => {
                 // Every request received is evidence the client is alive.
                 server.safety().heartbeat();
 
                 if let Some(reply) = server.handle_line(&line) {
-                    writeln!(stdout, "{reply}")?;
-                    stdout.flush()?;
+                    writeln!(out, "{reply}")?;
+                    out.flush()?;
                 }
             }
-            Err(e) => {
+            // The reader failed: halt the desktop before returning.
+            Ok(Err(e)) => {
                 server.safety().stop();
                 return Err(e);
+            }
+            // EOF, every line before it answered: the client is gone. Halt the
+            // desktop before returning, so a slow in-flight action cannot outlive
+            // the thing that asked for it.
+            Err(_) => {
+                server.safety().stop();
+                return Ok(());
             }
         }
     }

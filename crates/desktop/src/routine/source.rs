@@ -67,6 +67,29 @@ pub struct Record {
     pub started_at_ms: i64,
     /// Its tool calls, in order.
     pub calls: Vec<Call>,
+    /// Set when the record's OWN outcome says the run failed (an error, a failed
+    /// status), whatever its calls say. See `watchman::outcome_failure`.
+    pub failed: Option<String>,
+}
+
+impl Record {
+    /// A record that did not fail.
+    #[must_use]
+    pub fn new(id: &str, started_at_ms: i64, calls: Vec<Call>) -> Self {
+        Self {
+            id: id.to_string(),
+            started_at_ms,
+            calls,
+            failed: None,
+        }
+    }
+
+    /// The same record, its own outcome saying it failed with `why`.
+    #[must_use]
+    pub fn failing(mut self, why: &str) -> Self {
+        self.failed = Some(why.to_string());
+        self
+    }
 }
 
 /// Where records come from. `Send` because the server that holds one is built
@@ -132,11 +155,11 @@ mod tests {
 
     #[test]
     fn a_memory_source_answers_for_the_records_it_holds_and_only_those() {
-        let source = MemorySource::new().with(Record {
-            id: "w-1".to_string(),
-            started_at_ms: 5,
-            calls: vec![Call::ok("key", json!({"keys": ["ctrl", "s"]}))],
-        });
+        let source = MemorySource::new().with(Record::new(
+            "w-1",
+            5,
+            vec![Call::ok("key", json!({"keys": ["ctrl", "s"]}))],
+        ));
         assert_eq!(source.record("w-1").unwrap().calls.len(), 1);
         assert!(source.record("w-2").unwrap_err().contains("w-2"));
     }

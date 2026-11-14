@@ -140,6 +140,10 @@ pub struct Server {
     /// The routines file and where records come from. `None` until
     /// [`Server::with_routines`]; the routine tools refuse by name without it.
     routines: Option<RoutineKit>,
+    /// Set by the stdio reader when the client's end of the pipe closes, so a
+    /// call that waits (`watch`, `wait_for`) ends instead of running on for
+    /// nobody. `None` when nothing reads stdin (a test).
+    client_gone: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Server {
@@ -155,7 +159,23 @@ impl Server {
             tier: Tier::Act,
             hooks: None,
             routines: None,
+            client_gone: None,
         }
+    }
+
+    /// End a waiting call when `gone` is set: the flag the stdio reader raises at
+    /// end of input. See [`transport::run_lines`].
+    #[must_use]
+    pub fn with_client_gone(mut self, gone: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.client_gone = Some(gone);
+        self
+    }
+
+    /// Whether the client has gone away.
+    fn client_gone(&self) -> bool {
+        self.client_gone
+            .as_ref()
+            .is_some_and(|gone| gone.load(std::sync::atomic::Ordering::SeqCst))
     }
 
     /// Run the operator's own commands around every tool call.

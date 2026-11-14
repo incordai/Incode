@@ -42,6 +42,9 @@ incu - computer use for an agent, as an MCP server over stdio
 USAGE:
     incu serve [OPTIONS]      speak MCP on stdin/stdout (the default command)
     incu stop [OPTIONS]       halt the desktop a running server drives
+    incu routine list         show every learned routine, each step in full
+    incu routine keep <WORDS>     keep a routine from expiring (only you can)
+    incu routine unkeep <WORDS>   let it expire again, thirty days from now
     incu --help | --version
 
 OPTIONS for serve:
@@ -65,6 +68,11 @@ ENVIRONMENT for serve:
                               Watchman records from (default
                               http://127.0.0.1:9180; loopback only)
 
+OPTIONS for routine:
+    --file <PATH>             the routines file (else the config's, else the
+                              one serve uses)
+    --config <FILE>           the config to find it in
+
 OPTIONS for stop:
     --journal <PATH>          stop the server journalling to PATH
     --workspace <DIR>         stop the server for DIR's .incode/ journal
@@ -81,6 +89,33 @@ pub enum Command {
     Serve(ServeArgs),
     /// Ask a running server to stop.
     Stop(StopArgs),
+    /// List, keep or unkeep learned routines: what only the person does.
+    Routine(RoutineArgs),
+}
+
+/// What `incu routine` does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutineAction {
+    /// Show every routine, with every step in full.
+    List,
+    /// Keep a routine from expiring.
+    Keep,
+    /// Let a kept routine expire again (thirty days from now).
+    Unkeep,
+}
+
+/// The arguments of `incu routine`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutineArgs {
+    /// What to do.
+    pub action: RoutineAction,
+    /// The phrase naming the routine, for keep and unkeep. Matched as a request
+    /// is: by its words, in any order, filler ignored.
+    pub phrase: String,
+    /// The routines file, when named; else the config's, else the default.
+    pub file: Option<PathBuf>,
+    /// The config file named on the command line, if any.
+    pub config: Option<PathBuf>,
 }
 
 /// The flags of `incu serve`.
@@ -127,6 +162,10 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String>
         Some("stop") => {
             args.remove(0);
             parse_stop(args)
+        }
+        Some("routine") => {
+            args.remove(0);
+            parse_routine(args)
         }
         Some("-h" | "--help" | "help") => Ok(Command::Print(USAGE.to_string())),
         Some("--version" | "-V") => Ok(Command::Print(format!(
@@ -181,6 +220,49 @@ fn parse_serve(args: Vec<String>) -> Result<Command, String> {
         config,
         display,
     }))
+}
+
+fn parse_routine(args: Vec<String>) -> Result<Command, String> {
+    let mut it = args.into_iter();
+    let action = match it.next().as_deref() {
+        Some("list") => RoutineAction::List,
+        Some("keep") => RoutineAction::Keep,
+        Some("unkeep") => RoutineAction::Unkeep,
+        Some("-h" | "--help") => return Ok(Command::Print(USAGE.to_string())),
+        Some(other) => {
+            return Err(format!(
+                "unknown routine command `{other}` (list, keep or unkeep)\n\n{USAGE}"
+            ))
+        }
+        None => return Err(format!("routine needs list, keep or unkeep\n\n{USAGE}")),
+    };
+    let mut words = Vec::new();
+    let mut file = None;
+    let mut config = None;
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "-h" | "--help" => return Ok(Command::Print(USAGE.to_string())),
+            "--file" => file = Some(PathBuf::from(value(&arg, &mut it)?)),
+            "--config" => config = Some(PathBuf::from(value(&arg, &mut it)?)),
+            flag if flag.starts_with('-') => {
+                return Err(format!("unknown option `{flag}` for routine\n\n{USAGE}"))
+            }
+            _ => words.push(arg),
+        }
+    }
+    let phrase = words.join(" ");
+    match (action, phrase.trim().is_empty()) {
+        (RoutineAction::List, false) => Err("routine list takes no phrase".to_string()),
+        (RoutineAction::Keep | RoutineAction::Unkeep, true) => {
+            Err("name the routine: incu routine keep <the words that ask for it>".to_string())
+        }
+        _ => Ok(Command::Routine(RoutineArgs {
+            action,
+            phrase,
+            file,
+            config,
+        })),
+    }
 }
 
 fn parse_stop(args: Vec<String>) -> Result<Command, String> {
@@ -354,6 +436,87 @@ pub fn serve(options: ServeOptions) -> Result<(), String> {
     crate::mcp::run_stdio(server).map_err(|e| e.to_string())
 }
 
+/// The routines file `incu routine` works on: `--file`, else the config's
+/// `routines`, else `$INCU_ROUTINES`, else the per-user data folder: the file
+/// `incu serve` uses.
+///
+/// # Errors
+///
+/// The config cannot be read, or there is no place to keep routines.
+pub fn routine_store(
+    file: Option<PathBuf>,
+    config: Option<PathBuf>,
+) -> Result<crate::routine::store::Store, String> {
+    use crate::routine::store::Store;
+    let path = match file {
+        Some(path) => Some(path),
+        None => {
+            let config = match &config {
+                Some(path) => Config::load(path)?,
+                None => Config::load_default()?,
+            };
+            config.routines.or_else(Store::default_path)
+        }
+    };
+    path.map(Store::at)
+        .ok_or_else(|| "no place to keep routines: set INCU_ROUTINES or pass --file".to_string())
+}
+
+/// `incu routine`: what only the person does to the routines an agent saved.
+///
+/// **Why this is a command and not a tool.** A routine a person has kept never
+/// expires. If an agent could say "keep this", it could exempt its own saves from
+/// the thirty days that exist so that nothing it learned lives on unreviewed. So
+/// keeping is done here, at a terminal, by the person, and no tool has an
+/// argument for it.
+///
+/// # Errors
+///
+/// The file cannot be read or written, or no routine matches the phrase.
+pub fn run_routine(args: RoutineArgs) -> Result<String, String> {
+    let store = routine_store(args.file, args.config)?;
+    let now = crate::routine::now_ms();
+    match args.action {
+        RoutineAction::List => {
+            let file = store.load()?;
+            let mut out = format!("routines in {}\n", store.path().display());
+            let mut any = false;
+            for routine in file.live(now) {
+                any = true;
+                let status = match routine.days_left(now) {
+                    Some(days) => format!("expires in {days} days unless used"),
+                    None => "kept: never expires".to_string(),
+                };
+                out.push_str(&format!("\n\"{}\" ({status})\n", routine.phrase));
+                for (i, step) in routine.steps.iter().enumerate() {
+                    out.push_str(&format!("  {}. {}\n", i + 1, step.review()));
+                }
+            }
+            if !any {
+                out.push_str("\n(none)\n");
+            }
+            Ok(out.trim_end().to_string())
+        }
+        RoutineAction::Keep | RoutineAction::Unkeep => {
+            let keep = args.action == RoutineAction::Keep;
+            let phrase = args.phrase;
+            store.update(|file| {
+                if file.set_taught(&phrase, keep, now) {
+                    Ok(if keep {
+                        format!("kept \"{phrase}\": it will not expire")
+                    } else {
+                        format!("\"{phrase}\" will expire after thirty days unused, from now")
+                    })
+                } else {
+                    Err(format!(
+                        "no routine matches \"{phrase}\"; `incu routine list` shows what is saved"
+                    ))
+                }
+            })
+        }
+    }
+}
+
 /// Ask the server whose stop file is `path` to stop, and say so on stdout.
 ///
 /// REPORTED, never swallowed: a stop request that silently failed is worse than
@@ -386,6 +549,10 @@ pub fn run(command: Command) -> Result<(), String> {
             Ok(())
         }
         Command::Serve(args) => serve(ServeOptions::from_args(args)?),
+        Command::Routine(args) => {
+            println!("{}", run_routine(args)?);
+            Ok(())
+        }
         Command::Stop(args) => {
             let path = match (args.journal, args.workspace) {
                 (Some(journal), _) => crate::safety::stop_file_beside(&journal),
@@ -480,6 +647,82 @@ mod tests {
             parse(argv(&["--version"])),
             Ok(Command::Print(v)) if v.starts_with("incu ")
         ));
+    }
+
+    fn routine_args(words: &[&str]) -> RoutineArgs {
+        match parse(argv(words)).expect("parses") {
+            Command::Routine(args) => args,
+            other => panic!("expected routine, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn routine_keep_and_unkeep_take_the_words_that_ask_for_the_routine() {
+        let keep = routine_args(&["routine", "keep", "open", "the", "weekly", "report"]);
+        assert_eq!(keep.action, RoutineAction::Keep);
+        assert_eq!(keep.phrase, "open the weekly report");
+        let unkeep = routine_args(&["routine", "unkeep", "report", "--file", "r.json"]);
+        assert_eq!(unkeep.action, RoutineAction::Unkeep);
+        assert_eq!(unkeep.file.as_deref(), Some(Path::new("r.json")));
+        assert_eq!(
+            routine_args(&["routine", "list"]).action,
+            RoutineAction::List
+        );
+        // A routine is named, a list is not, and a typo is not guessed.
+        assert!(parse(argv(&["routine", "keep"])).is_err());
+        assert!(parse(argv(&["routine", "list", "extra"])).is_err());
+        assert!(parse(argv(&["routine", "teach", "x"])).is_err());
+        assert!(parse(argv(&["routine"])).is_err());
+        assert!(parse(argv(&["routine", "keep", "x", "--taught"])).is_err());
+    }
+
+    /// Only this command sets "kept"; keeping stops the expiry and unkeeping
+    /// starts it again.
+    #[test]
+    fn keeping_a_routine_is_done_here_and_stops_it_expiring() {
+        use crate::routine::store::{Routines, Store};
+        let dir = std::env::temp_dir().join(format!("incu-cli-keep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = dir.join("routines.json");
+        let store = Store::at(file.clone());
+        let mut routines = Routines::default();
+        routines
+            .learn(
+                "open notes",
+                vec![crate::routine::Step::new(
+                    "key",
+                    serde_json::json!({"keys": ["ctrl", "n"], "in_window": "app=notes"}),
+                )],
+                false,
+                crate::routine::now_ms(),
+            )
+            .unwrap();
+        store.save(&routines).unwrap();
+        let args = |action, phrase: &str| RoutineArgs {
+            action,
+            phrase: phrase.to_string(),
+            file: Some(file.clone()),
+            config: None,
+        };
+        assert!(store.load().unwrap().routines[0]
+            .days_left(crate::routine::now_ms())
+            .is_some());
+        let said = run_routine(args(RoutineAction::Keep, "notes open")).unwrap();
+        assert!(said.contains("will not expire"), "{said}");
+        let kept = store.load().unwrap();
+        assert!(kept.routines[0].taught);
+        assert_eq!(kept.routines[0].days_left(crate::routine::now_ms()), None);
+        let listed = run_routine(args(RoutineAction::List, "")).unwrap();
+        assert!(listed.contains("kept: never expires"), "{listed}");
+        assert!(
+            listed.contains("ctrl"),
+            "every step is shown in full: {listed}"
+        );
+        run_routine(args(RoutineAction::Unkeep, "open notes")).unwrap();
+        assert!(!store.load().unwrap().routines[0].taught);
+        let missing = run_routine(args(RoutineAction::Keep, "open mail")).unwrap_err();
+        assert!(missing.contains("no routine matches"), "{missing}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The usage must name every flag the parser takes, or an operator cannot

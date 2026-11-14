@@ -35,7 +35,7 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -55,6 +55,11 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// How long to wait for each read or write.
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long one whole request may take, from connecting to the last byte. The
+/// engine answers in milliseconds; a peer that drips a byte at a time must not
+/// hold the server's one thread for as long as it likes.
+const TOTAL_DEADLINE: Duration = Duration::from_secs(15);
 
 /// Records read from the local memory engine's Watchman endpoints.
 #[derive(Debug, Clone)]
@@ -131,23 +136,74 @@ pub fn parse_record(id: &str, text: &str) -> Result<Record, String> {
             return Err(format!("asked for record {id} and was given {named}"));
         }
     }
+    // A span of another kind that errored fails the run as surely as a tool
+    // call does, even though it is not a step: what went wrong may be why the
+    // tool calls after it did what they did.
+    let failed = outcome_failure(&doc).or_else(|| {
+        spans.iter().find_map(|s| {
+            let why = s.get("error").and_then(error_text)?;
+            let kind = s.get("kind").and_then(Value::as_str).unwrap_or("a span");
+            (kind != "ToolCall").then(|| format!("a {kind} span errored: {why}"))
+        })
+    });
+    // `kind` must BE `ToolCall`: a span that does not say what it is is not
+    // known to be a tool call, and a step is never guessed.
     let mut spans: Vec<&Value> = spans
         .iter()
-        .filter(|s| {
-            s.get("kind")
-                .and_then(Value::as_str)
-                .is_none_or(|k| k == "ToolCall")
-        })
+        .filter(|s| s.get("kind").and_then(Value::as_str) == Some("ToolCall"))
         .collect();
     spans.sort_by_key(|s| s.get("seq").and_then(Value::as_i64).unwrap_or(0));
-    Ok(Record {
-        id: id.to_string(),
-        started_at_ms: doc
-            .get("started_at_ms")
+    let mut record = Record::new(
+        id,
+        doc.get("started_at_ms")
             .and_then(Value::as_i64)
             .unwrap_or(0),
-        calls: spans.into_iter().filter_map(call_of).collect(),
-    })
+        spans.into_iter().filter_map(call_of).collect(),
+    );
+    record.failed = failed;
+    Ok(record)
+}
+
+/// What the record itself says of how its run went, when it says it failed.
+///
+/// The records captured on 2026-11-13 carry no outcome of their own (their keys
+/// are `record_id`, `started_at_ms`, `spans`, `task`, `task_input`,
+/// `task_output`, `user_id`, `space_id`, `recorder`, `producer_model`,
+/// `linked_memory`), so this reads the keys an outcome would be written under,
+/// should the engine add one: an `error`, an `outcome` or `status` that names a
+/// failure, or a `success`/`ok` of false. Absent, the run is taken to have
+/// worked, which the calls' own errors then confirm or deny.
+fn outcome_failure(doc: &Value) -> Option<String> {
+    const FAILED: &[&str] = &[
+        "failed",
+        "failure",
+        "error",
+        "errored",
+        "cancelled",
+        "canceled",
+        "aborted",
+        "timeout",
+        "timed_out",
+        "crashed",
+    ];
+    if let Some(why) = doc.get("error").and_then(error_text) {
+        return Some(why);
+    }
+    for key in ["outcome", "status", "result"] {
+        if let Some(word) = doc.get(key).and_then(Value::as_str) {
+            if FAILED.contains(&word.trim().to_lowercase().as_str()) {
+                return Some(format!("{key} is \"{word}\""));
+            }
+        }
+    }
+    for key in ["success", "ok"] {
+        if doc.get(key) == Some(&Value::Bool(false)) {
+            return Some(format!("{key} is false"));
+        }
+    }
+    (doc.get("is_error") == Some(&Value::Bool(true))
+        || doc.get("failed") == Some(&Value::Bool(true)))
+    .then(|| "it is marked as an error".to_string())
 }
 
 /// One span as a [`Call`]; `None` for a span with no tool name.
@@ -186,6 +242,14 @@ fn output_text(value: &Value) -> Option<String> {
 
 /// `GET path` from `base` (`http://host:port`), returning the status and body.
 fn get(base: &str, path: &str) -> Result<(u16, Vec<u8>), String> {
+    get_within(base, path, TOTAL_DEADLINE)
+}
+
+/// [`get`], the whole request held to `total`: the connect, the write and every
+/// read together, on top of the limit each read has. A per-read limit alone does
+/// not bound a peer that sends a byte at a time.
+fn get_within(base: &str, path: &str, total: Duration) -> Result<(u16, Vec<u8>), String> {
+    let deadline = Instant::now() + total;
     let (host, port) = split_base(base)?;
     let addr = (host.as_str(), port)
         .to_socket_addrs()
@@ -197,25 +261,52 @@ fn get(base: &str, path: &str) -> Result<(u16, Vec<u8>), String> {
                  engine on this machine"
             )
         })?;
-    let mut stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
+    let mut stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT.min(total))
         .map_err(|e| format!("the memory engine at {host}:{port} is not answering: {e}"))?;
-    let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
-    let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(IO_TIMEOUT.min(total)));
+    // An IPv6 address is bracketed in a Host header (RFC 9110): `::1:9180` would
+    // read as an address with no port.
+    let authority = if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
     let request = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nAccept: application/json\r\n\
+        "GET {path} HTTP/1.1\r\nHost: {authority}\r\nAccept: application/json\r\n\
          Connection: close\r\n\r\n"
     );
     stream
         .write_all(request.as_bytes())
         .map_err(|e| format!("cannot ask the memory engine: {e}"))?;
     let mut raw = Vec::new();
-    // One byte over the cap, to tell "exactly the cap" from "more".
-    stream
-        .take(MAX_RESPONSE_BYTES as u64 + 1)
-        .read_to_end(&mut raw)
-        .map_err(|e| format!("the memory engine stopped answering: {e}"))?;
-    if raw.len() > MAX_RESPONSE_BYTES {
-        return Err("the memory engine's answer is over 4 MiB".to_string());
+    let mut piece = [0u8; 8192];
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(format!(
+                "the memory engine did not finish answering within {} seconds",
+                total.as_secs()
+            ));
+        }
+        let _ = stream.set_read_timeout(Some(left.min(IO_TIMEOUT)));
+        match stream.read(&mut piece) {
+            Ok(0) => break,
+            Ok(n) => {
+                raw.extend_from_slice(&piece[..n]);
+                if raw.len() > MAX_RESPONSE_BYTES {
+                    return Err("the memory engine's answer is over 4 MiB".to_string());
+                }
+            }
+            // A quiet moment is not the end: the loop asks the clock.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::Interrupted
+                ) => {}
+            Err(e) => return Err(format!("the memory engine stopped answering: {e}")),
+        }
     }
     parse_http(&raw)
 }
@@ -295,11 +386,14 @@ fn dechunk(mut body: &[u8]) -> Result<Vec<u8>, String> {
         if size == 0 {
             return Ok(out);
         }
-        if body.len() < size + 2 {
+        // Checked: a size of `ffffffffffffffff` must be a malformed chunk, not an
+        // addition that wraps (and in a debug build panics the server).
+        let end = size.checked_add(2).ok_or_else(bad)?;
+        if body.len() < end || out.len().saturating_add(size) > MAX_RESPONSE_BYTES {
             return Err(bad());
         }
         out.extend_from_slice(&body[..size]);
-        body = &body[size + 2..];
+        body = &body[end..];
     }
 }
 
@@ -468,6 +562,147 @@ mod tests {
             "{request}"
         );
         assert!(request.contains("Connection: close"), "{request}");
+    }
+
+    #[test]
+    fn a_chunk_size_that_overflows_is_a_malformed_answer_not_a_panic() {
+        for size in ["ffffffffffffffff", "fffffffffffffffe", "7fffffffffffffff"] {
+            let body = format!("{size}\r\nhello\r\n0\r\n\r\n");
+            let why = dechunk(body.as_bytes()).unwrap_err();
+            assert!(why.contains("malformed"), "{size}: {why}");
+        }
+        let answer = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nffffffffffffffff\r\nx";
+        assert!(parse_http(answer).unwrap_err().contains("malformed"));
+        // A chunk that claims more than the answer may be is refused too.
+        let big = format!("{:x}\r\n", MAX_RESPONSE_BYTES + 1);
+        assert!(dechunk(big.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn a_peer_that_drips_a_byte_at_a_time_is_cut_off_at_the_total_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let drip = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf);
+            let _ = socket.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 100000\r\n\r\n");
+            // Faster than any per-read timeout, and for far longer than the deadline.
+            for _ in 0..200 {
+                if socket.write_all(b"x").is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+        let started = Instant::now();
+        let why = get_within(
+            &format!("http://127.0.0.1:{port}"),
+            "/x",
+            Duration::from_millis(600),
+        )
+        .unwrap_err();
+        assert!(why.contains("did not finish answering"), "{why}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "took {:?}",
+            started.elapsed()
+        );
+        drip.join().unwrap();
+    }
+
+    #[test]
+    fn a_span_that_does_not_say_it_is_a_tool_call_is_not_one() {
+        let doc = r#"{"spans":[
+            {"seq":1,"name":"key","input":{"keys":["a"]}},
+            {"seq":2,"kind":null,"name":"key","input":{"keys":["b"]}},
+            {"seq":3,"kind":"ToolCall","name":"key","input":{"keys":["c"]}}]}"#;
+        let record = parse_record("w-1", doc).unwrap();
+        assert_eq!(record.calls.len(), 1);
+        assert_eq!(record.calls[0].args["keys"][0], "c");
+    }
+
+    #[test]
+    fn a_record_whose_own_outcome_says_it_failed_is_marked_failed() {
+        let with = |extra: &str| {
+            format!(
+                r#"{{"record_id":"w-1",{extra}"spans":[{{"seq":1,"kind":"ToolCall","name":"key","input":{{}}}}]}}"#
+            )
+        };
+        for (extra, says) in [
+            (r#""error":"the turn crashed","#, "crashed"),
+            (r#""outcome":"Failed","#, "outcome"),
+            (r#""status":"cancelled","#, "status"),
+            (r#""success":false,"#, "success"),
+            (r#""is_error":true,"#, "error"),
+        ] {
+            let record = parse_record("w-1", &with(extra)).unwrap();
+            let why = record
+                .failed
+                .unwrap_or_else(|| panic!("{extra} was not read"));
+            assert!(why.contains(says), "{extra}: {why}");
+        }
+        for fine in [
+            r#""outcome":"done","#,
+            r#""success":true,"#,
+            r#""error":null,"#,
+            "",
+        ] {
+            assert_eq!(
+                parse_record("w-1", &with(fine)).unwrap().failed,
+                None,
+                "{fine}"
+            );
+        }
+        // The real, captured records say nothing of an outcome: not failed.
+        for real in [SHELL, FAILED, STRUCTURED] {
+            let id = serde_json::from_str::<Value>(real).unwrap()["record_id"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            assert_eq!(parse_record(&id, real).unwrap().failed, None, "{id}");
+        }
+    }
+
+    #[test]
+    fn an_errored_span_of_any_kind_fails_the_record() {
+        let doc = r#"{"spans":[
+            {"seq":1,"kind":"ModelCall","name":"claude","input":{},"error":"overloaded"},
+            {"seq":2,"kind":"ToolCall","name":"key","input":{"keys":["a"]},"error":null}]}"#;
+        let record = parse_record("w-1", doc).unwrap();
+        let why = record.failed.expect("the model span errored");
+        assert!(
+            why.contains("ModelCall") && why.contains("overloaded"),
+            "{why}"
+        );
+        // A tool call's own error stays on the call, where the learner reads it.
+        let tool =
+            r#"{"spans":[{"seq":1,"kind":"ToolCall","name":"Bash","input":{},"error":"exit 1"}]}"#;
+        let record = parse_record("w-1", tool).unwrap();
+        assert_eq!(record.calls[0].error.as_deref(), Some("exit 1"));
+    }
+
+    /// The request names an IPv6 host in brackets, as HTTP requires.
+    #[test]
+    fn an_ipv6_host_header_is_bracketed() {
+        let Ok(listener) = TcpListener::bind("[::1]:0") else {
+            return; // this machine has no IPv6 loopback
+        };
+        let port = listener.local_addr().unwrap().port();
+        let served = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let n = socket.read(&mut buf).unwrap();
+            let _ = socket.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}");
+            String::from_utf8_lossy(&buf[..n]).to_string()
+        });
+        let (status, _) = get(&format!("http://[::1]:{port}"), "/x").unwrap();
+        assert_eq!(status, 200);
+        let request = served.join().unwrap();
+        assert!(
+            request.contains(&format!("Host: [::1]:{port}\r\n")),
+            "{request}"
+        );
     }
 
     #[test]

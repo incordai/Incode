@@ -5,10 +5,11 @@
 //!
 //! 1. **The phrase must not point at the screen.** "this" or "that" means
 //!    whatever was on screen when it was said ([`super::words::is_deictic`]).
-//! 2. **The run must not have failed.** A call that errored, or a `wait_for`
-//!    that timed out or was stopped, is a run that did not do what it set out
-//!    to; replaying it would repeat the failure. Failed OBSERVING calls do not
-//!    count: they are dropped anyway.
+//! 2. **The run must not have failed.** ANY call that errored (a shell command,
+//!    a refused `ui_tree`, a file that was not there: not only a desktop call),
+//!    a record whose own outcome says it failed ([`check_record`]), or a
+//!    `wait_for` that timed out or was stopped, is a run that did not do what it
+//!    set out to; replaying it would repeat the failure.
 //! 3. **Every kept step must be replayable on another day.** The only way to
 //!    name a control that survives is a selector, so a step that uses an `eN`
 //!    id (valid for one `ui_tree` only), a pixel coordinate (valid for one
@@ -33,6 +34,10 @@
 //! left out and REPORTED in [`Cleaned::skipped`], so the agent knows that a
 //! step it may have relied on is not in the routine.
 //!
+//! Last, the text of a step that types into a secure field, or that a recording
+//! kept only as a placeholder, is taken out and made a parameter
+//! ([`super::params`]): a routine never holds a secret.
+//!
 //! The same per-step check, [`check_step`], runs again before a replay, so a
 //! hand-edited routines file cannot smuggle in a step the learner would have
 //! refused.
@@ -41,7 +46,8 @@ use std::fmt;
 
 use serde_json::Value;
 
-use super::source::Call;
+use super::params::{parameterise, Made};
+use super::source::{Call, Record};
 use super::words::{is_deictic, word_set};
 use super::{Step, MAX_STEPS, MAX_STEP_BYTES};
 use crate::permission::{ACTING, OBSERVING};
@@ -87,6 +93,13 @@ pub enum Refusal {
     Deictic,
     /// The phrase has no words of its own (all filler).
     NoWords,
+    /// A record's own outcome says the run failed, whatever its calls say.
+    RecordFailed {
+        /// The record.
+        id: String,
+        /// What it says.
+        why: String,
+    },
     /// A call in the run failed.
     RunFailed {
         /// Its 1-based position in the calls given.
@@ -123,6 +136,11 @@ impl fmt::Display for Refusal {
                 f,
                 "not learned: the phrase has no words of its own once filler words are \
                  ignored"
+            ),
+            Refusal::RecordFailed { id, why } => write!(
+                f,
+                "not learned: record {id} says its run failed ({why}). Only a run that worked \
+                 is kept; do the task again, cleanly, and save that"
             ),
             Refusal::RunFailed { step, tool, why } => write!(
                 f,
@@ -161,15 +179,25 @@ pub struct Cleaned {
     /// Keyboard steps that named no window and were given the window of the step
     /// before them.
     pub inferred_window: usize,
+    /// The steps whose text was taken out and made a parameter the run must be
+    /// given ([`super::params`]).
+    pub parameters: Vec<Made>,
 }
+
+/// The names incu's tools are recorded under as `mcp__<server>__<tool>`: the key
+/// incode's client configs register it by (`desktop`), the name `incu` itself
+/// answers to, and its protocol name, with the underscore a client makes of the
+/// hyphen. Nothing else is taken for this server.
+pub const OWN_SERVERS: &[&str] = &["desktop", "incu", "incode-desktop", "incode_desktop"];
 
 /// The desktop tool a recorded name is, if it is one.
 ///
 /// A recorded name is the plain tool name (incode's own tools), or an MCP
-/// name `mcp__<server>__<tool>`. For the second form the SERVER must look
-/// like this one (its name contains `desktop` or `incu`), because other MCP
-/// servers have tools called `key` or `scroll` too and a routine must never
-/// replay someone else's.
+/// name `mcp__<server>__<tool>`. For the second form the SERVER must be one of
+/// incu's own names ([`OWN_SERVERS`]), exactly: other MCP servers have tools
+/// called `key` or `scroll` too, and a server that merely has "desktop" in its
+/// name (a remote-desktop tool, a screen sharer) is not this one. A routine must
+/// never replay someone else's tool.
 #[must_use]
 pub fn desktop_tool(recorded: &str) -> Option<&str> {
     let known = |name: &str| OBSERVING.contains(&name) || ACTING.contains(&name);
@@ -177,8 +205,7 @@ pub fn desktop_tool(recorded: &str) -> Option<&str> {
         None => known(recorded).then_some(recorded),
         Some(rest) => {
             let (server, tool) = rest.split_once("__")?;
-            let server = server.to_lowercase();
-            ((server.contains("desktop") || server.contains("incu")) && known(tool)).then_some(tool)
+            (OWN_SERVERS.contains(&server) && known(tool)).then_some(tool)
         }
     }
 }
@@ -362,7 +389,36 @@ pub(super) fn wait_failure(answer: &str) -> Option<String> {
 /// A [`Refusal`]: the phrase, a failed call, a step that cannot be replayed, an
 /// empty result or too many steps.
 pub fn learn_from_calls(phrase: &str, calls: &[Call]) -> Result<Cleaned, Refusal> {
+    learn_with(phrase, calls, &|_| false)
+}
+
+/// As [`learn_from_calls`], with `is_secret` asked about the raw selector of a
+/// control that no name condemns: the desktop's own report that it is a
+/// password field (see [`super::params`]).
+///
+/// # Errors
+///
+/// As [`learn_from_calls`].
+pub fn learn_with(
+    phrase: &str,
+    calls: &[Call],
+    is_secret: &dyn Fn(&str) -> bool,
+) -> Result<Cleaned, Refusal> {
     check_phrase(phrase)?;
+    // ANY call that failed is a run that failed: a shell command that errored, a
+    // file that could not be read, a looking call that was refused. Not only the
+    // desktop calls: what went wrong there may be why the desktop calls that
+    // followed did what they did, and a routine made of them is not what the
+    // task needed.
+    for (index, call) in calls.iter().enumerate() {
+        if let Some(why) = &call.error {
+            return Err(Refusal::RunFailed {
+                step: index + 1,
+                tool: call.tool.clone(),
+                why: first_line(why),
+            });
+        }
+    }
     let mut steps = Vec::new();
     let mut dropped = 0;
     let mut skipped = Vec::new();
@@ -379,13 +435,6 @@ pub fn learn_from_calls(phrase: &str, calls: &[Call]) -> Result<Cleaned, Refusal
         if READING.contains(&tool) {
             dropped += 1;
             continue;
-        }
-        if let Some(why) = &call.error {
-            return Err(Refusal::RunFailed {
-                step: n,
-                tool: tool.to_string(),
-                why: first_line(why),
-            });
         }
         if let Some(why) = call
             .output
@@ -420,12 +469,31 @@ pub fn learn_from_calls(phrase: &str, calls: &[Call]) -> Result<Cleaned, Refusal
     if steps.len() > MAX_STEPS {
         return Err(Refusal::TooLong(steps.len()));
     }
+    // After every step is known replayable, and last: the text of a secure field
+    // or a redacted recording is taken out of the steps before they go anywhere.
+    let parameters = parameterise(&mut steps, is_secret);
     Ok(Cleaned {
         steps,
         dropped,
         skipped,
         inferred_window,
+        parameters,
     })
+}
+
+/// Whether a record that was read says its own run did not work.
+///
+/// # Errors
+///
+/// [`Refusal::RecordFailed`] when it does.
+pub fn check_record(record: &Record) -> Result<(), Refusal> {
+    match &record.failed {
+        Some(why) => Err(Refusal::RecordFailed {
+            id: record.id.clone(),
+            why: first_line(why),
+        }),
+        None => Ok(()),
+    }
 }
 
 /// The window part of a step's selector (or its `in_window`), as text, when it
@@ -737,15 +805,118 @@ mod tests {
         assert!(learn(&[wait("{\n  \"result\": \"found\"\n}")]).is_ok());
     }
 
+    /// A run is failed when ANY call in it failed: a looking call that was
+    /// refused, a shell command that exited non-zero, a file that was not there.
     #[test]
-    fn a_failed_looking_call_does_not_fail_the_run() {
-        let cleaned = learn(&[
+    fn a_failed_call_of_any_kind_is_a_failed_run() {
+        let ok = sel_click("role=button;name=Settings");
+        // The case that was missed: [Bash fails, incu key ok].
+        let key = Call::ok(
+            "mcp__desktop__key",
+            json!({"keys": ["enter"], "in_window": IN}),
+        );
+        let why = learn(&[
+            Call::ok("Bash", json!({"command": "false"})).failed("exit code 1"),
+            key.clone(),
+        ])
+        .unwrap_err();
+        match &why {
+            Refusal::RunFailed { step, tool, why } => {
+                assert_eq!((*step, tool.as_str()), (1, "Bash"));
+                assert_eq!(why, "exit code 1");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(why.to_string().contains("call 1 (Bash)"), "{why}");
+        // A looking call that failed, a call that is no desktop tool at all, and
+        // an error after the last desktop step.
+        for failing in [
             Call::ok("ui_tree", json!({})).failed("window has no tree"),
-            sel_click("role=button;name=Settings"),
+            Call::ok("mcp__memory__recall_index", json!({})).failed("unknown scope"),
+            Call::ok("Read", json!({"file_path": "x"})).failed("no such file"),
+        ] {
+            assert!(
+                matches!(
+                    learn(&[ok.clone(), failing.clone()]),
+                    Err(Refusal::RunFailed { .. })
+                ),
+                "{failing:?}"
+            );
+            assert!(matches!(
+                learn(&[failing, ok.clone()]),
+                Err(Refusal::RunFailed { .. })
+            ));
+        }
+        // And the same calls that all worked are learned.
+        assert!(learn(&[Call::ok("Bash", json!({"command": "true"})), key]).is_ok());
+    }
+
+    #[test]
+    fn a_record_whose_own_outcome_says_it_failed_is_not_learned() {
+        let record = Record::new("w-1", 1, vec![sel_click("role=button;name=Settings")]);
+        assert!(check_record(&record).is_ok());
+        let failed = check_record(&record.failing("status is \"failed\"\nmore")).unwrap_err();
+        assert_eq!(
+            failed,
+            Refusal::RecordFailed {
+                id: "w-1".to_string(),
+                why: "status is \"failed\"".to_string()
+            }
+        );
+        assert!(failed.to_string().contains("w-1"), "{failed}");
+    }
+
+    /// Only incu's own servers: a name with "desktop" in it is not enough.
+    #[test]
+    fn another_servers_tools_are_never_taken_for_incus() {
+        for foreign in [
+            "mcp__remote_desktop__key",
+            "mcp__desktop_sharing__click_element",
+            "mcp__my-incu-fork__key",
+            "mcp__Desktop__key",
+            "mcp__desktopx__wait_for",
+            "mcp__incu2__wait_for",
+        ] {
+            assert_eq!(desktop_tool(foreign), None, "{foreign}");
+        }
+        for own in OWN_SERVERS {
+            let name = format!("mcp__{own}__wait_for");
+            assert_eq!(desktop_tool(&name), Some("wait_for"), "{name}");
+        }
+        // Left out of a routine and reported, as any other call that is not ours.
+        let cleaned = learn(&[
+            Call::ok("mcp__remote_desktop__key", json!({"keys": ["enter"]})),
+            sel_click("role=button;name=New"),
         ])
         .unwrap();
         assert_eq!(cleaned.steps.len(), 1);
-        assert_eq!(cleaned.dropped, 1);
+        assert_eq!(cleaned.skipped, ["mcp__remote_desktop__key"]);
+    }
+
+    #[test]
+    fn typing_into_a_password_field_is_learned_as_a_parameter() {
+        let cleaned = learn(&[
+            sel_click("role=edit;name=Password"),
+            Call::ok(
+                "type_text",
+                json!({"text": "hunter2-secret", "in_window": IN}),
+            ),
+        ])
+        .unwrap();
+        assert_eq!(cleaned.parameters.len(), 1);
+        assert_eq!(cleaned.steps[1].args["text"], "{{password}}");
+        assert!(!format!("{cleaned:?}").contains("hunter2"));
+        // The desktop's own word that a control is a password field counts too.
+        let by_desktop = learn_with(
+            "sign in",
+            &[
+                sel_click("role=edit;name=Code"),
+                Call::ok("type_text", json!({"text": "482913", "in_window": IN})),
+            ],
+            &|raw: &str| raw.contains("name=Code"),
+        )
+        .unwrap();
+        assert_eq!(by_desktop.steps[1].args["text"], "{{code}}");
     }
 
     #[test]

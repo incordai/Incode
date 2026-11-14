@@ -11,6 +11,11 @@
 //!
 //! Direction words are NOT filler: "turn the volume up" and "turn the volume
 //! down" must stay different requests, and so must "on" and "off".
+//!
+//! "Any order" stops at a word that says which way something goes ([`DIRECTION`]:
+//! to, from, into, ...). The phrase is cut there and each side matches as its own
+//! set, so "copy backup files to desktop" never runs for "copy desktop files to
+//! backup": the same words, the opposite task.
 
 use std::collections::BTreeSet;
 
@@ -36,11 +41,44 @@ pub fn word_set(phrase: &str) -> BTreeSet<String> {
         .collect()
 }
 
-/// The phrase's identity: its word set, sorted and joined. Two phrases with the
-/// same key are the same request.
+/// Words that say which way a thing goes. They are filler or ordinary words
+/// elsewhere, but here the words on each side of one must stay on that side:
+/// "copy backup files to desktop" is not "copy desktop files to backup", and
+/// a routine that ran on the second would copy the wrong way round.
+pub const DIRECTION: &[&str] = &[
+    "to", "from", "into", "onto", "over", "under", "before", "after",
+];
+
+/// The phrase's identity. Two phrases with the same key are the same request.
+///
+/// With no direction word ([`DIRECTION`]) it is the word set, sorted and
+/// joined: any order. With one, the phrase is cut at each direction word and
+/// each side is its own sorted word set, so the words may come in any order
+/// WITHIN a side and never cross a direction word.
 #[must_use]
 pub fn key(phrase: &str) -> String {
-    word_set(phrase).into_iter().collect::<Vec<_>>().join(" ")
+    let lowered = phrase.to_lowercase();
+    let mut sides: Vec<BTreeSet<&str>> = vec![BTreeSet::new()];
+    let mut directions: Vec<&str> = Vec::new();
+    for word in lowered.split(|c: char| !c.is_alphanumeric()) {
+        if word.is_empty() {
+            continue;
+        }
+        if let Some(direction) = DIRECTION.iter().find(|d| **d == word) {
+            directions.push(direction);
+            sides.push(BTreeSet::new());
+        } else if !STOP.contains(&word) {
+            if let Some(side) = sides.last_mut() {
+                side.insert(word);
+            }
+        }
+    }
+    let side = |words: &BTreeSet<&str>| words.iter().copied().collect::<Vec<_>>().join(" ");
+    let mut out = side(&sides[0]);
+    for (direction, words) in directions.iter().zip(&sides[1..]) {
+        out.push_str(&format!(" | {direction} | {}", side(words)));
+    }
+    out
 }
 
 /// Whether the phrase points at what is on screen right now ("close this",
@@ -59,11 +97,11 @@ pub fn is_deictic(phrase: &str) -> bool {
 /// words of its own (all filler) matches nothing.
 #[must_use]
 pub fn find<'a>(routines: &'a [Routine], phrase: &str) -> Option<&'a Routine> {
-    let want = word_set(phrase);
-    if want.is_empty() {
+    if word_set(phrase).is_empty() {
         return None;
     }
-    routines.iter().find(|r| word_set(&r.phrase) == want)
+    let want = key(phrase);
+    routines.iter().find(|r| key(&r.phrase) == want)
 }
 
 #[cfg(test)]
@@ -132,6 +170,28 @@ mod tests {
         assert!(find(&routines, "open notes and mail").is_none());
         assert!(find(&routines, "open").is_none());
         assert!(find(&routines, "report weekly send").is_some());
+    }
+
+    #[test]
+    fn the_words_on_each_side_of_a_direction_word_stay_on_that_side() {
+        assert_ne!(
+            key("copy backup files to desktop"),
+            key("copy desktop files to backup")
+        );
+        // Any order still holds within a side.
+        assert_eq!(
+            key("copy backup files to desktop"),
+            key("files backup copy, to the desktop")
+        );
+        let routines = [routine("copy backup files to desktop")];
+        assert!(find(&routines, "copy desktop files to backup").is_none());
+        assert!(find(&routines, "desktop to copy files backup").is_none());
+        assert!(find(&routines, "copy files backup to desktop").is_some());
+        // The same words under another direction word are another request.
+        assert_ne!(key("move notes to trash"), key("move notes from trash"));
+        // Two direction words keep three sides.
+        assert_ne!(key("copy a from b to c"), key("copy a from c to b"));
+        assert_eq!(key("copy a from b to c"), key("a copy from b to c"));
     }
 
     #[test]

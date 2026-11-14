@@ -374,18 +374,35 @@ shortcuts (`atticus.py`, MIT), kept as simple as they are there.
 ### What a routine is
 
 Per routine: the cleaned step list (`tool` + `args`, the same names and arguments the live
-tools take), the trigger phrase, the date learned, the last-used time and a user-taught flag.
-All in one JSON file (below). Code: `crates/desktop/src/routine/` (`words`, `learn`, `store`,
-`source`, `watchman`, `replay`) and `mcp/routine_tool.rs`.
+tools take), the trigger phrase, the date learned, the last-used time and a "kept" flag that
+**only the person sets** (`incu routine keep`, below). All in one JSON file (below). Code:
+`crates/desktop/src/routine/` (`words`, `learn`, `params`, `store`, `source`, `watchman`,
+`replay`, `pictures`) and `mcp/routine_tool.rs`.
 
 | Tool | Tier | What it does |
 |---|---|---|
-| `routine_save` | acting | Learn a routine under `phrase` from `records` (Watchman record ids) or from `steps`. Saving under a phrase with the same words replaces the routine: that is how a failed one is redone. |
-| `routine_run` | acting | Replay the routine a phrase matches, on the real desktop, attended. |
+| `routine_save` | acting | Learn a routine under `phrase` from `records` (Watchman record ids) or from `steps`. Saving under a phrase with the same words replaces the routine: that is how a failed one is redone. There is no `taught` argument (see "Keeping"). |
+| `routine_run` | acting | Replay the routine a phrase matches, on the real desktop, attended. Takes `params` for the secrets a routine does not keep. |
 | `routine_forget` | acting | Delete one. |
-| `routine_list` | observing | Every live routine: phrase, step count, dates, taught, days left. |
-| `routine_match` | observing | The routine a phrase would run, with its steps (typed text by length only), or that none matches. Runs nothing. |
+| `routine_list` | observing | Every live routine: phrase, **every step with its full typed text and selectors**, the parameters it needs, dates, kept, days left. |
+| `routine_match` | observing | The routine a phrase would run, with every step in full, or that none matches. Runs nothing. |
 | `watch` | observing | Below. |
+
+### Keeping a routine (only the person)
+
+A routine unused for 30 days expires, so that nothing an agent learned lives on unreviewed. A
+routine the person **keeps** never expires. That is set at a terminal, never by a tool, so an
+agent cannot exempt its own saves from the thirty days:
+
+```
+incu routine list                 every routine, each step in full
+incu routine keep <the words>     keep one (matched as a request is: by its words)
+incu routine unkeep <the words>   let it expire again, thirty days from now
+```
+
+(`--file <PATH>` or `--config <FILE>` to name the routines file; else the one `incu serve`
+uses.) A `routine_save` that replaces a kept routine leaves it kept. Passing `taught` to
+`routine_save` is refused with this explanation.
 
 `routine_save` and `routine_forget` are acting although they touch a file and not the screen,
 because the file is what a later `routine_run` does to the machine. `routine_list` and
@@ -401,10 +418,19 @@ two phrases are the same request when the word SETS are equal, in any order. No 
 partial match: a routine that runs on a near miss runs the wrong thing on a machine the
 operator is signed into. Direction words (`up`, `down`, `on`, `off`) are not filler.
 
+"Any order" stops at a word that says which way something goes: `to from into onto over under
+before after`. The phrase is cut there and each side is matched as its own set, so "copy
+backup files to desktop" is the same request as "files backup copy to the desktop" and never
+the same as "copy desktop files to backup".
+
 ### What is refused, and what is cleaned
 
-Nothing is learned when: the phrase says "this" or "that"; any call failed (a tool error, or a
-`wait_for` that timed out or was stopped); or any kept step cannot be replayed on another day:
+Nothing is learned when: the phrase says "this" or "that"; **any call or span of the source
+records failed, desktop or not** (a shell command that errored, a refused `ui_tree`, an errored
+model span: `[Bash fails, incu key ok]` is refused), the record's own outcome says it failed
+(an `error`, or a failed `outcome`/`status`, `success: false`; the engine's records of
+2026-11-13 carry none, so today this reads only the spans), or a `wait_for` timed out or was
+stopped; or any kept step cannot be replayed on another day:
 an `eN` id (valid for one `ui_tree` only), a raw coordinate (`click`, `move_mouse`, `drag`), a
 window handle (`window`, `focus_window`), a `wait_for` with a `baseline`, a missing or
 unparseable `selector`, or another routine tool. The whole routine is refused, because dropping
@@ -421,7 +447,7 @@ refused. `scroll` is never replayable: it takes no selector and scrolls under th
 (use `element_action scroll_into_view`, or Page Down then `wait_for screen_changes`).
 
 `ui_tree`, `screenshot`, `list_windows`,
-`screen_info` and `cursor_position` are dropped (a failed one does not fail the run);
+`screen_info` and `cursor_position` are dropped (a failed one DOES fail the run: see above);
 `wait_for` is kept. `screenshot_after` is removed from kept steps. Calls that are not desktop
 tools (a shell command) are left out and **reported** in the reply. The same per-step check
 runs again before a replay, so a hand-edited file cannot get past it.
@@ -436,10 +462,14 @@ tool, never ask for it. `WatchmanSource` reads one endpoint of the local memory 
 record becomes steps replayed on this desktop):
 
 `GET /v1/memory/watchman/record/{id}` -> `{record_id, started_at_ms, spans:[{seq, kind, name,
-input, output, error}]}`. Only `ToolCall` spans are read, in `seq` order, and several records
-are joined by `started_at_ms`. `error` set means the call failed; `output` may be text, null
-or JSON. A desktop tool is recognised by its plain name or as `mcp__<server>__<tool>` with a
-server name containing `desktop` or `incu`. Checked against a running engine on 2026-11-13;
+input, output, error}]}`. Only spans whose `kind` is exactly `ToolCall` are steps (a span
+that does not say is not guessed), in `seq` order, and several records are joined by
+`started_at_ms`. `error` set means the call failed; `output` may be text, null or JSON. A
+desktop tool is recognised by its plain name or as `mcp__<server>__<tool>` with the server
+named exactly `desktop`, `incu`, `incode-desktop` or `incode_desktop`: another server that
+merely has "desktop" in its name (a remote-desktop tool) is not incu and is left out. A
+request is held to 15 seconds in all (on top of 10 s per read), a malformed or overflowing
+chunk is refused, and the `Host` header brackets an IPv6 address. Checked against a running engine on 2026-11-13;
 the test fixtures are real answers with the project, user and text replaced. The engine had
 no record of a desktop call at that date, so the desktop-call tests build their records from
 that shape and the span fields above.
@@ -456,18 +486,64 @@ step that changed the screen, and **stops at the first failure**, saying which s
 
 Three rules from the live test: **links and buttons are invoked**: a recorded left click on a
 control whose role is `link` or `button` runs first as `element_action invoke` (works for a
-control scrolled out of view, moves no mouse, takes no focus) and only if that is refused as
-the recorded `click_element`; both go through the gates and both are journalled. A keyboard
+control scrolled out of view, moves no mouse, takes no focus) and the recorded
+`click_element` runs instead ONLY when the invoke was refused before it did anything: the
+control "does not support/offer invoke" (each platform's whole message is matched, not a
+word of it). Any other error from the invoke (the pattern call failed, a timeout, the
+operator's hook, the stop) may have come after the control acted, and a second action would
+press a button twice, so the step fails and the replay stops. A keyboard
 step's `in_window` is looked up **now** and passed as the tool's `window`, so the tool
 refuses unless that window really has the focus (a window that is not there fails the step
-before any key is sent). And the replay **stops when a `set_value` or `element_action`
-answers "unverified" and the next step acts on the screen** (a click or typing; a `wait_for`
-after it is allowed, because it checks the screen itself). A click always says "unverified"
-and does not stop the replay: the next step's selector, or a `wait_for`, is its check. A
+before any key is sent). And the replay **stops when a step that SETS A VALUE answers
+"unverified" or "tried to set" and the next step acts on the screen** (a click or typing; a
+`wait_for` after it is allowed, because it checks the screen itself): `set_value`, and the
+`element_action`s `increment` and `decrement`. A click, `invoke`, `press` or
+`scroll_into_view` always says "unverified" (a press has no state to read back; live, on
+Windows, every one does) and **never** stops the replay: the next step's selector, or a
+`wait_for`, is its check. A
 consequence: filling a web field with `set_value` in a browser (whose read-back is
 unreliable) stops a replay at that step. **No repair**: the reply tells the caller
 to do the whole task again and `routine_save` it under the same phrase, which replaces the
 routine. A routine that ran to the end has its last-used time reset.
+
+### Pictures of a replay
+
+Each step of `routine_run` gets one picture before it and one after it (after the screen has
+had its settle time), taken with incu's own capture, under the same guard as `screenshot` (a
+blocked application's window is never captured): of the window the step is for (its selector's
+window part, or its `in_window`), else of the screen, which is also what a window that cannot
+be found gets. JPEG, kept in `last-replay/` beside `routines.json` as
+`step-003-before.jpg` / `step-003-after.jpg`. **Only the last run is kept** (the next run
+clears the folder, touching only files of that name), the folder is held to 48 MiB by deleting
+the oldest first, so the failed step's pictures, the newest, always survive, and one picture
+over 4 MiB is not kept. A failure names the failed step's two pictures by path; the success
+reply gives the folder and how many were kept. A screen that cannot be captured (headless, a
+blocked window on screen) is said in `pictures.trouble` and does not fail the replay. There is
+no video and no ffmpeg, and the pictures are **never sent to the engine's OCR** (or anywhere):
+reading them is for whoever is given the path. They are written by the replay itself, not
+through `screenshot`, so each is not a journal line of its own.
+
+### Parameters: secrets a routine does not keep
+
+The file holds what a routine types so that the person can read it, EXCEPT text that must not
+be on disk. When a routine is learned, a step becomes a **parameter**, stored as `{{name}}`,
+when: it types into a password or other secure field (the field's name or automation id says
+so: `password`, `passcode`, `PIN`, `OTP`, `token`, `api key`, `security code`, ...; or, when
+the control is still on screen as the routine is saved, the desktop reports it as a password
+field; a typing step goes into the control the step before it named); or the recording kept
+only a **placeholder or a digest** in place of the text (`[REDACTED]`, `<hidden>`, `****`,
+`[12 chars]`, `sha256:...`, a bare 64-digit hex, or a value that is not text): replaying a
+placeholder into a login box is a wrong password, not a shortcut. An agent can also write
+`{{name}}` in a text itself. `routine_save` lists the parameters it made, `routine_list` shows
+`params_needed`, and `routine_run` **refuses before step 1** unless `params: {"name": "..."}`
+gives every one (and no name the routine does not take). A value is substituted in memory
+into the one call that types it and is taken back out of any message the replay returns; it is
+not written to the file, the journal (which describes typing by length) or the reply. The
+operator's own pre/post-tool hooks, as for any typing, still see the real arguments. This is
+a screen on what the learner can see, not a promise: a secure field whose label does not say
+so and that is gone when the routine is saved is not found, which is why `routine_save`,
+`routine_list` and `routine_match` show **the full typed text of every step** (and every
+selector in full): the person reads exactly what a routine will type before it runs.
 
 ### Storage
 
@@ -477,24 +553,36 @@ never read as empty. Path: `routines` in the config (`--config`), else `$INCU_RO
 `%APPDATA%\incord-desktop\routines.json` (Windows), `~/Library/Application Support/
 incord-desktop/routines.json` (macOS), `$XDG_DATA_HOME` or `~/.local/share` then
 `incord-desktop/routines.json` (Linux). A routine unused for 30 days expires (it is hidden at
-once and removed on the next write) unless it was taught. Up to 200 routines of up to 100
-steps. **Typed text is stored literally**; do not save a routine that types a secret.
+once and removed on the next write) unless the person kept it. Up to 100 routines of up to 100
+steps, one step's arguments at most 4 KiB and one routine at most 24 KiB (counting each
+step's structure, so many tiny steps are not mistaken for a small routine). **The file can never
+lock itself out:** a load refuses a file over 4 MiB, so a save refuses to write one (before
+writing anything, with the old file untouched), and a test writes the largest file the caps
+allow and reads it back. **Two servers do not lose each other's changes:** every change is
+load, change, save under a lock file (`routines.json.lock`, an exclusive create; a lock older
+than 30 s is taken to be a dead process's and removed; a change waits up to 10 s for it).
 
 ### `watch`
 
 "Watch for me" is one `wait_for` with a long deadline, as a tool of its own. A separate tool
 rather than an option because `wait_for`'s 60 s cap and 50 ms to 2 s polling are properties
 its tests pin for a call that returns in moments, while a watch is the opposite promise: it
-**blocks** the call for up to 24 hours (default 1 hour), polled every 1 s (250 ms to 10 s).
+**blocks** the call for up to 24 hours (default 1 hour), polled every 1 s (250 ms to 10 s),
+**every 5 s for `screen_changes`**, whose look is a capture and a hash of the whole screen.
 The look is the same code (`wait::run`, new `Budget::watch`). The stop file ends it within
-a second. When it ends, the operator's **post-tool hook for `watch`** is run with the reply
+a second. **A watch holds the server for its whole duration**: the server answers one call at
+a time, so while it runs no other desktop call is served, the caller's included (the tool's
+description says so). When it ends, the operator's **post-tool hook for `watch`** is run with the reply
 (`result`, what it found, `message`) as `tool_response`: that hook is the notification or
 the follow-up (for example `osascript -e 'display notification ...'`, `notify-send`, or a
 command that starts a session). Only for `watch` is the answer passed to the hook; every
 other tool's hook still gets none. No model runs and nothing polls it. A line `started: ...`
 is journalled when a watch begins. Through incode's toolbox the call bound for `watch` is
-24 h plus a minute and for `routine_run` ten minutes (otherwise 120 s). If the client goes
-away during a watch, the server notices when the watch ends or the stop file is written.
+24 h plus a minute and for `routine_run` ten minutes (otherwise 120 s). **If the client goes
+away during a watch, the watch ends**: stdin is read on a thread of its own, which raises a
+flag at end of input that waiting calls look at as often as the stop file, so the pipe's EOF
+is no longer unread behind a call that runs for a day. (Every line sent before the end is
+still answered, and the desktop is stopped after them, as before.)
 
 ### Not built
 

@@ -49,6 +49,11 @@ pub const DEFAULT_WATCH_MS: u64 = 60 * 60 * 1000;
 pub const MAX_WATCH_MS: u64 = 24 * 60 * 60 * 1000;
 /// How often a `watch` looks when the call does not say.
 pub const DEFAULT_WATCH_POLL_MS: u64 = 1_000;
+/// How often a `watch` of the SCREEN looks when the call does not say. A look
+/// at the screen is a capture and a hash of every pixel of it, which costs far
+/// more than asking whether a window exists; for hours, once in five seconds is
+/// the price a background watch should pay.
+pub const DEFAULT_WATCH_SCREEN_POLL_MS: u64 = 5_000;
 /// The fastest and slowest a `watch` may look. A watch is not waiting for a
 /// dialog to settle, so it is held to a slower floor than `wait_for`'s.
 pub const MIN_WATCH_POLL_MS: u64 = 250;
@@ -97,12 +102,27 @@ const WATCH_BOUNDS: Bounds = Bounds {
     max_poll: MAX_WATCH_POLL_MS,
 };
 
+/// `watch` of the screen: as [`WATCH_BOUNDS`], looking every
+/// [`DEFAULT_WATCH_SCREEN_POLL_MS`] unless told otherwise.
+const WATCH_SCREEN_BOUNDS: Bounds = Bounds {
+    default_poll: DEFAULT_WATCH_SCREEN_POLL_MS,
+    ..WATCH_BOUNDS
+};
+
 impl Budget {
     /// `timeout_ms` and `poll_ms` as the call gave them (or did not), held to
     /// the bounds.
     #[must_use]
     pub fn new(timeout_ms: Option<u64>, poll_ms: Option<u64>) -> Budget {
         Self::within(&WAIT_BOUNDS, timeout_ms, poll_ms)
+    }
+
+    /// A `watch` of the screen (`screen_changes`): the same bounds as
+    /// [`Budget::watch`], looking every [`DEFAULT_WATCH_SCREEN_POLL_MS`] unless
+    /// told otherwise.
+    #[must_use]
+    pub fn watch_screen(timeout_ms: Option<u64>, poll_ms: Option<u64>) -> Budget {
+        Self::within(&WATCH_SCREEN_BOUNDS, timeout_ms, poll_ms)
     }
 
     /// The same for a `watch`: up to [`MAX_WATCH_MS`], looking every

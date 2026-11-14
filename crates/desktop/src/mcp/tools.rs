@@ -82,16 +82,18 @@ impl Server {
                 // stop ends a wait within a fraction of a second.
                 let stopped = || {
                     self.catch_stop_file();
-                    self.safety.is_stopped()
+                    self.safety.is_stopped() || self.client_gone()
                 };
                 super::wait_tool::wait_for(args, &stopped)
             }
             "watch" => {
                 self.journal_note("watch", &Self::describe("watch", args));
-                // The same stop, asked as often, for a wait of hours.
+                // The same stop, asked as often, for a wait of hours, and the
+                // client going away (its end of stdin closing) ends it too: a
+                // watch nobody is listening to must not run out its day.
                 let stopped = || {
                     self.catch_stop_file();
-                    self.safety.is_stopped()
+                    self.safety.is_stopped() || self.client_gone()
                 };
                 super::wait_tool::watch(args, &stopped)
             }
@@ -616,7 +618,10 @@ pub(super) fn element_target(args: &Value) -> Result<Target, String> {
 /// compared with a window named by id: a mismatch error describes the window,
 /// and for a blocked one that is its title, and a match and a mismatch would
 /// be told apart.
-fn resolve_selector(window: Option<&str>, selector: &Selector) -> Result<uia::Resolved, String> {
+pub(super) fn resolve_selector(
+    window: Option<&str>,
+    selector: &Selector,
+) -> Result<uia::Resolved, String> {
     let info = uia::window_for(window, selector, &refuse_blocked).map_err(|e| e.to_string())?;
     uia::resolve_in(info, selector).map_err(|e| e.to_string())
 }
@@ -707,15 +712,29 @@ pub(super) fn guard_capture(window: Option<&str>) -> Result<Option<WindowInfo>, 
     Ok(Some(info))
 }
 
-/// A screenshot of one window, or of the primary display — refused when a
-/// blocked application's window is in what would be captured.
-fn shoot(window: Option<&str>, options: CaptureOptions) -> Result<Vec<Value>, String> {
+/// The capture of one window, or of the primary display, under
+/// [`guard_capture`]'s rule: refused when a blocked application's window is in
+/// what would be captured. The window it was of, when one was named.
+///
+/// Called by [`shoot`] and by a routine replay's before and after pictures, so
+/// both are held to the one guard.
+pub(super) fn capture(
+    window: Option<&str>,
+    options: CaptureOptions,
+) -> Result<(capture::Screenshot, Option<WindowInfo>), String> {
     let of = guard_capture(window)?;
     let shot = match &of {
         Some(info) => capture::capture_region(info.rect, options),
         None => capture::capture_primary(options),
     }
     .map_err(|e| e.to_string())?;
+    Ok((shot, of))
+}
+
+/// A screenshot of one window, or of the primary display — refused when a
+/// blocked application's window is in what would be captured.
+fn shoot(window: Option<&str>, options: CaptureOptions) -> Result<Vec<Value>, String> {
+    let (shot, of) = capture(window, options)?;
     let (width, height) = shot.model_size();
     let t = shot.transform;
     Ok(vec![

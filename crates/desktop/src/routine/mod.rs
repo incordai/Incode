@@ -24,7 +24,8 @@
 //! `atticus.py`, "learned shortcuts"), kept as simple as it is there:
 //!
 //! - per routine: the cleaned steps, the trigger phrase, the date, when it was
-//!   last used, and whether the user taught it by name;
+//!   last used, and whether the person kept it (`incu routine keep`: no tool can
+//!   set it);
 //! - a phrase matches when its WORD SET is the routine's, in any order, with
 //!   the filler words ignored ([`words`]);
 //! - nothing is learned when the phrase says "this" or "that", when the run
@@ -47,6 +48,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub mod learn;
+pub mod params;
+pub mod pictures;
 pub mod replay;
 pub mod source;
 pub mod store;
@@ -65,10 +68,22 @@ pub const MAX_STEPS: usize = 100;
 
 /// The most routines the file holds; saving a new one past this is refused
 /// rather than silently dropping an old one.
-pub const MAX_ROUTINES: usize = 200;
+pub const MAX_ROUTINES: usize = 100;
 
-/// The most one step's arguments may take as JSON, in bytes.
-pub const MAX_STEP_BYTES: usize = 16 * 1024;
+/// The most one step's arguments may take as JSON, in bytes. Typed text is the
+/// bulk of it; a routine that types a page is not a shortcut.
+pub const MAX_STEP_BYTES: usize = 4 * 1024;
+
+/// The most one routine may take, by [`Routine::size_bytes`]. With
+/// [`MAX_ROUTINES`] of them the file stays under what it may be
+/// ([`store::MAX_FILE_BYTES`]), with room for the indentation the file is
+/// written with; a test writes the largest file the two allow and reads it back.
+pub const MAX_ROUTINE_BYTES: usize = 24 * 1024;
+
+/// What a step costs beyond its own bytes: the keys, quotes and indentation of
+/// the readable file. Counted so that a routine of many tiny steps, which is
+/// mostly structure, is not mistaken for a small one.
+const STEP_OVERHEAD_BYTES: usize = 160;
 
 /// One desktop tool call to run again: the tool and the arguments it was
 /// given. The same names and arguments the live tools take, so one dispatcher
@@ -122,6 +137,28 @@ impl Step {
             format!("{} {}", self.tool, shown.join(" "))
         }
     }
+
+    /// The step in one line with EVERYTHING it types and every selector in
+    /// full: what `routine_save`, `routine_list` and `routine_match` show, so the
+    /// person can read exactly what a routine will type and where before it runs.
+    ///
+    /// A parameter (`{{password}}`) is shown as that name, which is all the file
+    /// holds of it. Not for the journal or a failure message: those take
+    /// [`Step::summary`], which keeps typed text out.
+    #[must_use]
+    pub fn review(&self) -> String {
+        let mut shown = Vec::new();
+        if let Some(map) = self.args.as_object() {
+            for (key, value) in map {
+                shown.push(format!("{key}={value}"));
+            }
+        }
+        if shown.is_empty() {
+            self.tool.clone()
+        } else {
+            format!("{} {}", self.tool, shown.join(" "))
+        }
+    }
 }
 
 /// A learned routine.
@@ -136,12 +173,29 @@ pub struct Routine {
     pub date: String,
     /// When it last ran to the end (or was learned), in Unix milliseconds.
     pub last_used_ms: i64,
-    /// The user taught it by name. Such a routine never expires.
+    /// The person asked to keep it (`incu routine keep`). Such a routine never
+    /// expires. Only the person sets this: no tool takes it as an argument, so an
+    /// agent cannot exempt what it saved from expiry. A save that replaces a kept
+    /// routine stays kept.
     #[serde(default)]
     pub taught: bool,
 }
 
 impl Routine {
+    /// What this routine takes of the file, in bytes, as [`MAX_ROUTINE_BYTES`]
+    /// counts it: its phrase, each step's tool and arguments, and
+    /// [`STEP_OVERHEAD_BYTES`] for each step.
+    #[must_use]
+    pub fn size_bytes(&self) -> usize {
+        self.phrase.len()
+            + 64
+            + self
+                .steps
+                .iter()
+                .map(|s| s.tool.len() + s.args.to_string().len() + STEP_OVERHEAD_BYTES)
+                .sum::<usize>()
+    }
+
     /// Whether this routine has gone unused long enough to be forgotten at
     /// `now_ms`. A routine the user taught never is. A clock that went
     /// backwards (a `last_used_ms` after `now_ms`) does not expire anything.

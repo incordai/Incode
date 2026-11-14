@@ -449,12 +449,34 @@ pub(super) fn wait_for(args: &Value, stopped: &dyn Fn() -> bool) -> Result<Vec<V
 /// `message` is carried into the reply and so into the operator's post-tool
 /// hook, which is how a watch notifies: see `Server::tell_post_hooks`.
 ///
+/// A watch of the SCREEN (`screen_changes`) looks every five seconds unless told
+/// otherwise ([`Budget::watch_screen`]), not every second: each look is a capture
+/// and a hash of the whole screen.
+///
+/// **A watch holds the server for its whole duration.** The server answers one
+/// call at a time on one thread, so while a watch runs no other call is served;
+/// it ends when the condition holds, its time runs out, the operator stops the
+/// desktop, or the client goes away (`Server::client_gone`).
+///
 /// Called by `Server::run_tool`.
 pub(super) fn watch(args: &Value, stopped: &dyn Fn() -> bool) -> Result<Vec<Value>, String> {
     let condition = condition_of(args)?;
-    let budget = Budget::watch(whole(args, "timeout_ms")?, whole(args, "poll_ms")?);
+    let budget = watch_budget(
+        &condition,
+        whole(args, "timeout_ms")?,
+        whole(args, "poll_ms")?,
+    );
     let message = message_arg(args)?;
     look_until(&condition, &budget, stopped, message)
+}
+
+/// How long a `watch` of `condition` may run and how often it looks: a look at
+/// the screen is the slow one, so it is the one given the slower default.
+fn watch_budget(condition: &Condition, timeout: Option<u64>, poll: Option<u64>) -> Budget {
+    match condition {
+        Condition::Screen { .. } => Budget::watch_screen(timeout, poll),
+        _ => Budget::watch(timeout, poll),
+    }
 }
 
 /// The most of a `watch` message that is kept, in characters.
@@ -498,6 +520,30 @@ fn look_until(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A watch of the screen looks every five seconds, not every second, and
+    /// anything else keeps its second; a poll the caller gives is still theirs.
+    #[test]
+    fn a_watch_of_the_screen_polls_every_five_seconds_by_default() {
+        let screen = condition_of(&json!({"condition": "screen_changes"})).unwrap();
+        let window =
+            condition_of(&json!({"condition": "window_gone", "selector": "app=zz;window=none"}))
+                .unwrap();
+        assert_eq!(watch_budget(&screen, None, None).poll_ms, 5_000);
+        assert_eq!(watch_budget(&window, None, None).poll_ms, 1_000);
+        assert_eq!(watch_budget(&screen, None, Some(2_000)).poll_ms, 2_000);
+        // The same bounds otherwise: an hour by default, a day at most.
+        assert_eq!(
+            watch_budget(&screen, None, None).timeout_ms,
+            wait::DEFAULT_WATCH_MS
+        );
+        assert_eq!(
+            watch_budget(&screen, Some(u64::MAX), None).timeout_ms,
+            wait::MAX_WATCH_MS
+        );
+        // And wait_for is not touched: still 250 ms.
+        assert_eq!(Budget::new(None, None).poll_ms, wait::DEFAULT_POLL_MS);
+    }
 
     /// **A look that blocks cannot outlive its limit.** The live hang was a
     /// call that did not return for minutes; here the work sleeps far longer

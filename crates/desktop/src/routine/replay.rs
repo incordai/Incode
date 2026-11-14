@@ -18,18 +18,32 @@
 //! back as a timeout or a stop, because that is what "the screen is not as the
 //! routine expects" looks like.
 //!
+//! Before and after each step the runner is asked for a picture
+//! ([`Runner::look`], kept by [`super::pictures`]); a failure names the failed
+//! step's two. A picture that cannot be taken is no reason to fail a replay.
+//!
 //! Every step is checked with [`super::learn::check_step`] BEFORE the first one
 //! runs, so a routines file edited by hand cannot get a coordinate click or an
 //! `eN` id past the rule the learner applies, and a bad step means nothing ran.
 
 use std::fmt;
+use std::path::PathBuf;
 
 use super::learn::{check_step, wait_failure};
+use super::pictures::When;
 use super::{Routine, Step};
 
 /// What runs one step. The server's own implements it over its gates; tests
 /// implement it over a script.
 pub trait Runner {
+    /// A picture of the screen, or of the window the step is for, before or
+    /// after `step` (step `n`): the path it was kept at. `None` when there is no
+    /// picture (the default, and a screen that could not be captured: a
+    /// replay does not fail for want of one).
+    fn look(&mut self, _n: usize, _step: &Step, _when: When) -> Option<PathBuf> {
+        None
+    }
+
     /// Run `step` as step `n`. `Ok` is what the tool answered, as text; `Err` is
     /// its refusal or error, in its own words.
     ///
@@ -75,6 +89,12 @@ pub struct Failure {
     pub why: String,
     /// The step was refused before anything ran (so no step ran).
     pub before_start: bool,
+    /// Where the picture taken before the failed step is kept, when there is
+    /// one.
+    pub before_picture: Option<String>,
+    /// Where the picture taken after it is kept: what the screen showed when it
+    /// failed.
+    pub after_picture: Option<String>,
 }
 
 impl fmt::Display for Failure {
@@ -86,6 +106,8 @@ impl fmt::Display for Failure {
             summary,
             why,
             before_start,
+            before_picture,
+            after_picture,
         } = self;
         if *before_start {
             write!(
@@ -101,6 +123,19 @@ impl fmt::Display for Failure {
                 step - 1
             )?;
         }
+        match (before_picture, after_picture) {
+            (None, None) => {}
+            (before, after) => {
+                write!(f, " Pictures of step {step}:")?;
+                if let Some(path) = before {
+                    write!(f, " before: {path}")?;
+                }
+                if let Some(path) = after {
+                    write!(f, " after: {path}")?;
+                }
+                write!(f, ".")?;
+            }
+        }
         write!(
             f,
             " Do the whole task yourself from the screen as it is now, then routine_save it \
@@ -115,47 +150,81 @@ impl fmt::Display for Failure {
 ///
 /// A [`Failure`] naming the step and why: a step the rules refuse (nothing ran),
 /// a step the tool refused or errored on, or a `wait_for` that timed out.
-pub fn replay(routine: &Routine, runner: &mut dyn Runner) -> Result<Report, Failure> {
+pub fn replay(routine: &Routine, runner: &mut dyn Runner) -> Result<Report, Box<Failure>> {
     let total = routine.steps.len();
-    let failure = |step: usize, why: String, before_start: bool| Failure {
-        phrase: routine.phrase.clone(),
-        step,
-        total,
-        summary: routine.steps[step - 1].summary(),
-        why,
-        before_start,
+    type Pictures = (Option<PathBuf>, Option<PathBuf>);
+    let failure = |step: usize, why: String, before_start: bool, pictures: &Pictures| {
+        Box::new(Failure {
+            phrase: routine.phrase.clone(),
+            step,
+            total,
+            summary: routine.steps[step - 1].summary(),
+            why,
+            before_start,
+            before_picture: pictures.0.as_ref().map(|p| p.display().to_string()),
+            after_picture: pictures.1.as_ref().map(|p| p.display().to_string()),
+        })
     };
+    let none: Pictures = (None, None);
     for (i, step) in routine.steps.iter().enumerate() {
-        check_step(step, i + 1).map_err(|why| failure(i + 1, why.to_string(), true))?;
+        check_step(step, i + 1).map_err(|why| failure(i + 1, why.to_string(), true, &none))?;
     }
     let mut ran = Vec::with_capacity(total);
     for (i, step) in routine.steps.iter().enumerate() {
         let n = i + 1;
-        let answer = runner.run(n, step).map_err(|why| failure(n, why, false))?;
+        let before = runner.look(n, step, When::Before);
+        let answered = runner.run(n, step);
+        // The screen has had its moment before the picture of it: after every
+        // step that changes it, the last included. A wait looks for itself.
+        if step.tool != "wait_for" {
+            runner.settle();
+        }
+        let pictures = (before, runner.look(n, step, When::After));
+        let answer = answered.map_err(|why| failure(n, why, false, &pictures))?;
         if step.tool == "wait_for" {
             if let Some(why) = wait_failure(&answer) {
-                return Err(failure(n, why, false));
+                return Err(failure(n, why, false, &pictures));
             }
         }
         if let Some(why) = unverified_before(step, &answer, routine.steps.get(n)) {
-            return Err(failure(n, why, false));
+            return Err(failure(n, why, false, &pictures));
         }
         ran.push(Ran {
             summary: step.summary(),
             answer: first_line(&answer),
         });
-        if step.tool != "wait_for" && n < total {
-            runner.settle();
-        }
     }
     Ok(Report { ran })
 }
 
-/// The tools whose answer says whether the effect was read back. A click's
-/// answer always says "unverified" (a click has no state to read back), so it
-/// is not one of them: the next step's own selector, or a `wait_for`, is what
-/// checks a click.
-const READS_BACK: &[&str] = &["set_value", "element_action"];
+/// The steps whose "unverified" is a reason to stop: the ones that SET A VALUE,
+/// where "unverified" means the value may not have taken (`set_value`, and the
+/// `element_action`s that set one, [`sets_a_value`]).
+///
+/// NOT a click, an `invoke`, a `press` or a `scroll_into_view`: those always
+/// answer "unverified" (live, on Windows, every one of them), because a button
+/// press has no state to read back. Stopping on it would stop every routine that
+/// presses a button; the next step's own selector, or a `wait_for`, is what
+/// checks one.
+fn reads_back(step: &Step) -> bool {
+    step.tool == "set_value" || sets_a_value(step)
+}
+
+/// Whether `step` is an `element_action` that sets a value (a spinner's
+/// `increment` or `decrement`), as opposed to pressing, invoking or scrolling.
+fn sets_a_value(step: &Step) -> bool {
+    step.tool == "element_action"
+        && step
+            .args
+            .get("action")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|a| {
+                matches!(
+                    a.trim().to_ascii_lowercase().as_str(),
+                    "increment" | "decrement"
+                )
+            })
+}
 
 /// The steps that act on what the step before them did.
 const DEPENDS_ON_THE_SCREEN: &[&str] = &[
@@ -177,7 +246,8 @@ const DEPENDS_ON_THE_SCREEN: &[&str] = &[
 /// state the routine never reached.
 fn unverified_before(step: &Step, answer: &str, next: Option<&Step>) -> Option<String> {
     let next = next.filter(|n| DEPENDS_ON_THE_SCREEN.contains(&n.tool.as_str()))?;
-    if !READS_BACK.contains(&step.tool.as_str()) || !answer.to_lowercase().contains("unverified") {
+    let said = answer.to_lowercase();
+    if !reads_back(step) || !(said.contains("unverified") || said.contains("tried to set")) {
         return None;
     }
     Some(format!(
@@ -443,8 +513,130 @@ mod tests {
     fn the_desktop_settles_after_a_step_that_changes_the_screen_and_not_after_a_wait() {
         let mut desk = Script::answering(vec![]);
         replay(&three(), &mut desk).unwrap();
-        // After the click (step 1); not after the wait (2) or the last step (3).
-        assert_eq!(desk.settles, 1);
+        // After the click (1) and the typing (3), so the picture after each shows
+        // the result; not after the wait (2), which looks for itself.
+        assert_eq!(desk.settles, 2);
+    }
+
+    /// A button press is not a reason to stop: it ALWAYS says "unverified".
+    #[test]
+    fn a_recorded_button_press_does_not_stop_the_replay() {
+        let invoke = |action: &str| {
+            Step::new(
+                "element_action",
+                json!({"selector": "app=mail;window=Inbox;role=button;name=New", "action": action}),
+            )
+        };
+        let typing = Step::new(
+            "type_text",
+            json!({"text": "hello", "in_window": "window~=Compose"}),
+        );
+        for action in ["invoke", "press", "scroll_into_view", "click"] {
+            let routine = routine(vec![invoke(action), typing.clone()]);
+            let mut desk = Script::answering(vec![Ok(
+                "invoked button (unverified: a press has no state to read back)".to_string(),
+            )]);
+            let report = replay(&routine, &mut desk)
+                .unwrap_or_else(|f| panic!("{action} stopped the replay: {f}"));
+            assert_eq!(report.ran.len(), 2, "{action}");
+        }
+    }
+
+    #[test]
+    fn a_value_setting_action_that_is_unverified_does_stop_the_replay() {
+        let spin = Step::new(
+            "element_action",
+            json!({"selector": "app=calc;window=Calc;role=edit;name=Count", "action": "increment"}),
+        );
+        let typing = Step::new(
+            "type_text",
+            json!({"text": "1", "in_window": "app=calc;window=Calc"}),
+        );
+        let mut desk =
+            Script::answering(vec![Ok("incremented (unverified: no state)".to_string())]);
+        let failed = replay(&routine(vec![spin, typing]), &mut desk).unwrap_err();
+        assert_eq!(failed.step, 1);
+        assert_eq!(desk.calls, ["1:element_action"]);
+        // A set_value that only "tried to set" is the same.
+        let (routine, mut desk) =
+            set_then_click("tried to set e49 (Edit) to 17 chars: it reads back as nothing");
+        assert!(replay(&routine, &mut desk).is_err());
+    }
+
+    /// What the scripted desktop sees, for the pictures.
+    struct Watching {
+        inner: Script,
+        looks: Vec<String>,
+    }
+
+    impl Runner for Watching {
+        fn look(&mut self, n: usize, _step: &Step, when: When) -> Option<PathBuf> {
+            self.looks.push(format!("{n}:{when:?}"));
+            Some(PathBuf::from(format!("shots/step-{n}-{when:?}.jpg")))
+        }
+        fn run(&mut self, n: usize, step: &Step) -> Result<String, String> {
+            self.looks.push(format!("{n}:run"));
+            self.inner.run(n, step)
+        }
+        fn settle(&mut self) {
+            self.inner.settle();
+        }
+    }
+
+    #[test]
+    fn a_picture_is_taken_before_and_after_each_step() {
+        let mut desk = Watching {
+            inner: Script::answering(vec![]),
+            looks: Vec::new(),
+        };
+        replay(&three(), &mut desk).unwrap();
+        assert_eq!(
+            desk.looks,
+            [
+                "1:Before", "1:run", "1:After", "2:Before", "2:run", "2:After", "3:Before",
+                "3:run", "3:After"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failure_names_the_pictures_of_the_failed_step() {
+        let mut desk = Watching {
+            inner: Script::answering(vec![
+                Ok("clicked".to_string()),
+                Err("selector matches no window".to_string()),
+            ]),
+            looks: Vec::new(),
+        };
+        let failed = replay(&three(), &mut desk).unwrap_err();
+        assert!(failed
+            .before_picture
+            .as_deref()
+            .unwrap()
+            .contains("step-2-Before"));
+        assert!(failed
+            .after_picture
+            .as_deref()
+            .unwrap()
+            .contains("step-2-After"));
+        let said = failed.to_string();
+        assert!(said.contains("Pictures of step 2"), "{said}");
+        assert!(said.contains("step-2-Before.jpg"), "{said}");
+        assert!(said.contains("step-2-After.jpg"), "{said}");
+        // A wait that timed out is a failure with pictures too.
+        let timeout = "{\"result\": \"timeout\", \"waited_ms\": 1}";
+        let mut desk = Watching {
+            inner: Script::answering(vec![Ok("c".to_string()), Ok(timeout.to_string())]),
+            looks: Vec::new(),
+        };
+        assert!(replay(&three(), &mut desk)
+            .unwrap_err()
+            .to_string()
+            .contains("step-2-After"));
+        // And with no pictures at all, the message has no picture sentence.
+        let mut plain = Script::answering(vec![Err("nope".to_string())]);
+        let said = replay(&three(), &mut plain).unwrap_err().to_string();
+        assert!(!said.contains("Pictures of step"), "{said}");
     }
 
     #[test]

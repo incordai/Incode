@@ -1134,8 +1134,9 @@ list; the engine is optional.
 
 - `ui_tree`, `screenshot` and the other looking calls are dropped; `wait_for` is
   kept.
-- **Nothing is kept** when the phrase says "this" or "that", when a call failed
-  or a `wait_for` timed out, or when any step uses an `eN` id, a pixel
+- **Nothing is kept** when the phrase says "this" or "that", when ANY call or
+  span in the records failed (a shell command too, not only a desktop call) or
+  the record says its run failed, when a `wait_for` timed out, or when any step uses an `eN` id, a pixel
   coordinate (`click`, `move_mouse`, `drag`) or a window handle (`window`,
   `focus_window`). Only selector-based steps replay, and each must say where:
   a selector needs an `app=`/`window=` part, and a typing or key step carries
@@ -1143,27 +1144,41 @@ list; the engine is optional.
   it; the replay still refuses to type unless that window has the focus).
   `scroll` is never replayable. A replay invokes links and buttons through
   `element_action invoke` (no mouse, no focus) and falls back to the recorded
-  click, and it stops when a `set_value` or `element_action` answers
-  "unverified" and the next step acts on it.
-- A phrase matches by its **words in any order, ignoring filler words**; a near
-  miss runs nothing. `routine_match` shows what a phrase would run.
+  click only when the invoke was refused before it did anything (the control
+  does not offer it), and it stops when a `set_value` (or an
+  increment/decrement) answers "unverified" and the next step acts on it; a
+  button press always says "unverified" and never stops it.
+- A phrase matches by its **words in any order, ignoring filler words**, except
+  that the words on each side of `to`, `from`, `into`, `onto`, `over`, `under`,
+  `before` or `after` stay on that side ("copy a to b" is not "copy b to a"); a
+  near miss runs nothing. `routine_match` shows what a phrase would run.
 - A replay runs every step through the same checks as a live call (blocked apps,
   hooks, stop file, journal) and **stops at the first failure**, saying which
-  step and why. There is no repair: do the task yourself and `routine_save` it
-  under the same phrase to replace the routine.
-- A routine unused for 30 days is forgotten, unless saved with `taught: true`.
+  step and why, with the paths of that step's before and after pictures (one of
+  each is taken for every step, of the last run only, beside `routines.json`;
+  never sent to OCR). There is no repair: do the task yourself and
+  `routine_save` it under the same phrase to replace the routine.
+- A routine unused for 30 days is forgotten. Only **you** can keep one for good:
+  `incu routine keep <words>` (and `unkeep`, `list`) at a terminal; no tool has
+  an argument for it.
 - The file is `routines.json` in the per-user data folder
   (`%APPDATA%\incord-desktop`, `~/Library/Application Support/incord-desktop`,
   or `$XDG_DATA_HOME`/`~/.local/share/incord-desktop`), overridden by
-  `INCU_ROUTINES` or `routines` in the config. Typed text is stored in it as
-  typed: do not save a routine that types a secret.
+  `INCU_ROUTINES` or `routines` in the config. It holds typed text as typed, and
+  `routine_save`, `routine_list` and `routine_match` show every step's full
+  text so you can read what a routine will type. **Text typed into a password or
+  other secure field, and text a recording kept only as a placeholder, is never
+  stored**: that step is a parameter (`{{password}}`) and `routine_run` refuses
+  to start unless it is given `params`. Changes to the file take a lock, so two
+  servers do not lose each other's saves.
 
 `watch` is `wait_for` with a long deadline (default 1 hour, at most 24, looked
-at every second): it blocks until the condition holds, then runs your
-post-tool hook for the tool `watch` with the reply (`result`, what it found, the
-`message` you passed) as `tool_response`. Put the notification in that hook, for
-example `osascript -e 'display notification "…"'` on macOS or `notify-send`
-on Linux. The stop file ends a watch within a second.
+at every second, every five for `screen_changes`): it blocks until the condition
+holds, then runs your post-tool hook for the tool `watch` with the reply
+(`result`, what it found, the `message` you passed) as `tool_response`. Put the
+notification in that hook, for example `osascript -e 'display notification "…"'`
+on macOS or `notify-send` on Linux. The stop file, or the client going away, ends
+a watch within a second; while it runs the server answers nothing else.
 
 ### What it will not do
 

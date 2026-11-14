@@ -23,16 +23,23 @@
 
 use serde_json::{json, Value};
 
-use crate::routine::learn::{check_phrase, learn_from_calls, learn_from_steps, Cleaned, IN_WINDOW};
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+use crate::capture::{CaptureOptions, ShotFormat};
+use crate::routine::learn::{check_phrase, check_record, learn_with, Cleaned, IN_WINDOW};
+use crate::routine::params::{self, Values, Why};
+use crate::routine::pictures::{Pictures, When};
 use crate::routine::replay::{replay, Runner};
-use crate::routine::source::{Call, StepSource};
-use crate::routine::store::{Routines, Store};
+use crate::routine::source::{Call, Record, StepSource};
+use crate::routine::store::Store;
 use crate::routine::words::word_set;
 use crate::routine::{now_ms, Routine, Step};
 
 use crate::selector::Selector;
 
-use super::tools::{text, text_of, window_id_for};
+use super::tools::{capture, resolve_selector, text, text_of, window_id_for};
 use super::Server;
 
 /// The most record ids one `routine_save` reads.
@@ -45,13 +52,32 @@ const MAX_PHRASE_CHARS: usize = 200;
 pub struct RoutineKit {
     store: Store,
     source: Box<dyn StepSource>,
+    /// Takes the picture of a step; incu's own capture when `None`. Replaced in
+    /// tests, so that what is kept and named is tested without photographing the
+    /// screen of the machine running them.
+    shooter: Option<Shooter>,
 }
+
+/// What takes the picture of the window a step is for: the image's bytes (JPEG).
+pub type Shooter = Box<dyn Fn(&Step) -> Result<Vec<u8>, String> + Send>;
 
 impl RoutineKit {
     /// A kit over `store`, reading records from `source`.
     #[must_use]
     pub fn new(store: Store, source: Box<dyn StepSource>) -> Self {
-        Self { store, source }
+        Self {
+            store,
+            source,
+            shooter: None,
+        }
+    }
+
+    /// The same kit, taking its step pictures with `shooter` and not incu's own
+    /// capture.
+    #[must_use]
+    pub fn with_shooter(mut self, shooter: Shooter) -> Self {
+        self.shooter = Some(shooter);
+        self
     }
 
     /// Where the routines file is.
@@ -93,9 +119,26 @@ impl Server {
     fn routine_save(&mut self, args: &Value) -> Result<Vec<Value>, String> {
         let phrase = phrase_arg(args)?;
         check_phrase(&phrase).map_err(|r| r.to_string())?;
-        let taught = args.get("taught").and_then(Value::as_bool).unwrap_or(false);
+        // Being kept (never expiring) is the person's to give, by `incu routine
+        // keep`. Said plainly, so an agent does not believe it did it.
+        if args.get("taught").is_some() {
+            return Err(
+                "`taught` is not an argument: only the person keeps a routine \
+                        from expiring, with `incu routine keep \"<phrase>\"` at a terminal"
+                    .to_string(),
+            );
+        }
         let kit = self.kit()?;
-        let cleaned = match (args.get("records"), args.get("steps")) {
+        // What the desktop says is a password field, asked about each control a
+        // typing step might have gone into, once each.
+        let seen: RefCell<HashMap<String, bool>> = RefCell::new(HashMap::new());
+        let is_secret = |raw: &str| {
+            *seen
+                .borrow_mut()
+                .entry(raw.to_string())
+                .or_insert_with(|| desktop_says_password(raw))
+        };
+        let calls: Vec<Call> = match (args.get("records"), args.get("steps")) {
             (Some(_), Some(_)) => {
                 return Err("give `records` or `steps`, not both".to_string());
             }
@@ -104,14 +147,24 @@ impl Server {
                     "give `records` (Watchman record ids) or `steps` to learn from".to_string(),
                 );
             }
-            (Some(ids), None) => learn_from_calls(&phrase, &calls_of(kit.source.as_ref(), ids)?),
-            (None, Some(steps)) => learn_from_steps(&phrase, &steps_of(steps)?),
-        }
-        .map_err(|r| r.to_string())?;
+            (Some(ids), None) => {
+                let records = records_of(kit.source.as_ref(), ids)?;
+                // A run that failed is not kept, whatever calls it holds.
+                for record in &records {
+                    check_record(record).map_err(|r| r.to_string())?;
+                }
+                records.into_iter().flat_map(|r| r.calls).collect()
+            }
+            (None, Some(steps)) => steps_of(steps)?
+                .iter()
+                .map(|s| Call::ok(&s.tool, s.args.clone()))
+                .collect(),
+        };
+        let cleaned = learn_with(&phrase, &calls, &is_secret).map_err(|r| r.to_string())?;
         let now = now_ms();
-        let mut file = kit.store.load()?;
-        let saved = file.learn(&phrase, cleaned.steps.clone(), taught, now)?;
-        kit.store.save(&file)?;
+        let saved = kit
+            .store
+            .update(|file| file.learn(&phrase, cleaned.steps.clone(), false, now))?;
         Ok(vec![text(saved_reply(
             &phrase,
             &cleaned,
@@ -124,7 +177,12 @@ impl Server {
     fn routine_run(&mut self, args: &Value) -> Result<Vec<Value>, String> {
         let phrase = phrase_arg(args)?;
         let routine = self.find_routine(&phrase)?;
-        let outcome = replay(&routine, &mut Live { server: self });
+        // Every parameter must be given before anything runs: a secret the
+        // routine does not keep is asked for here, not half way through.
+        let values = Values::bind(&routine.steps, args.get("params"))?;
+        let mut live = Live::new(self, values);
+        let outcome = replay(&routine, &mut live);
+        let pictures = live.pictures_note();
         let report = outcome.map_err(|failure| failure.to_string())?;
         // Used, so its thirty days begin again. Not a reason to fail a routine
         // that has just run to the end.
@@ -139,6 +197,7 @@ impl Server {
             "ran": routine.phrase,
             "steps_run": report.ran.len(),
             "steps": steps,
+            "pictures": pictures,
         });
         if let Err(why) = remembered {
             reply["note"] = json!(format!(
@@ -152,13 +211,15 @@ impl Server {
     fn routine_forget(&mut self, args: &Value) -> Result<Vec<Value>, String> {
         let phrase = phrase_arg(args)?;
         let kit = self.kit()?;
-        let mut file = kit.store.load()?;
-        if !file.forget(&phrase, now_ms()) {
-            return Err(format!(
-                "no routine matches \"{phrase}\"; routine_list shows what is saved"
-            ));
-        }
-        kit.store.save(&file)?;
+        kit.store.update(|file| {
+            if file.forget(&phrase, now_ms()) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "no routine matches \"{phrase}\"; routine_list shows what is saved"
+                ))
+            }
+        })?;
         Ok(vec![text(format!("forgot the routine for \"{phrase}\""))])
     }
 
@@ -184,9 +245,7 @@ impl Server {
         let words: Vec<String> = word_set(&phrase).into_iter().collect();
         let reply = match file.matching(&phrase, now) {
             Some(routine) => {
-                let mut shown = describe(routine, now);
-                shown["steps"] = json!(routine.steps.iter().map(Step::summary).collect::<Vec<_>>());
-                json!({"matched": true, "words": words, "routine": shown})
+                json!({"matched": true, "words": words, "routine": describe(routine, now)})
             }
             None => json!({"matched": false, "words": words}),
         };
@@ -204,10 +263,10 @@ impl Server {
     /// Record that the routine `phrase` ran to the end, reading the file again
     /// first so a routine saved meanwhile is not overwritten.
     fn remember_use(&self, phrase: &str) -> Result<(), String> {
-        let kit = self.kit()?;
-        let mut file: Routines = kit.store.load()?;
-        file.used(phrase, now_ms());
-        kit.store.save(&file)
+        self.kit()?.store.update(|file| {
+            file.used(phrase, now_ms());
+            Ok(())
+        })
     }
 
     /// One tool call through every gate, as `tools/call` runs it. The content it
@@ -231,29 +290,202 @@ impl Server {
 /// The live desktop as a [`Runner`]: every step through the server's gates.
 struct Live<'a> {
     server: &'a mut Server,
+    /// What the caller gave for the routine's parameters. In memory only.
+    values: Values,
+    /// The folder this run's pictures go to, or `None` when it could not be made.
+    pictures: Option<Pictures>,
+    /// Why there are no pictures, or fewer: the first thing that went wrong.
+    picture_trouble: Option<String>,
 }
 
-impl Runner for Live<'_> {
-    fn run(&mut self, _n: usize, step: &Step) -> Result<String, String> {
+impl<'a> Live<'a> {
+    /// A run over `server`, with the parameters `values` and a fresh folder for
+    /// its pictures (the last run's are cleared).
+    fn new(server: &'a mut Server, values: Values) -> Self {
+        let (pictures, picture_trouble) = match server
+            .kit()
+            .map(|kit| kit.store.pictures_dir())
+            .and_then(Pictures::begin)
+        {
+            Ok(pictures) => (Some(pictures), None),
+            Err(why) => (None, Some(format!("no pictures: {why}"))),
+        };
+        Live {
+            server,
+            values,
+            pictures,
+            picture_trouble,
+        }
+    }
+
+    /// What the reply says of the pictures: where they are and how many, or why
+    /// there are none.
+    fn pictures_note(&self) -> Value {
+        match &self.pictures {
+            Some(pictures) => {
+                let mut note = json!({
+                    "folder": pictures.dir().display().to_string(),
+                    "kept": pictures.count(),
+                    "note": "one picture before and one after each step, of the last run only",
+                });
+                if let Some(trouble) = &self.picture_trouble {
+                    note["trouble"] = json!(trouble);
+                }
+                note
+            }
+            None => json!({"kept": 0, "trouble": self.picture_trouble}),
+        }
+    }
+
+    /// One step, as the live desktop runs it (see [`Runner::run`]).
+    fn step(&mut self, step: &Step) -> Result<String, String> {
         let args = live_args(step)?;
         // A link or a button is invoked through its own pattern when it has one:
         // that needs no mouse, works for a control scrolled out of view and takes
-        // no focus. A control that will not be invoked (or a refusal of the
-        // invoke) leaves the recorded click to run, each through the same gates;
-        // the journal shows both.
+        // no focus. The recorded click runs INSTEAD only when the invoke was
+        // refused before it did anything; see [`after_invoke`].
         if let Some(invoke) = invoke_for(step) {
-            if let Ok(content) = self.server.gated_call("element_action", &invoke) {
-                return Ok(text_of(&content));
+            match after_invoke(self.server.gated_call("element_action", &invoke)) {
+                AfterInvoke::Done(answer) => return answer,
+                AfterInvoke::ClickAsRecorded => {}
             }
         }
         self.server
             .gated_call(&step.tool, &args)
             .map(|content| text_of(&content))
     }
+}
+
+impl Runner for Live<'_> {
+    fn run(&mut self, _n: usize, step: &Step) -> Result<String, String> {
+        // The parameters go into the arguments of this one call, in memory, and
+        // come out of whatever it answers.
+        let filled = self.values.fill(step);
+        self.step(&filled)
+            .map(|answer| self.values.scrub(&answer))
+            .map_err(|why| self.values.scrub(&why))
+    }
 
     fn settle(&mut self) {
         std::thread::sleep(crate::limits::get().settle);
     }
+
+    fn look(&mut self, n: usize, step: &Step, when: When) -> Option<PathBuf> {
+        let Live {
+            server,
+            pictures,
+            picture_trouble,
+            ..
+        } = self;
+        let pictures = pictures.as_mut()?;
+        // A stop is a stop: nothing more is read off the screen either.
+        server.catch_stop_file();
+        if server.safety.is_stopped() {
+            return None;
+        }
+        let mut note = |why: String| {
+            picture_trouble.get_or_insert(why);
+        };
+        let taken = match server.kit().ok().and_then(|kit| kit.shooter.as_ref()) {
+            Some(shooter) => shooter(step),
+            None => picture_of(step),
+        };
+        match taken {
+            Ok(bytes) => pictures
+                .keep(n, when, "jpg", &bytes)
+                .map_err(|why| note(format!("step {n}: {why}")))
+                .ok(),
+            Err(why) => {
+                note(format!("step {n}: no picture: {why}"));
+                None
+            }
+        }
+    }
+}
+
+/// What to do after the `element_action invoke` tried in place of a recorded
+/// click.
+pub(super) enum AfterInvoke {
+    /// That is the step's answer, good or bad.
+    Done(Result<String, String>),
+    /// The invoke was refused before it did anything: run the recorded click.
+    ClickAsRecorded,
+}
+
+/// Decide from what the invoke answered.
+///
+/// The click runs after an error ONLY when the error says the control cannot be
+/// invoked at all ([`refused_before_acting`]). Any other error (the pattern call
+/// failed, the call timed out, the operator's hook or the stop refused it) may
+/// have come after the control acted, and a second action on top would press a
+/// button twice: the step fails with that error and the replay stops.
+pub(super) fn after_invoke(answer: Result<Vec<Value>, String>) -> AfterInvoke {
+    match answer {
+        Ok(content) => AfterInvoke::Done(Ok(text_of(&content))),
+        Err(why) if refused_before_acting(&why) => AfterInvoke::ClickAsRecorded,
+        Err(why) => AfterInvoke::Done(Err(why)),
+    }
+}
+
+/// Whether an `element_action invoke` error says the control does not offer the
+/// action: nothing was done, as each platform words it (UI Automation: "does not
+/// support", macOS and Linux: "does not offer", "offers no actions").
+///
+/// Narrow on purpose. It matches the whole of each platform's message (the
+/// action's name in quotes AND the list of what the control does offer that
+/// follows it), so a message that merely contains some of those words (an
+/// operator's hook explaining a refusal) is not taken for one.
+pub(super) fn refused_before_acting(why: &str) -> bool {
+    let said = why.to_lowercase();
+    said.contains("does not support \"invoke\"; it supports:")
+        || (said.contains("does not offer \"invoke\"") && said.contains("; it offers:"))
+        || said.contains("offers no actions; use click_element or set_value")
+}
+
+/// The window a step is for, as a selector of only its window part: the one its
+/// own selector names, or its `in_window`.
+fn step_window(step: &Step) -> Option<Selector> {
+    let raw = step
+        .args
+        .get("selector")
+        .or_else(|| step.args.get(IN_WINDOW))?
+        .as_str()?;
+    let whole = Selector::parse(raw).ok()?;
+    whole
+        .has_window_part()
+        .then(|| Selector::parse(&whole.render_window_part()).ok())?
+}
+
+/// A picture of the window `step` is for, else of the screen: incu's own capture,
+/// under the same guards as `screenshot` (a blocked application's window is never
+/// captured). A window that cannot be found (it may be what failed) is the
+/// screen.
+///
+/// JPEG at a middling quality: the pictures are for a person and a model to look
+/// at, and many of them are kept.
+fn picture_of(step: &Step) -> Result<Vec<u8>, String> {
+    let window = step_window(step).and_then(|selector| window_id_for(&selector).ok());
+    let options = CaptureOptions {
+        format: ShotFormat::Jpeg,
+        jpeg_quality: 70,
+        ..CaptureOptions::default()
+    };
+    capture(window.as_deref(), options).map(|(shot, _)| shot.bytes)
+}
+
+/// Whether the desktop says the control `raw` names is a password field, now.
+/// Asked when a routine is saved, of a control that no name condemns; the control
+/// may not be on screen any more, and then the answer is no.
+fn desktop_says_password(raw: &str) -> bool {
+    let Ok(selector) = Selector::parse(raw) else {
+        return false;
+    };
+    // Only a selector that says which window: without one it would be looked for
+    // in whatever is in front.
+    if !selector.has_window_part() || !selector.has_element_part() {
+        return false;
+    }
+    resolve_selector(None, &selector).is_ok_and(|found| found.element.secret)
 }
 
 /// The arguments the tool is called with for `step`. A keyboard step's
@@ -306,8 +538,8 @@ fn phrase_arg(args: &Value) -> Result<String, String> {
     Ok(phrase.to_string())
 }
 
-/// The recorded calls of the records `ids` names, oldest record first.
-fn calls_of(source: &dyn StepSource, ids: &Value) -> Result<Vec<Call>, String> {
+/// The records `ids` names, oldest first.
+fn records_of(source: &dyn StepSource, ids: &Value) -> Result<Vec<Record>, String> {
     let ids: Vec<&str> = ids
         .as_array()
         .ok_or("records must be a list of Watchman record ids")?
@@ -324,7 +556,7 @@ fn calls_of(source: &dyn StepSource, ids: &Value) -> Result<Vec<Call>, String> {
     // A task spans several turns, one record each; they run in the order they
     // happened, not the order they were named. Stable, so equal times keep it.
     records.sort_by_key(|r| r.started_at_ms);
-    Ok(records.into_iter().flat_map(|r| r.calls).collect())
+    Ok(records)
 }
 
 /// An explicit step list: `[{"tool": ..., "args": {...}}, ...]`.
@@ -345,11 +577,18 @@ fn steps_of(steps: &Value) -> Result<Vec<Step>, String> {
 fn describe(routine: &Routine, now: i64) -> Value {
     let mut shown = json!({
         "phrase": routine.phrase,
-        "steps": routine.steps.len(),
+        "step_count": routine.steps.len(),
+        // Everything each step types and every selector, in full: this is what
+        // the person reads to see what the routine will do before it runs.
+        "steps": routine.steps.iter().map(Step::review).collect::<Vec<_>>(),
         "learned": routine.date,
         "last_used": crate::routine::day_of(routine.last_used_ms),
         "taught": routine.taught,
     });
+    let needs = params::names(&routine.steps);
+    if !needs.is_empty() {
+        shown["params_needed"] = json!(needs);
+    }
     if let Some(days) = routine.days_left(now) {
         shown["expires_in_days"] = json!(days);
     }
@@ -367,10 +606,31 @@ fn saved_reply(
         "saved": phrase,
         "replaced_an_older_routine": saved.replaced,
         "taught": saved.taught,
-        "steps": cleaned.steps.iter().map(Step::summary).collect::<Vec<_>>(),
+        // Every step with the full text it types: read it, it is what will run.
+        "steps": cleaned.steps.iter().map(Step::review).collect::<Vec<_>>(),
         "looking_steps_dropped": cleaned.dropped,
         "file": file.display().to_string(),
     });
+    if !cleaned.parameters.is_empty() {
+        reply["parameters"] = json!(cleaned
+            .parameters
+            .iter()
+            .map(|p| json!({
+                "name": p.name,
+                "step": p.step,
+                "why": match p.why {
+                    Why::SecureField => "typed into a password or other secure field",
+                    Why::Redacted => "the recording kept only a placeholder for the text",
+                },
+            }))
+            .collect::<Vec<_>>());
+        reply["parameters_note"] = json!(
+            "those steps are NOT stored with their text. routine_run refuses to start \
+             unless it is given every one, as params: {\"name\": \"...\"}. The value is \
+             used in memory for that run only and is never written to the routines file \
+             or the journal"
+        );
+    }
     if cleaned.inferred_window > 0 {
         reply["keyboard_steps_given_the_window_before_them"] = json!(cleaned.inferred_window);
         reply["window_note"] = json!(

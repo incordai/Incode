@@ -30,11 +30,18 @@ fn folder(name: &str) -> PathBuf {
     dir
 }
 
+/// A picture that is not one: the bytes a test's replay keeps, so that no test
+/// photographs the screen of the machine that runs it (and none slows another
+/// that looks at the real screen).
+fn pretend_shot(_: &Step) -> Result<Vec<u8>, String> {
+    Ok(b"\xff\xd8 a picture".to_vec())
+}
+
 fn server_with(dir: &Path, source: Box<dyn StepSource>) -> Server {
-    Server::new(InputThread::start().expect("input thread")).with_routines(RoutineKit::new(
-        Store::at(dir.join("routines.json")),
-        source,
-    ))
+    Server::new(InputThread::start().expect("input thread")).with_routines(
+        RoutineKit::new(Store::at(dir.join("routines.json")), source)
+            .with_shooter(Box::new(pretend_shot)),
+    )
 }
 
 fn server(dir: &Path) -> Server {
@@ -267,20 +274,20 @@ fn a_routine_is_learned_from_watchman_records_in_the_order_they_happened() {
     let dir = folder("records");
     let source = MemorySource::new()
         // Named second, happened first.
-        .with(Record {
-            id: "w-b".to_string(),
-            started_at_ms: 2_000,
-            calls: vec![Call::ok("mcp__desktop__wait_for", never_gone_second())],
-        })
-        .with(Record {
-            id: "w-a".to_string(),
-            started_at_ms: 1_000,
-            calls: vec![
+        .with(Record::new(
+            "w-b",
+            2_000,
+            vec![Call::ok("mcp__desktop__wait_for", never_gone_second())],
+        ))
+        .with(Record::new(
+            "w-a",
+            1_000,
+            vec![
                 Call::ok("mcp__desktop__ui_tree", json!({})),
                 Call::ok("mcp__desktop__wait_for", gone()),
                 Call::ok("Bash", json!({"command": "ls"})),
             ],
-        });
+        ));
     let mut s = server_with(&dir, Box::new(source));
     let reply = call(
         &mut s,
@@ -318,11 +325,11 @@ fn never_gone_second() -> Value {
 #[test]
 fn a_failed_recorded_run_is_not_learned() {
     let dir = folder("failed-record");
-    let source = MemorySource::new().with(Record {
-        id: "w-1".to_string(),
-        started_at_ms: 1,
-        calls: vec![Call::ok("wait_for", gone()).failed("selector matches nothing")],
-    });
+    let source = MemorySource::new().with(Record::new(
+        "w-1",
+        1,
+        vec![Call::ok("wait_for", gone()).failed("selector matches nothing")],
+    ));
     let mut s = server_with(&dir, Box::new(source));
     let reply = call(
         &mut s,
@@ -620,36 +627,528 @@ fn a_replayed_typing_step_into_a_window_that_is_not_there_fails_and_types_nothin
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A window no program has, as an `in_window`, for steps that type.
+const TYPING_WINDOW: &str = NO_SUCH_WINDOW;
+
 #[test]
-fn typed_text_and_steps_never_reach_the_journal_or_a_listing() {
-    let dir = folder("redaction");
+fn a_secret_typed_into_a_password_field_is_a_parameter_and_never_stored_or_journalled() {
+    let dir = folder("secret");
     let journal = dir.join("desktop.jsonl");
-    let mut s = server(&dir).with_journal(journal.clone());
+    let (hooks, pre, _post) = Recording::new(None);
+    let mut s = server(&dir)
+        .with_journal(journal.clone())
+        .with_hook_runner(Box::new(hooks));
     let reply = call(
         &mut s,
         "routine_save",
-        json!({"phrase": "type my token", "steps": [
-            {"tool": "set_value", "args": {"selector": "app=vault;role=edit;name=Token", "value": "hunter2-secret"}}
+        json!({"phrase": "unlock the vault", "steps": [
+            {"tool": "wait_for", "args": gone()},
+            {"tool": "type_text", "args": {"text": "plain words", "in_window": TYPING_WINDOW}},
+            {"tool": "set_value", "args": {"selector": "app=vault;window=Sign in;role=edit;name=Password", "value": "hunter2-secret"}},
         ]}),
     );
-    assert!(!refused(&reply), "{reply}");
+    let saved = answer(&reply);
+    assert_eq!(saved["parameters"][0]["name"], "password", "{saved}");
+    assert_eq!(saved["parameters"][0]["step"], 3);
+    assert_eq!(saved["parameters"].as_array().unwrap().len(), 1, "{saved}");
     assert!(!said(&reply).contains("hunter2"), "{}", said(&reply));
-    let matched = said(&call(
-        &mut s,
-        "routine_match",
-        json!({"phrase": "token type"}),
-    ));
+    assert!(saved["parameters_note"].is_string());
+    // On disk: the placeholder, never the value. The ordinary text is kept.
+    let file = std::fs::read_to_string(dir.join("routines.json")).unwrap();
+    assert!(!file.contains("hunter2"), "{file}");
+    assert!(file.contains("{{password}}") && file.contains("plain words"));
+    // The listing says what the routine needs.
+    let listed = answer(&call(&mut s, "routine_list", json!({})));
+    assert_eq!(listed["routines"][0]["params_needed"], json!(["password"]));
+
+    // Without it, the run is refused before step 1: no step is asked of any gate.
+    let refusal = call(&mut s, "routine_run", json!({"phrase": "vault unlock"}));
+    assert!(refused(&refusal), "{refusal}");
+    assert!(said(&refusal).contains("password"), "{}", said(&refusal));
     assert!(
-        !matched.contains("hunter2") && matched.contains("14 characters"),
-        "{matched}"
+        said(&refusal).contains("Nothing was done"),
+        "{}",
+        said(&refusal)
     );
-    // A text field's name is what was typed in it: not in a step's line either.
-    assert!(!matched.contains("name=Token"), "{matched}");
+    let wrong = call(
+        &mut s,
+        "routine_run",
+        json!({"phrase": "vault unlock", "params": {"pasword": "x"}}),
+    );
+    assert!(
+        refused(&wrong) && said(&wrong).contains("takes: password"),
+        "{wrong}"
+    );
+    assert_eq!(
+        *pre.lock().unwrap(),
+        ["routine_save", "routine_list", "routine_run", "routine_run"],
+        "not even the first step was tried"
+    );
+
+    // Given, it is accepted and the run starts: it goes as far as it can on the
+    // test desktop (the first step passes, the second finds no such window) and
+    // whatever it says, the value is nowhere.
+    let ran = call(
+        &mut s,
+        "routine_run",
+        json!({"phrase": "vault unlock", "params": {"password": "hunter2-secret"}}),
+    );
+    assert!(refused(&ran), "{ran}");
+    assert!(
+        said(&ran).contains("failed at step 2 of 3"),
+        "{}",
+        said(&ran)
+    );
+    assert!(!said(&ran).contains("hunter2"), "{}", said(&ran));
     let lines = std::fs::read_to_string(&journal).unwrap();
     assert!(!lines.contains("hunter2"), "{lines}");
-    // It is in the routines file, as the docs say.
     let file = std::fs::read_to_string(dir.join("routines.json")).unwrap();
-    assert!(file.contains("hunter2-secret"));
+    assert!(!file.contains("hunter2"), "{file}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_recordings_placeholder_is_a_parameter_and_is_not_replayed() {
+    let dir = folder("redacted-record");
+    let source = MemorySource::new().with(Record::new(
+        "w-1",
+        1,
+        vec![Call::ok(
+            "mcp__desktop__type_text",
+            json!({"text": "[REDACTED]", "in_window": TYPING_WINDOW}),
+        )],
+    ));
+    let mut s = server_with(&dir, Box::new(source));
+    let saved = answer(&call(
+        &mut s,
+        "routine_save",
+        json!({"phrase": "type the code", "records": ["w-1"]}),
+    ));
+    assert_eq!(saved["parameters"][0]["name"], "text");
+    assert!(saved["parameters"][0]["why"]
+        .as_str()
+        .unwrap()
+        .contains("placeholder"));
+    let file = std::fs::read_to_string(dir.join("routines.json")).unwrap();
+    assert!(
+        !file.contains("REDACTED") && file.contains("{{text}}"),
+        "{file}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_full_text_of_every_step_is_shown_when_saving_listing_and_matching() {
+    let dir = folder("review");
+    let mut s = server(&dir);
+    let saved = answer(&call(
+        &mut s,
+        "routine_save",
+        json!({"phrase": "greet the room", "steps": [
+            {"tool": "type_text", "args": {"text": "hello there, everyone", "in_window": TYPING_WINDOW}}
+        ]}),
+    ));
+    let listed = answer(&call(&mut s, "routine_list", json!({})));
+    let matched = answer(&call(
+        &mut s,
+        "routine_match",
+        json!({"phrase": "room greet"}),
+    ));
+    for (what, shown) in [
+        ("save", &saved["steps"][0]),
+        ("list", &listed["routines"][0]["steps"][0]),
+        ("match", &matched["routine"]["steps"][0]),
+    ] {
+        let line = shown.as_str().unwrap();
+        assert!(line.contains("hello there, everyone"), "{what}: {line}");
+        assert!(
+            line.contains(TYPING_WINDOW),
+            "{what}: the window in full: {line}"
+        );
+        assert!(
+            !line.contains("characters"),
+            "{what}: not just a length: {line}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_agent_cannot_make_a_routine_kept_and_a_save_never_sets_it() {
+    let dir = folder("taught");
+    let mut s = server(&dir);
+    let reply = call(
+        &mut s,
+        "routine_save",
+        json!({"phrase": "check the window", "steps": [step(gone())], "taught": true}),
+    );
+    assert!(refused(&reply), "{reply}");
+    assert!(
+        said(&reply).contains("incu routine keep"),
+        "{}",
+        said(&reply)
+    );
+    assert!(!dir.join("routines.json").exists());
+    let tool = tool_definitions()
+        .into_iter()
+        .find(|t| t["name"] == "routine_save")
+        .unwrap();
+    assert!(tool["inputSchema"]["properties"].get("taught").is_none());
+    let plain = answer(&save_steps(&mut s, "check the window", vec![step(gone())]));
+    assert_eq!(plain["taught"], false);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_failed_shell_call_or_a_failed_record_is_not_learned() {
+    let dir = folder("any-failure");
+    let source = MemorySource::new()
+        .with(Record::new(
+            "w-bash",
+            1,
+            vec![
+                Call::ok("Bash", json!({"command": "false"})).failed("exit code 1"),
+                Call::ok("mcp__desktop__wait_for", gone()),
+            ],
+        ))
+        .with(
+            Record::new(
+                "w-failed",
+                2,
+                vec![Call::ok("mcp__desktop__wait_for", gone())],
+            )
+            .failing("outcome is \"failed\""),
+        )
+        .with(Record::new(
+            "w-good",
+            3,
+            vec![Call::ok("mcp__desktop__wait_for", gone())],
+        ));
+    let mut s = server_with(&dir, Box::new(source));
+    for (id, says) in [
+        ("w-bash", "exit code 1"),
+        ("w-failed", "says its run failed"),
+    ] {
+        let reply = call(
+            &mut s,
+            "routine_save",
+            json!({"phrase": "wait for it", "records": [id]}),
+        );
+        assert!(
+            refused(&reply) && said(&reply).contains(says),
+            "{id}: {reply}"
+        );
+    }
+    // One failed record among several refuses the whole.
+    let mixed = call(
+        &mut s,
+        "routine_save",
+        json!({"phrase": "wait for it", "records": ["w-good", "w-failed"]}),
+    );
+    assert!(refused(&mixed), "{mixed}");
+    assert!(!dir.join("routines.json").exists());
+    assert!(!refused(&call(
+        &mut s,
+        "routine_save",
+        json!({"phrase": "wait for it", "records": ["w-good"]})
+    )));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_invoke_falls_back_to_the_recorded_click_only_when_it_was_refused_before_acting() {
+    use super::routine_tool::{after_invoke, refused_before_acting, AfterInvoke};
+    // The control does not offer the action, as each platform says it.
+    for refused in [
+        "button \"Send\" does not support \"invoke\"; it supports: toggle, focus",
+        "button \"Send\" does not offer \"invoke\" (AXPress); it offers: AXShowMenu",
+        "button \"Send\" offers no actions; use click_element or set_value",
+    ] {
+        assert!(refused_before_acting(refused), "{refused}");
+        assert!(matches!(
+            after_invoke(Err(refused.to_string())),
+            AfterInvoke::ClickAsRecorded
+        ));
+    }
+    // Everything else may have happened after the control acted: no second try.
+    for after in [
+        "could not invoke button \"Send\": HRESULT 0x80004005",
+        "button \"Send\" refused AXPress (error -25200)",
+        "the desktop did not answer within 5000 ms",
+        "desktop stopped by the operator",
+        "the operator does not support \"invoke\" today",
+        "selector `app=mail;role=button` matches no control",
+        "button \"Send\" is disabled",
+    ] {
+        assert!(!refused_before_acting(after), "{after}");
+        match after_invoke(Err(after.to_string())) {
+            AfterInvoke::Done(Err(why)) => assert_eq!(why, after),
+            _ => panic!("{after} fell back to a second click"),
+        }
+    }
+    // A good answer is the step's answer.
+    match after_invoke(Ok(vec![super::tools::text(
+        "invoked button (unverified: x)".to_string(),
+    )])) {
+        AfterInvoke::Done(Ok(said)) => assert!(said.contains("invoked")),
+        _ => panic!("a good answer was not taken"),
+    }
+}
+
+#[test]
+fn a_replay_leaves_a_folder_of_pictures_and_only_the_last_runs() {
+    let dir = folder("pictures");
+    let mut s = server(&dir);
+    answer(&save_steps(
+        &mut s,
+        "check the windows",
+        vec![step(gone()), step(gone())],
+    ));
+    // Left by an earlier run: must be cleared.
+    let shots = dir.join("last-replay");
+    std::fs::create_dir_all(&shots).unwrap();
+    std::fs::write(shots.join("step-099-after.jpg"), "old").unwrap();
+    std::fs::write(shots.join("keep-me.txt"), "mine").unwrap();
+    let ran = answer(&call(
+        &mut s,
+        "routine_run",
+        json!({"phrase": "windows check"}),
+    ));
+    assert_eq!(
+        ran["pictures"]["folder"],
+        shots.display().to_string(),
+        "{ran}"
+    );
+    assert!(
+        !shots.join("step-099-after.jpg").exists(),
+        "the last run's pictures remain"
+    );
+    assert!(
+        shots.join("keep-me.txt").exists(),
+        "a file that is not ours was deleted"
+    );
+    // Whether the screen could be captured here or not, the run says which.
+    // One before and one after each of the two steps, and no more.
+    assert_eq!(ran["pictures"]["kept"], 4, "{ran}");
+    let mut named: Vec<String> = std::fs::read_dir(&shots)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .filter(|n| n.starts_with("step-"))
+        .collect();
+    named.sort();
+    assert_eq!(
+        named,
+        [
+            "step-001-after.jpg",
+            "step-001-before.jpg",
+            "step-002-after.jpg",
+            "step-002-before.jpg"
+        ]
+    );
+    // A second run starts again: only it is kept.
+    answer(&call(
+        &mut s,
+        "routine_run",
+        json!({"phrase": "windows check"}),
+    ));
+    assert_eq!(
+        std::fs::read_dir(&shots)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("step-")
+            })
+            .count(),
+        4
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_screen_that_cannot_be_captured_is_said_and_does_not_fail_the_replay() {
+    let dir = folder("no-pictures");
+    let kit = RoutineKit::new(Store::at(dir.join("routines.json")), Box::new(NoSource))
+        .with_shooter(Box::new(|_| Err("no display in this session".to_string())));
+    let mut s = Server::new(InputThread::start().expect("input thread")).with_routines(kit);
+    answer(&save_steps(&mut s, "check the window", vec![step(gone())]));
+    let ran = answer(&call(
+        &mut s,
+        "routine_run",
+        json!({"phrase": "check the window"}),
+    ));
+    assert_eq!(ran["steps_run"], 1);
+    assert_eq!(ran["pictures"]["kept"], 0);
+    assert!(
+        ran["pictures"]["trouble"]
+            .as_str()
+            .unwrap()
+            .contains("no display"),
+        "{ran}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_failed_replay_names_the_pictures_of_the_failed_step() {
+    let dir = folder("failed-pictures");
+    let mut s = server(&dir);
+    answer(&save_steps(
+        &mut s,
+        "three waits",
+        vec![step(gone()), step(never_appears()), step(gone())],
+    ));
+    let reply = call(&mut s, "routine_run", json!({"phrase": "three waits"}));
+    assert!(refused(&reply), "{reply}");
+    let said = said(&reply);
+    let shots = dir.join("last-replay");
+    // The failed step's two pictures are named, by full path, and exist.
+    let (before, after) = (
+        shots.join("step-002-before.jpg"),
+        shots.join("step-002-after.jpg"),
+    );
+    assert!(said.contains("Pictures of step 2"), "{said}");
+    assert!(said.contains(&before.display().to_string()), "{said}");
+    assert!(said.contains(&after.display().to_string()), "{said}");
+    assert!(before.exists() && after.exists());
+    assert!(
+        !shots.join("step-003-before.jpg").exists(),
+        "step 3 never ran"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn two_servers_saving_at_once_each_keep_the_others_routines() {
+    let dir = folder("two-servers");
+    let workers: Vec<_> = (0..2)
+        .map(|w| {
+            let dir = dir.clone();
+            std::thread::spawn(move || {
+                let mut s = server(&dir);
+                for i in 0..4 {
+                    let reply = save_steps(
+                        &mut s,
+                        &format!("task from server{w} number{i}"),
+                        vec![step(gone())],
+                    );
+                    assert!(!refused(&reply), "{reply}");
+                }
+            })
+        })
+        .collect();
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    let kept = Store::at(dir.join("routines.json")).load().unwrap();
+    assert_eq!(
+        kept.routines.len(),
+        8,
+        "a save overwrote another server's routine"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_routine_saved_for_copying_one_way_is_not_run_for_the_other() {
+    let dir = folder("direction");
+    let mut s = server(&dir);
+    answer(&save_steps(
+        &mut s,
+        "copy backup files to desktop",
+        vec![step(gone())],
+    ));
+    let other = answer(&call(
+        &mut s,
+        "routine_match",
+        json!({"phrase": "copy desktop files to backup"}),
+    ));
+    assert_eq!(other["matched"], false);
+    let same = answer(&call(
+        &mut s,
+        "routine_match",
+        json!({"phrase": "files backup copy, to the desktop"}),
+    ));
+    assert_eq!(same["matched"], true);
+    let run = call(
+        &mut s,
+        "routine_run",
+        json!({"phrase": "copy desktop files to backup"}),
+    );
+    assert!(
+        refused(&run) && said(&run).contains("no routine matches"),
+        "{run}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A reader that gives its lines when told to and then, when its sender is
+/// dropped, ends.
+struct Wire(std::sync::mpsc::Receiver<Vec<u8>>, Vec<u8>);
+
+impl std::io::Read for Wire {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.1.is_empty() {
+            match self.0.recv() {
+                Ok(more) => self.1 = more,
+                Err(_) => return Ok(0),
+            }
+        }
+        let n = self.1.len().min(buf.len());
+        buf[..n].copy_from_slice(&self.1[..n]);
+        self.1.drain(..n);
+        Ok(n)
+    }
+}
+
+#[test]
+fn a_watch_ends_when_the_client_goes_away_instead_of_running_for_a_day() {
+    let dir = folder("watch-eof");
+    let (to_server, from_client) = std::sync::mpsc::channel::<Vec<u8>>();
+    let request = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "watch", "arguments": {
+            "condition": "window_appears", "selector": NO_SUCH_WINDOW, "timeout_ms": 86_400_000
+        }}
+    });
+    to_server.send(format!("{request}\n").into_bytes()).unwrap();
+    // The client disconnects a moment after asking, while the watch is polling.
+    let hangup = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        drop(to_server);
+    });
+    let started = std::time::Instant::now();
+    let mut out = Vec::new();
+    let s = server(&dir);
+    super::transport::run_lines(s, Wire(from_client, Vec::new()), &mut out).unwrap();
+    hangup.join().unwrap();
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "the watch ran on for {:?}",
+        started.elapsed()
+    );
+    // It answered (refused: stopped) before returning, and did not hang.
+    let reply = String::from_utf8(out).unwrap();
+    assert!(reply.contains("\"isError\":true"), "{reply}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn every_line_before_the_end_of_input_is_still_answered() {
+    let dir = folder("eof-lines");
+    let (to_server, from_client) = std::sync::mpsc::channel::<Vec<u8>>();
+    for id in 1..=3 {
+        to_server
+            .send(format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"ping\"}}\n").into_bytes())
+            .unwrap();
+    }
+    drop(to_server);
+    let mut out = Vec::new();
+    super::transport::run_lines(server(&dir), Wire(from_client, Vec::new()), &mut out).unwrap();
+    let replies = String::from_utf8(out).unwrap();
+    assert_eq!(replies.lines().count(), 3, "{replies}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

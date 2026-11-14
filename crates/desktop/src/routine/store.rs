@@ -24,23 +24,49 @@
 //! routines is REFUSED ([`Store::load`]), not read as empty: reading it as empty
 //! and then saving would destroy every routine in it.
 //!
-//! The file holds typed text literally (a routine that types a phrase must
-//! store it), so on Unix it is created readable by its owner only.
+//! The file holds the text a routine types, literally, EXCEPT what goes into a
+//! password or other secure field and anything a recording kept only as a
+//! placeholder: those are parameters (`{{name}}`, see [`super::params`]) that the
+//! caller of `routine_run` supplies, and are never written here. So that the
+//! person can still see everything the file does hold, on Unix it is created
+//! readable by its owner only.
+//!
+//! # Never locked out by its own size
+//!
+//! [`Store::load`] refuses a file over [`MAX_FILE_BYTES`], so [`Store::save`]
+//! refuses to write one: a file that can be written but not read again would
+//! lose every routine in it. [`MAX_ROUTINES`] times the most one routine may take
+//! ([`super::MAX_ROUTINE_BYTES`]) is held under that bound by a test.
+//!
+//! # Two servers, one file
+//!
+//! A change is load, change, save. [`Store::update`] holds a lock file beside the
+//! routines file across all three, so two servers (or `incu routine keep`) that
+//! change it at once each keep the other's change instead of the later save
+//! writing over the earlier.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
 use super::words::{key, word_set};
-use super::{day_of, Routine, Step, MAX_ROUTINES};
+use super::{day_of, Routine, Step, MAX_ROUTINES, MAX_ROUTINE_BYTES};
 
 /// The environment variable that names the routines file when the config does
 /// not.
 pub const ROUTINES_ENV: &str = "INCU_ROUTINES";
 
-/// The most of a routines file that is read, in bytes. A file over this was not
-/// written by this crate.
-const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
+/// The most of a routines file that is read or written, in bytes. A file over
+/// this was not written by this crate.
+pub const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// How long a lock file may stand before it is taken to be left by a process
+/// that died. A change holds it for milliseconds.
+const STALE_LOCK: Duration = Duration::from_secs(30);
+
+/// How long a change waits for another's lock before giving up.
+const LOCK_WAIT: Duration = Duration::from_secs(10);
 
 /// The document on disk.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -85,11 +111,35 @@ impl Routines {
     /// The live routine `phrase` asks for.
     #[must_use]
     pub fn matching(&self, phrase: &str, now_ms: i64) -> Option<&Routine> {
-        let want = word_set(phrase);
-        if want.is_empty() {
+        if word_set(phrase).is_empty() {
             return None;
         }
-        self.live(now_ms).find(|r| word_set(&r.phrase) == want)
+        let want = key(phrase);
+        self.live(now_ms).find(|r| key(&r.phrase) == want)
+    }
+
+    /// Mark the routine `phrase` asks for as taught by the person (it never
+    /// expires) or not; whether there was one.
+    ///
+    /// Only the person does this (`incu routine keep`); no tool takes it as an
+    /// argument, so an agent cannot exempt what it saved from expiry.
+    pub fn set_taught(&mut self, phrase: &str, taught: bool, now_ms: i64) -> bool {
+        self.prune(now_ms);
+        let wanted = key(phrase);
+        if word_set(phrase).is_empty() {
+            return false;
+        }
+        match self.routines.iter_mut().find(|r| key(&r.phrase) == wanted) {
+            Some(routine) => {
+                routine.taught = taught;
+                // Un-keeping starts the thirty days from now, not from long ago.
+                if !taught {
+                    routine.last_used_ms = now_ms;
+                }
+                true
+            }
+            None => false,
+        }
     }
 
     /// Learn `steps` under `phrase`, replacing the routine that asks the same.
@@ -124,6 +174,13 @@ impl Routines {
             last_used_ms: now_ms,
             taught: taught || was_taught,
         };
+        let size = routine.size_bytes();
+        if size > MAX_ROUTINE_BYTES {
+            return Err(format!(
+                "this routine is {size} bytes, over the {MAX_ROUTINE_BYTES} one routine may \
+                 take; save a shorter task (fewer or shorter typed texts)"
+            ));
+        }
         let taught = routine.taught;
         match at {
             Some(i) => self.routines[i] = routine,
@@ -173,6 +230,103 @@ impl Store {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Where the pictures of the last replay are kept: a folder beside the
+    /// routines file.
+    #[must_use]
+    pub fn pictures_dir(&self) -> PathBuf {
+        self.path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .join("last-replay")
+    }
+
+    /// Change the routines: load, `change`, save, with the lock held across all
+    /// three so that no other change lands in between and is lost.
+    ///
+    /// `change` answering `Err` saves nothing and is the error of the call.
+    ///
+    /// # Errors
+    ///
+    /// The lock could not be had within ten seconds, the file could not be loaded
+    /// or saved, or `change` refused.
+    pub fn update<T>(
+        &self,
+        change: impl FnOnce(&mut Routines) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let _held = self.lock()?;
+        let mut file = self.load()?;
+        let out = change(&mut file)?;
+        self.save(&file)?;
+        Ok(out)
+    }
+
+    /// The lock file's path: the routines file's name and `.lock`.
+    fn lock_path(&self) -> PathBuf {
+        let mut name = self
+            .path
+            .file_name()
+            .map_or_else(|| "routines".into(), std::ffi::OsString::from);
+        name.push(".lock");
+        self.path.with_file_name(name)
+    }
+
+    /// Take the lock: an exclusive create of the lock file, retried until
+    /// [`LOCK_WAIT`], a file older than [`STALE_LOCK`] taken to be left by a
+    /// process that died and removed.
+    fn lock(&self) -> Result<Lock, String> {
+        let path = self.lock_path();
+        if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(dir)
+                .map_err(|e| format!("cannot make the folder for {}: {e}", path.display()))?;
+        }
+        let started = Instant::now();
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    use std::io::Write;
+                    let _ = write!(file, "{}", std::process::id());
+                    return Ok(Lock { path });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if lock_is_stale(&path) {
+                        // Another waiter may remove it first; that is as good.
+                        let _ = std::fs::remove_file(&path);
+                        continue;
+                    }
+                    if started.elapsed() >= LOCK_WAIT {
+                        return Err(format!(
+                            "another change to the routines is in progress ({} is held); \
+                             try again in a moment",
+                            path.display()
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                // Windows answers "access denied" to an exclusive create of a
+                // file another process is deleting at that moment (its release):
+                // a lock being let go of, which is waited for like a held one.
+                Err(e)
+                    if cfg!(windows)
+                        && e.kind() == std::io::ErrorKind::PermissionDenied
+                        && started.elapsed() < LOCK_WAIT =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "cannot lock the routines ({}): {e}",
+                        path.display()
+                    ));
+                }
+            }
+        }
     }
 
     /// The default path: `$INCU_ROUTINES`, else the per-user data folder.
@@ -240,6 +394,16 @@ impl Store {
         std::fs::create_dir_all(dir).map_err(|e| fail("making the folder", e))?;
         let json = serde_json::to_string_pretty(routines)
             .map_err(|e| format!("cannot encode the routines: {e}"))?;
+        // The bound `load` holds the file to. A file written over it could not be
+        // read again, and every routine in it would be locked out.
+        if json.len() as u64 > MAX_FILE_BYTES {
+            return Err(format!(
+                "not saved: the routines file would be {} bytes, over the {MAX_FILE_BYTES} \
+                 it may be, and could not be read again. Nothing was written; routine_forget \
+                 a routine you no longer need",
+                json.len()
+            ));
+        }
         let temp = dir.join(format!(
             ".{}.tmp-{}",
             self.path
@@ -257,6 +421,27 @@ impl Store {
             fail("replacing the file", e)
         })
     }
+}
+
+/// The lock, held until it is dropped.
+struct Lock {
+    path: PathBuf,
+}
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Whether the lock file at `path` has stood longer than [`STALE_LOCK`]. A file
+/// whose age cannot be read is not stale: waiting is the safe way to be wrong.
+fn lock_is_stale(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| SystemTime::now().duration_since(t).ok())
+        .is_some_and(|age| age > STALE_LOCK)
 }
 
 /// Write and flush a new file readable by its owner only (on Unix).
@@ -483,6 +668,179 @@ mod tests {
         std::fs::write(&path, "\u{feff}{\"version\": 1, \"routines\": []}").unwrap();
         assert!(Store::at(path).load().unwrap().routines.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_save_over_the_size_a_load_accepts_is_refused_before_anything_is_written() {
+        let dir = folder("toobig");
+        let path = dir.join("routines.json");
+        let store = Store::at(path.clone());
+        let mut file = Routines::default();
+        file.learn("open notes", steps(), false, 0).unwrap();
+        store.save(&file).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        // Stuff the document past the bound without going through `learn`.
+        file.routines[0].steps = vec![Step::new(
+            "type_text",
+            json!({"text": "x".repeat(MAX_FILE_BYTES as usize)}),
+        )];
+        let why = store.save(&file).unwrap_err();
+        assert!(why.contains("could not be read again"), "{why}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert!(store.load().is_ok(), "the file is still readable");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The arithmetic behind "never locked out": the most the cap on routines
+    /// and the cap on one routine allow, written out, fits what `load` reads.
+    #[test]
+    fn the_most_the_caps_allow_is_a_file_that_can_be_read_again() {
+        let dir = folder("arithmetic");
+        let store = Store::at(dir.join("routines.json"));
+        // Two shapes of a full routine: a few steps with the most text each can
+        // hold, and the most steps with the least in each (the most structure).
+        for shape in 0..2 {
+            let mut file = Routines::default();
+            for i in 0..MAX_ROUTINES {
+                let steps = if shape == 0 {
+                    // Typed text up to the routine's whole allowance.
+                    let each = MAX_ROUTINE_BYTES / 4;
+                    (0..3)
+                        .map(|_| Step::new("type_text", json!({"text": "t".repeat(each - 100)})))
+                        .collect()
+                } else {
+                    (0..crate::routine::MAX_STEPS)
+                        .map(|_| Step::new("key", json!({"keys": ["a"]})))
+                        .collect::<Vec<_>>()
+                };
+                let mut routine = Routine {
+                    phrase: format!("{}{i}", "p".repeat(190)),
+                    steps,
+                    date: "2026-01-01".to_string(),
+                    last_used_ms: 0,
+                    taught: true,
+                };
+                // Grow it to the cap exactly, with filler in its last step.
+                let room = MAX_ROUTINE_BYTES.saturating_sub(routine.size_bytes());
+                if let Some(last) = routine.steps.last_mut() {
+                    last.args = json!({"text": "f".repeat(room.saturating_sub(10))});
+                    last.tool = "type_text".to_string();
+                }
+                assert!(routine.size_bytes() <= MAX_ROUTINE_BYTES);
+                file.routines.push(routine);
+            }
+            store
+                .save(&file)
+                .unwrap_or_else(|why| panic!("shape {shape}: {why}"));
+            assert_eq!(store.load().unwrap().routines.len(), MAX_ROUTINES);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn two_changes_at_once_each_keep_the_others_routine() {
+        let dir = folder("race");
+        let path = dir.join("routines.json");
+        let workers: Vec<_> = (0..8)
+            .map(|w| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    // A store of its own, as a second server has.
+                    let store = Store::at(path);
+                    for i in 0..5 {
+                        store
+                            .update(|file| {
+                                file.learn(&format!("task w{w} n{i}"), steps(), false, 0)
+                                    .map(|_| ())
+                            })
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let kept = Store::at(path).load().unwrap().routines.len();
+        assert_eq!(kept, 40, "a save overwrote another's routine");
+        assert!(
+            !dir.join("routines.json.lock").exists(),
+            "the lock was left behind"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_change_that_refuses_saves_nothing_and_frees_the_lock() {
+        let dir = folder("refuse");
+        let store = Store::at(dir.join("routines.json"));
+        let why = store
+            .update(|_| Err::<(), _>("no such routine".to_string()))
+            .unwrap_err();
+        assert_eq!(why, "no such routine");
+        assert!(!dir.join("routines.json").exists());
+        assert!(!dir.join("routines.json.lock").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_lock_left_by_a_process_that_died_is_taken_over_and_a_live_one_is_waited_for() {
+        let dir = folder("stale-lock");
+        let store = Store::at(dir.join("routines.json"));
+        let lock = dir.join("routines.json.lock");
+        // Left long ago: taken over.
+        std::fs::write(&lock, "4242").unwrap();
+        let old = SystemTime::now() - Duration::from_secs(120);
+        std::fs::File::options()
+            .write(true)
+            .open(&lock)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        store
+            .update(|file| file.learn("open notes", steps(), false, 0).map(|_| ()))
+            .unwrap();
+        assert_eq!(store.load().unwrap().routines.len(), 1);
+        // Held just now: not taken over (it is released here after a moment).
+        std::fs::write(&lock, "4243").unwrap();
+        let release = lock.clone();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            std::fs::remove_file(release).unwrap();
+        });
+        let started = Instant::now();
+        store
+            .update(|file| file.learn("open mail", steps(), false, 0).map(|_| ()))
+            .unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(250));
+        releaser.join().unwrap();
+        assert_eq!(store.load().unwrap().routines.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_the_person_can_keep_a_routine_and_unkeeping_restarts_its_thirty_days() {
+        let mut file = Routines::default();
+        file.learn("open notes", steps(), false, 0).unwrap();
+        assert!(file.set_taught("notes open", true, 1_000));
+        assert!(file.matching("open notes", 400 * DAY_MS).is_some());
+        assert!(file.set_taught("open notes", false, 100 * DAY_MS));
+        assert!(file.matching("open notes", 120 * DAY_MS).is_some());
+        assert!(file.matching("open notes", 131 * DAY_MS).is_none());
+        assert!(!file.set_taught("open mail", true, 0));
+        assert!(!file.set_taught("please", true, 0), "no words, no routine");
+    }
+
+    #[test]
+    fn a_routine_over_its_own_size_is_refused_with_the_number() {
+        let mut file = Routines::default();
+        let big = vec![Step::new(
+            "type_text",
+            json!({"text": "x".repeat(MAX_ROUTINE_BYTES)}),
+        )];
+        let why = file.learn("type a lot", big, false, 0).unwrap_err();
+        assert!(why.contains("one routine may take"), "{why}");
+        assert!(file.routines.is_empty());
     }
 
     #[test]
