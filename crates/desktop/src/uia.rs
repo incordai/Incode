@@ -182,6 +182,18 @@ impl Element {
             value.chars().count()
         )
     }
+
+    /// What `set_value` did when it could not confirm it:
+    /// `tried to set e49 (Edit) to 17 chars`. Never "set": a reply that says
+    /// `set` claims a change, and an unconfirmed one must not.
+    pub(crate) fn tried_to_set(&self, value: &str) -> String {
+        format!(
+            "tried to set e{} ({:?}) to {} chars",
+            self.id,
+            self.role,
+            value.chars().count()
+        )
+    }
 }
 
 /// The result of one walk.
@@ -652,6 +664,14 @@ pub fn window_exists(window: &str) -> Option<bool> {
 pub fn focus_window(window: &str) -> Result<Done, DesktopError> {
     platform::focus_window(window)
 }
+
+// What reading a field back after `set_value` can honestly say: `readback.rs`.
+mod readback;
+#[cfg_attr(
+    not(any(windows, target_os = "macos", target_os = "linux")),
+    allow(unused_imports)
+)]
+pub(crate) use readback::{judge, ReadBack};
 
 // Acting on a control by selector instead of by id: `resolve.rs`.
 mod resolve;

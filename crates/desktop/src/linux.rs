@@ -1226,6 +1226,11 @@ pub(crate) fn set_value(
     let desktop = desktop()?;
     let (bus, node, described) = control(&desktop, window, want, max_depth)?;
     let what = described.label();
+    // What it held before (never a password field's), to tell a field that
+    // ignored the set from one whose read-back is unreliable.
+    let before = (!described.secret)
+        .then(|| ask::<String, _>(bus, &node, "org.a11y.atspi.Text", "GetText", &(0i32, -1i32)).ok())
+        .flatten();
     let set: bool = ask(
         bus,
         &node,
@@ -1242,21 +1247,22 @@ pub(crate) fn set_value(
         return Err(DesktopError::Os(format!("{what} refused the new text")));
     }
     let did = described.set_to(value);
+    let tried = described.tried_to_set(value);
     if described.secret {
-        return Ok(Done::unverified(did, "a password field is never read back"));
+        return Ok(Done::unverified(tried, "a password field is never read back"));
     }
     Ok(
         match ask::<String, _>(bus, &node, "org.a11y.atspi.Text", "GetText", &(0i32, -1i32)) {
-            Ok(now) if now == value => Done::verified(did),
-            Ok(now) => Done::unverified(
-                did,
-                &format!(
-                    "it reads back as {} characters, not the {} sent",
-                    now.chars().count(),
-                    value.chars().count()
-                ),
-            ),
-            Err(_) => Done::unverified(did, "its text could not be read back"),
+            Ok(now) => match uia::judge(value, before.as_deref(), &now, false) {
+                uia::ReadBack::Same => Done::verified(did),
+                uia::ReadBack::Unverified(why) => Done::unverified(tried, &why),
+                uia::ReadBack::Differs(why) => {
+                    return Err(DesktopError::Os(format!(
+                        "{what} did not take the value: {why}"
+                    )))
+                }
+            },
+            Err(_) => Done::unverified(tried, "its text could not be read back"),
         },
     )
 }

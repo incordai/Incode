@@ -308,34 +308,63 @@ pub(super) fn set_value(
     max_depth: u32,
     value: &str,
 ) -> Result<Done, DesktopError> {
-    let (element, described, _) = control(window, want, max_depth)?;
+    let (element, described, info) = control(window, want, max_depth)?;
     let what = described.label();
     let did = described.set_to(value);
+    let tried = described.tried_to_set(value);
     if let Ok(pattern) = element.get_pattern::<UIValuePattern>() {
+        // What it held before, so a field that ignored the set can be told
+        // from one whose read-back is just unreliable. Never a password's.
+        let before = (!described.secret)
+            .then(|| pattern.get_value().ok())
+            .flatten();
+        let in_front_before = foreground_hwnd();
         pattern
             .set_value(value)
             .map_err(|e| DesktopError::Os(format!("could not set {what}: {e}")))?;
+        // `set_value` is documented as needing no focus. Some programs take it
+        // themselves when a value is set (Notepad does: measured with a plain
+        // .NET UIA client, no incu involved), and the reply says so.
+        let came_to_front = in_front_before != foreground_hwnd()
+            && info.id.parse::<isize>().ok() == Some(foreground_hwnd());
+        let said = |done: Done| {
+            if came_to_front {
+                Done {
+                    detail: format!(
+                        "{}; the program brought its window to the front when its value was set",
+                        done.detail
+                    ),
+                    ..done
+                }
+            } else {
+                done
+            }
+        };
         if described.secret {
-            return Ok(Done::unverified(did, "a password field is never read back"));
+            return Ok(said(Done::unverified(
+                tried,
+                "a password field is never read back",
+            )));
         }
-        return Ok(match pattern.get_value() {
-            Ok(now) if now == value => Done::verified(did),
-            Ok(now) => Done::unverified(
-                did,
-                &format!(
-                    "it reads back as {} characters, not the {} sent",
-                    now.chars().count(),
-                    value.chars().count()
-                ),
-            ),
-            Err(_) => Done::unverified(did, "its value could not be read back"),
-        });
+        return match pattern.get_value() {
+            Ok(now) => match super::judge(value, before.as_deref(), &now, false) {
+                super::ReadBack::Same => Ok(said(Done::verified(did))),
+                super::ReadBack::Unverified(why) => Ok(said(Done::unverified(tried, &why))),
+                super::ReadBack::Differs(why) => Err(DesktopError::Os(format!(
+                    "{what} did not take the value: {why}"
+                ))),
+            },
+            Err(_) => Ok(said(Done::unverified(
+                tried,
+                "its value could not be read back",
+            ))),
+        };
     }
     if let Ok(pattern) = element.get_pattern::<UILegacyIAccessiblePattern>() {
         if pattern.set_value(value).is_ok() {
             return Ok(Done::unverified(
-                did,
-                "set through the legacy accessibility interface, which cannot be read back",
+                tried,
+                "sent through the legacy accessibility interface, which cannot be read back",
             ));
         }
     }

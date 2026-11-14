@@ -106,8 +106,16 @@ fn base_definitions() -> Vec<Value> {
                             the accessibility interface, by the id ui_tree gave it or by a \
                             `selector` — no typing, no focus needed, no clipboard. PREFER \
                             THIS over type_text for a field. The value is read back where \
-                            allowed and the result says whether it matched (a password \
-                            field is never read back).",
+                            allowed: it reads back as sent (verified), or the call is an \
+                            ERROR when it reads back as something else or as it was \
+                            before, or the reply says `tried to set` and `unverified` \
+                            when the control cannot tell (a browser's input reads back \
+                            empty; a password field is never read back). Line endings do \
+                            not count as a difference. A program may bring its window to \
+                            the front when its value is set, and some do not count it as \
+                            an edit (Notepad does not mark the document modified, so \
+                            closing it discards the text): type_text or paste_text are \
+                            the real edits.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

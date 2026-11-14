@@ -713,26 +713,39 @@ pub(crate) fn set_value(
     let what = described.label();
     let text =
         cf_string(value).ok_or_else(|| DesktopError::Os("could not hold the value".to_string()))?;
+    // What it held before (never a secure field's), to tell a field that
+    // ignored the set from one whose read-back is unreliable.
+    let before = (!described.secret)
+        .then(|| text_attribute(&element, "AXValue"))
+        .flatten();
     if !set_attribute(&element, "AXValue", text.0) {
         return Err(DesktopError::Os(format!(
             "{what} has no value to set; click_element it and use type_text instead"
         )));
     }
     let did = described.set_to(value);
+    let tried = described.tried_to_set(value);
     if described.secret {
-        return Ok(Done::unverified(did, "a password field is never read back"));
+        return Ok(Done::unverified(tried, "a password field is never read back"));
     }
+    // `text_attribute` trims and drops an empty value, so the sent text is
+    // trimmed too and an empty read-back is `None`.
     Ok(match text_attribute(&element, "AXValue") {
-        Some(now) if now == value.trim() => Done::verified(did),
-        Some(now) => Done::unverified(
-            did,
-            &format!(
-                "it reads back as {} characters, not the {} sent",
-                now.chars().count(),
-                value.chars().count()
-            ),
+        Some(now) => match super::uia::judge(value, before.as_deref(), &now, true) {
+            super::uia::ReadBack::Same => Done::verified(did),
+            super::uia::ReadBack::Unverified(why) => Done::unverified(tried, &why),
+            super::uia::ReadBack::Differs(why) => {
+                return Err(DesktopError::Os(format!(
+                    "{what} did not take the value: {why}"
+                )))
+            }
+        },
+        None if value.trim().is_empty() => Done::verified(did),
+        None => Done::unverified(
+            tried,
+            "it reads back empty, which a browser or custom control does when it does not \
+             report its value, so the text may be there; look at the result",
         ),
-        None => Done::unverified(did, "its value could not be read back"),
     })
 }
 
