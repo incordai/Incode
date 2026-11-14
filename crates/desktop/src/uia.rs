@@ -435,9 +435,26 @@ impl Done {
 }
 
 impl Element {
-    /// `e7 "Save" (Button)`, for a message.
+    /// The name as a message may say it: `None` for an edit or a text field.
+    ///
+    /// Messages go to the operator's journal word for word (an error is
+    /// recorded as it was returned), and on macOS the name of such a field IS
+    /// what is in it (`AXValue`, the fallback of `describe`), which may have
+    /// been typed. So no message names one, on any platform.
+    pub(crate) fn name_for_messages(&self) -> Option<&str> {
+        match self.role {
+            Role::Edit | Role::Text => None,
+            _ => Some(&self.name),
+        }
+    }
+
+    /// `e7 "Save" (Button)`, for a message. An edit or text field is `e7 (Edit)`,
+    /// without its name: see [`Self::name_for_messages`].
     pub fn label(&self) -> String {
-        format!("e{} \"{}\" ({:?})", self.id, self.name, self.role)
+        match self.name_for_messages() {
+            Some(name) => format!("e{} \"{name}\" ({:?})", self.id, self.role),
+            None => format!("e{} ({:?})", self.id, self.role),
+        }
     }
 }
 

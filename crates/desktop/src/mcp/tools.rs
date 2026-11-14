@@ -289,12 +289,18 @@ fn click_element(input: &InputThread, args: &Value) -> Result<Vec<Value>, String
                      set_value on it"
                 ));
             }
-            let label = format!(
-                "selector `{}` (\"{}\", {:?})",
-                selector.render_redacted(),
-                found.element.name,
-                found.element.role
-            );
+            let label = match found.element.name_for_messages() {
+                Some(name) => format!(
+                    "selector `{}` (\"{name}\", {:?})",
+                    selector.render_redacted(),
+                    found.element.role
+                ),
+                None => format!(
+                    "selector `{}` ({:?})",
+                    selector.render_redacted(),
+                    found.element.role
+                ),
+            };
             let cut = with_cut_note(String::new(), &found);
             (found.element, label, cut)
         }
@@ -585,15 +591,16 @@ fn resolve_selector(window: Option<&str>, selector: &Selector) -> Result<uia::Re
 }
 
 /// Why clicking a disabled control is refused. The id path names the control
-/// as it always has. A selector is named redacted and the control is not named
-/// at all: this error is journalled word for word, and a text field's name is
-/// what was typed in it.
+/// as it always has, except that an edit or text field is not named
+/// ([`uia::Element::name_for_messages`]). A selector is named redacted and the
+/// control is not named at all: this error is journalled word for word, and a
+/// text field's name is what was typed in it.
 pub(super) fn disabled_error(target: &Target, element: &uia::Element) -> String {
     match target {
-        Target::Id(id) => format!(
-            "e{id} \"{}\" is disabled; clicking it would do nothing",
-            element.name
-        ),
+        Target::Id(id) => match element.name_for_messages() {
+            Some(name) => format!("e{id} \"{name}\" is disabled; clicking it would do nothing"),
+            None => format!("e{id} is disabled; clicking it would do nothing"),
+        },
         Target::Selector(selector) => format!(
             "selector `{}` ({:?}) is disabled; clicking it would do nothing",
             selector.render_redacted(),

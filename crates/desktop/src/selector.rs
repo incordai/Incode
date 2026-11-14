@@ -105,8 +105,15 @@ pub enum Text {
 /// letters inside the whole name, and the selector would miss its own element.
 /// Folding each character on its own gives the same letters wherever the text
 /// is cut.
+///
+/// A final sigma `ς` is folded to `σ` as well. `char::to_lowercase` leaves a
+/// typed `ς` alone, so `λόγος` would not match `ΛΌΓΟΣ` (whose capital Σ folds
+/// to `σ`), which `str::to_lowercase` did match.
 fn fold(text: &str) -> String {
-    text.chars().flat_map(char::to_lowercase).collect()
+    text.chars()
+        .flat_map(char::to_lowercase)
+        .map(|c| if c == 'ς' { 'σ' } else { c })
+        .collect()
 }
 
 impl Text {
@@ -513,7 +520,17 @@ impl Selector {
                 let examples = found
                     .iter()
                     .take(EXAMPLES)
-                    .map(|&i| selector_for(elements, i, true).render_element_part())
+                    .map(|&i| {
+                        // With the depth of THIS selector: an example's `nth`
+                        // counts the controls of the walk that found the
+                        // matches, and the resolver must walk as deep to count
+                        // the same ones (see [`Selector::depth`]).
+                        Selector {
+                            depth: self.depth,
+                            ..selector_for(elements, i, true)
+                        }
+                        .render_element_part()
+                    })
                     .collect();
                 return Err(SelectError::Ambiguous { count, examples });
             }
@@ -858,6 +875,60 @@ mod tests {
         assert!(stamped.iter().all(|s| s.depth == Some(20)));
         let plain = selectors_for(&dialog(), false, None);
         assert!(plain.iter().all(|s| s.depth.is_none()));
+    }
+
+    /// An ambiguity error's examples count `nth` in the walk that found the
+    /// matches, so they carry that walk's depth.
+    #[test]
+    fn an_ambiguity_examples_carry_the_depth_of_the_selector_that_failed() {
+        let tree = vec![el(1, 1, Role::Button, "OK"), el(2, 1, Role::Button, "OK")];
+        let at_three = Selector::parse("role=button;name=OK;depth=3").unwrap();
+        match at_three.resolve_in(&tree) {
+            Err(SelectError::Ambiguous { examples, .. }) => {
+                assert_eq!(examples.len(), 2);
+                for example in &examples {
+                    assert!(example.ends_with(";depth=3"), "{example}");
+                }
+                assert_eq!(examples[1], "role=button;name=OK;nth=1;depth=3");
+                // What the error suggests is a selector that resolves, in a
+                // walk of that depth, to the control it named.
+                let again = Selector::parse(&examples[1]).unwrap();
+                assert_eq!(again.resolve_in(&tree).unwrap().id, 2);
+            }
+            other => panic!("{other:?}"),
+        }
+        // No depth said, none suggested.
+        let plain = Selector::parse("role=button;name=OK").unwrap();
+        match plain.resolve_in(&tree) {
+            Err(SelectError::Ambiguous { examples, .. }) => {
+                assert!(
+                    examples.iter().all(|e| !e.contains("depth")),
+                    "{examples:?}"
+                )
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A typed final sigma is the same letter as a capital one in a name:
+    /// `str::to_lowercase` made them match, so the per-character fold must.
+    #[test]
+    fn a_typed_final_sigma_matches_a_capital_sigma_in_the_name() {
+        let tree = vec![el(1, 1, Role::Text, "ΛΌΓΟΣ"), el(2, 1, Role::Text, "other")];
+        for typed in ["name~=λόγος", "name~=λόγοσ", "name~=ΛΌΓΟΣ", "name~=γος"] {
+            let s = Selector::parse(typed).unwrap();
+            assert_eq!(s.resolve_in(&tree).unwrap().id, 1, "{typed}");
+        }
+        // And a lowercase name, with the final form, is found by a capital one.
+        let tree = vec![el(1, 1, Role::Text, "λόγος")];
+        let s = Selector::parse("name~=ΛΌΓΟΣ").unwrap();
+        assert_eq!(s.resolve_in(&tree).unwrap().id, 1);
+        // The derived selector for a name ending in ς still finds it.
+        let tree = vec![el(1, 1, Role::Text, &format!("{}ς", "a".repeat(80)))];
+        assert_eq!(
+            selector_for(&tree, 0, false).resolve_in(&tree).unwrap().id,
+            1
+        );
     }
 
     /// A name cut off at a capital sigma lowercases to a different letter than

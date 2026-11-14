@@ -227,6 +227,46 @@ fn what_a_selector_error_says_is_never_what_was_typed() {
     assert!(!why.contains("hunter2"), "{why}");
 }
 
+/// **No message names an edit or text field, on either path.** Platform
+/// errors (`set_value`, `element_action`: "`{what}` has no value to set") say
+/// `Element::label`, the disabled refusal says the id, and on macOS the name of
+/// such a field is what is in it. Every message goes to the journal as it was
+/// returned.
+#[test]
+fn no_message_names_an_edit_or_a_text_field_whatever_the_platform() {
+    use super::tools::disabled_error;
+    use crate::uia::{Element, Role};
+    let element = |role, name: &str| Element {
+        id: 7,
+        depth: 1,
+        role,
+        name: name.to_string(),
+        rect: crate::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        },
+        enabled: false,
+        secret: false,
+        automation_id: String::new(),
+    };
+    for role in [Role::Edit, Role::Text] {
+        let typed = element(role, "hunter2");
+        assert_eq!(typed.label(), format!("e7 ({role:?})"));
+        assert!(!typed.label().contains("hunter2"));
+        let why = disabled_error(&Target::Id(7), &typed);
+        assert!(!why.contains("hunter2"), "{why}");
+        assert!(why.contains("e7 is disabled"), "{why}");
+    }
+    // A control whose name is a label, not content, is named as before.
+    for role in [Role::Button, Role::CheckBox, Role::MenuItem, Role::Link] {
+        let named = element(role, "Save");
+        assert_eq!(named.label(), format!("e7 \"Save\" ({role:?})"));
+        assert!(disabled_error(&Target::Id(7), &named).contains("\"Save\""));
+    }
+}
+
 /// The "is disabled" refusal is journalled word for word.
 #[test]
 fn a_disabled_control_is_refused_without_naming_a_selected_text_field() {
