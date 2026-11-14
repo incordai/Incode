@@ -13,8 +13,8 @@
 //! - **Calls** [`crate::wait::run`] with [`Live`], which reads
 //!   [`crate::uia`] and [`crate::capture`] through [`super::guard`].
 
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{mpsc, Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -43,36 +43,103 @@ const FINGERPRINT_EDGE: u32 = 256;
 /// wait stops waiting for it at its deadline plus this much.
 const LOOK_GRACE: Duration = Duration::from_millis(1000);
 
-/// Most looks that have been given up on and are still blocked, in this
-/// process. At the limit no new look is started: another would only join them.
-const MAX_ABANDONED: usize = 4;
+/// Most looks at ONE window (or one kind of look) that have been given up on
+/// and are still blocked. At the limit no new look at it is started: another
+/// would only join them. Counted per window, so one hung program does not stop
+/// a wait on any other.
+const MAX_ABANDONED_PER_KEY: usize = 4;
+
+/// Most looks given up on and still blocked in the whole process: a safety net
+/// above the per-window limit, against a desktop where very many windows hang.
+const MAX_ABANDONED_IN_ALL: usize = 24;
+
+/// How often a look being waited for asks whether the operator stopped the
+/// wait. A stop is acted on within this, not at the look's limit.
+const STOP_SLICE: Duration = Duration::from_millis(100);
+
+/// The looks given up on that have not returned yet, by what they looked at
+/// (a window's id, or the kind of look when it is not of one window).
+struct Stuck {
+    looks: Mutex<Vec<(String, usize)>>,
+}
+
+impl Stuck {
+    const fn new() -> Stuck {
+        Stuck {
+            looks: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn held(&self) -> MutexGuard<'_, Vec<(String, usize)>> {
+        self.looks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// How many looks at `key` are still blocked.
+    fn of(&self, key: &str) -> usize {
+        self.held()
+            .iter()
+            .find(|(k, _)| k == key)
+            .map_or(0, |(_, n)| *n)
+    }
+
+    /// How many are still blocked, whatever they looked at.
+    fn all(&self) -> usize {
+        self.held().iter().map(|(_, n)| *n).sum()
+    }
+
+    fn add(&self, key: &str) {
+        let mut held = self.held();
+        match held.iter_mut().find(|(k, _)| k == key) {
+            Some((_, n)) => *n += 1,
+            None => held.push((key.to_string(), 1)),
+        }
+    }
+
+    fn remove(&self, key: &str) {
+        let mut held = self.held();
+        if let Some(at) = held.iter().position(|(k, _)| k == key) {
+            held[at].1 = held[at].1.saturating_sub(1);
+            if held[at].1 == 0 {
+                held.remove(at);
+            }
+        }
+    }
+}
 
 /// Looks given up on that have not returned yet.
-static ABANDONED: AtomicUsize = AtomicUsize::new(0);
+static STUCK: Stuck = Stuck::new();
 
-/// `work`, run on a thread of its own and waited for at most `limit`.
+/// `work`, run on a thread of its own and waited for at most `limit`, or until
+/// `stopped` says the operator stopped the wait (asked every [`STOP_SLICE`]).
 ///
-/// On time it is `work`'s answer. Past `limit` the thread is left to finish
-/// by itself (it cannot be stopped from outside: it is inside a call the
-/// operating system has not returned from) and the answer is
-/// [`UNANSWERED`], counted in `abandoned` until the thread does return.
+/// On time it is `work`'s answer. Past `limit`, or at the stop, the thread is
+/// left to finish by itself (it cannot be stopped from outside: it is inside a
+/// call the operating system has not returned from) and the answer is
+/// [`UNANSWERED`], counted against `key` in `stuck` until the thread does
+/// return. The wait that asked ends as stopped, not as unanswered, because it
+/// asks the stop first.
 fn bounded<T: Send + 'static>(
     what: &str,
+    key: &str,
     limit: Duration,
-    abandoned: &'static AtomicUsize,
+    stuck: &'static Stuck,
+    stopped: &dyn Fn() -> bool,
     work: impl FnOnce() -> Result<T, String> + Send + 'static,
 ) -> Result<T, String> {
-    let still_blocked = abandoned.load(Ordering::SeqCst);
-    if still_blocked >= MAX_ABANDONED {
+    let (here, everywhere) = (stuck.of(key), stuck.all());
+    if here >= MAX_ABANDONED_PER_KEY || everywhere >= MAX_ABANDONED_IN_ALL {
         return Err(format!(
-            "{UNANSWERED}: {still_blocked} earlier looks are still blocked in the \
-             accessibility layer, so none was started to {what}"
+            "{UNANSWERED}: {here} earlier looks at this are still blocked in the \
+             accessibility layer ({everywhere} in all), so none was started to {what}"
         ));
     }
     // 0 running, 1 returned in time, 2 given up on.
     let state = Arc::new(AtomicU8::new(0));
     let (send, receive) = mpsc::channel();
     let theirs = Arc::clone(&state);
+    let owned_key = key.to_string();
     let spawned = std::thread::Builder::new()
         .name("wait-look".to_string())
         .spawn(move || {
@@ -83,61 +150,81 @@ fn bounded<T: Send + 'static>(
                 .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
                 .is_err()
             {
-                abandoned.fetch_sub(1, Ordering::SeqCst);
+                stuck.remove(&owned_key);
             }
             let _ = send.send(answer);
         });
     if let Err(e) = spawned {
         return Err(format!("could not start a look to {what}: {e}"));
     }
-    match receive.recv_timeout(limit) {
-        Ok(answer) => answer,
-        Err(_) => {
-            if state
-                .compare_exchange(0, 2, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
-                abandoned.fetch_add(1, Ordering::SeqCst);
-                Err(format!(
-                    "{UNANSWERED} to {what} within {} ms (a window that is closing or not \
-                     responding can do this)",
-                    limit.as_millis()
-                ))
-            } else {
-                // It returned in the instant between the timeout and this.
-                receive
-                    .recv()
-                    .unwrap_or_else(|_| Err(format!("the look to {what} ended without an answer")))
+    let end = Instant::now() + limit;
+    loop {
+        let left = end.saturating_duration_since(Instant::now());
+        match receive.recv_timeout(left.min(STOP_SLICE)) {
+            Ok(answer) => return answer,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(format!("the look to {what} ended without an answer"))
             }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
+        let why = if stopped() {
+            "the wait was stopped".to_string()
+        } else if Instant::now() >= end {
+            format!(
+                "within {} ms (a window that is closing or not responding can do this)",
+                limit.as_millis()
+            )
+        } else {
+            continue;
+        };
+        return if state
+            .compare_exchange(0, 2, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            stuck.add(key);
+            Err(format!("{UNANSWERED} to {what}: {why}"))
+        } else {
+            // It returned in the instant between the timeout and this.
+            receive
+                .recv()
+                .unwrap_or_else(|_| Err(format!("the look to {what} ended without an answer")))
+        };
     }
 }
 
+/// What a look at nothing in particular is counted against.
+const ANYWHERE: &str = "(the desktop)";
+
 /// The desktop as this process sees it, with a clock that starts now.
-struct Live {
+struct Live<'a> {
     started: Instant,
     /// When the wait's `timeout_ms` is up. A look may run to this and
     /// [`LOOK_GRACE`] beyond it.
     deadline: Instant,
+    /// The operator's stop, asked while a look is waited for.
+    stopped: &'a dyn Fn() -> bool,
 }
 
-impl Live {
-    fn new(budget: &Budget) -> Live {
+impl<'a> Live<'a> {
+    fn new(budget: &Budget, stopped: &'a dyn Fn() -> bool) -> Live<'a> {
         let started = Instant::now();
         Live {
             started,
             deadline: started + Duration::from_millis(budget.timeout_ms),
+            stopped,
         }
     }
 
-    /// `work` as one look, held to the deadline and the grace after it.
+    /// `work` as one look at `key` (a window's id, or [`ANYWHERE`]), held to
+    /// the deadline and the grace after it, and to the operator's stop.
     fn within<T: Send + 'static>(
         &self,
         what: &str,
+        key: &str,
         work: impl FnOnce() -> Result<T, String> + Send + 'static,
     ) -> Result<T, String> {
         let limit = (self.deadline + LOOK_GRACE).saturating_duration_since(Instant::now());
-        bounded(what, limit, &ABANDONED, work)
+        bounded(what, key, limit, &STUCK, self.stopped, work)
     }
 }
 
@@ -145,7 +232,7 @@ fn text_of(e: impl ToString) -> String {
     e.to_string()
 }
 
-impl Env for Live {
+impl Env for Live<'_> {
     fn now_ms(&mut self) -> u64 {
         u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
@@ -157,7 +244,7 @@ impl Env for Live {
     fn windows(&mut self) -> Result<Vec<WindowInfo>, String> {
         // Not the windows of a blocked application: they are not listed, and a
         // selector must not be able to find one by its title.
-        let all = self.within("list the windows", listed)?;
+        let all = self.within("list the windows", ANYWHERE, listed)?;
         Ok(all
             .into_iter()
             .filter(|w| crate::limits::get().blocked(&w.app).is_none())
@@ -169,7 +256,7 @@ impl Env for Live {
     }
 
     fn focused_window(&mut self) -> Result<WindowInfo, String> {
-        let window = self.within("find the focused window", || {
+        let window = self.within("find the focused window", ANYWHERE, || {
             uia::window_info(None).map_err(text_of)
         })?;
         refuse_blocked(&window)?;
@@ -178,7 +265,10 @@ impl Env for Live {
 
     fn tree(&mut self, window: &str, depth: Option<u32>) -> Result<Tree, String> {
         let id = window.to_string();
-        let (info, tree) = self.within("walk the window", move || {
+        // Counted against this window, so a window that hangs stops the looks
+        // at it and at no other.
+        let key = window.to_string();
+        let (info, tree) = self.within("walk the window", &key, move || {
             let info = uia::window_info(Some(&id)).map_err(text_of)?;
             // Refused before the window is walked: a blocked application's
             // window is never read.
@@ -194,7 +284,8 @@ impl Env for Live {
 
     fn screen(&mut self, window: Option<&str>) -> Result<Fingerprint, String> {
         let window = window.map(str::to_string);
-        self.within("capture the screen", move || {
+        let key = window.clone().unwrap_or_else(|| ANYWHERE.to_string());
+        self.within("capture the screen", &key, move || {
             let of = guard_capture(window.as_deref())?;
             let options = CaptureOptions {
                 max_edge: FINGERPRINT_EDGE,
@@ -309,7 +400,7 @@ fn condition_of(args: &Value) -> Result<Condition, String> {
 pub(super) fn wait_for(args: &Value, stopped: &dyn Fn() -> bool) -> Result<Vec<Value>, String> {
     let condition = condition_of(args)?;
     let budget = Budget::new(whole(args, "timeout_ms")?, whole(args, "poll_ms")?);
-    let mut env = Live::new(&budget);
+    let mut env = Live::new(&budget, stopped);
     let outcome = wait::run(&mut env, &condition, &budget, stopped)?;
     if matches!(outcome, Outcome::Stopped { .. }) {
         return Err(crate::safety::Refusal::Stopped.message());
@@ -332,12 +423,14 @@ mod tests {
     /// than the limit and `bounded` must hand back long before it returns.
     #[test]
     fn a_look_that_blocks_is_given_up_on_at_its_limit_not_waited_for() {
-        static COUNT: AtomicUsize = AtomicUsize::new(0);
+        static STUCK: Stuck = Stuck::new();
         let started = Instant::now();
         let answer = bounded(
             "walk the window",
+            "w1",
             Duration::from_millis(150),
-            &COUNT,
+            &STUCK,
+            &|| false,
             || {
                 std::thread::sleep(Duration::from_secs(5));
                 Ok(1)
@@ -351,20 +444,59 @@ mod tests {
             took < Duration::from_millis(150) + LOOK_GRACE,
             "a 150 ms limit held the caller for {took:?}"
         );
-        assert_eq!(COUNT.load(Ordering::SeqCst), 1, "counted while it blocks");
+        assert_eq!(STUCK.of("w1"), 1, "counted while it blocks");
+    }
+
+    /// **The operator's stop is acted on within a slice, not at the limit.** A
+    /// 60 s look at a hung window, stopped at 300 ms, gives the caller back at
+    /// about 300 ms (and the caller's wait asks the stop before its deadline,
+    /// so it ends as stopped).
+    #[test]
+    fn a_stop_ends_the_wait_for_a_blocked_look_within_a_slice() {
+        static STUCK: Stuck = Stuck::new();
+        let stop_at = Instant::now() + Duration::from_millis(300);
+        let started = Instant::now();
+        let answer: Result<(), String> = bounded(
+            "walk the window",
+            "w1",
+            Duration::from_secs(60),
+            &STUCK,
+            &|| Instant::now() >= stop_at,
+            || {
+                std::thread::sleep(Duration::from_secs(5));
+                Ok(())
+            },
+        );
+        let took = started.elapsed();
+        let why = answer.unwrap_err();
+        assert!(why.starts_with(UNANSWERED), "{why}");
+        assert!(why.contains("stopped"), "{why}");
+        assert!(
+            took >= Duration::from_millis(300)
+                && took < Duration::from_millis(300) + STOP_SLICE * 5,
+            "stopped at 300 ms, returned at {took:?}"
+        );
+        assert_eq!(STUCK.of("w1"), 1);
     }
 
     #[test]
     fn a_look_given_up_on_is_taken_off_the_count_when_it_returns() {
-        static COUNT: AtomicUsize = AtomicUsize::new(0);
-        let answer = bounded("walk", Duration::from_millis(50), &COUNT, || {
-            std::thread::sleep(Duration::from_millis(300));
-            Ok(())
-        });
+        static STUCK: Stuck = Stuck::new();
+        let answer = bounded(
+            "walk",
+            "w1",
+            Duration::from_millis(50),
+            &STUCK,
+            &|| false,
+            || {
+                std::thread::sleep(Duration::from_millis(300));
+                Ok(())
+            },
+        );
         assert!(answer.is_err());
-        assert_eq!(COUNT.load(Ordering::SeqCst), 1);
+        assert_eq!(STUCK.of("w1"), 1);
         let until = Instant::now() + Duration::from_secs(5);
-        while COUNT.load(Ordering::SeqCst) != 0 {
+        while STUCK.all() != 0 {
             assert!(Instant::now() < until, "the count was never given back");
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -372,25 +504,47 @@ mod tests {
 
     #[test]
     fn a_look_that_answers_in_time_gives_its_answer_or_its_error() {
-        static COUNT: AtomicUsize = AtomicUsize::new(0);
-        let ok = bounded("list", Duration::from_secs(5), &COUNT, || Ok(vec![1, 2]));
+        static STUCK: Stuck = Stuck::new();
+        let ok = bounded(
+            "list",
+            "w1",
+            Duration::from_secs(5),
+            &STUCK,
+            &|| false,
+            || Ok(vec![1, 2]),
+        );
         assert_eq!(ok.unwrap(), vec![1, 2]);
-        let refused: Result<(), String> = bounded("list", Duration::from_secs(5), &COUNT, || {
-            Err("refused: blocked".to_string())
-        });
+        let refused: Result<(), String> = bounded(
+            "list",
+            "w1",
+            Duration::from_secs(5),
+            &STUCK,
+            &|| false,
+            || Err("refused: blocked".to_string()),
+        );
         assert_eq!(refused.unwrap_err(), "refused: blocked");
-        assert_eq!(COUNT.load(Ordering::SeqCst), 0);
+        assert_eq!(STUCK.all(), 0);
     }
 
     #[test]
-    fn no_new_look_is_started_while_too_many_are_still_blocked() {
-        static COUNT: AtomicUsize = AtomicUsize::new(MAX_ABANDONED);
+    fn no_new_look_is_started_while_too_many_are_still_blocked_at_the_same_window() {
+        static STUCK: Stuck = Stuck::new();
+        for _ in 0..MAX_ABANDONED_PER_KEY {
+            STUCK.add("hung");
+        }
         let ran = Arc::new(AtomicU8::new(0));
         let flag = Arc::clone(&ran);
-        let answer = bounded("walk", Duration::from_secs(5), &COUNT, move || {
-            flag.store(1, Ordering::SeqCst);
-            Ok(())
-        });
+        let answer = bounded(
+            "walk",
+            "hung",
+            Duration::from_secs(5),
+            &STUCK,
+            &|| false,
+            move || {
+                flag.store(1, Ordering::SeqCst);
+                Ok(())
+            },
+        );
         let why = answer.unwrap_err();
         assert!(why.starts_with(UNANSWERED), "{why}");
         assert!(why.contains("still blocked"), "{why}");
@@ -398,9 +552,61 @@ mod tests {
         assert_eq!(ran.load(Ordering::SeqCst), 0, "a look was started anyway");
     }
 
+    /// **One hung program does not stop a wait on any other.** The limit on
+    /// abandoned looks is per window: with a window's looks all stuck, a look
+    /// at another window runs and answers.
+    #[test]
+    fn a_hung_window_does_not_stop_looks_at_another() {
+        static STUCK: Stuck = Stuck::new();
+        for _ in 0..MAX_ABANDONED_PER_KEY {
+            STUCK.add("hung");
+        }
+        let other = bounded(
+            "walk",
+            "healthy",
+            Duration::from_secs(5),
+            &STUCK,
+            &|| false,
+            || Ok("walked"),
+        );
+        assert_eq!(other.unwrap(), "walked");
+        // The hung one is still refused.
+        assert!(bounded(
+            "walk",
+            "hung",
+            Duration::from_secs(5),
+            &STUCK,
+            &|| false,
+            || { Ok("walked") }
+        )
+        .is_err());
+    }
+
+    /// The process-wide net is above the per-window limit, and holds.
+    #[test]
+    fn the_net_over_all_windows_is_higher_than_one_windows_limit_and_holds() {
+        const { assert!(MAX_ABANDONED_IN_ALL > MAX_ABANDONED_PER_KEY) };
+        static STUCK: Stuck = Stuck::new();
+        for at in 0..MAX_ABANDONED_IN_ALL {
+            STUCK.add(&format!("window {at}"));
+        }
+        let why = bounded(
+            "walk",
+            "fresh",
+            Duration::from_secs(5),
+            &STUCK,
+            &|| false,
+            || Ok(()),
+        )
+        .unwrap_err();
+        assert!(why.starts_with(UNANSWERED), "{why}");
+        assert!(why.contains("in all"), "{why}");
+    }
+
     #[test]
     fn the_live_deadline_is_the_budgets_timeout_from_now() {
-        let live = Live::new(&Budget::new(Some(4_000), None));
+        let never = || false;
+        let live = Live::new(&Budget::new(Some(4_000), None), &never);
         let left = live.deadline.saturating_duration_since(Instant::now());
         assert!(left <= Duration::from_millis(4_000));
         assert!(left > Duration::from_millis(3_000), "{left:?}");

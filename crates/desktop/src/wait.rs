@@ -249,6 +249,12 @@ fn wait_until<E: Env, T>(
             Err(why) if why.starts_with(UNANSWERED) => why,
             Err(why) => return Err(why),
         };
+        // The stop is asked BEFORE the deadline: a look that was waited for
+        // until the deadline (or abandoned because the stop came) must end the
+        // wait as stopped, not as a timeout the operator did not ask for.
+        if stopped() {
+            return Ok(Waited::Stopped(env.now_ms() - start));
+        }
         let elapsed = env.now_ms() - start;
         if elapsed >= budget.timeout_ms {
             return Ok(Waited::TimedOut(elapsed, polls, last));
@@ -758,6 +764,8 @@ mod tests {
         alive: Option<At<bool>>,
         /// A walk that blocks this many virtual ms and is then given up on.
         tree_blocks_ms: Option<u64>,
+        /// Set when a walk blocks: the operator's stop arrives during it.
+        stop_during_block: Option<std::rc::Rc<std::cell::Cell<bool>>>,
         windows_calls: u32,
         screen: At<u128>,
         sleeps: Vec<u64>,
@@ -775,6 +783,7 @@ mod tests {
                 tree_fails_from: None,
                 alive: None,
                 tree_blocks_ms: None,
+                stop_during_block: None,
                 windows_calls: 0,
                 screen: Box::new(|_| 0),
                 sleeps: Vec::new(),
@@ -807,6 +816,9 @@ mod tests {
         fn tree(&mut self, window: &str, _: Option<u32>) -> Result<Tree, String> {
             self.trees += 1;
             if let Some(blocked) = self.tree_blocks_ms {
+                if let Some(stop) = &self.stop_during_block {
+                    stop.set(true);
+                }
                 self.now += blocked;
                 return Err(format!(
                     "{UNANSWERED} to walk the window within {blocked} ms"
@@ -1298,6 +1310,25 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// **A stop that comes during a blocked look ends the wait as stopped.**
+    /// The look is given up on (by the stop, or at its limit) and the wait
+    /// returns to its loop past the deadline: the stop is asked first, so the
+    /// operator is told it stopped, not that it timed out.
+    #[test]
+    fn a_stop_during_a_blocked_look_is_a_stop_not_a_timeout() {
+        let stop = std::rc::Rc::new(std::cell::Cell::new(false));
+        let mut env = Fake::new();
+        env.elements = Box::new(|_| vec![button(1, "OK")]);
+        env.tree_blocks_ms = Some(3_000);
+        env.stop_during_block = Some(std::rc::Rc::clone(&stop));
+        let flag = std::rc::Rc::clone(&stop);
+        let c = appears("name=OK");
+        // The deadline (2 s) is past by the time the look is given up on.
+        let out = run(&mut env, &c, &budget(2_000, 250), &move || flag.get()).unwrap();
+        assert!(matches!(out, Outcome::Stopped { .. }), "{out:?}");
+        assert_eq!(env.trees, 1, "no look after the stop");
     }
 
     /// **A look that blocks cannot keep the wait past its deadline.** The
