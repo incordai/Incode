@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::routine::learn::{check_phrase, check_record, learn_with, Cleaned, IN_WINDOW};
-use crate::routine::params::{self, types_a_secret, Target, Values, Why};
+use crate::routine::params::{self, types_a_secret, Probe, Values, Why};
 use crate::routine::pictures::{Pictures, When};
 use crate::routine::replay::{replay, Runner};
 use crate::routine::source::{Call, Record, StepSource};
@@ -55,10 +55,17 @@ pub struct RoutineKit {
     /// tests, so that what is kept and named is tested without photographing the
     /// screen of the machine running them.
     shooter: Option<Shooter>,
+    /// Asks what the desktop says of a control (a password field or not); the
+    /// live desktop when `None`. Replaced in tests, which have no sign-in form to
+    /// ask about.
+    prober: Option<Prober>,
 }
 
 /// What takes the picture of the window a step is for: the image's bytes (JPEG).
 pub type Shooter = Box<dyn Fn(&Step) -> Result<Vec<u8>, String> + Send>;
+
+/// What says whether the control a raw selector names is a password field.
+pub type Prober = Box<dyn Fn(&str) -> Probe + Send>;
 
 impl RoutineKit {
     /// A kit over `store`, reading records from `source`.
@@ -68,7 +75,16 @@ impl RoutineKit {
             store,
             source,
             shooter: None,
+            prober: None,
         }
+    }
+
+    /// The same kit, asking `prober` what the desktop says of a control when a
+    /// routine is saved.
+    #[must_use]
+    pub fn with_prober(mut self, prober: Prober) -> Self {
+        self.prober = Some(prober);
+        self
     }
 
     /// The same kit, taking its step pictures with `shooter` and not incu's own
@@ -128,14 +144,17 @@ impl Server {
             );
         }
         let kit = self.kit()?;
-        // What the desktop says is a password field, asked about each control a
-        // typing step might have gone into, once each.
-        let seen: RefCell<HashMap<String, bool>> = RefCell::new(HashMap::new());
-        let is_secret = |raw: &str| {
+        // What the desktop says of each control a typing step names (a password
+        // field, a plain one, or nothing it could check), asked once each.
+        let seen: RefCell<HashMap<String, Probe>> = RefCell::new(HashMap::new());
+        let probe = |raw: &str| {
             *seen
                 .borrow_mut()
                 .entry(raw.to_string())
-                .or_insert_with(|| desktop_says_password(raw))
+                .or_insert_with(|| match &kit.prober {
+                    Some(prober) => prober(raw),
+                    None => probe_control(raw),
+                })
         };
         let calls: Vec<Call> = match (args.get("records"), args.get("steps")) {
             (Some(_), Some(_)) => {
@@ -159,7 +178,7 @@ impl Server {
                 .map(|s| Call::ok(&s.tool, s.args.clone()))
                 .collect(),
         };
-        let cleaned = learn_with(&phrase, &calls, &is_secret).map_err(|r| r.to_string())?;
+        let cleaned = learn_with(&phrase, &calls, &probe).map_err(|r| r.to_string())?;
         let now = now_ms();
         let saved = kit
             .store
@@ -175,10 +194,21 @@ impl Server {
     /// `routine_run`: replay the routine a phrase asks for.
     fn routine_run(&mut self, args: &Value) -> Result<Vec<Value>, String> {
         let phrase = phrase_arg(args)?;
+        // The agent does not say where a secret comes from: that is bound by the
+        // person. Said plainly, so it does not try again with another spelling.
+        if args.get("params").is_some_and(|p| !p.is_null()) {
+            return Err(
+                "routine_run takes no `params`: a secret the routine does not keep is read \
+                 from the environment variable the PERSON bound it to, at a terminal, with \
+                 `incu routine bind \"<phrase>\" <param> INCU_PARAM_<NAME>`; routine_list \
+                 shows what each routine needs (`params_needed`) and what is bound"
+                    .to_string(),
+            );
+        }
         let routine = self.find_routine(&phrase)?;
-        // Every parameter must be given before anything runs: a secret the
-        // routine does not keep is asked for here, not half way through.
-        let values = Values::bind(&routine.steps, args.get("params"))?;
+        // Every parameter must be bound, for these steps, and its variable set,
+        // before anything runs: refused here, not half way through.
+        let values = Values::from_routine(&routine)?;
         let mut live = Live::new(self, values);
         let outcome = replay(&routine, &mut live);
         let pictures = live.pictures_note();
@@ -330,10 +360,6 @@ pub(super) struct Live<'a> {
     pictures: Option<Pictures>,
     /// Why there are no pictures, or fewer: the first thing that went wrong.
     picture_trouble: Option<String>,
-    /// Where the typing target is as the steps run (see [`Target`]), and where it
-    /// was before the step now running.
-    pub(super) target: Target,
-    pub(super) before_target: Target,
     /// The step just run typed a secret: the picture before the next is skipped.
     skip_next_before: bool,
     /// The pictures that were not taken because a secret was on screen.
@@ -357,8 +383,6 @@ impl<'a> Live<'a> {
             values,
             pictures,
             picture_trouble,
-            target: Target::Nothing,
-            before_target: Target::Nothing,
             skip_next_before: false,
             skipped: Vec::new(),
         }
@@ -387,12 +411,22 @@ impl<'a> Live<'a> {
     /// One step, as the live desktop runs it (see [`Runner::run`]). `stored` is
     /// the step as saved, `filled` the same with its parameters in.
     fn step(&mut self, stored: &Step, filled: &Step) -> Result<String, String> {
-        // The client went away: the person who asked is not there to be told how
-        // it ended, and nothing more is done for them.
-        if self.server.client_gone() {
-            return Err("the client went away; the replay stopped here".to_string());
+        let mut args = live_args(filled)?;
+        // A typing step that names the field it types into focuses it first, then
+        // types (the tool takes no selector, so it is not passed on). This is what
+        // makes the field the step names the field its text goes to: without it
+        // the name would be a claim the replay never checked. A field that cannot
+        // be focused fails the step, and the replay stops before anything is typed.
+        if matches!(filled.tool.as_str(), "type_text" | "paste_text") {
+            if let Some(map) = args.as_object_mut() {
+                if let Some(Value::String(field)) = map.remove("selector") {
+                    let focus = json!({"selector": field, "action": "focus"});
+                    self.server
+                        .gated_call("element_action", &focus)
+                        .map_err(|why| format!("could not focus the field it types into: {why}"))?;
+                }
+            }
         }
-        let args = live_args(filled)?;
         // What the hooks are shown: the step's real arguments with each
         // parameter's value left as its `{{name}}`.
         let seen = hidden_params(&args, stored);
@@ -434,13 +468,9 @@ impl Runner for Live<'_> {
         // The parameters go into the arguments of this one call, in memory, and
         // come out of whatever it answers.
         let filled = self.values.fill(step);
-        self.before_target = self.target.clone();
-        let answer = self
-            .step(step, &filled)
+        self.step(step, &filled)
             .map(|answer| self.values.scrub(&answer))
-            .map_err(|why| self.values.scrub(&why));
-        self.target.after(step);
-        answer
+            .map_err(|why| self.values.scrub(&why))
     }
 
     fn settle(&mut self) {
@@ -459,11 +489,11 @@ impl Runner for Live<'_> {
                 ));
                 return None;
             }
-            When::After if types_a_secret(step, &self.before_target) => {
+            When::After if types_a_secret(step) => {
                 self.skip_next_before = true;
                 self.skipped.push(format!(
                     "step {n}: no picture after: it typed a secret (a parameter, or text \
-                     into a field that is, or may be, a password field)"
+                     into a field whose name says it is secret)"
                 ));
                 return None;
             }
@@ -564,19 +594,25 @@ fn step_window(step: &Step) -> Option<Selector> {
         .then(|| Selector::parse(&whole.render_window_part()).ok())?
 }
 
-/// Whether the desktop says the control `raw` names is a password field, now.
-/// Asked when a routine is saved, of a control that no name condemns; the control
-/// may not be on screen any more, and then the answer is no.
-fn desktop_says_password(raw: &str) -> bool {
+/// What the desktop says of the control `raw` names, now: a password field, a
+/// plain one, or nothing it could check. Asked when a routine is saved, of each
+/// control a typing step names; the control may not be on screen any more, and
+/// then the answer is [`Probe::Unknown`], which is not "plain": a text is kept
+/// only for a control positively known to be plain.
+fn probe_control(raw: &str) -> Probe {
     let Ok(selector) = Selector::parse(raw) else {
-        return false;
+        return Probe::Unknown;
     };
     // Only a selector that says which window: without one it would be looked for
     // in whatever is in front.
     if !selector.has_window_part() || !selector.has_element_part() {
-        return false;
+        return Probe::Unknown;
     }
-    resolve_selector(None, &selector).is_ok_and(|found| found.element.secret)
+    match resolve_selector(None, &selector) {
+        Ok(found) if found.element.secret => Probe::Secret,
+        Ok(_) => Probe::Plain,
+        Err(_) => Probe::Unknown,
+    }
 }
 
 /// The arguments the tool is called with for `step`. A keyboard step's
@@ -678,6 +714,20 @@ fn describe(routine: &Routine, now: i64) -> Value {
     });
     let needs = params::names(&routine.steps);
     if !needs.is_empty() {
+        // What the person has bound each to (the variable's NAME), and what is
+        // still to be bound: `routine_run` refuses until none is.
+        let unbound: Vec<&String> = needs
+            .iter()
+            .filter(|n| !routine.bindings.contains_key(*n))
+            .collect();
+        let stale =
+            !routine.bindings.is_empty() && routine.bound_steps != params::digest(&routine.steps);
+        shown["params_bound"] = json!(routine.bindings);
+        shown["params_unbound"] = json!(unbound);
+        if stale {
+            shown["params_binding_stale"] =
+                json!("the steps are not the ones the parameters were bound for: bind again");
+        }
         shown["params_needed"] = json!(needs);
     }
     if let Some(days) = routine.days_left(now) {
@@ -709,6 +759,13 @@ fn saved_reply(
              Only the person can keep it again, after reading it: `incu routine keep`"
         );
     }
+    if saved.unbound {
+        reply["bindings_dropped"] = json!(
+            "the routine this replaced had parameters the person had bound, and these steps \
+             are not the ones they bound them for, so every binding is dropped; the person \
+             binds again with `incu routine bind`"
+        );
+    }
     if !cleaned.parameters.is_empty() {
         reply["parameters"] = json!(cleaned
             .parameters
@@ -719,20 +776,22 @@ fn saved_reply(
                 "why": match p.why {
                     Why::SecureField => "typed into a password or other secure field",
                     Why::Redacted => "the recording kept only a placeholder for the text",
-                    Why::UnknownField => {
-                        "typed after a key that can move focus (Tab, Enter, an arrow), so \
-                         the field is not known and may be a password field"
+                    Why::NotKnownPlain => {
+                        "not typed into a control the step itself names and that is known \
+                         to be a plain text box (focus may be anywhere, a sign-in dialog or \
+                         a prompt included), so it may be a password"
                     }
                 },
             }))
             .collect::<Vec<_>>());
         reply["parameters_note"] = json!(
-            "those steps are NOT stored with their text. routine_run refuses to start \
-             unless it is given a REFERENCE for every one, as params: {\"name\": {\"env\": \
-             \"INCU_PARAM_NAME\"}}: the person sets that variable in the environment of the \
-             incu process, so the value never passes through you or your transcript (a \
-             literal value is refused). It is used in memory for that run only and is \
-             never written to the routines file, the journal or what the hooks are shown"
+            "those steps are NOT stored with their text, and routine_run refuses to start \
+             until the PERSON has bound each one to an environment variable of incu's own: \
+             `incu routine bind \"<phrase>\" <name> INCU_PARAM_<NAME>`, with that variable \
+             set where incu is launched. routine_run takes no params, so the value never \
+             passes through you or your transcript. It is used in memory for that run only \
+             and is never written to the routines file, the journal or what the hooks are \
+             shown. Tell the person what to bind"
         );
     }
     if cleaned.inferred_window > 0 {

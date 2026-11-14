@@ -82,18 +82,19 @@ impl Server {
                 // stop ends a wait within a fraction of a second.
                 let stopped = || {
                     self.catch_stop_file();
-                    self.safety.is_stopped() || self.client_gone()
+                    self.safety.is_stopped()
                 };
                 super::wait_tool::wait_for(args, &stopped)
             }
             "watch" => {
                 self.journal_note("watch", &Self::describe("watch", args));
-                // The same stop, asked as often, for a wait of hours, and the
-                // client going away (its end of stdin closing) ends it too: a
-                // watch nobody is listening to must not run out its day.
+                // The same stop, asked as often, for a wait of hours. Nothing
+                // else ends it early: end of input does not (a watch that was
+                // the last request sent is still wanted), so an orphaned watch
+                // lasts until its deadline or `incu stop`.
                 let stopped = || {
                     self.catch_stop_file();
-                    self.safety.is_stopped() || self.client_gone()
+                    self.safety.is_stopped()
                 };
                 super::wait_tool::watch(args, &stopped)
             }

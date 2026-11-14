@@ -152,67 +152,39 @@ pub fn run_stdio(server: Server) -> std::io::Result<()> {
 
 /// [`run_stdio`] over any reader and writer.
 ///
-/// # Why input is read on a thread of its own
+/// # EOF does not end a call that is running
 ///
-/// The server handles one call at a time on this thread, and a `watch` holds the
-/// call for up to a day. With the read inline, a client that went away in the
-/// middle of one would not be noticed until the call returned: the pipe's EOF
-/// sat unread behind it. So a reader thread takes the lines and the EOF, passes
-/// the lines on, and tells the server ([`super::ClientLink`]) when the client has
-/// gone, which the waiting calls look at as often as they look at the stop file.
-/// "Gone" is end of input AND every line sent before it taken up to be answered
-/// (a count kept beside the channel), so a client that pipelined requests and
-/// closed its end is not mistaken for one that left. The EOF is still only ACTED
-/// on here, after every line before it has been answered, exactly as it always
-/// was.
+/// The server answers one line at a time, in order, and reads the next only when
+/// the last is answered. So the end of input is seen only after every line before
+/// it has been answered, and **a `watch` or a `routine_run` that was the last
+/// line sent completes normally**: a client that pipelined its requests and closed
+/// its end is waiting for those answers, and EOF is not evidence that it has gone.
+/// An earlier version read stdin on a thread and ended a waiting call at EOF; that
+/// cut off the last pipelined request, and it is gone. A `watch` or a replay ends
+/// by its own deadline, the stop file (`incu stop`), or an error writing its
+/// answer to stdout, and an orphaned `watch` lasts until one of them.
 ///
 /// # Errors
 ///
 /// Reading or writing failed.
-pub(crate) fn run_lines<R, W>(server: Server, input: R, mut out: W) -> std::io::Result<()>
+pub(crate) fn run_lines<R, W>(mut server: Server, input: R, mut out: W) -> std::io::Result<()>
 where
-    R: std::io::Read + Send + 'static,
+    R: std::io::Read,
     W: Write,
 {
-    use std::sync::{mpsc, Arc};
-
-    let link = Arc::new(super::ClientLink::default());
-    let server = server.with_client_link(link.clone());
-    let (lines, queued) = mpsc::channel::<std::io::Result<String>>();
-    let reader_link = link.clone();
-    std::thread::Builder::new()
-        .name("incode-desktop-stdin".to_string())
-        .spawn(move || {
-            let mut reader = std::io::BufReader::new(input);
-            loop {
-                let mut line = String::new();
-                match reader.read_line(&mut line) {
-                    Ok(0) => {
-                        reader_link.input_ended();
-                        return;
-                    }
-                    Ok(_) => {
-                        // Counted before it is sent, so the count is never behind
-                        // a line that is on its way to the server loop.
-                        reader_link.line_read();
-                        if lines.send(Ok(line)).is_err() {
-                            return;
-                        }
-                    }
-                    Err(e) => {
-                        reader_link.input_ended();
-                        let _ = lines.send(Err(e));
-                        return;
-                    }
-                }
-            }
-        })?;
-    let mut server = server;
+    let mut reader = std::io::BufReader::new(input);
+    let mut line = String::new();
     loop {
-        match queued.recv() {
-            Ok(Ok(line)) => {
-                // Taken up: from here it is being answered, not waiting to be.
-                link.line_taken();
+        line.clear();
+        match reader.read_line(&mut line) {
+            // EOF: every line before it is answered. Halt the desktop before
+            // returning, so a slow in-flight action cannot outlive the thing that
+            // asked for it.
+            Ok(0) => {
+                server.safety().stop();
+                return Ok(());
+            }
+            Ok(_) => {
                 // Every request received is evidence the client is alive.
                 server.safety().heartbeat();
 
@@ -221,17 +193,9 @@ where
                     out.flush()?;
                 }
             }
-            // The reader failed: halt the desktop before returning.
-            Ok(Err(e)) => {
+            Err(e) => {
                 server.safety().stop();
                 return Err(e);
-            }
-            // EOF, every line before it answered: the client is gone. Halt the
-            // desktop before returning, so a slow in-flight action cannot outlive
-            // the thing that asked for it.
-            Err(_) => {
-                server.safety().stop();
-                return Ok(());
             }
         }
     }

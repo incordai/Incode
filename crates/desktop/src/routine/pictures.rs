@@ -20,9 +20,18 @@
 //!
 //! A new run deletes the folders of runs that have FINISHED, so only the last run
 //! is kept, and never the folder of a run that is still going: each run holds an
-//! exclusive OS lock on a `.active` file in its folder for as long as it lives
-//! (the OS drops it if the run dies), and a folder whose mark cannot be locked
-//! is left alone. Within a run the folder is held under [`MAX_TOTAL_BYTES`]: when
+//! exclusive OS lock on a mark file BESIDE its folder (`run-<id>.lock`) for as
+//! long as it lives (the OS drops it if the run dies). Cleanup deletes only a
+//! `run-*` folder whose mark it can take; a folder with no mark, or whose mark is
+//! held, is left alone.
+//!
+//! **The mark comes first.** A run takes its mark BEFORE it makes its folder, so
+//! no folder of a run ever exists unmarked for another run's cleanup to find and
+//! delete (a folder made first and marked after had that window). The mark is
+//! beside the folder and not inside it so that nothing has to be renamed into
+//! place: on Windows a folder with an open file in it cannot be renamed.
+//!
+//! Within a run the folder is held under [`MAX_TOTAL_BYTES`]: when
 //! a new picture would pass it the OLDEST picture is deleted, so the pictures of
 //! the step that failed (the newest) are always the ones that survive. One
 //! picture over [`MAX_PICTURE_BYTES`] is not kept. (Runs going at once each have
@@ -57,9 +66,6 @@ pub const MAX_PICTURE_BYTES: u64 = 4 * 1024 * 1024;
 
 /// The most the pictures of one run may take, in bytes.
 pub const MAX_TOTAL_BYTES: u64 = 48 * 1024 * 1024;
-
-/// The mark in a run's folder that its OS lock is held on while the run lives.
-const ACTIVE: &str = ".active";
 
 /// Which of a step's two pictures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,21 +109,39 @@ impl Pictures {
     }
 
     fn begin_within(root: PathBuf, max_total: u64, id: &str) -> Result<Self, String> {
+        Self::begin_with(root, max_total, id, &|| {})
+    }
+
+    /// [`Pictures::begin_within`], calling `between` after the run is marked and
+    /// before its folder is made: the moment a cleanup by another run could
+    /// otherwise have found the folder unmarked. A test puts a whole other run in
+    /// there.
+    fn begin_with(
+        root: PathBuf,
+        max_total: u64,
+        id: &str,
+        between: &dyn Fn(),
+    ) -> Result<Self, String> {
         make_private_dir(&root)?;
-        let dir = root.join(id);
-        make_private_dir(&dir)?;
+        // The mark first, the folder second, so that no folder of a run exists
+        // that is not already marked: a cleanup by another run deletes only a
+        // `run-*` folder whose mark it can take, and cannot take this one.
+        let mark = mark_of(&root, id);
         let mut active = OsLock::new(
             File::options()
                 .read(true)
                 .write(true)
                 .create(true)
                 .truncate(false)
-                .open(dir.join(ACTIVE))
-                .map_err(|e| format!("cannot mark {} as in use: {e}", dir.display()))?,
+                .open(&mark)
+                .map_err(|e| format!("cannot mark {id} as in use: {e}"))?,
         );
         active
             .acquire_within(Duration::from_secs(1))
-            .map_err(|_| format!("cannot mark {} as in use", dir.display()))?;
+            .map_err(|_| format!("cannot mark {id} as in use"))?;
+        between();
+        let dir = root.join(id);
+        make_private_dir(&dir)?;
         clear_finished(&root, id)?;
         Ok(Self {
             dir,
@@ -205,30 +229,49 @@ fn clear_finished(root: &Path, keep: &str) -> Result<(), String> {
         if is_loose_picture(&name) && path.is_file() {
             std::fs::remove_file(&path)
                 .map_err(|e| format!("cannot clear {}: {e}", path.display()))?;
-        } else if name.starts_with("run-") && path.is_dir() && !is_going(&path) {
+        } else if name.starts_with("run-") && path.is_dir() && run_is_over(root, &name) {
             // Best effort: a folder that will not go is left for the next run.
-            let _ = std::fs::remove_dir_all(&path);
+            if std::fs::remove_dir_all(&path).is_ok() {
+                let _ = std::fs::remove_file(mark_of(root, &name));
+            }
+        } else if name.starts_with("run-") && name.ends_with(MARK_END) && path.is_file() {
+            // A mark with no folder: the run that made it died between marking
+            // and making the folder, or its folder was cleared and the mark was
+            // not. Taken only when nobody holds it (a run between the two steps
+            // does).
+            let run = name.trim_end_matches(MARK_END);
+            if !root.join(run).exists() && is_free(&path) {
+                let _ = std::fs::remove_file(&path);
+            }
         }
     }
     Ok(())
 }
 
-/// Whether the run whose folder is `dir` is still going: its mark is locked by
-/// a handle that is still open. A folder with no mark is a finished (or never
-/// started) run.
-fn is_going(dir: &Path) -> bool {
-    let Ok(mark) = File::options()
-        .read(true)
-        .write(true)
-        .open(dir.join(ACTIVE))
-    else {
+/// The mark of the run `id` under `root`: a file beside its folder, never inside
+/// it, locked for as long as the run lives.
+fn mark_of(root: &Path, id: &str) -> PathBuf {
+    root.join(format!("{id}{MARK_END}"))
+}
+
+/// What a mark's file name ends with.
+const MARK_END: &str = ".lock";
+
+/// Whether the run `id`'s folder may be deleted: it has a mark, and the mark can
+/// be taken, so nobody is running in it. A folder with no mark is NOT deleted: it
+/// is not one this module made, or its run is between marking and making it.
+fn run_is_over(root: &Path, id: &str) -> bool {
+    is_free(&mark_of(root, id))
+}
+
+/// Whether the mark at `path` exists and can be taken: taking the lock for a
+/// moment (it goes when the file closes, at the end of this) says nobody holds
+/// it. Cannot tell: not free, so that what might be in use is not deleted.
+fn is_free(path: &Path) -> bool {
+    let Ok(mark) = File::options().read(true).write(true).open(path) else {
         return false;
     };
-    // Taking the lock for a moment (it goes when the file closes, at the end of
-    // this) says nobody holds it. Cannot tell: do not delete what might be in use.
-    OsLock::new(mark)
-        .try_acquire()
-        .map_or(true, |acquired| !acquired)
+    OsLock::new(mark).try_acquire().unwrap_or(false)
 }
 
 /// Whether `name` is a picture file of the earlier, flat layout.
@@ -282,10 +325,11 @@ mod tests {
         names
     }
 
+    /// The run folders under `root` (not their marks).
     fn runs(root: &Path) -> Vec<String> {
         files(root)
             .into_iter()
-            .filter(|n| n.starts_with("run-"))
+            .filter(|n| n.starts_with("run-") && !n.ends_with(MARK_END))
             .collect()
     }
 
@@ -319,8 +363,9 @@ mod tests {
         let second = Pictures::begin(root.clone()).unwrap();
         assert!(!first_dir.exists(), "the finished run's folder remains");
         assert_eq!(runs(&root).len(), 1);
-        // This run's folder, and the two things that are not ours.
-        assert_eq!(files(&root).len(), 3, "{:?}", files(&root));
+        // This run's folder and its mark, and the two things that are not ours;
+        // the finished run's mark went with its folder.
+        assert_eq!(files(&root).len(), 4, "{:?}", files(&root));
         assert!(root.join("notes.txt").exists() && root.join("my-folder").exists());
         assert!(!root.join("step-099-after.jpg").exists());
         assert_eq!(second.count(), 0);
@@ -362,9 +407,71 @@ mod tests {
         let dead = root.join("run-000000000000001-99999-0");
         std::fs::create_dir_all(&dead).unwrap();
         std::fs::write(dead.join("step-001-after.jpg"), "x").unwrap();
-        std::fs::write(dead.join(ACTIVE), "").unwrap();
+        std::fs::write(mark_of(&root, "run-000000000000001-99999-0"), "").unwrap();
+        // A mark whose folder is gone, and nobody holds it: tidied too.
+        let orphan = mark_of(&root, "run-000000000000002-99999-0");
+        std::fs::write(&orphan, "").unwrap();
         let _live = Pictures::begin(root.clone()).unwrap();
         assert!(!dead.exists());
+        assert!(!mark_of(&root, "run-000000000000001-99999-0").exists());
+        assert!(!orphan.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A folder that has no mark is not one a run is known to be over: left alone
+    /// (it is not ours, or its run has marked it and not yet made it).
+    #[test]
+    fn a_run_folder_with_no_mark_is_not_deleted() {
+        let root = folder("unmarked");
+        let stray = root.join("run-000000000000003-1-0");
+        std::fs::create_dir_all(&stray).unwrap();
+        std::fs::write(stray.join("step-001-after.jpg"), "x").unwrap();
+        let _live = Pictures::begin(root.clone()).unwrap();
+        assert!(stray.join("step-001-after.jpg").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The race: a run has marked itself and is about to make its folder; another
+    /// run begins and cleans up in that moment. The new folder must not be found
+    /// unmarked and deleted, and the other run must not be touched either.
+    #[test]
+    fn a_folder_made_after_a_cleanup_cannot_be_deleted_by_it() {
+        let root = folder("race");
+        let other = std::cell::RefCell::new(None);
+        // `a` is between its mark and its folder when `b` begins, whole, and
+        // cleans up.
+        let a = Pictures::begin_with(root.clone(), MAX_TOTAL_BYTES, "run-a-1-0", &|| {
+            *other.borrow_mut() =
+                Some(Pictures::begin_within(root.clone(), MAX_TOTAL_BYTES, "run-b-1-1").unwrap());
+        })
+        .unwrap();
+        let b = other.borrow_mut().take().unwrap();
+        assert!(a.dir().exists(), "a's folder was deleted");
+        assert!(b.dir().exists(), "b's folder was deleted");
+        // The mark of a run between its steps is held: `b`'s cleanup left it.
+        assert!(mark_of(&root, "run-a-1-0").exists());
+        // And once both are marked and made, neither deletes the other's.
+        let mut a = a;
+        let shot = a.keep(1, When::After, "jpg", b"x").unwrap();
+        drop(Pictures::begin_within(root.clone(), MAX_TOTAL_BYTES, "run-c-1-2").unwrap());
+        assert!(shot.exists(), "a's picture was deleted by a later run");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_mark_is_taken_before_the_folder_exists() {
+        // Seen from inside: when the folder is made, its mark is already held.
+        let root = folder("mark-first");
+        let id = "run-m-1-0";
+        let seen = std::cell::Cell::new(false);
+        let _run = Pictures::begin_with(root.clone(), MAX_TOTAL_BYTES, id, &|| {
+            seen.set(!root.join(id).exists() && !is_free(&mark_of(&root, id)));
+        })
+        .unwrap();
+        assert!(
+            seen.get(),
+            "the folder existed, or the mark was not held, first"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

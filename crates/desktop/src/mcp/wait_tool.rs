@@ -455,8 +455,11 @@ pub(super) fn wait_for(args: &Value, stopped: &dyn Fn() -> bool) -> Result<Vec<V
 ///
 /// **A watch holds the server for its whole duration.** The server answers one
 /// call at a time on one thread, so while a watch runs no other call is served;
-/// it ends when the condition holds, its time runs out, the operator stops the
-/// desktop, or the client goes away (`Server::client_gone`).
+/// it ends when the condition holds, its time runs out, or the operator stops
+/// the desktop (`incu stop`). **Nothing else ends it**: end of input on stdin does
+/// not (a watch that was the last request a client sent is still wanted), so a
+/// watch whose client has gone lasts until its deadline (1 hour unless asked for
+/// more, 24 at most) or `incu stop`.
 ///
 /// Called by `Server::run_tool`.
 pub(super) fn watch(args: &Value, stopped: &dyn Fn() -> bool) -> Result<Vec<Value>, String> {

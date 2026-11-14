@@ -177,9 +177,20 @@ pub struct Routine {
     /// The person asked to keep it (`incu routine keep`). Such a routine never
     /// expires. Only the person sets this: no tool takes it as an argument, so an
     /// agent cannot exempt what it saved from expiry. A save that replaces a kept
-    /// routine stays kept.
+    /// routine with other steps un-keeps it.
     #[serde(default)]
     pub taught: bool,
+    /// Which environment variable each of the routine's parameters (`{{name}}` in
+    /// its steps) is read from, bound by the person (`incu routine bind`). Only
+    /// the variable's NAME is stored, never a value. Empty for a routine with no
+    /// parameters, or none bound yet.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub bindings: std::collections::BTreeMap<String, String>,
+    /// [`params::digest`] of the steps when the bindings were made. A routine
+    /// whose steps no longer have this digest is not run: the bindings are for
+    /// other steps. Empty when nothing is bound.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub bound_steps: String,
 }
 
 impl Routine {
@@ -195,6 +206,13 @@ impl Routine {
                 .iter()
                 .map(|s| s.tool.len() + s.args.to_string().len() + STEP_OVERHEAD_BYTES)
                 .sum::<usize>()
+            // The bindings (a name and a variable each) and the digest of the steps.
+            + self
+                .bindings
+                .iter()
+                .map(|(name, var)| name.len() + var.len() + 32)
+                .sum::<usize>()
+            + self.bound_steps.len()
     }
 
     /// Whether this routine has gone unused long enough to be forgotten at
@@ -245,6 +263,8 @@ mod tests {
             date: "2026-01-01".to_string(),
             last_used_ms,
             taught,
+            bindings: Default::default(),
+            bound_steps: String::new(),
         }
     }
 

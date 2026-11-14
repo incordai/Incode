@@ -46,7 +46,7 @@ use std::fmt;
 
 use serde_json::Value;
 
-use super::params::{names, parameterise, Made, MAX_PARAMS};
+use super::params::{names, parameterise, Made, Probe, MAX_PARAMS};
 use super::source::{Call, Record};
 use super::words::{is_deictic, word_set};
 use super::{Step, MAX_STEPS, MAX_STEP_BYTES};
@@ -300,8 +300,24 @@ pub fn check_step(step: &Step, n: usize) -> Result<(), Refusal> {
     }
     let looks_at_screen = tool == "wait_for"
         && args.get("condition").and_then(Value::as_str) == Some("screen_changes");
-    let needs_selector = NEEDS_SELECTOR.contains(&tool) || (tool == "wait_for" && !looks_at_screen);
+    // A typing step MAY name the control it types into (and only then is its
+    // text kept literally: see `params`); when it does, the replay focuses that
+    // control first, so it must say which window it is in.
+    let names_its_field = matches!(tool, "type_text" | "paste_text") && given("selector");
+    let needs_selector = NEEDS_SELECTOR.contains(&tool)
+        || (tool == "wait_for" && !looks_at_screen)
+        || names_its_field;
     check_selector(args.get("selector"), needs_selector).map_err(refuse)?;
+    if names_its_field {
+        let named = args.get("selector").and_then(Value::as_str);
+        if named.is_some_and(|raw| Selector::parse(raw).is_ok_and(|s| !s.has_element_part())) {
+            return Err(refuse(
+                "names a window and no control in `selector`; name the field it types into \
+                 (role=edit;name=...) or leave the selector out"
+                    .to_string(),
+            ));
+        }
+    }
     if KEYBOARD.contains(&tool) {
         check_in_window(args.get(IN_WINDOW)).map_err(refuse)?;
     }
@@ -397,12 +413,15 @@ pub(super) fn wait_failure(answer: &str) -> Option<String> {
 /// A [`Refusal`]: the phrase, a failed call, a step that cannot be replayed, an
 /// empty result or too many steps.
 pub fn learn_from_calls(phrase: &str, calls: &[Call]) -> Result<Cleaned, Refusal> {
-    learn_with(phrase, calls, &|_| false)
+    // With nothing to ask the desktop, no control is known to be plain: every
+    // typed text becomes a parameter (see [`super::params::why_not_kept`]).
+    learn_with(phrase, calls, &|_| Probe::Unknown)
 }
 
-/// As [`learn_from_calls`], with `is_secret` asked about the raw selector of a
-/// control that no name condemns: the desktop's own report that it is a
-/// password field (see [`super::params`]).
+/// As [`learn_from_calls`], with `probe` asked about the raw selector of a control
+/// a typing step names: the desktop's own report, at save time, of whether it is
+/// a password field. A text is kept only when a step names a control that
+/// `probe` says is plain (see [`super::params`]).
 ///
 /// # Errors
 ///
@@ -410,7 +429,7 @@ pub fn learn_from_calls(phrase: &str, calls: &[Call]) -> Result<Cleaned, Refusal
 pub fn learn_with(
     phrase: &str,
     calls: &[Call],
-    is_secret: &dyn Fn(&str) -> bool,
+    probe: &dyn Fn(&str) -> Probe,
 ) -> Result<Cleaned, Refusal> {
     check_phrase(phrase)?;
     // ANY call that failed is a run that failed: a shell command that errored, a
@@ -479,7 +498,7 @@ pub fn learn_with(
     }
     // After every step is known replayable, and last: the text of a secure field
     // or a redacted recording is taken out of the steps before they go anywhere.
-    let parameters = parameterise(&mut steps, is_secret);
+    let parameters = parameterise(&mut steps, probe);
     let taken = names(&steps).len();
     if taken > MAX_PARAMS {
         return Err(Refusal::TooManyParams(taken));
@@ -916,10 +935,68 @@ mod tests {
             Call::ok("key", json!({"keys": ["Enter"], "in_window": IN})),
         ])
         .unwrap();
-        assert_eq!(cleaned.parameters.len(), 1);
-        assert_eq!(cleaned.steps[3].args["text"], "{{text}}");
-        assert_eq!(cleaned.steps[1].args["text"], "alice");
-        assert!(!format!("{cleaned:?}").contains("hunter2"));
+        // No step names a field, so no typed text is kept: not the password, and
+        // not the user name either.
+        assert_eq!(cleaned.parameters.len(), 2);
+        assert_eq!(cleaned.steps[3].args["text"], "{{text_2}}");
+        assert_eq!(cleaned.steps[1].args["text"], "{{text}}");
+        let kept = format!("{cleaned:?}");
+        assert!(
+            !kept.contains("hunter2") && !kept.contains("alice"),
+            "{kept}"
+        );
+    }
+
+    /// Text is kept when the step itself names a plain text box that the desktop
+    /// confirms is not a password field, and not otherwise.
+    #[test]
+    fn a_step_that_names_a_plain_field_keeps_its_text_when_the_desktop_confirms_it() {
+        let named = |field: &str| {
+            Call::ok(
+                "type_text",
+                json!({"text": "rust", "in_window": IN, "selector": format!("{IN};{field}")}),
+            )
+        };
+        let plain = |_: &str| Probe::Plain;
+        let kept =
+            learn_with("search for rust", &[named("role=edit;name=Search")], &plain).unwrap();
+        assert!(kept.parameters.is_empty());
+        assert_eq!(kept.steps[0].args["text"], "rust");
+        // The desktop could not check it: a parameter.
+        let unchecked =
+            learn_from_calls("search for rust", &[named("role=edit;name=Search")]).unwrap();
+        assert_eq!(unchecked.steps[0].args["text"], "{{search}}");
+        // Marked as a password by the desktop, whatever it is called.
+        let secret = learn_with(
+            "search for rust",
+            &[named("role=edit;name=Search")],
+            &|_: &str| Probe::Secret,
+        )
+        .unwrap();
+        assert_eq!(secret.steps[0].args["text"], "{{search}}");
+        assert_eq!(
+            secret.parameters[0].why,
+            crate::routine::params::Why::SecureField
+        );
+        // A selector that names a window and no control is refused outright: the
+        // replay would have nothing to focus.
+        let no_control = Call::ok(
+            "type_text",
+            json!({"text": "x", "in_window": IN, "selector": IN}),
+        );
+        assert!(matches!(
+            learn_with("search for rust", &[no_control], &plain),
+            Err(Refusal::NotReplayable { .. })
+        ));
+        // One with no window part would be focused in whatever is in front.
+        let no_window = Call::ok(
+            "type_text",
+            json!({"text": "x", "in_window": IN, "selector": "role=edit;name=Search"}),
+        );
+        assert!(matches!(
+            learn_with("search for rust", &[no_window], &plain),
+            Err(Refusal::NotReplayable { .. })
+        ));
     }
 
     #[test]
@@ -950,19 +1027,36 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(cleaned.parameters.len(), 1);
-        assert_eq!(cleaned.steps[1].args["text"], "{{password}}");
+        assert_eq!(cleaned.steps[1].args["text"], "{{text}}");
         assert!(!format!("{cleaned:?}").contains("hunter2"));
+        // A step that names the field itself, with the name saying it is secret.
+        let named = learn_with(
+            "sign in",
+            &[Call::ok(
+                "type_text",
+                json!({"text": "hunter2-secret", "in_window": IN, "selector": format!("{IN};role=edit;name=Password")}),
+            )],
+            &|_: &str| Probe::Plain,
+        )
+        .unwrap();
+        assert_eq!(named.steps[0].args["text"], "{{password}}");
         // The desktop's own word that a control is a password field counts too.
         let by_desktop = learn_with(
             "sign in",
-            &[
-                sel_click("role=edit;name=Code"),
-                Call::ok("type_text", json!({"text": "482913", "in_window": IN})),
-            ],
-            &|raw: &str| raw.contains("name=Code"),
+            &[Call::ok(
+                "set_value",
+                json!({"selector": format!("{IN};role=edit;name=Code"), "value": "482913"}),
+            )],
+            &|raw: &str| {
+                if raw.contains("name=Code") {
+                    Probe::Secret
+                } else {
+                    Probe::Plain
+                }
+            },
         )
         .unwrap();
-        assert_eq!(by_desktop.steps[1].args["text"], "{{code}}");
+        assert_eq!(by_desktop.steps[0].args["value"], "{{code}}");
     }
 
     #[test]

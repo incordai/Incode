@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 use super::*;
 use crate::hooks::HookOutcome;
 use crate::permission::OBSERVING;
-use crate::routine::params::Values;
+use crate::routine::params::{Probe, Values};
 use crate::routine::source::{Call, MemorySource, NoSource, Record, StepSource};
 use crate::routine::store::{Routines, Store};
 use crate::routine::{Routine, Step};
@@ -41,8 +41,18 @@ fn pretend_shot(_: &Step) -> Result<Vec<u8>, String> {
 fn server_with(dir: &Path, source: Box<dyn StepSource>) -> Server {
     Server::new(InputThread::start().expect("input thread")).with_routines(
         RoutineKit::new(Store::at(dir.join("routines.json")), source)
-            .with_shooter(Box::new(pretend_shot)),
+            .with_shooter(Box::new(pretend_shot))
+            // No sign-in form here to ask: every control the steps name is a
+            // plain one. (The rule for what is not is tested in `params`.)
+            .with_prober(Box::new(|_| Probe::Plain)),
     )
+}
+
+/// The person's `incu routine bind`, as a test does it.
+fn bind(dir: &Path, phrase: &str, param: &str, var: &str) {
+    Store::at(dir.join("routines.json"))
+        .update(|file| file.bind(phrase, param, var, crate::routine::now_ms()))
+        .expect("bind");
 }
 
 fn server(dir: &Path) -> Server {
@@ -509,6 +519,8 @@ fn a_routine_unused_for_thirty_days_is_gone_unless_it_was_taught() {
         date: "2026-01-01".to_string(),
         last_used_ms: 1_000,
         taught,
+        bindings: Default::default(),
+        bound_steps: String::new(),
     };
     let file = Routines {
         version: 1,
@@ -544,6 +556,8 @@ fn a_stored_step_the_rules_refuse_runs_nothing() {
             date: String::new(),
             last_used_ms: crate::routine::now_ms(),
             taught: true,
+            bindings: Default::default(),
+            bound_steps: String::new(),
         }],
     };
     Store::at(dir.join("routines.json")).save(&file).unwrap();
@@ -614,12 +628,22 @@ fn a_replayed_typing_step_into_a_window_that_is_not_there_fails_and_types_nothin
     let dir = folder("typing");
     let (hooks, pre, _post) = Recording::new(None);
     let mut s = server(&dir).with_hook_runner(Box::new(hooks));
+    // It names the field it types into (a plain one, the desktop says), so its
+    // text is kept and the replay focuses the field first: in a window that is
+    // not there, that is where it fails.
     let reply = save_steps(
         &mut s,
         "type a note",
-        vec![json!({"tool": "type_text", "args": {"text": "hi", "in_window": NO_SUCH_WINDOW}})],
+        vec![json!({"tool": "type_text", "args": {
+            "text": "hi", "in_window": NO_SUCH_WINDOW,
+            "selector": format!("{NO_SUCH_WINDOW};role=edit;name=Body")
+        }})],
     );
     assert!(!refused(&reply), "{reply}");
+    assert!(answer(&reply)["steps"][0]
+        .as_str()
+        .unwrap()
+        .contains("\"hi\""));
     let run = call(&mut s, "routine_run", json!({"phrase": "type a note"}));
     assert!(refused(&run), "{run}");
     assert!(
@@ -646,85 +670,113 @@ fn a_secret_typed_into_a_password_field_is_a_parameter_and_never_stored_or_journ
     let hook_inputs = hooks.inputs.clone();
     // Where the person keeps the secret: incu's own environment.
     std::env::set_var("INCU_PARAM_TEST_VAULT_PASSWORD", "hunter2-secret");
-    let reference = json!({"env": "INCU_PARAM_TEST_VAULT_PASSWORD"});
     let mut s = server(&dir)
         .with_journal(journal.clone())
         .with_hook_runner(Box::new(hooks));
+    let steps = || {
+        json!([
+            {"tool": "wait_for", "args": gone()},
+            // Names its own plain field: the text is kept, the replay focuses it.
+            {"tool": "type_text", "args": {
+                "text": "plain words", "in_window": TYPING_WINDOW,
+                "selector": format!("{TYPING_WINDOW};role=edit;name=Body")
+            }},
+            {"tool": "set_value", "args": {"selector": "app=vault;window=Sign in;role=edit;name=Password", "value": "hunter2-secret"}},
+        ])
+    };
     let reply = call(
         &mut s,
         "routine_save",
-        json!({"phrase": "unlock the vault", "steps": [
-            {"tool": "wait_for", "args": gone()},
-            {"tool": "type_text", "args": {"text": "plain words", "in_window": TYPING_WINDOW}},
-            {"tool": "set_value", "args": {"selector": "app=vault;window=Sign in;role=edit;name=Password", "value": "hunter2-secret"}},
-        ]}),
+        json!({"phrase": "unlock the vault", "steps": steps()}),
     );
     let saved = answer(&reply);
     assert_eq!(saved["parameters"][0]["name"], "password", "{saved}");
     assert_eq!(saved["parameters"][0]["step"], 3);
     assert_eq!(saved["parameters"].as_array().unwrap().len(), 1, "{saved}");
     assert!(!said(&reply).contains("hunter2"), "{}", said(&reply));
-    assert!(saved["parameters_note"].is_string());
+    assert!(saved["parameters_note"]
+        .as_str()
+        .unwrap()
+        .contains("incu routine bind"));
     // On disk: the placeholder, never the value. The ordinary text is kept.
     let file = std::fs::read_to_string(dir.join("routines.json")).unwrap();
     assert!(!file.contains("hunter2"), "{file}");
     assert!(file.contains("{{password}}") && file.contains("plain words"));
-    // The listing says what the routine needs.
+    // The listing says what the routine needs and that nothing is bound.
     let listed = answer(&call(&mut s, "routine_list", json!({})));
     assert_eq!(listed["routines"][0]["params_needed"], json!(["password"]));
+    assert_eq!(listed["routines"][0]["params_unbound"], json!(["password"]));
 
-    // Without it, the run is refused before step 1: no step is asked of any gate.
+    // Unbound, the run is refused before step 1, naming the person's command: no
+    // step is asked of any gate.
     let refusal = call(&mut s, "routine_run", json!({"phrase": "vault unlock"}));
     assert!(refused(&refusal), "{refusal}");
-    assert!(said(&refusal).contains("password"), "{}", said(&refusal));
+    assert!(
+        said(&refusal)
+            .contains("incu routine bind \"unlock the vault\" password INCU_PARAM_PASSWORD"),
+        "{}",
+        said(&refusal)
+    );
     assert!(
         said(&refusal).contains("Nothing was done"),
         "{}",
         said(&refusal)
     );
-    let wrong = call(
-        &mut s,
-        "routine_run",
-        json!({"phrase": "vault unlock", "params": {"pasword": reference}}),
-    );
-    assert!(
-        refused(&wrong) && said(&wrong).contains("takes: password"),
-        "{wrong}"
-    );
-    // The secret itself is refused: it would be in the caller's transcript.
-    let literal = call(
-        &mut s,
-        "routine_run",
-        json!({"phrase": "vault unlock", "params": {"password": "hunter2-secret"}}),
-    );
-    assert!(refused(&literal), "{literal}");
-    assert!(said(&literal).contains("REFERENCE"), "{}", said(&literal));
-    assert!(
-        said(&literal).contains("INCU_PARAM_PASSWORD"),
-        "{}",
-        said(&literal)
-    );
-    assert!(!said(&literal).contains("hunter2"), "{}", said(&literal));
-    assert_eq!(
-        *pre.lock().unwrap(),
-        [
-            "routine_save",
-            "routine_list",
+    // `params` is not an argument any more, in any spelling, and the secret in
+    // one is never repeated.
+    for params in [
+        json!({"password": "hunter2-secret"}),
+        json!({"password": {"env": "INCU_PARAM_TEST_VAULT_PASSWORD"}}),
+        json!({"password": {"env": "HOME"}}),
+    ] {
+        let attempt = call(
+            &mut s,
             "routine_run",
-            "routine_run",
-            "routine_run"
-        ],
-        "not even the first step was tried"
+            json!({"phrase": "vault unlock", "params": params}),
+        );
+        assert!(refused(&attempt), "{attempt}");
+        assert!(
+            said(&attempt).contains("incu routine bind"),
+            "{}",
+            said(&attempt)
+        );
+        assert!(!said(&attempt).contains("hunter2"), "{}", said(&attempt));
+    }
+    assert!(
+        !pre.lock().unwrap().iter().any(|t| t == "wait_for"),
+        "a step was tried before the parameter was bound"
     );
+    // The agent cannot bind: the only way is the person's command (the Store),
+    // and it takes only an INCU_PARAM_ variable.
+    let store = Store::at(dir.join("routines.json"));
+    for var in ["HOME", "PATH", "ANTHROPIC_API_KEY"] {
+        let why = store
+            .update(|file| file.bind("vault unlock", "password", var, 0))
+            .unwrap_err();
+        assert!(why.contains("INCU_PARAM_"), "{why}");
+    }
 
-    // Given a reference, it is accepted and the run starts: it goes as far as it
-    // can on the test desktop (the first step passes, the second finds no such
-    // window) and whatever it says, the value is nowhere.
-    let ran = call(
-        &mut s,
-        "routine_run",
-        json!({"phrase": "vault unlock", "params": {"password": reference}}),
+    // The person binds it. Only the variable's NAME goes in the file.
+    bind(
+        &dir,
+        "vault unlock",
+        "password",
+        "INCU_PARAM_TEST_VAULT_PASSWORD",
     );
+    let file = std::fs::read_to_string(dir.join("routines.json")).unwrap();
+    assert!(file.contains("INCU_PARAM_TEST_VAULT_PASSWORD"), "{file}");
+    assert!(!file.contains("hunter2"), "{file}");
+    let listed = answer(&call(&mut s, "routine_list", json!({})));
+    assert_eq!(
+        listed["routines"][0]["params_bound"],
+        json!({"password": "INCU_PARAM_TEST_VAULT_PASSWORD"})
+    );
+    assert_eq!(listed["routines"][0]["params_unbound"], json!([]));
+
+    // Bound, the run starts: it goes as far as it can on the test desktop (the
+    // first step passes, the second finds no such window) and whatever it says,
+    // the value is nowhere.
+    let ran = call(&mut s, "routine_run", json!({"phrase": "vault unlock"}));
     assert!(refused(&ran), "{ran}");
     assert!(
         said(&ran).contains("failed at step 2 of 3"),
@@ -740,18 +792,19 @@ fn a_secret_typed_into_a_password_field_is_a_parameter_and_never_stored_or_journ
         .filter(|(tool, _)| tool == "routine_run")
         .map(|(_, input)| input)
         .collect();
-    assert!(run_inputs.len() >= 3);
+    assert!(run_inputs.len() >= 5);
     for input in &run_inputs {
         assert!(!input.contains("hunter2"), "{input}");
         assert!(!input.contains("INCU_PARAM_TEST"), "{input}");
+        assert!(!input.contains("\"HOME\""), "{input}");
     }
-    assert!(
+    // The attempts at `params` were shown as `<param>`.
+    assert_eq!(
         run_inputs
-            .last()
-            .unwrap()
-            .contains("\"password\":\"<param>\""),
-        "{}",
-        run_inputs.last().unwrap()
+            .iter()
+            .filter(|i| i.contains("\"password\":\"<param>\""))
+            .count(),
+        3
     );
     // No call of the replay (the steps) was shown it either. (What the agent
     // wrote into `routine_save` itself is its own, and in its own transcript.)
@@ -763,6 +816,39 @@ fn a_secret_typed_into_a_password_field_is_a_parameter_and_never_stored_or_journ
     assert!(!lines.contains("hunter2"), "{lines}");
     let file = std::fs::read_to_string(dir.join("routines.json")).unwrap();
     assert!(!file.contains("hunter2"), "{file}");
+
+    // The same steps saved again keep the binding; other steps drop it, and the
+    // person binds again after reading them.
+    let again = answer(&call(
+        &mut s,
+        "routine_save",
+        json!({"phrase": "unlock the vault", "steps": steps()}),
+    ));
+    assert!(again.get("bindings_dropped").is_none(), "{again}");
+    let listed = answer(&call(&mut s, "routine_list", json!({})));
+    assert_eq!(listed["routines"][0]["params_unbound"], json!([]));
+    let mut other = steps();
+    other.as_array_mut().unwrap().push(step(gone()));
+    let changed = answer(&call(
+        &mut s,
+        "routine_save",
+        json!({"phrase": "unlock the vault", "steps": other}),
+    ));
+    assert!(
+        changed["bindings_dropped"]
+            .as_str()
+            .unwrap()
+            .contains("incu routine bind"),
+        "{changed}"
+    );
+    let listed = answer(&call(&mut s, "routine_list", json!({})));
+    assert_eq!(listed["routines"][0]["params_bound"], json!({}));
+    assert_eq!(listed["routines"][0]["params_unbound"], json!(["password"]));
+    let refusal = call(&mut s, "routine_run", json!({"phrase": "vault unlock"}));
+    assert!(
+        refused(&refusal) && said(&refusal).contains("not bound"),
+        "{refusal}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -804,7 +890,10 @@ fn the_full_text_of_every_step_is_shown_when_saving_listing_and_matching() {
         &mut s,
         "routine_save",
         json!({"phrase": "greet the room", "steps": [
-            {"tool": "type_text", "args": {"text": "hello there, everyone", "in_window": TYPING_WINDOW}}
+            {"tool": "type_text", "args": {
+                "text": "hello there, everyone", "in_window": TYPING_WINDOW,
+                "selector": format!("{TYPING_WINDOW};role=edit;name=Greeting")
+            }}
         ]}),
     ));
     let listed = answer(&call(&mut s, "routine_list", json!({})));
@@ -969,6 +1058,8 @@ fn a_replay_leaves_a_folder_of_pictures_and_only_the_last_runs() {
     let old_run = root.join("run-000000000000001-1-0");
     std::fs::create_dir_all(&old_run).unwrap();
     std::fs::write(old_run.join("step-001-after.jpg"), "old").unwrap();
+    // Its mark, which nobody holds: the run is over.
+    std::fs::write(root.join("run-000000000000001-1-0.lock"), "").unwrap();
     std::fs::write(root.join("step-099-after.jpg"), "older").unwrap();
     std::fs::write(root.join("keep-me.txt"), "mine").unwrap();
     let ran = answer(&call(
@@ -1161,135 +1252,106 @@ impl std::io::Read for Wire {
     }
 }
 
-#[test]
-fn a_watch_ends_when_the_client_goes_away_instead_of_running_for_a_day() {
-    let dir = folder("watch-eof");
+/// What a server answers to `lines` sent whole and then end of input, in order.
+fn pipelined(s: Server, lines: &[Value]) -> Vec<Value> {
     let (to_server, from_client) = std::sync::mpsc::channel::<Vec<u8>>();
-    let request = json!({
-        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-        "params": {"name": "watch", "arguments": {
-            "condition": "window_appears", "selector": NO_SUCH_WINDOW, "timeout_ms": 86_400_000
-        }}
-    });
-    to_server.send(format!("{request}\n").into_bytes()).unwrap();
-    // The client disconnects a moment after asking, while the watch is polling.
-    let hangup = std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        drop(to_server);
-    });
-    let started = std::time::Instant::now();
-    let mut out = Vec::new();
-    let s = server(&dir);
-    super::transport::run_lines(s, Wire(from_client, Vec::new()), &mut out).unwrap();
-    hangup.join().unwrap();
-    assert!(
-        started.elapsed() < std::time::Duration::from_secs(10),
-        "the watch ran on for {:?}",
-        started.elapsed()
-    );
-    // It answered (refused: stopped) before returning, and did not hang.
-    let reply = String::from_utf8(out).unwrap();
-    assert!(reply.contains("\"isError\":true"), "{reply}");
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// The client has sent three requests and closed its end: it is still waiting
-/// for three answers, so a watch among them is NOT cut short by the EOF.
-#[test]
-fn a_watch_is_not_cut_short_by_an_end_of_input_that_has_lines_still_to_answer() {
-    let dir = folder("eof-pipelined");
-    let (to_server, from_client) = std::sync::mpsc::channel::<Vec<u8>>();
-    let watch = json!({
-        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-        "params": {"name": "watch", "arguments": {
-            "condition": "window_appears", "selector": NO_SUCH_WINDOW,
-            "timeout_ms": 600, "poll_ms": 250
-        }}
-    });
-    to_server.send(format!("{watch}\n").into_bytes()).unwrap();
-    to_server
-        .send(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n".to_vec())
-        .unwrap();
+    for line in lines {
+        to_server.send(format!("{line}\n").into_bytes()).unwrap();
+    }
+    // The client closes its end the moment it has sent them.
     drop(to_server);
     let mut out = Vec::new();
-    super::transport::run_lines(server(&dir), Wire(from_client, Vec::new()), &mut out).unwrap();
-    let replies: Vec<Value> = String::from_utf8(out)
+    super::transport::run_lines(s, Wire(from_client, Vec::new()), &mut out).unwrap();
+    String::from_utf8(out)
         .unwrap()
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
-        .collect();
-    assert_eq!(replies.len(), 2, "{replies:?}");
-    // The watch ran its whole 600 ms and answered: not "stopped".
-    assert_eq!(replies[0]["result"]["isError"], false, "{}", replies[0]);
+        .collect()
+}
+
+fn ping(id: u32) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "method": "ping"})
+}
+
+/// End of input does not mean the client is gone. A `watch` that was the last
+/// request sent runs to its own end and is answered, as does one with another
+/// request after it.
+#[test]
+fn a_pipelined_watch_completes_normally_after_end_of_input() {
+    let dir = folder("eof-watch");
+    let watch = |id: u32| {
+        json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": {"name": "watch", "arguments": {
+                "condition": "window_appears", "selector": NO_SUCH_WINDOW,
+                "timeout_ms": 600, "poll_ms": 250
+            }}
+        })
+    };
+    // The last line of all.
+    let started = std::time::Instant::now();
+    let last = pipelined(server(&dir), &[ping(1), watch(2)]);
+    assert_eq!(last.len(), 2, "{last:?}");
+    assert_eq!(last[1]["id"], 2);
+    assert_eq!(last[1]["result"]["isError"], false, "{}", last[1]);
     assert!(
-        replies[0]["result"]["content"][0]["text"]
+        last[1]["result"]["content"][0]["text"]
             .as_str()
             .unwrap()
             .contains("\"result\": \"timeout\""),
-        "{}",
-        replies[0]
+        "the watch did not run its time: {}",
+        last[1]
     );
-    assert_eq!(replies[1]["id"], 2);
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(500),
+        "ended after {:?}, before its 600 ms",
+        started.elapsed()
+    );
+    // With a request after it.
+    let first = pipelined(server(&dir), &[watch(1), ping(2)]);
+    assert_eq!(first.len(), 2, "{first:?}");
+    assert_eq!(first[0]["result"]["isError"], false, "{}", first[0]);
+    assert_eq!(first[1]["id"], 2);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// "Gone" is end of input AND nothing the client sent left to be answered.
+/// Likewise a replay that was the last request sent.
 #[test]
-fn the_client_is_gone_only_at_the_end_of_input_with_every_line_taken_up() {
-    let link = ClientLink::default();
-    assert!(!link.gone(), "nothing has happened");
-    link.line_read();
-    link.line_read();
-    assert!(!link.gone());
-    link.input_ended();
-    assert!(!link.gone(), "two lines are still to be answered");
-    link.line_taken();
-    assert!(!link.gone(), "one is");
-    link.line_taken();
-    assert!(link.gone(), "the end of input, and nothing left to answer");
-    // No end of input: never gone, however many are taken.
-    let open = ClientLink::default();
-    open.line_read();
-    open.line_taken();
-    assert!(!open.gone());
-}
-
-/// A replay does not go on for a client that has gone away.
-#[test]
-fn a_replay_stops_between_steps_when_the_client_has_gone() {
-    let dir = folder("client-gone");
-    let (hooks, pre, _post) = Recording::new(None);
-    let link = std::sync::Arc::new(ClientLink::default());
-    let mut s = server(&dir)
-        .with_hook_runner(Box::new(hooks))
-        .with_client_link(link.clone());
+fn a_pipelined_routine_run_completes_normally_after_end_of_input() {
+    let dir = folder("eof-run");
+    let mut s = server(&dir);
     answer(&save_steps(
         &mut s,
         "three waits",
         vec![step(gone()), step(gone()), step(gone())],
     ));
-    // The client is there: the routine runs.
-    answer(&call(
-        &mut s,
-        "routine_run",
-        json!({"phrase": "three waits"}),
-    ));
-    pre.lock().unwrap().clear();
-    // Gone before it starts: not one step is run.
-    link.input_ended();
-    let reply = call(&mut s, "routine_run", json!({"phrase": "three waits"}));
-    assert!(refused(&reply), "{reply}");
-    assert!(
-        said(&reply).contains("client went away"),
-        "{}",
-        said(&reply)
-    );
-    assert!(
-        said(&reply).contains("failed at step 1 of 3"),
-        "{}",
-        said(&reply)
-    );
-    assert_eq!(*pre.lock().unwrap(), ["routine_run"], "a step was run");
+    let run = json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {"name": "routine_run", "arguments": {"phrase": "three waits"}}
+    });
+    let replies = pipelined(s, &[ping(1), run]);
+    assert_eq!(replies.len(), 2, "{replies:?}");
+    assert_eq!(replies[1]["result"]["isError"], false, "{}", replies[1]);
+    let text = replies[1]["result"]["content"][0]["text"].as_str().unwrap();
+    let ran: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(ran["steps_run"], 3, "every step ran: {ran}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The one thing end of input does: stop the desktop, after every line before it
+/// has been answered.
+#[test]
+fn end_of_input_with_nothing_running_stops_the_desktop_and_returns() {
+    let dir = folder("eof-idle");
+    let s = server(&dir);
+    let safety = s.safety();
+    assert!(!safety.is_stopped());
+    let (to_server, from_client) = std::sync::mpsc::channel::<Vec<u8>>();
+    drop(to_server);
+    let mut out = Vec::new();
+    super::transport::run_lines(s, Wire(from_client, Vec::new()), &mut out).unwrap();
+    assert!(out.is_empty());
+    assert!(safety.is_stopped(), "the desktop was left running");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1335,7 +1397,6 @@ fn a_hook_that_refuses_screenshot_refuses_the_replays_pictures_and_they_are_aske
 #[test]
 fn no_picture_is_taken_after_a_step_that_typed_a_secret_or_before_the_next() {
     use super::routine_tool::Live;
-    use crate::routine::params::Target;
     use crate::routine::pictures::When;
     use crate::routine::replay::Runner;
     let dir = folder("secret-pictures");
@@ -1379,34 +1440,29 @@ fn no_picture_is_taken_after_a_step_that_typed_a_secret_or_before_the_next() {
     assert!(skipped[0].contains("secret") && skipped[1].contains("secret"));
     assert_eq!(taken.lock().unwrap().len(), 6);
 
-    // Plain text into a field whose NAME says secret is a secret too, and so is
-    // text typed where focus may have moved.
-    let plain = Step::new(
-        "type_text",
-        json!({"text": "words", "in_window": TYPING_WINDOW}),
-    );
-    for target in [
-        Target::Known("app=login;window=Sign in;role=edit;name=Password".to_string()),
-        Target::Unknown,
-    ] {
-        let mut s = Server::new(InputThread::start().expect("input thread")).with_routines(
-            RoutineKit::new(Store::at(dir.join("other.json")), Box::new(NoSource))
+    // Plain text into a field whose NAME says secret is a secret too (a routine
+    // edited by hand: a saved one would have made it a parameter); text into a
+    // plain named field is photographed.
+    let typing_in = |field: &str| {
+        Step::new(
+            "type_text",
+            json!({"text": "words", "in_window": TYPING_WINDOW,
+                   "selector": format!("{TYPING_WINDOW};role=edit;name={field}")}),
+        )
+    };
+    let fresh = |name: &str| {
+        Server::new(InputThread::start().expect("input thread")).with_routines(
+            RoutineKit::new(Store::at(dir.join(name)), Box::new(NoSource))
                 .with_shooter(Box::new(|_| Ok(b"x".to_vec()))),
-        );
-        let mut live = Live::new(&mut s, Values::default());
-        live.before_target = target.clone();
-        assert_eq!(live.look(1, &plain, When::After), None, "{target:?}");
-        assert_eq!(live.pictures_note()["skipped"].as_array().unwrap().len(), 1);
-    }
-    // A plain field is photographed.
-    let mut s = Server::new(InputThread::start().expect("input thread")).with_routines(
-        RoutineKit::new(Store::at(dir.join("third.json")), Box::new(NoSource))
-            .with_shooter(Box::new(|_| Ok(b"x".to_vec()))),
-    );
+        )
+    };
+    let mut s = fresh("other.json");
     let mut live = Live::new(&mut s, Values::default());
-    live.before_target =
-        Target::Known("app=login;window=Sign in;role=edit;name=Username".to_string());
-    assert!(live.look(1, &plain, When::After).is_some());
+    assert_eq!(live.look(1, &typing_in("Password"), When::After), None);
+    assert_eq!(live.pictures_note()["skipped"].as_array().unwrap().len(), 1);
+    let mut s = fresh("third.json");
+    let mut live = Live::new(&mut s, Values::default());
+    assert!(live.look(1, &typing_in("Username"), When::After).is_some());
     let _ = std::fs::remove_dir_all(&dir);
 }
 

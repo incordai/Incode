@@ -45,6 +45,12 @@ USAGE:
     incu routine list         show every learned routine, each step in full
     incu routine keep <WORDS>     keep a routine from expiring (only you can)
     incu routine unkeep <WORDS>   let it expire again, thirty days from now
+    incu routine bind <WORDS> <PARAM> <ENV_VAR>
+                              read a routine's secret {PARAM} from the
+                              environment variable ENV_VAR (named INCU_PARAM_...)
+                              of incu's own environment, for the steps as they are
+                              now. Only you bind; the variable's NAME is stored
+    incu routine unbind <WORDS> <PARAM>   remove that binding
     incu --help | --version
 
 OPTIONS for serve:
@@ -102,6 +108,10 @@ pub enum RoutineAction {
     Keep,
     /// Let a kept routine expire again (thirty days from now).
     Unkeep,
+    /// Bind a parameter of a routine to an environment variable of incu's own.
+    Bind,
+    /// Remove such a binding.
+    Unbind,
 }
 
 /// The arguments of `incu routine`.
@@ -109,9 +119,13 @@ pub enum RoutineAction {
 pub struct RoutineArgs {
     /// What to do.
     pub action: RoutineAction,
-    /// The phrase naming the routine, for keep and unkeep. Matched as a request
-    /// is: by its words, in any order, filler ignored.
+    /// The phrase naming the routine, for keep, unkeep, bind and unbind. Matched
+    /// as a request is: by its words, in any order, filler ignored.
     pub phrase: String,
+    /// The parameter, for bind and unbind.
+    pub param: String,
+    /// The environment variable (its NAME), for bind.
+    pub var: String,
     /// The routines file, when named; else the config's, else the default.
     pub file: Option<PathBuf>,
     /// The config file named on the command line, if any.
@@ -228,13 +242,19 @@ fn parse_routine(args: Vec<String>) -> Result<Command, String> {
         Some("list") => RoutineAction::List,
         Some("keep") => RoutineAction::Keep,
         Some("unkeep") => RoutineAction::Unkeep,
+        Some("bind") => RoutineAction::Bind,
+        Some("unbind") => RoutineAction::Unbind,
         Some("-h" | "--help") => return Ok(Command::Print(USAGE.to_string())),
         Some(other) => {
             return Err(format!(
-                "unknown routine command `{other}` (list, keep or unkeep)\n\n{USAGE}"
+                "unknown routine command `{other}` (list, keep, unkeep, bind or unbind)\n\n{USAGE}"
             ))
         }
-        None => return Err(format!("routine needs list, keep or unkeep\n\n{USAGE}")),
+        None => {
+            return Err(format!(
+                "routine needs list, keep, unkeep, bind or unbind\n\n{USAGE}"
+            ))
+        }
     };
     let mut words = Vec::new();
     let mut file = None;
@@ -250,15 +270,46 @@ fn parse_routine(args: Vec<String>) -> Result<Command, String> {
             _ => words.push(arg),
         }
     }
+    // Bind and unbind end with the parameter (and, for bind, the variable); what
+    // comes before is the words that name the routine.
+    let (mut param, mut var) = (String::new(), String::new());
+    match action {
+        RoutineAction::Bind => {
+            if words.len() < 3 {
+                return Err(
+                    "incu routine bind <the words that ask for the routine> <param> \
+                            <ENV_VAR>"
+                        .to_string(),
+                );
+            }
+            var = words.pop().unwrap_or_default();
+            param = words.pop().unwrap_or_default();
+        }
+        RoutineAction::Unbind => {
+            if words.len() < 2 {
+                return Err(
+                    "incu routine unbind <the words that ask for the routine> <param>".to_string(),
+                );
+            }
+            param = words.pop().unwrap_or_default();
+        }
+        _ => {}
+    }
     let phrase = words.join(" ");
     match (action, phrase.trim().is_empty()) {
         (RoutineAction::List, false) => Err("routine list takes no phrase".to_string()),
-        (RoutineAction::Keep | RoutineAction::Unkeep, true) => {
-            Err("name the routine: incu routine keep <the words that ask for it>".to_string())
-        }
+        (
+            RoutineAction::Keep
+            | RoutineAction::Unkeep
+            | RoutineAction::Bind
+            | RoutineAction::Unbind,
+            true,
+        ) => Err("name the routine: incu routine keep <the words that ask for it>".to_string()),
         _ => Ok(Command::Routine(RoutineArgs {
             action,
             phrase,
+            param,
+            var,
             file,
             config,
         })),
@@ -491,11 +542,68 @@ pub fn run_routine(args: RoutineArgs) -> Result<String, String> {
                 for (i, step) in routine.steps.iter().enumerate() {
                     out.push_str(&format!("  {}. {}\n", i + 1, step.review()));
                 }
+                // What it needs the person to bind, and what is bound: the
+                // variable's NAME and whether it is set here, never its value.
+                let needs = crate::routine::params::names(&routine.steps);
+                let stale = !routine.bindings.is_empty()
+                    && routine.bound_steps != crate::routine::params::digest(&routine.steps);
+                for param in &needs {
+                    match routine.bindings.get(param) {
+                        Some(var) if stale => out.push_str(&format!(
+                            "  {{{{{param}}}}} bound to {var}, but the steps are not the ones it \
+                             was bound for: bind it again\n"
+                        )),
+                        Some(var) => out.push_str(&format!(
+                            "  {{{{{param}}}}} bound to {var} ({})\n",
+                            if std::env::var_os(var).is_some_and(|v| !v.is_empty()) {
+                                "set in this environment"
+                            } else {
+                                "NOT set in this environment"
+                            }
+                        )),
+                        None => out.push_str(&format!(
+                            "  {{{{{param}}}}} NOT BOUND: incu routine bind \"{}\" {param} {}{}\n",
+                            routine.phrase,
+                            crate::routine::params::ENV_PREFIX,
+                            param.to_uppercase()
+                        )),
+                    }
+                }
             }
             if !any {
                 out.push_str("\n(none)\n");
             }
             Ok(out.trim_end().to_string())
+        }
+        RoutineAction::Bind => {
+            let (phrase, param, var) = (args.phrase, args.param, args.var);
+            store.update(|file| {
+                file.bind(&phrase, &param, &var, now)?;
+                Ok(format!(
+                    "bound {{{{{param}}}}} of \"{phrase}\" to {var}. Set {var} in the \
+                     environment where incu is launched: {}",
+                    if std::env::var_os(&var).is_some_and(|v| !v.is_empty()) {
+                        "it is set in this environment"
+                    } else {
+                        "it is NOT set in this environment"
+                    }
+                ))
+            })
+        }
+        RoutineAction::Unbind => {
+            let (phrase, param) = (args.phrase, args.param);
+            store.update(|file| {
+                if file.unbind(&phrase, &param, now) {
+                    Ok(format!(
+                        "{{{{{param}}}}} of \"{phrase}\" is no longer bound"
+                    ))
+                } else {
+                    Err(format!(
+                        "\"{phrase}\" has no binding for {param:?}; `incu routine list` shows \
+                         what is bound"
+                    ))
+                }
+            })
         }
         RoutineAction::Keep | RoutineAction::Unkeep => {
             let keep = args.action == RoutineAction::Keep;
@@ -701,6 +809,8 @@ mod tests {
         let args = |action, phrase: &str| RoutineArgs {
             action,
             phrase: phrase.to_string(),
+            param: String::new(),
+            var: String::new(),
             file: Some(file.clone()),
             config: None,
         };
@@ -722,6 +832,113 @@ mod tests {
         assert!(!store.load().unwrap().routines[0].taught);
         let missing = run_routine(args(RoutineAction::Keep, "open mail")).unwrap_err();
         assert!(missing.contains("no routine matches"), "{missing}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn routine_bind_takes_the_routine_words_then_the_param_then_the_variable() {
+        let bind = routine_args(&[
+            "routine",
+            "bind",
+            "unlock",
+            "the",
+            "vault",
+            "password",
+            "INCU_PARAM_VAULT",
+            "--file",
+            "r.json",
+        ]);
+        assert_eq!(bind.action, RoutineAction::Bind);
+        assert_eq!(bind.phrase, "unlock the vault");
+        assert_eq!(
+            (bind.param.as_str(), bind.var.as_str()),
+            ("password", "INCU_PARAM_VAULT")
+        );
+        let unbind = routine_args(&["routine", "unbind", "unlock", "vault", "password"]);
+        assert_eq!(unbind.action, RoutineAction::Unbind);
+        assert_eq!(unbind.phrase, "unlock vault");
+        assert_eq!(unbind.param, "password");
+        // Too few words: a routine, a param and a variable are all needed.
+        assert!(parse(argv(&["routine", "bind", "vault", "password"])).is_err());
+        assert!(parse(argv(&["routine", "bind"])).is_err());
+        assert!(parse(argv(&["routine", "unbind", "password"])).is_err());
+    }
+
+    /// The person binds; the file keeps the variable's NAME and a digest of the
+    /// steps, never a value.
+    #[test]
+    fn binding_is_the_persons_command_and_stores_a_name_not_a_value() {
+        use crate::routine::store::{Routines, Store};
+        let dir = std::env::temp_dir().join(format!("incu-cli-bind-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = dir.join("routines.json");
+        let store = Store::at(file.clone());
+        let mut routines = Routines::default();
+        routines
+            .learn(
+                "unlock the vault",
+                vec![crate::routine::Step::new(
+                    "type_text",
+                    serde_json::json!({"text": "{{password}}", "in_window": "app=vault"}),
+                )],
+                false,
+                crate::routine::now_ms(),
+            )
+            .unwrap();
+        store.save(&routines).unwrap();
+        let args = |action, param: &str, var: &str| RoutineArgs {
+            action,
+            phrase: "vault unlock".to_string(),
+            param: param.to_string(),
+            var: var.to_string(),
+            file: Some(file.clone()),
+            config: None,
+        };
+        std::env::set_var("INCU_PARAM_CLI_TEST_BIND", "hunter2-secret");
+        let said = run_routine(args(
+            RoutineAction::Bind,
+            "password",
+            "INCU_PARAM_CLI_TEST_BIND",
+        ))
+        .unwrap();
+        assert!(said.contains("INCU_PARAM_CLI_TEST_BIND"), "{said}");
+        assert!(!said.contains("hunter2"), "{said}");
+        let on_disk = std::fs::read_to_string(&file).unwrap();
+        assert!(on_disk.contains("INCU_PARAM_CLI_TEST_BIND"), "{on_disk}");
+        assert!(
+            !on_disk.contains("hunter2"),
+            "a value reached the file: {on_disk}"
+        );
+        let routine = &store.load().unwrap().routines[0];
+        assert_eq!(routine.bindings["password"], "INCU_PARAM_CLI_TEST_BIND");
+        assert_eq!(
+            routine.bound_steps,
+            crate::routine::params::digest(&routine.steps)
+        );
+        // The listing says what is bound and whether it is set, with no value.
+        let listed = run_routine(args(RoutineAction::List, "", "")).unwrap();
+        assert!(
+            listed.contains("bound to INCU_PARAM_CLI_TEST_BIND (set in this environment)"),
+            "{listed}"
+        );
+        assert!(!listed.contains("hunter2"), "{listed}");
+        // Refused: another variable of the environment, a param it does not take,
+        // a routine that is not there.
+        let home = run_routine(args(RoutineAction::Bind, "password", "HOME")).unwrap_err();
+        assert!(home.contains("INCU_PARAM_"), "{home}");
+        let nope = run_routine(args(RoutineAction::Bind, "pasword", "INCU_PARAM_X")).unwrap_err();
+        assert!(nope.contains("takes: password"), "{nope}");
+        let mut elsewhere = args(RoutineAction::Bind, "password", "INCU_PARAM_X");
+        elsewhere.phrase = "open mail".to_string();
+        assert!(run_routine(elsewhere)
+            .unwrap_err()
+            .contains("no routine matches"));
+        // Unbinding removes it.
+        run_routine(args(RoutineAction::Unbind, "password", "")).unwrap();
+        assert!(store.load().unwrap().routines[0].bindings.is_empty());
+        assert!(store.load().unwrap().routines[0].bound_steps.is_empty());
+        let again = run_routine(args(RoutineAction::Unbind, "password", "")).unwrap_err();
+        assert!(again.contains("no binding"), "{again}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

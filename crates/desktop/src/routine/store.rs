@@ -96,6 +96,10 @@ pub struct Saved {
     /// not: what the person reviewed and kept is not what is saved now, so it
     /// has to be reviewed and kept again.
     pub unkept: bool,
+    /// The replaced routine had parameters bound by the person and these steps
+    /// are not the ones they bound them for: every binding is dropped, and the
+    /// person binds again (`incu routine bind`).
+    pub unbound: bool,
 }
 
 impl Routines {
@@ -145,6 +149,71 @@ impl Routines {
         }
     }
 
+    /// Bind the parameter `param` of the routine `phrase` asks for to the
+    /// environment variable `var`, for the routine's steps as they are now.
+    ///
+    /// Only the person does this (`incu routine bind`); `routine_run` takes no
+    /// `params` and no tool binds. Only the variable's NAME is stored.
+    ///
+    /// # Errors
+    ///
+    /// No routine matches, the routine takes no parameter `param`, or `var` is not
+    /// a name this program accepts ([`super::params::check_env_name`]).
+    pub fn bind(
+        &mut self,
+        phrase: &str,
+        param: &str,
+        var: &str,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        self.prune(now_ms);
+        super::params::check_env_name(var)?;
+        if word_set(phrase).is_empty() {
+            return Err("name the routine".to_string());
+        }
+        let wanted = key(phrase);
+        let Some(routine) = self.routines.iter_mut().find(|r| key(&r.phrase) == wanted) else {
+            return Err(format!(
+                "no routine matches \"{phrase}\"; `incu routine list` shows what is saved"
+            ));
+        };
+        let needed = super::params::names(&routine.steps);
+        if !needed.iter().any(|n| n == param) {
+            return Err(format!(
+                "\"{}\" takes no parameter named {param:?}{}",
+                routine.phrase,
+                if needed.is_empty() {
+                    "; it takes none".to_string()
+                } else {
+                    format!("; it takes: {}", needed.join(", "))
+                }
+            ));
+        }
+        routine.bindings.insert(param.to_string(), var.to_string());
+        routine.bound_steps = super::params::digest(&routine.steps);
+        Ok(())
+    }
+
+    /// Remove the binding of `param` of the routine `phrase` asks for; whether
+    /// there was one.
+    pub fn unbind(&mut self, phrase: &str, param: &str, now_ms: i64) -> bool {
+        self.prune(now_ms);
+        if word_set(phrase).is_empty() {
+            return false;
+        }
+        let wanted = key(phrase);
+        match self.routines.iter_mut().find(|r| key(&r.phrase) == wanted) {
+            Some(routine) => {
+                let had = routine.bindings.remove(param).is_some();
+                if routine.bindings.is_empty() {
+                    routine.bound_steps.clear();
+                }
+                had
+            }
+            None => false,
+        }
+    }
+
     /// Learn `steps` under `phrase`, replacing the routine that asks the same.
     ///
     /// A redo after a failed replay replaces the old routine. **It does not
@@ -170,6 +239,17 @@ impl Routines {
         let was_taught = at.is_some_and(|i| self.routines[i].taught);
         let same_steps = at.is_some_and(|i| self.routines[i].steps == steps);
         let keeps = was_taught && same_steps;
+        // What the person bound is for the steps they bound it for: the same
+        // steps keep it, other steps drop every binding (as they drop the kept
+        // flag), and the person binds again after reading them.
+        let (bindings, bound_steps) = match at {
+            Some(i) if same_steps => (
+                self.routines[i].bindings.clone(),
+                self.routines[i].bound_steps.clone(),
+            ),
+            _ => Default::default(),
+        };
+        let had_bindings = at.is_some_and(|i| !self.routines[i].bindings.is_empty());
         if at.is_none() && self.routines.len() >= MAX_ROUTINES {
             return Err(format!(
                 "the routines file holds {MAX_ROUTINES} routines already; routine_forget \
@@ -182,6 +262,8 @@ impl Routines {
             date: day_of(now_ms),
             last_used_ms: now_ms,
             taught: taught || keeps,
+            bindings,
+            bound_steps,
         };
         let size = routine.size_bytes();
         if size > MAX_ROUTINE_BYTES {
@@ -195,10 +277,12 @@ impl Routines {
             Some(i) => self.routines[i] = routine,
             None => self.routines.push(routine),
         }
+        let unbound = had_bindings && !same_steps;
         Ok(Saved {
             replaced: at.is_some(),
             taught,
             unkept: was_taught && !taught,
+            unbound,
         })
     }
 
@@ -482,7 +566,8 @@ mod tests {
             Saved {
                 replaced: false,
                 taught: true,
-                unkept: false
+                unkept: false,
+                unbound: false
             }
         );
         // The same steps again (nothing the person has not read): still kept.
@@ -492,7 +577,8 @@ mod tests {
             Saved {
                 replaced: true,
                 taught: true,
-                unkept: false
+                unkept: false,
+                unbound: false
             }
         );
         let newer = vec![Step::new("key", json!({"keys": ["ctrl", "t"]}))];
@@ -506,7 +592,8 @@ mod tests {
             Saved {
                 replaced: true,
                 taught: false,
-                unkept: true
+                unkept: true,
+                unbound: false
             }
         );
         assert_eq!(file.routines.len(), 1);
@@ -711,6 +798,8 @@ mod tests {
                     date: "2026-01-01".to_string(),
                     last_used_ms: 0,
                     taught: true,
+                    bindings: Default::default(),
+                    bound_steps: String::new(),
                 };
                 // Grow it to the cap exactly, with filler in its last step.
                 let room = MAX_ROUTINE_BYTES.saturating_sub(routine.size_bytes());

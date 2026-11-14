@@ -315,6 +315,8 @@ mod tests {
             date: String::new(),
             last_used_ms: 0,
             taught: false,
+            bindings: Default::default(),
+            bound_steps: String::new(),
         }
     }
 

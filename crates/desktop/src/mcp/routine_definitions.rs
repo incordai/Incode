@@ -44,10 +44,11 @@ fn watch_definition() -> Value {
              hook for `watch` is run with the reply as its `tool_response`, which is how \
              it notifies (a desktop notification, a message, a follow-up command: \
              whatever the operator wrote). THIS CALL BLOCKS until the condition holds, \
-             the time runs out, the operator stops the desktop (the stop file ends it \
-             within a second) or the client disconnects, and your turn waits with it. \
-             IT ALSO HOLDS THIS SERVER: while it runs no other desktop call is answered, \
-             including yours. Use it only when waiting is the task. For a few seconds \
+             the time runs out or the operator stops the desktop (`incu stop`, the stop \
+             file: it ends within a second), and your turn waits with it. Nothing else \
+             ends it, not even your client going away: an orphaned watch lasts until its \
+             deadline. IT ALSO HOLDS THIS SERVER: while it runs no other desktop call is \
+             answered, including yours. Use it only when waiting is the task. For a few seconds \
              use wait_for. `timeout_ms` defaults to {default} \
              ms (one hour) and is held to {max} ms; `poll_ms` {min_poll} to {max_poll}. \
              `message` is what the notification should say; it is returned in the reply. \
@@ -149,16 +150,20 @@ fn routine_save_definition() -> Value {
              onto, over, under, before or after stay on that side) REPLACES it: that is \
              how a routine that failed is redone. TYPED TEXT IS STORED AS IT IS in the \
              routines file, and the reply shows every step's full text so you and the \
-             person can read it, EXCEPT text typed into a password or other secure \
-             field, and text a recording kept only as a placeholder or a digest: those \
-             steps are stored as a parameter, `{{{{name}}}}`, listed in the reply, and \
-             `routine_run` must be given a reference for every one as `params` or it \
-             refuses before step 1. So are texts typed where focus may have moved (after \
-             Tab, Enter or an arrow), which could be a password field. You may write \
+             person can read it, ONLY WHEN THE TYPING STEP ITSELF NAMES THE FIELD: a \
+             `selector` of its own (with app= or window=, role=edit or role=combobox, \
+             no password-like name) that the desktop confirms is not a password field \
+             when you save; the replay focuses that field before it types. EVERY OTHER \
+             typed text (no selector of its own, because focus may be anywhere, a \
+             sign-in dialog or a prompt included; a button; a secure field; a text a \
+             recording kept only as a placeholder or digest) is stored as a parameter, \
+             `{{{{name}}}}`, listed in the reply, and `routine_run` refuses to start \
+             until the PERSON has bound each one (`incu routine bind`). So a routine you \
+             save from a recording has parameters for all its typing. You may write \
              `{{{{name}}}}` in a typed text yourself to make one. A routine unused for 30 \
              days is forgotten; only the person can keep one for good (`incu routine \
              keep`), so there is no argument for it, and saving other steps over a kept \
-             routine un-keeps it. {UNTRUSTED}"
+             or bound routine un-keeps and un-binds it. {UNTRUSTED}"
         ),
         "inputSchema": {
             "type": "object",
@@ -208,34 +213,19 @@ fn routine_run_definition() -> Value {
              step through the same gates as `screenshot` (a hook that refuses \
              `screenshot` refuses them), kept for the last run only, and the paths of the \
              failed step's two pictures are in the failure; none is taken after a step \
-             that typed a secret or before the next. A routine whose list shows \
-             `params_needed` needs every one of them in `params` (secrets it does not \
-             keep): without them it refuses before step 1. `params` take REFERENCES, never \
-             the value (your transcript would keep it): {{\"password\": {{\"env\": \
-             \"INCU_PARAM_PASSWORD\"}}}}, naming a variable the person set in incu's own \
-             environment; a literal value is refused. The value is used in memory for that \
-             run only. The routine moves the mouse and keyboard of the machine the \
-             operator is using. {UNTRUSTED}"
+             that typed a secret or before the next. THERE ARE NO ARGUMENTS FOR SECRETS: \
+             a routine whose list shows `params_needed` reads each from the environment \
+             variable the PERSON bound it to, at a terminal (`incu routine bind \
+             \"<phrase>\" <param> INCU_PARAM_<NAME>`); until every one is bound, for the \
+             steps as they are now, it refuses before step 1 and says what to bind. \
+             Passing `params` is refused. The value is used in memory for that run only. \
+             The routine moves the mouse and keyboard of the machine the operator is \
+             using. {UNTRUSTED}"
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "phrase": phrase_property("The words that ask for the routine."),
-                "params": {
-                    "type": "object",
-                    "additionalProperties": {
-                        "type": "object",
-                        "properties": {"env": {"type": "string"}},
-                        "required": ["env"],
-                    },
-                    "description": "A REFERENCE for each of the routine's parameters, by \
-                                    name: {\"password\": {\"env\": \"INCU_PARAM_PASSWORD\"}}, \
-                                    the variable (INCU_PARAM_...) the person set in the \
-                                    environment of the incu process. Never the value \
-                                    itself (refused). Every name in the routine's \
-                                    `params_needed` and no other. (A keyring reference is \
-                                    not available in this build.)",
-                },
             },
             "required": ["phrase"],
         },
@@ -262,7 +252,9 @@ fn routine_list_definition() -> Value {
         "name": "routine_list",
         "description": "Every saved routine that has not expired: its phrase, each step \
                         with ALL the text it types and its full selector (read it: it is \
-                        what will run), the parameters it needs (`params_needed`), when \
+                        what will run), the parameters it needs (`params_needed`), which \
+                        the person has bound to which variable (`params_bound`) and which \
+                        are not (`params_unbound`), when \
                         it was learned and last used, whether the person kept it (never \
                         expires), and how many days it has left.",
         "inputSchema": {"type": "object", "properties": {}},

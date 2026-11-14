@@ -1171,24 +1171,29 @@ list; the engine is optional.
   or `$XDG_DATA_HOME`/`~/.local/share/incord-desktop`), overridden by
   `INCU_ROUTINES` or `routines` in the config. It holds typed text as typed, and
   `routine_save`, `routine_list` and `routine_match` show every step's full
-  text so you can read what a routine will type. **Text typed into a password or
-  other secure field, and text a recording kept only as a placeholder, is never
-  stored**, and neither is text typed where focus may have moved (after Tab,
-  Enter or an arrow): that step is a parameter (`{{password}}`) and
-  `routine_run` refuses to start unless `params` gives a **reference** for each,
-  `{"password": {"env": "INCU_PARAM_PASSWORD"}}`, a variable you set in incu's
-  environment (a literal value is refused: it would be in the agent's
-  transcript; there is no keyring reference in this build). The hooks are never
-  shown a value. Changes to the file take an OS file lock, so two servers do not
-  lose each other's saves.
+  text so you can read what a routine will type. **Typed text is stored only
+  when the typing step itself names a plain text box** (a `selector` of its own
+  with a window, role edit or combobox, no password-like name, and not a password
+  field on the desktop when saved; the replay focuses it first). **Every other
+  typed text is never stored**: it is a parameter (`{{password}}`), so a routine
+  saved from a recording has one for all its typing. You bind each at a terminal,
+  `incu routine bind <words> <param> INCU_PARAM_<NAME>`, to a variable you set in
+  incu's environment; only the variable's name is stored, `routine_run` takes no
+  `params` and refuses to start until every one is bound for the steps as they
+  are, and saving other steps drops the bindings. The hooks are never shown a
+  value. Changes to the file take an OS file lock, so two servers do not lose
+  each other's saves.
 
 `watch` is `wait_for` with a long deadline (default 1 hour, at most 24, looked
 at every second, every five for `screen_changes`): it blocks until the condition
 holds, then runs your post-tool hook for the tool `watch` with the reply
 (`result`, what it found, the `message` you passed) as `tool_response`. Put the
 notification in that hook, for example `osascript -e 'display notification "…"'`
-on macOS or `notify-send` on Linux. The stop file, or the client going away, ends
-a watch within a second; while it runs the server answers nothing else.
+on macOS or `notify-send` on Linux. The stop file (`incu stop`) ends a watch
+within a second; nothing else does but its deadline, not even the client going
+away (end of input does not cut off a request the client already sent), so an
+orphaned watch lasts until its deadline or `incu stop`; while it runs the server
+answers nothing else.
 
 ### What it will not do
 

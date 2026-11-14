@@ -2061,6 +2061,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "sha2",
  "uiautomation",
  "windows-sys 0.61.2",
  "x11rb",

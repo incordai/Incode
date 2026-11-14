@@ -31,6 +31,9 @@ regex = "1"
 # 1.89 where this crate's floor is 1.88. Already in the lock file (rustyline
 # uses it): no new package.
 fd-lock = "4"
+# A digest of a routine's steps, stored with the person's parameter bindings
+# (`src/routine/params.rs`). The root package already depends on it: no new package.
+sha2 = "0.10"
 
 # Moved here from incode with the code that uses them, at the same pins; the
 # reasoning for each choice is recorded in incode's Cargo.toml history and in

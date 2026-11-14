@@ -7,53 +7,57 @@
 //! secure field must not be on disk at all, and neither must a recording's
 //! stand-in for text it redacted (replaying `[REDACTED]` into a login box is a
 //! wrong password, not a shortcut). Such a step is made a PARAMETER when the
-//! routine is learned: its text is stored as `{{name}}`, `routine_run` must be
-//! given `params` for every one, and refuses before step 1 when one is missing.
-//! The value is substituted into the arguments of the one call that types it, in
-//! memory. It is not written to the routines file or the journal
-//! ([`crate::mcp`]'s `describe` shows the length only), it is hidden from the
-//! operator's hooks, and [`Values::scrub`] takes it back out of any message a
-//! replay returns.
+//! routine is learned: its text is stored as `{{name}}`, and `routine_run`
+//! refuses before step 1 unless every one is bound. The value is substituted into
+//! the arguments of the one call that types it, in memory. It is not written to
+//! the routines file or the journal ([`crate::mcp`]'s `describe` shows the length
+//! only), it is hidden from the operator's hooks, and [`Values::scrub`] takes it
+//! back out of any message a replay returns.
 //!
-//! # `params` are REFERENCES, never the secret
+//! # The PERSON binds parameters, not the agent
 //!
-//! The caller's own transcript records the arguments of `routine_run`, so a
-//! literal secret in `params` would land in a place incu cannot clean. `params`
-//! therefore takes only a reference to where the person keeps the value:
-//! `{"password": {"env": "INCU_PARAM_PASSWORD"}}`, read from incu's own
-//! environment (the person sets it where incu is launched). A literal string is
-//! refused, with an error that names this form. A `keyring` reference is not
-//! offered: no credential-store crate is in the build, and one is not added for
-//! this; the error says so. An `env` reference must name a variable beginning
-//! [`ENV_PREFIX`], so that an agent cannot have incu type out any variable of its
-//! environment (an API key of the person's) into a window.
+//! `routine_run` takes no `params`. Each `{{param}}` is read from the environment
+//! variable the person bound it to with `incu routine bind <phrase> <param>
+//! <ENV_VAR>` at a terminal. Only the variable's NAME is stored (in the routine,
+//! with a [`digest`] of its steps at the time), never a value. Had the agent
+//! named the variable, it could name any `INCU_PARAM_*` variable the person set
+//! for some other routine and have it typed into a window of its choosing; and a
+//! literal value would land in the agent's own transcript. Saving different steps
+//! drops every binding (as it drops the kept flag), and a routine whose steps are
+//! not the ones that were bound is refused. Variable names must begin
+//! [`ENV_PREFIX`], so a parameter can never be bound to `PATH` or an API key.
 //!
 //! # What makes a step a parameter
 //!
-//! 1. Its text is a stand-in for text that was removed: [`looks_redacted`], or a
-//!    value that is not text at all (a recording's `{"redacted": true}`).
-//! 2. It goes into a secure field, by the field's own name or automation id
-//!    ([`is_secret_name`]), or because the desktop reports the control as a
-//!    password field when the routine is saved. A typing step goes into the
-//!    control the step before it named ([`Target`]).
-//! 3. It goes where focus may have MOVED: after a `key` that can move it (Tab,
-//!    Shift+Tab, Enter, the arrows, ...) the control typed into is unknown, and
-//!    a login form's password is typed after a Tab. Such a typing step is a
-//!    parameter unless it names a non-secret control of its own.
-//! 4. The step already has `{{name}}` in its text: the agent made it one.
+//! **The rule is inverted: typed text is stored literally only when the step
+//! itself names a control that is positively not secret** ([`why_not_kept`]): a
+//! selector of its own with a window part, role `edit` or `combobox`, no
+//! secret-looking name or automation id ([`is_secret_name`]), and not marked as a
+//! password field by the desktop when the routine is saved. Everything else is a
+//! parameter:
 //!
-//! This is a screen on what the learner can see, not a promise: a secure field
-//! whose label does not say so, and that is no longer on screen when the routine
-//! is saved, is not found. That is why `routine_save`, `routine_list` and
-//! `routine_match` show the full text of every step: the person reads what is
-//! kept.
+//! - a typing step with no selector of its own (it types where focus is; focus
+//!   moves without a key, to a sign-in dialog a click opened, a first-step sudo
+//!   or KeePass prompt, the address bar by Ctrl+L, Alt+D or F6, and no list of
+//!   such moves is complete);
+//! - one that names a button or other control that is not a text box, or a secure
+//!   one, or one that could not be checked;
+//! - text a recording replaced with a placeholder or a digest
+//!   ([`looks_redacted`]), or a value that is not text at all;
+//! - text that already has `{{name}}` in it: the agent made it one.
+//!
+//! This is a screen on what the learner can see, not a promise (a `key` that
+//! types a password a letter at a time is not looked at), which is why
+//! `routine_save`, `routine_list` and `routine_match` show the full text of every
+//! step: the person reads what is kept.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
-use super::Step;
+use super::{Routine, Step};
 use crate::selector::{Selector, Text};
+use crate::uia::Role;
 
 /// The arguments that carry typed text, by tool.
 fn text_key(tool: &str) -> Option<&'static str> {
@@ -126,33 +130,39 @@ pub fn names(steps: &[Step]) -> Vec<String> {
 pub struct Values(BTreeMap<String, String>);
 
 impl Values {
-    /// The values the references in `given` (the `params` argument of
-    /// `routine_run`) point at, for the parameters `steps` take; the environment
-    /// variables are read from this process's own.
+    /// The values of the parameters `routine` takes, read from the environment
+    /// variables the PERSON bound them to (`incu routine bind`), in this
+    /// process's own environment.
     ///
     /// # Errors
     ///
-    /// See [`Values::bind_with`].
-    pub fn bind(steps: &[Step], given: Option<&Value>) -> Result<Values, String> {
-        Self::bind_with(steps, given, &|var| std::env::var(var).ok())
+    /// See [`Values::from_routine_with`].
+    pub fn from_routine(routine: &Routine) -> Result<Values, String> {
+        Self::from_routine_with(routine, &|var| std::env::var(var).ok())
     }
 
-    /// [`Values::bind`] with `env` as the environment, so a test need not set
-    /// the process's.
+    /// [`Values::from_routine`] with `env` as the environment, so a test need not
+    /// set the process's.
+    ///
+    /// **The agent does not choose where a value comes from.** `routine_run` takes
+    /// no `params`: each `{{param}}` is read from the variable the person bound it
+    /// to, so an agent cannot name some other variable of incu's environment and
+    /// have it typed into a window of its choosing. The binding is stored with a
+    /// digest of the routine's steps at the time ([`digest`]), and a routine whose
+    /// steps are not the ones that were bound is refused.
     ///
     /// # Errors
     ///
-    /// A parameter has no reference; a reference is not `{"env": "INCU_PARAM_..."}`
-    /// (a literal value is refused by name, because it would be in the caller's
-    /// transcript); the variable is not set or is too long; or a reference is
-    /// given for a name the routine does not take (a typo that would otherwise
-    /// type nothing where something was meant). No error ever contains a value.
-    pub fn bind_with(
-        steps: &[Step],
-        given: Option<&Value>,
+    /// A parameter is not bound (the error names the command that binds it); the
+    /// steps are not the ones that were bound; a bound variable name is not one
+    /// this program accepts ([`check_env_name`], as the file may have been edited);
+    /// or the variable is not set, is empty, or is too long. All before any step
+    /// runs. No error contains a value.
+    pub fn from_routine_with(
+        routine: &Routine,
         env: &dyn Fn(&str) -> Option<String>,
     ) -> Result<Values, String> {
-        let needed = names(steps);
+        let needed = names(&routine.steps);
         if needed.len() > MAX_PARAMS {
             return Err(format!(
                 "this routine takes {} parameters, more than the {MAX_PARAMS} one may; it was \
@@ -160,53 +170,56 @@ impl Values {
                 needed.len()
             ));
         }
-        let map = match given {
-            None | Some(Value::Null) => serde_json::Map::new(),
-            Some(Value::Object(map)) => map.clone(),
-            Some(_) => {
-                return Err("params must be an object of name to reference, e.g. \
-                     {\"password\": {\"env\": \"INCU_PARAM_PASSWORD\"}}"
-                    .to_string())
-            }
-        };
-        let mut values = BTreeMap::new();
-        for (name, reference) in &map {
-            if !needed.contains(name) {
-                return Err(format!(
-                    "this routine takes no parameter named {name:?}{}",
-                    listing(&needed)
-                ));
-            }
-            let var = env_reference(name, reference)?;
-            let value = env(&var).filter(|v| !v.is_empty()).ok_or_else(|| {
-                format!(
-                    "params.{name}: the environment variable {var} is not set (or is empty) in \
-                     incu's environment. The person sets it where incu is launched; the value \
-                     is never passed through the agent"
-                )
-            })?;
-            if value.chars().count() > MAX_PARAM_CHARS {
-                return Err(format!(
-                    "params.{name}: the value of {var} is over {MAX_PARAM_CHARS} characters"
-                ));
-            }
-            values.insert(name.clone(), value);
+        if needed.is_empty() {
+            return Ok(Values::default());
         }
-        let missing: Vec<&String> = needed.iter().filter(|n| !values.contains_key(*n)).collect();
-        if !missing.is_empty() {
+        let unbound: Vec<&String> = needed
+            .iter()
+            .filter(|n| !routine.bindings.contains_key(*n))
+            .collect();
+        if !unbound.is_empty() {
             return Err(format!(
-                "routine_run needs params for: {}. Nothing was done. These are the secrets \
-                 and redacted texts the routine does not keep. Pass each as a REFERENCE to \
-                 where the person keeps it, never the value: params: {{\"{}\": {{\"env\": \
-                 \"{ENV_PREFIX}{}\"}}}}",
-                missing
+                "routine_run cannot start: {} {} not bound to a value. Nothing was done. These \
+                 are the secrets and redacted texts the routine does not keep, and only the \
+                 PERSON binds them, at a terminal, to an environment variable of incu's own: \
+                 `incu routine bind \"{}\" {} {ENV_PREFIX}{}`",
+                unbound
                     .iter()
                     .map(|n| n.as_str())
                     .collect::<Vec<_>>()
                     .join(", "),
-                missing[0],
-                missing[0].to_uppercase()
+                if unbound.len() == 1 { "is" } else { "are" },
+                routine.phrase,
+                unbound[0],
+                unbound[0].to_uppercase()
             ));
+        }
+        if routine.bound_steps != digest(&routine.steps) {
+            return Err(format!(
+                "routine_run cannot start: the steps of \"{}\" are not the ones its parameters \
+                 were bound for (the file was changed since). Nothing was done. The person \
+                 reads the routine again (`incu routine list`) and binds again with \
+                 `incu routine bind`",
+                routine.phrase
+            ));
+        }
+        let mut values = BTreeMap::new();
+        for name in &needed {
+            let var = &routine.bindings[name];
+            check_env_name(var).map_err(|e| format!("the binding of {name} is not usable: {e}"))?;
+            let value = env(var).filter(|v| !v.is_empty()).ok_or_else(|| {
+                format!(
+                    "routine_run cannot start: the environment variable {var} that {name} is \
+                     bound to is not set (or is empty) in incu's environment. The person sets \
+                     it where incu is launched. Nothing was done"
+                )
+            })?;
+            if value.chars().count() > MAX_PARAM_CHARS {
+                return Err(format!(
+                    "the value of {var} is over {MAX_PARAM_CHARS} characters"
+                ));
+            }
+            values.insert(name.clone(), value);
         }
         Ok(Values(values))
     }
@@ -315,48 +328,43 @@ fn replace_whole(text: &str, value: &str, with: &str) -> String {
     out
 }
 
-/// The environment variable a parameter's reference names.
-fn env_reference(name: &str, reference: &Value) -> Result<String, String> {
-    let example = format!("{{\"env\": \"{ENV_PREFIX}{}\"}}", name.to_uppercase());
-    let Some(map) = reference.as_object() else {
-        // A string, a number, anything that is the value itself.
-        return Err(format!(
-            "params.{name} must be a REFERENCE, never the secret itself: the caller's own \
-             transcript records the arguments of routine_run, and a secret in it cannot be \
-             taken back. Use {example}, with that variable set in the environment of the \
-             incu process by the person"
-        ));
-    };
-    if map.contains_key("keyring") {
-        return Err(format!(
-            "params.{name}: keyring references are not available in this build (no \
-             credential-store crate is compiled in). Use {example}"
-        ));
-    }
-    let var = match (map.len(), map.get("env").and_then(Value::as_str)) {
-        (1, Some(var)) => var,
-        _ => return Err(format!("params.{name} must be exactly {example}")),
-    };
+/// Whether `var` is a name this program will read a parameter from: capitals,
+/// digits and `_`, beginning [`ENV_PREFIX`] with something after it, at most 128.
+///
+/// The prefix is what keeps a binding to what the person set aside for routines:
+/// a parameter can never be bound to `PATH`, `HOME` or an API key of the person's
+/// that incu inherited, however the file came to say so.
+///
+/// # Errors
+///
+/// It is not.
+pub fn check_env_name(var: &str) -> Result<(), String> {
     let well_formed = var.len() <= 128
         && var
             .chars()
             .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
-    if !well_formed || !var.starts_with(ENV_PREFIX) || var.len() == ENV_PREFIX.len() {
-        return Err(format!(
-            "params.{name}: the variable must be named {ENV_PREFIX}<NAME> (capitals, digits and \
-             _), so that a routine can only read what the person set aside for it, never the \
-             rest of incu's environment. Use {example}"
-        ));
+    if well_formed && var.starts_with(ENV_PREFIX) && var.len() > ENV_PREFIX.len() {
+        Ok(())
+    } else {
+        Err(format!(
+            "the variable must be named {ENV_PREFIX}<NAME> (capitals, digits and _), so that a \
+             routine can only read what the person set aside for it, never the rest of incu's \
+             environment"
+        ))
     }
-    Ok(var.to_string())
 }
 
-fn listing(needed: &[String]) -> String {
-    if needed.is_empty() {
-        "; it takes none".to_string()
-    } else {
-        format!("; it takes: {}", needed.join(", "))
-    }
+/// A digest of a routine's steps: SHA-256 of their JSON, in hex. Stored with a
+/// routine's bindings, so a binding is only honoured for the steps it was made
+/// for.
+#[must_use]
+pub fn digest(steps: &[Step]) -> String {
+    use sha2::{Digest, Sha256};
+    let json = serde_json::to_string(steps).unwrap_or_default();
+    Sha256::digest(json.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// Whether a control's name or automation id says it holds a secret.
@@ -487,103 +495,59 @@ pub fn looks_redacted(text: &str) -> bool {
 /// Why a step was made a parameter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Why {
-    /// It types into a secure field.
+    /// It types into a secure field: the name or automation id of the control the
+    /// step names says so, or the desktop reports it as a password field.
     SecureField,
     /// The recording kept a placeholder or a digest in place of the text.
     Redacted,
-    /// It types where focus may have moved (after Tab, Enter, an arrow...), so
-    /// the field is not known and may be a secure one.
-    UnknownField,
+    /// Nothing positively says the control is a plain text field: the step names
+    /// none of its own (it types where focus happens to be: the focus may have
+    /// moved without a key, to a sign-in dialog, a prompt or the address bar), or
+    /// names one that is not an edit or combo box, or one that could not be
+    /// checked on the desktop when the routine was saved.
+    NotKnownPlain,
 }
 
-/// The control the next typing step goes into, as far as the steps so far say.
-///
-/// `type_text` takes no selector: it types into whatever has focus. The last
-/// step that named a control (a click, a `set_value`) gave it focus; a `key` that
-/// can MOVE focus makes it unknown again.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub enum Target {
-    /// Nothing has named a control yet: typing goes to the window's own focus.
-    #[default]
-    Nothing,
-    /// The raw selector of the control the last click or `set_value` named.
-    Known(String),
-    /// A key that moves focus has been pressed since: the field is not known.
+/// What the desktop says of the control a selector names, at the moment a routine
+/// is saved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Probe {
+    /// It is there and is marked as a password or other secure field.
+    Secret,
+    /// It is there and is not so marked.
+    Plain,
+    /// It could not be checked: the window or control is not on screen (or no
+    /// desktop is there to ask). Not the same as `Plain`.
     Unknown,
 }
 
-/// The keys that can move focus out of the field it was in: Tab (alone or in any
-/// chord, which covers Shift+Tab), Enter, and the arrows and page keys.
-const FOCUS_KEYS: &[&str] = &[
-    "tab",
-    "enter",
-    "return",
-    "kp_enter",
-    "up",
-    "down",
-    "left",
-    "right",
-    "arrowup",
-    "arrowdown",
-    "arrowleft",
-    "arrowright",
-    "up_arrow",
-    "down_arrow",
-    "left_arrow",
-    "right_arrow",
-    "pageup",
-    "pagedown",
-    "page_up",
-    "page_down",
-    "home",
-    "end",
-];
-
-/// Whether `step` is a `key` that can move focus.
-fn moves_focus(step: &Step) -> bool {
-    if step.tool != "key" {
-        return false;
-    }
-    let named = |k: &str| FOCUS_KEYS.contains(&k.trim().to_lowercase().as_str());
-    match step.args.get("keys").or_else(|| step.args.get("key")) {
-        Some(Value::Array(keys)) => keys.iter().filter_map(Value::as_str).any(named),
-        Some(Value::String(one)) => one.split('+').any(named),
-        _ => false,
-    }
+/// The roles a control may have for its text to be kept: a text box or a combo
+/// box. (The selector vocabulary has no document role; a rich-text area is
+/// `edit` or `pane`, and only `edit` is taken.)
+fn is_plain_role(role: Option<Role>) -> bool {
+    matches!(role, Some(Role::Edit | Role::ComboBox))
 }
 
-/// The raw selector of the control `step` names, if it names one that it also
-/// acts on (a click, a `set_value`, an `element_action`: not a wait).
-fn control_of(step: &Step) -> Option<String> {
-    if !matches!(
-        step.tool.as_str(),
-        "click_element" | "set_value" | "element_action"
-    ) {
-        return None;
-    }
-    step.args
-        .get("selector")
-        .and_then(Value::as_str)
-        .filter(|raw| Selector::parse(raw).is_ok_and(|s| s.has_element_part()))
-        .map(str::to_string)
-}
-
-impl Target {
-    /// The target once `step` has run.
-    pub fn after(&mut self, step: &Step) {
-        if let Some(control) = control_of(step) {
-            *self = Target::Known(control);
-        } else if moves_focus(step) {
-            *self = Target::Unknown;
-        }
-    }
-}
-
-/// Why a typing step's text must not be kept, if it must not: it is a stand-in
-/// for removed text, it goes into a secure field, or it goes where focus may have
-/// moved. `None` for text that is kept (and for a step that is not typing, or
-/// that already is a parameter).
-fn why_not_kept(step: &Step, target: &Target, is_secret: &dyn Fn(&str) -> bool) -> Option<Why> {
+/// Why a typing step's text must not be kept, if it must not.
+///
+/// **The rule is inverted: typed text is kept only when the step itself names a
+/// control that is positively not secret.** A step's text is stored literally
+/// only when the step carries a selector of its own that
+///
+/// 1. has a window part (so it says which window),
+/// 2. names a control of role `edit` or `combobox`,
+/// 3. has no secret-looking name or automation id ([`is_secret_name`]), and
+/// 4. is not marked as a password or secure field by the desktop at save time
+///    (`probe`; a control that could not be checked does not pass).
+///
+/// Everything else becomes a parameter: no selector of its own, an inherited
+/// target (the last click, which may have opened a dialog), a button, a secure
+/// control, text a recording redacted. The earlier rule followed focus through
+/// the steps and kept the rest; focus moves without a key (a click that opens a
+/// sign-in dialog, a first-step prompt, Ctrl+L, Alt+D, F6), and no list of such
+/// moves is complete. `None` for a step that is not typing, or already a
+/// parameter.
+fn why_not_kept(step: &Step, probe: &dyn Fn(&str) -> Probe) -> Option<Why> {
     let key = text_key(&step.tool)?;
     let value = step.args.get(key).cloned().unwrap_or(Value::Null);
     match &value {
@@ -594,18 +558,25 @@ fn why_not_kept(step: &Step, target: &Target, is_secret: &dyn Fn(&str) -> bool) 
         // A recording's `{"redacted": true}` or the like: not text.
         _ => return Some(Why::Redacted),
     }
-    // The control: a `set_value`'s own; for typing, one it names itself, else the
-    // target the steps before it left.
-    let own = control_of_any(step);
-    let control = match (&own, step.tool.as_str()) {
-        (Some(own), _) => Target::Known(own.clone()),
-        (None, "set_value") => Target::Nothing,
-        (None, _) => target.clone(),
+    let Some(raw) = control_of_any(step) else {
+        return Some(Why::NotKnownPlain);
     };
-    match control {
-        Target::Known(raw) if selector_is_secret(&raw) || is_secret(&raw) => Some(Why::SecureField),
-        Target::Known(_) | Target::Nothing => None,
-        Target::Unknown => Some(Why::UnknownField),
+    let Ok(selector) = Selector::parse(&raw) else {
+        return Some(Why::NotKnownPlain);
+    };
+    if !selector.has_window_part() {
+        return Some(Why::NotKnownPlain);
+    }
+    if selector_is_secret(&raw) {
+        return Some(Why::SecureField);
+    }
+    if !is_plain_role(selector.role) {
+        return Some(Why::NotKnownPlain);
+    }
+    match probe(&raw) {
+        Probe::Plain => None,
+        Probe::Secret => Some(Why::SecureField),
+        Probe::Unknown => Some(Why::NotKnownPlain),
     }
 }
 
@@ -618,14 +589,14 @@ fn control_of_any(step: &Step) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Whether `step`, run when the typing target is `target`, puts a secret on
-/// screen: it types a parameter, or text into a field whose NAME says it is
-/// secret (or into one not known at all). Used to keep the replay from
-/// photographing it; the desktop's own report is not asked here, a picture is
-/// not worth a probe.
+/// Whether `step` puts a secret on screen, as far as the replay can tell without
+/// asking the desktop: it types a parameter, or text into a control whose NAME or
+/// automation id says it is secret. Used to keep the replay from photographing it.
 #[must_use]
-pub fn types_a_secret(step: &Step, target: &Target) -> bool {
-    !names_of(step).is_empty() || why_not_kept(step, target, &|_| false).is_some()
+pub fn types_a_secret(step: &Step) -> bool {
+    !names_of(step).is_empty()
+        || (text_key(&step.tool).is_some()
+            && control_of_any(step).is_some_and(|raw| selector_is_secret(&raw)))
 }
 
 /// One step made a parameter.
@@ -639,41 +610,35 @@ pub struct Made {
     pub why: Why,
 }
 
-/// Make the steps that type a secret or a redacted text into parameters, in
-/// place, and say which. `is_secret` is asked about the raw selector of a
-/// control the name does not already condemn: the desktop's own report of a
-/// password field.
-pub fn parameterise(steps: &mut [Step], is_secret: &dyn Fn(&str) -> bool) -> Vec<Made> {
+/// Make every typing step whose text is not positively safe to keep ([`why_not_kept`])
+/// a parameter, in place, and say which. `probe` is asked about the raw selector
+/// of a control a step names: the desktop's own report, at save time, of whether
+/// it is a password field.
+pub fn parameterise(steps: &mut [Step], probe: &dyn Fn(&str) -> Probe) -> Vec<Made> {
     let mut made = Vec::new();
     let mut taken: BTreeSet<String> = names(steps).into_iter().collect();
-    let mut target = Target::Nothing;
     for (index, step) in steps.iter_mut().enumerate() {
-        let why = why_not_kept(step, &target, is_secret);
-        // The control the parameter is named after: the step's own, else the
-        // target when it is known.
-        let control = control_of_any(step).or(match &target {
-            Target::Known(raw) => Some(raw.clone()),
-            _ => None,
-        });
-        if let (Some(why), Some(key)) = (why, text_key(&step.tool)) {
-            let name = fresh_name(
-                match why {
-                    Why::SecureField => "password",
-                    Why::Redacted | Why::UnknownField => "text",
-                },
-                control.as_deref(),
-                &mut taken,
-            );
-            if let Some(map) = step.args.as_object_mut() {
-                map.insert(key.to_string(), Value::String(format!("{{{{{name}}}}}")));
-            }
-            made.push(Made {
-                name,
-                step: index + 1,
-                why,
-            });
+        let (Some(why), Some(key)) = (why_not_kept(step, probe), text_key(&step.tool)) else {
+            continue;
+        };
+        // Named after the control the step names, when it names one.
+        let control = control_of_any(step);
+        let name = fresh_name(
+            match why {
+                Why::SecureField => "password",
+                Why::Redacted | Why::NotKnownPlain => "text",
+            },
+            control.as_deref(),
+            &mut taken,
+        );
+        if let Some(map) = step.args.as_object_mut() {
+            map.insert(key.to_string(), Value::String(format!("{{{{{name}}}}}")));
         }
-        target.after(step);
+        made.push(Made {
+            name,
+            step: index + 1,
+            why,
+        });
     }
     made
 }
@@ -712,8 +677,14 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn no_probe(_: &str) -> bool {
-        false
+    /// A desktop with nothing on it: no control can be checked.
+    fn no_probe(_: &str) -> Probe {
+        Probe::Unknown
+    }
+
+    /// A desktop that says every control it is asked about is a plain text box.
+    fn plain_probe(_: &str) -> Probe {
+        Probe::Plain
     }
 
     #[test]
@@ -736,39 +707,30 @@ mod tests {
         assert_eq!(names(&steps), ["user", "password"]);
     }
 
-    #[test]
-    fn a_run_must_give_every_parameter_and_only_the_ones_there_are() {
-        let steps = [Step::new("type_text", json!({"text": "{{password}}"}))];
-        let refer = json!({"env": "INCU_PARAM_PASSWORD"});
-        let missing = Values::bind_with(&steps, None, &no_env).unwrap_err();
-        assert!(
-            missing.contains("password") && missing.contains("Nothing was done"),
-            "{missing}"
-        );
-        // The error shows the form to use, never a value.
-        assert!(missing.contains("INCU_PARAM_PASSWORD"), "{missing}");
-        let unknown = Values::bind_with(
-            &steps,
-            Some(&json!({"password": refer, "pasword": refer})),
-            &secret_env,
-        )
-        .unwrap_err();
-        assert!(
-            unknown.contains("pasword") && unknown.contains("password"),
-            "{unknown}"
-        );
-        assert!(Values::bind_with(&steps, Some(&json!({"password": 5})), &secret_env).is_err());
-        assert!(Values::bind_with(&steps, Some(&json!("x")), &secret_env).is_err());
-        let long = |_: &str| Some("x".repeat(MAX_PARAM_CHARS + 1));
-        assert!(Values::bind_with(&steps, Some(&json!({"password": refer})), &long).is_err());
-        let bound =
-            Values::bind_with(&steps, Some(&json!({"password": refer})), &secret_env).unwrap();
-        assert!(!bound.is_empty());
-        // A routine with none needs none, and says so when one is offered.
-        let plain = [Step::new("key", json!({"keys": ["enter"]}))];
-        assert!(Values::bind_with(&plain, None, &no_env).unwrap().is_empty());
-        let extra = Values::bind_with(&plain, Some(&json!({"x": refer})), &secret_env).unwrap_err();
-        assert!(extra.contains("takes none"), "{extra}");
+    /// A routine that types `{{password}}`, with the bindings the person made.
+    fn routine_with(steps: Vec<Step>, bind: &[(&str, &str)]) -> Routine {
+        let mut routine = Routine {
+            phrase: "unlock the vault".to_string(),
+            steps,
+            date: String::new(),
+            last_used_ms: 0,
+            taught: false,
+            bindings: BTreeMap::new(),
+            bound_steps: String::new(),
+        };
+        for (param, var) in bind {
+            routine
+                .bindings
+                .insert((*param).to_string(), (*var).to_string());
+        }
+        if !bind.is_empty() {
+            routine.bound_steps = digest(&routine.steps);
+        }
+        routine
+    }
+
+    fn typing_password() -> Vec<Step> {
+        vec![Step::new("type_text", json!({"text": "{{password}}"}))]
     }
 
     /// The environment of a test: this variable and no other.
@@ -780,72 +742,120 @@ mod tests {
         None
     }
 
-    /// A literal secret in `params` would be in the caller's transcript: refused,
-    /// naming the form to use, and never repeated.
-    #[test]
-    fn a_literal_value_is_refused_and_the_error_names_the_env_form() {
-        let steps = [Step::new("type_text", json!({"text": "{{password}}"}))];
-        let why = Values::bind_with(
-            &steps,
-            Some(&json!({"password": "hunter2-secret"})),
-            &secret_env,
+    /// A value, for the tests of what is done with one.
+    fn values(pairs: &[(&str, &str)]) -> Values {
+        Values(
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
         )
-        .unwrap_err();
-        assert!(why.contains("REFERENCE"), "{why}");
-        assert!(why.contains("{\"env\": \"INCU_PARAM_PASSWORD\"}"), "{why}");
-        assert!(!why.contains("hunter2"), "the value was repeated: {why}");
-        // The reference must be exactly that and nothing else.
-        for bad in [
-            json!({"env": "HOME"}),
-            json!({"env": "PATH"}),
-            json!({"env": "ANTHROPIC_API_KEY"}),
-            json!({"env": "INCU_PARAM_"}),
-            json!({"env": "incu_param_password"}),
-            json!({"env": "INCU_PARAM_A B"}),
-            json!({"env": "INCU_PARAM_PASSWORD", "value": "x"}),
-            json!({"env": 5}),
-            json!({}),
-        ] {
-            let why = Values::bind_with(&steps, Some(&json!({"password": bad})), &|_| {
-                Some("leaked".to_string())
-            })
-            .unwrap_err();
-            assert!(!why.contains("leaked"), "{bad}: {why}");
-        }
-        // A variable that is not set, or is empty, is said by name.
-        let unset = Values::bind_with(
-            &steps,
-            Some(&json!({"password": {"env": "INCU_PARAM_PASSWORD"}})),
-            &no_env,
-        )
-        .unwrap_err();
-        assert!(
-            unset.contains("INCU_PARAM_PASSWORD") && unset.contains("not set"),
-            "{unset}"
-        );
-        let empty = |_: &str| Some(String::new());
-        assert!(Values::bind_with(
-            &steps,
-            Some(&json!({"password": {"env": "INCU_PARAM_PASSWORD"}})),
-            &empty
-        )
-        .is_err());
     }
 
     #[test]
-    fn a_keyring_reference_is_refused_and_says_there_is_no_keyring_here() {
-        let steps = [Step::new("type_text", json!({"text": "{{password}}"}))];
-        let why = Values::bind_with(
-            &steps,
-            Some(&json!({"password": {"keyring": "vault/me"}})),
-            &secret_env,
-        )
-        .unwrap_err();
+    fn a_run_needs_every_parameter_bound_by_the_person_for_these_steps() {
+        let bound = routine_with(typing_password(), &[("password", "INCU_PARAM_PASSWORD")]);
+        // Bound, for these steps, and the variable is set: read from it.
+        let got = Values::from_routine_with(&bound, &secret_env).unwrap();
+        assert!(!got.is_empty());
+        assert_eq!(got.fill(&bound.steps[0]).args["text"], "hunter2-secret");
+        // Not bound: refused, naming the command and never a value.
+        let unbound = routine_with(typing_password(), &[]);
+        let why = Values::from_routine_with(&unbound, &secret_env).unwrap_err();
         assert!(
-            why.contains("keyring") && why.contains("not available"),
+            why.contains("not bound") && why.contains("Nothing was done"),
             "{why}"
         );
-        assert!(why.contains("INCU_PARAM_PASSWORD"), "{why}");
+        assert!(
+            why.contains("incu routine bind \"unlock the vault\" password INCU_PARAM_PASSWORD"),
+            "{why}"
+        );
+        assert!(!why.contains("hunter2"), "{why}");
+        // Some bound, some not: the unbound ones are named.
+        let two = vec![Step::new(
+            "type_text",
+            json!({"text": "{{user}} {{password}}"}),
+        )];
+        let half = routine_with(two, &[("password", "INCU_PARAM_PASSWORD")]);
+        let why = Values::from_routine_with(&half, &secret_env).unwrap_err();
+        assert!(why.contains("user") && !why.contains("password,"), "{why}");
+        // The variable is not set, or empty, or too long: said by name.
+        let why = Values::from_routine_with(&bound, &no_env).unwrap_err();
+        assert!(
+            why.contains("INCU_PARAM_PASSWORD") && why.contains("not set"),
+            "{why}"
+        );
+        let empty = |_: &str| Some(String::new());
+        assert!(Values::from_routine_with(&bound, &empty).is_err());
+        let long = |_: &str| Some("x".repeat(MAX_PARAM_CHARS + 1));
+        assert!(Values::from_routine_with(&bound, &long).is_err());
+        // A routine with none needs none.
+        let plain = routine_with(vec![Step::new("key", json!({"keys": ["enter"]}))], &[]);
+        assert!(Values::from_routine_with(&plain, &no_env)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// The steps changed since the person bound: a binding is for steps it was
+    /// made for, and is not honoured for others (a hand-edited file).
+    #[test]
+    fn a_routine_whose_steps_changed_since_they_were_bound_is_refused() {
+        let mut routine = routine_with(typing_password(), &[("password", "INCU_PARAM_PASSWORD")]);
+        assert!(Values::from_routine_with(&routine, &secret_env).is_ok());
+        routine
+            .steps
+            .push(Step::new("key", json!({"keys": ["enter"]})));
+        let why = Values::from_routine_with(&routine, &secret_env).unwrap_err();
+        assert!(
+            why.contains("not the ones its parameters were bound for"),
+            "{why}"
+        );
+        assert!(why.contains("incu routine bind"), "{why}");
+        // The digest is of the steps and nothing else: same steps, same digest.
+        assert_eq!(digest(&typing_password()), digest(&typing_password()));
+        assert_ne!(digest(&typing_password()), digest(&routine.steps));
+        assert_eq!(digest(&typing_password()).len(), 64);
+    }
+
+    /// Only a variable the person set aside for routines can be bound: the prefix
+    /// is the line, in the command and again when the file is read.
+    #[test]
+    fn a_binding_can_name_only_an_incu_param_variable() {
+        for good in [
+            "INCU_PARAM_PASSWORD",
+            "INCU_PARAM_A",
+            "INCU_PARAM_VAULT_PIN_2",
+        ] {
+            assert!(check_env_name(good).is_ok(), "{good}");
+        }
+        for bad in [
+            "HOME",
+            "PATH",
+            "ANTHROPIC_API_KEY",
+            "INCU_PARAM_",
+            "incu_param_password",
+            "INCU_PARAM_A B",
+            "INCU_PARAM_A=B",
+            "XINCU_PARAM_A",
+            "",
+        ] {
+            assert!(check_env_name(bad).is_err(), "{bad:?}");
+        }
+        // A file edited to bind a parameter to something else is refused at run
+        // time, before the variable is read.
+        let mut edited = routine_with(typing_password(), &[("password", "HOME")]);
+        edited.bound_steps = digest(&edited.steps);
+        let read = std::cell::Cell::new(false);
+        let spy = |_: &str| {
+            read.set(true);
+            Some("leaked".to_string())
+        };
+        let why = Values::from_routine_with(&edited, &spy).unwrap_err();
+        assert!(
+            why.contains("INCU_PARAM_") && !why.contains("leaked"),
+            "{why}"
+        );
+        assert!(!read.get(), "the variable was read");
     }
 
     #[test]
@@ -854,24 +864,29 @@ mod tests {
             .map(|i| Step::new("type_text", json!({"text": format!("{{{{p{i}}}}}")})))
             .collect();
         assert_eq!(names(&steps).len(), MAX_PARAMS + 1);
-        let why = Values::bind_with(&steps, None, &no_env).unwrap_err();
+        let bound: Vec<(String, String)> = (0..=MAX_PARAMS)
+            .map(|i| (format!("p{i}"), format!("INCU_PARAM_P{i}")))
+            .collect();
+        let pairs: Vec<(&str, &str)> = bound
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        let routine = routine_with(steps, &pairs);
+        let why = Values::from_routine_with(&routine, &|_| Some("x".to_string())).unwrap_err();
         assert!(why.contains("more than the 16"), "{why}");
     }
 
     #[test]
     fn a_value_is_substituted_in_one_pass_and_scrubbed_from_what_comes_back() {
-        let steps = [Step::new("type_text", json!({"text": "pw={{password}}!"}))];
-        let refer = json!({"password": {"env": "INCU_PARAM_PASSWORD"}});
-        let tricky = |_: &str| Some("a{{password}}b".to_string());
-        let values = Values::bind_with(&steps, Some(&refer), &tricky).unwrap();
-        let filled = values.fill(&steps[0]);
+        let step = Step::new("type_text", json!({"text": "pw={{password}}!"}));
+        let tricky = values(&[("password", "a{{password}}b")]);
+        let filled = tricky.fill(&step);
         assert_eq!(filled.args["text"], "pw=a{{password}}b!");
         // The stored step is untouched.
-        assert_eq!(steps[0].args["text"], "pw={{password}}!");
+        assert_eq!(step.args["text"], "pw={{password}}!");
         let message = "could not type hunter2-secret into the window";
-        let values = Values::bind_with(&steps, Some(&refer), &secret_env).unwrap();
         assert_eq!(
-            values.scrub(message),
+            values(&[("password", "hunter2-secret")]).scrub(message),
             "could not type {{password}} into the window"
         );
     }
@@ -879,11 +894,7 @@ mod tests {
     /// A value of any length is scrubbed; a short one only where it stands whole.
     #[test]
     fn a_short_value_is_scrubbed_whole_and_never_out_of_the_middle_of_a_word() {
-        let steps = [Step::new("type_text", json!({"text": "{{password}}"}))];
-        let refer = json!({"password": {"env": "INCU_PARAM_PASSWORD"}});
-        let with = |value: &'static str| {
-            Values::bind_with(&steps, Some(&refer), &move |_| Some(value.to_string())).unwrap()
-        };
+        let with = |value: &'static str| values(&[("password", value)]);
         // One character.
         assert_eq!(
             with("x").scrub("typed x into box"),
@@ -912,14 +923,7 @@ mod tests {
             "it was {{password}}er2 and {{password}}"
         );
         // Longer values go first, so a short one inside a long one cannot split it.
-        let two = [Step::new("type_text", json!({"text": "{{a}} {{b}}"}))];
-        let refs = json!({"a": {"env": "INCU_PARAM_A"}, "b": {"env": "INCU_PARAM_B"}});
-        let env = |var: &str| match var {
-            "INCU_PARAM_A" => Some("secret".to_string()),
-            "INCU_PARAM_B" => Some("secret-longer".to_string()),
-            _ => None,
-        };
-        let both = Values::bind_with(&two, Some(&refs), &env).unwrap();
+        let both = values(&[("a", "secret"), ("b", "secret-longer")]);
         assert_eq!(both.scrub("secret-longer and secret"), "{{b}} and {{a}}");
     }
 
@@ -996,66 +1000,180 @@ mod tests {
         }
     }
 
+    /// A typing step that names a plain text box of its own, in a window, that
+    /// the desktop confirms is not a password field: the only text that is kept.
+    fn typing_in(selector: &str, text: &str) -> Step {
+        Step::new(
+            "type_text",
+            json!({"text": text, "in_window": "app=browser;window~=Home", "selector": selector}),
+        )
+    }
+
+    const SEARCH_BOX: &str = "app=browser;window~=Home;role=edit;name=Search";
+
+    /// The inverted rule: a plain named search box keeps its literal text.
     #[test]
-    fn typing_into_a_password_field_becomes_a_parameter_and_the_secret_is_not_kept() {
+    fn a_plain_named_search_box_keeps_its_literal_text() {
         let mut steps = vec![
+            typing_in(SEARCH_BOX, "rust lifetimes"),
             Step::new(
                 "set_value",
-                json!({"selector": "app=login;window=Sign in;role=edit;name=Email", "value": "me@example.com"}),
+                json!({"selector": "app=browser;window~=Home;role=combobox;name=Language", "value": "English"}),
             ),
+        ];
+        let made = parameterise(&mut steps, &plain_probe);
+        assert!(made.is_empty(), "{made:?}");
+        assert_eq!(steps[0].args["text"], "rust lifetimes");
+        assert_eq!(steps[1].args["value"], "English");
+        assert!(names(&steps).is_empty());
+    }
+
+    /// Everything that does not positively say "plain text box" is a parameter.
+    #[test]
+    fn a_text_is_kept_only_for_a_control_positively_known_to_be_a_plain_text_box() {
+        let in_window = "app=browser;window~=Home";
+        type Case<'a> = (&'a str, Value, &'a dyn Fn(&str) -> Probe, Why);
+        let cases: &[Case] = &[
+            // The desktop could not check it (the window is gone, or no desktop).
+            (
+                "unchecked",
+                typing_in(SEARCH_BOX, "x").args,
+                &no_probe,
+                Why::NotKnownPlain,
+            ),
+            // The desktop says it is a password field, whatever its name.
+            (
+                "marked secure",
+                typing_in(SEARCH_BOX, "x").args,
+                &|_| Probe::Secret,
+                Why::SecureField,
+            ),
+            // A name that says secret.
+            (
+                "secret name",
+                typing_in(&format!("{in_window};role=edit;name=Password"), "x").args,
+                &plain_probe,
+                Why::SecureField,
+            ),
+            (
+                "secret automation id",
+                typing_in(&format!("{in_window};role=edit;aid=txtPassword"), "x").args,
+                &plain_probe,
+                Why::SecureField,
+            ),
+            // Not a text box.
+            (
+                "a button",
+                typing_in(&format!("{in_window};role=button;name=Sign in"), "x").args,
+                &plain_probe,
+                Why::NotKnownPlain,
+            ),
+            (
+                "a text label",
+                typing_in(&format!("{in_window};role=text;name=Hello"), "x").args,
+                &plain_probe,
+                Why::NotKnownPlain,
+            ),
+            (
+                "no role",
+                typing_in(&format!("{in_window};name=Search"), "x").args,
+                &plain_probe,
+                Why::NotKnownPlain,
+            ),
+            // Does not say which window.
+            (
+                "no window part",
+                typing_in("role=edit;name=Search", "x").args,
+                &plain_probe,
+                Why::NotKnownPlain,
+            ),
+            // No selector of its own at all: it types where focus is.
+            (
+                "no selector",
+                json!({"text": "x", "in_window": in_window}),
+                &plain_probe,
+                Why::NotKnownPlain,
+            ),
+        ];
+        for (what, args, probe, why) in cases {
+            let mut steps = vec![Step::new("type_text", args.clone())];
+            let made = parameterise(&mut steps, probe);
+            assert_eq!(made.len(), 1, "{what}: kept as text");
+            assert_eq!(made[0].why, *why, "{what}");
+            assert!(
+                steps[0].args["text"].as_str().unwrap().starts_with("{{"),
+                "{what}"
+            );
+        }
+    }
+
+    /// A click that opens a sign-in dialog: the password goes into a field no
+    /// step named, and the focus moved without any key.
+    #[test]
+    fn a_password_typed_after_a_click_that_opened_a_sign_in_dialog_is_a_parameter() {
+        let mut steps = vec![
             Step::new(
                 "click_element",
-                json!({"selector": "app=login;window=Sign in;role=edit;name=Password"}),
+                json!({"selector": "app=editor;window=Doc;role=button;name=Sign in"}),
             ),
             Step::new(
                 "type_text",
-                json!({"text": "hunter2-secret", "in_window": "app=login;window=Sign in"}),
+                json!({"text": "hunter2", "in_window": "app=editor;window~=Sign in"}),
             ),
         ];
-        let made = parameterise(&mut steps, &no_probe);
-        assert_eq!(
-            made,
-            [Made {
-                name: "password".to_string(),
-                step: 3,
-                why: Why::SecureField
-            }]
-        );
-        assert_eq!(steps[2].args["text"], "{{password}}");
-        // The email is ordinary text and stays.
-        assert_eq!(steps[0].args["value"], "me@example.com");
-        assert!(!serde_json::to_string(&steps).unwrap().contains("hunter2"));
-        assert_eq!(names(&steps), ["password"]);
-    }
-
-    #[test]
-    fn a_set_value_on_a_secret_field_is_a_parameter_named_after_it() {
-        let mut steps = vec![Step::new(
-            "set_value",
-            json!({"selector": "app=vault;role=edit;name=Token", "value": "hunter2-secret"}),
-        )];
-        let made = parameterise(&mut steps, &no_probe);
-        assert_eq!(made[0].name, "token");
-        assert_eq!(steps[0].args["value"], "{{token}}");
-    }
-
-    #[test]
-    fn the_desktops_own_report_of_a_password_field_counts_when_the_name_does_not_say() {
-        let mut steps = vec![Step::new(
-            "set_value",
-            json!({"selector": "app=bank;window=Login;role=edit;name=Enter it here", "value": "s3cret"}),
-        )];
-        let seen_as_password = |raw: &str| raw.contains("Enter it here");
-        let made = parameterise(&mut steps, &seen_as_password);
+        // Even a desktop that calls every control plain does not save it: the
+        // step does not name the field.
+        let made = parameterise(&mut steps, &plain_probe);
         assert_eq!(made.len(), 1);
-        assert_eq!(made[0].why, Why::SecureField);
-        assert!(!steps[0].args.to_string().contains("s3cret"));
+        assert!(!serde_json::to_string(&steps).unwrap().contains("hunter2"));
     }
 
-    /// The login form: click the user name, type it, Tab, type the password,
-    /// Enter. The password is in a field no selector named.
+    /// A first-step prompt: nothing has named a control yet (sudo, KeePass).
     #[test]
-    fn a_password_typed_after_a_tab_is_a_parameter() {
+    fn a_secret_typed_as_the_first_step_is_a_parameter() {
+        let mut steps = vec![
+            Step::new(
+                "type_text",
+                json!({"text": "correct horse", "in_window": "app=terminal;window~=sudo"}),
+            ),
+            Step::new(
+                "key",
+                json!({"keys": ["enter"], "in_window": "app=terminal"}),
+            ),
+        ];
+        let made = parameterise(&mut steps, &plain_probe);
+        assert_eq!(made.len(), 1);
+        assert_eq!(made[0].step, 1);
+        assert!(!serde_json::to_string(&steps).unwrap().contains("horse"));
+    }
+
+    /// Focus moves with no key at all, or with one no list of keys would hold:
+    /// Ctrl+L, Alt+D, F6 put it in the address bar.
+    #[test]
+    fn text_typed_after_ctrl_l_or_alt_d_or_f6_is_a_parameter() {
+        let window = "app=browser;window~=Home";
+        for keys in [json!(["ctrl", "l"]), json!(["alt", "d"]), json!(["f6"])] {
+            let mut steps = vec![
+                Step::new(
+                    "click_element",
+                    json!({"selector": format!("{window};role=edit;name=Search")}),
+                ),
+                Step::new("key", json!({"keys": keys, "in_window": window})),
+                Step::new(
+                    "type_text",
+                    json!({"text": "secret-url", "in_window": window}),
+                ),
+            ];
+            let made = parameterise(&mut steps, &plain_probe);
+            assert_eq!(made.len(), 1, "{keys}");
+            assert_eq!(made[0].step, 3);
+        }
+    }
+
+    /// The login form, now: every text is a parameter, the user name too, because
+    /// no step names a field.
+    #[test]
+    fn the_login_form_with_a_tab_keeps_no_text() {
         let window = "app=login;window=Sign in";
         let mut steps = vec![
             Step::new(
@@ -1067,122 +1185,109 @@ mod tests {
             Step::new("type_text", json!({"text": "hunter2", "in_window": window})),
             Step::new("key", json!({"keys": ["Enter"], "in_window": window})),
         ];
-        let made = parameterise(&mut steps, &no_probe);
-        assert_eq!(made.len(), 1, "{made:?}");
-        assert_eq!((made[0].step, made[0].why), (4, Why::UnknownField));
-        assert_eq!(steps[3].args["text"], "{{text}}");
+        let made = parameterise(&mut steps, &plain_probe);
+        assert_eq!(made.len(), 2, "{made:?}");
+        let kept = serde_json::to_string(&steps).unwrap();
+        assert!(
+            !kept.contains("hunter2") && !kept.contains("alice"),
+            "{kept}"
+        );
+        // The two get two names.
+        assert_eq!(names(&steps), ["text", "text_2"]);
+    }
+
+    #[test]
+    fn typing_into_a_password_field_becomes_a_parameter_named_after_it() {
+        let mut steps = vec![
+            typing_in(
+                "app=login;window~=Home;role=edit;name=Email",
+                "me@example.com",
+            ),
+            typing_in(
+                "app=login;window~=Home;role=edit;name=Password",
+                "hunter2-secret",
+            ),
+        ];
+        let made = parameterise(&mut steps, &plain_probe);
+        assert_eq!(
+            made,
+            [Made {
+                name: "password".to_string(),
+                step: 2,
+                why: Why::SecureField
+            }]
+        );
+        assert_eq!(steps[1].args["text"], "{{password}}");
+        // The email goes into a named plain field: it stays.
+        assert_eq!(steps[0].args["text"], "me@example.com");
         assert!(!serde_json::to_string(&steps).unwrap().contains("hunter2"));
-        // Before the Tab the target was the user name field: its text is kept.
-        assert_eq!(steps[1].args["text"], "alice");
     }
 
     #[test]
-    fn every_key_that_can_move_focus_makes_the_next_typing_a_parameter() {
-        let window = "app=form;window=F";
-        let after = |keys: Value| {
-            let mut steps = vec![
-                Step::new(
-                    "click_element",
-                    json!({"selector": format!("{window};role=edit;name=Name")}),
-                ),
-                Step::new("key", json!({"keys": keys, "in_window": window})),
-                Step::new("type_text", json!({"text": "next", "in_window": window})),
-            ];
-            let made = parameterise(&mut steps, &no_probe);
-            made.len()
+    fn a_set_value_follows_the_same_rule_through_its_own_selector() {
+        let mut steps = vec![
+            Step::new(
+                "set_value",
+                json!({"selector": "app=vault;window=V;role=edit;name=Token", "value": "hunter2-secret"}),
+            ),
+            // No window part: not kept.
+            Step::new(
+                "set_value",
+                json!({"selector": "role=edit;name=Title", "value": "a title"}),
+            ),
+            Step::new(
+                "set_value",
+                json!({"selector": "app=vault;window=V;role=edit;name=Title", "value": "a title"}),
+            ),
+        ];
+        let made = parameterise(&mut steps, &plain_probe);
+        assert_eq!(made[0].name, "token");
+        assert_eq!(steps[0].args["value"], "{{token}}");
+        assert_eq!(made.len(), 2, "{made:?}");
+        assert_eq!(made[1].step, 2);
+        assert_eq!(steps[2].args["value"], "a title");
+    }
+
+    #[test]
+    fn the_desktops_own_report_of_a_password_field_counts_when_the_name_does_not_say() {
+        let mut steps = vec![Step::new(
+            "set_value",
+            json!({"selector": "app=bank;window=Login;role=edit;name=Enter it here", "value": "s3cret"}),
+        )];
+        let seen_as_password = |raw: &str| {
+            if raw.contains("Enter it here") {
+                Probe::Secret
+            } else {
+                Probe::Plain
+            }
         };
-        for moves in [
-            json!(["tab"]),
-            json!(["Tab"]),
-            json!(["shift", "tab"]),
-            json!(["ctrl", "shift", "Tab"]),
-            json!(["enter"]),
-            json!(["Return"]),
-            json!(["down"]),
-            json!(["Up"]),
-            json!(["left"]),
-            json!(["right"]),
-            json!(["pagedown"]),
-            json!("shift+tab"),
-        ] {
-            assert_eq!(after(moves.clone()), 1, "{moves}");
-        }
-        // A chord that does not move focus leaves the target where it was.
-        for stays in [json!(["ctrl", "a"]), json!(["ctrl", "c"]), json!(["shift"])] {
-            assert_eq!(after(stays.clone()), 0, "{stays}");
-        }
-    }
-
-    #[test]
-    fn a_typing_step_after_a_tab_that_names_a_plain_control_of_its_own_is_kept() {
-        let window = "app=form;window=F";
-        let mut steps = vec![
-            Step::new("key", json!({"keys": ["tab"], "in_window": window})),
-            Step::new(
-                "type_text",
-                json!({"text": "kept", "in_window": window, "selector": format!("{window};role=edit;name=City")}),
-            ),
-            Step::new("key", json!({"keys": ["tab"], "in_window": window})),
-            Step::new(
-                "type_text",
-                json!({"text": "not kept", "in_window": window, "selector": format!("{window};role=edit;name=Password")}),
-            ),
-        ];
-        let made = parameterise(&mut steps, &no_probe);
+        let made = parameterise(&mut steps, &seen_as_password);
         assert_eq!(made.len(), 1);
-        assert_eq!((made[0].step, made[0].why), (4, Why::SecureField));
-        assert_eq!(steps[1].args["text"], "kept");
-        // A click names a control again, ending the doubt.
-        let mut steps = vec![
-            Step::new("key", json!({"keys": ["tab"], "in_window": window})),
-            Step::new(
-                "click_element",
-                json!({"selector": format!("{window};role=edit;name=City")}),
-            ),
-            Step::new(
-                "type_text",
-                json!({"text": "city text", "in_window": window}),
-            ),
-        ];
-        assert!(parameterise(&mut steps, &no_probe).is_empty());
+        assert_eq!(made[0].why, Why::SecureField);
+        assert!(!steps[0].args.to_string().contains("s3cret"));
     }
 
     #[test]
     fn the_replay_can_tell_a_step_that_puts_a_secret_on_screen() {
         let window = "app=login;window=Sign in";
-        let typing = Step::new("type_text", json!({"text": "plain", "in_window": window}));
-        let secret = Target::Known(format!("{window};role=edit;name=Password"));
-        let plain = Target::Known(format!("{window};role=edit;name=Username"));
-        assert!(
-            types_a_secret(&typing, &secret),
-            "typing into a password field"
-        );
-        assert!(
-            types_a_secret(&typing, &Target::Unknown),
-            "typing where focus is not known"
-        );
-        assert!(!types_a_secret(&typing, &plain));
-        assert!(!types_a_secret(&typing, &Target::Nothing));
-        // A parameter is a secret whatever is around it.
+        // A parameter is a secret, whatever is around it.
         let param = Step::new(
             "type_text",
             json!({"text": "{{text}}", "in_window": window}),
         );
-        assert!(types_a_secret(&param, &plain));
-        // The target follows the steps as they run.
-        let mut target = Target::Nothing;
-        target.after(&Step::new(
+        assert!(types_a_secret(&param));
+        // Text into a field whose name says secret.
+        assert!(types_a_secret(&typing_in(
+            &format!("{window};role=edit;name=Password"),
+            "plain"
+        )));
+        // Plain text into a plain field, and steps that type nothing.
+        assert!(!types_a_secret(&typing_in(SEARCH_BOX, "plain")));
+        assert!(!types_a_secret(&Step::new("key", json!({"keys": ["tab"]}))));
+        assert!(!types_a_secret(&Step::new(
             "click_element",
-            json!({"selector": format!("{window};role=edit;name=Username")}),
-        ));
-        assert_eq!(target, plain);
-        target.after(&Step::new(
-            "key",
-            json!({"keys": ["tab"], "in_window": window}),
-        ));
-        assert_eq!(target, Target::Unknown);
-        target.after(&Step::new("wait_for", json!({"condition": "element_appears", "selector": format!("{window};role=edit;name=X")})));
-        assert_eq!(target, Target::Unknown, "a wait focuses nothing");
+            json!({"selector": format!("{window};role=edit;name=Password")})
+        )));
     }
 
     #[test]
@@ -1196,19 +1301,19 @@ mod tests {
                 "type_text",
                 json!({"text": {"redacted": true, "sha256": "ab"}, "in_window": "app=mail"}),
             ),
-            Step::new(
-                "type_text",
-                json!({"text": "hello", "in_window": "app=mail"}),
-            ),
+            typing_in("app=mail;window~=Compose;role=edit;name=Subject", "hello"),
         ];
-        let made = parameterise(&mut steps, &no_probe);
+        let made = parameterise(&mut steps, &plain_probe);
         assert_eq!(made.len(), 2);
         assert!(made.iter().all(|m| m.why == Why::Redacted));
         assert_eq!(steps[0].args["value"], "{{body}}");
-        // Named after the control it went into, numbered to stay apart.
-        assert_eq!(steps[1].args["text"], "{{body_2}}");
-        assert_eq!(steps[2].args["text"], "hello", "ordinary text stays");
-        assert_eq!(names(&steps), ["body", "body_2"]);
+        // No control of its own: named plainly, numbered to stay apart.
+        assert_eq!(steps[1].args["text"], "{{text}}");
+        assert_eq!(
+            steps[2].args["text"], "hello",
+            "ordinary text in a named plain field stays"
+        );
+        assert_eq!(names(&steps), ["body", "text"]);
     }
 
     #[test]
@@ -1227,7 +1332,7 @@ mod tests {
                 json!({"text": "{{mine}}", "in_window": "app=a"}),
             ),
         ];
-        let made = parameterise(&mut steps, &no_probe);
+        let made = parameterise(&mut steps, &plain_probe);
         assert_eq!(made[0].name, "password");
         assert_eq!(made[1].name, "password_2");
         assert_eq!(made.len(), 2, "{{mine}} is the agent's, not made");
