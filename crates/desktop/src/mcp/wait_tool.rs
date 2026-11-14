@@ -433,12 +433,60 @@ fn condition_of(args: &Value) -> Result<Condition, String> {
 pub(super) fn wait_for(args: &Value, stopped: &dyn Fn() -> bool) -> Result<Vec<Value>, String> {
     let condition = condition_of(args)?;
     let budget = Budget::new(whole(args, "timeout_ms")?, whole(args, "poll_ms")?);
-    let mut env = Live::new(&budget, stopped);
-    let outcome = wait::run(&mut env, &condition, &budget, stopped)?;
+    look_until(&condition, &budget, stopped, None)
+}
+
+/// `watch`: the same look, for hours, with a note for the operator's hook.
+///
+/// **Why a tool of its own and not an option of `wait_for`.** `wait_for` is held
+/// to 60 seconds, polled every 50 ms to 2 s, and that bound is a safety property
+/// its tests pin: a call that is supposed to return in moments. A watch is the
+/// opposite promise (it holds the call open until something happens, up to a
+/// day, and looks gently), so it takes its own limits ([`Budget::watch`]) and
+/// its own description, which says plainly that it blocks. The look itself is
+/// the same code ([`look_until`]).
+///
+/// `message` is carried into the reply and so into the operator's post-tool
+/// hook, which is how a watch notifies: see `Server::tell_post_hooks`.
+///
+/// Called by `Server::run_tool`.
+pub(super) fn watch(args: &Value, stopped: &dyn Fn() -> bool) -> Result<Vec<Value>, String> {
+    let condition = condition_of(args)?;
+    let budget = Budget::watch(whole(args, "timeout_ms")?, whole(args, "poll_ms")?);
+    let message = message_arg(args)?;
+    look_until(&condition, &budget, stopped, message)
+}
+
+/// The most of a `watch` message that is kept, in characters.
+const MAX_MESSAGE_CHARS: usize = 200;
+
+/// What the watch is to say when it fires, if the call gave one.
+fn message_arg(args: &Value) -> Result<Option<String>, String> {
+    match args.get("message") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(m)) if m.chars().count() <= MAX_MESSAGE_CHARS => Ok(Some(m.clone())),
+        Some(Value::String(_)) => Err(format!("message is over {MAX_MESSAGE_CHARS} characters")),
+        Some(_) => Err("message must be text".to_string()),
+    }
+}
+
+/// Look for `condition` on the live desktop within `budget` and render the
+/// reply. A stop is a refusal, not a reply.
+fn look_until(
+    condition: &Condition,
+    budget: &Budget,
+    stopped: &dyn Fn() -> bool,
+    message: Option<String>,
+) -> Result<Vec<Value>, String> {
+    let mut env = Live::new(budget, stopped);
+    let outcome = wait::run(&mut env, condition, budget, stopped)?;
     if matches!(outcome, Outcome::Stopped { .. }) {
         return Err(crate::safety::Refusal::Stopped.message());
     }
-    let reply = outcome.to_json(&condition, &budget);
+    let mut reply = outcome.to_json(condition, budget);
+    if let Some(message) = message {
+        reply["message"] = serde_json::json!(message);
+    }
     Ok(vec![text(format!(
         "{}\n{}",
         serde_json::to_string_pretty(&reply).unwrap_or_default(),

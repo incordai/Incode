@@ -183,13 +183,34 @@ impl Server {
         // It cannot deny: the action is already done, and reporting a refusal
         // for it would be a lie to the agent.
         if let Some(hooks) = self.hooks.as_ref() {
-            if outcome.is_ok() {
-                let said = hooks.run_post_tool_use(name, raw_args, "", false);
+            if let Ok(content) = outcome {
+                // Every tool's hook is told the call and not its answer, as it
+                // always was: a screen's text is not the operator's to be
+                // handed by default. `watch` is the exception, because telling
+                // the operator WHAT it saw is the whole point of it: its hook
+                // is the notification, and `tool_response` is the reply
+                // (found or timeout, the control or window, the `message`).
+                let answer = if name == "watch" {
+                    super::tools::text_of(content)
+                } else {
+                    String::new()
+                };
+                let said = hooks.run_post_tool_use(name, raw_args, &answer, false);
                 for message in said.messages() {
                     // stderr, never stdout: stdout is the protocol channel.
                     eprintln!("hook after {name}: {message}");
                 }
             }
+        }
+    }
+
+    /// A line in the journal that is not a finished call: a `watch` that has
+    /// begun, so an operator following the journal sees the wait.
+    ///
+    /// Called by `Server::run_tool` before a `watch` starts to poll.
+    pub(super) fn journal_note(&mut self, t: &str, detail: &str) {
+        if let Some(journal) = self.journal.as_mut() {
+            let _ = journal.record(t, &format!("started: {detail}"), true);
         }
     }
 
@@ -256,13 +277,21 @@ impl Server {
             "element_action" => format!("{} {}", element_ref(args), s("action")),
             // The condition and the selector as `Selector::render_redacted`
             // has it (no text field's name), and how long it may wait.
-            "wait_for" => format!(
+            // `watch` is the same, and its `message` (what its hook is told to
+            // say) stays out of the journal like any other free text.
+            "wait_for" | "watch" => format!(
                 "{} {} timeout {}",
                 s("condition"),
                 selector_ref(args),
                 args.get("timeout_ms")
                     .map_or("default".to_string(), |ms| format!("{ms} ms"))
             ),
+            // The phrase a routine is asked for by, which is the operator's own
+            // name for it; never its steps, which may carry typed text.
+            "routine_save" | "routine_run" | "routine_forget" | "routine_match" => {
+                let phrase: String = s("phrase").chars().take(80).collect();
+                format!("\"{phrase}\"")
+            }
             "focus_window" => format!("window {}", window_arg(args).unwrap_or_default()),
             "click" | "move_mouse" => format!("({}, {})", n("x"), n("y")),
             "drag" => format!(

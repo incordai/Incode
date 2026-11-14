@@ -57,6 +57,14 @@ OPTIONS for serve:
                               $INCU_CONFIG, else the platform config folder
     --display <SPEC>          Linux: \":N\" or \"xvfb[:WxH]\" (overrides the config)
 
+ENVIRONMENT for serve:
+    INCU_ROUTINES             the file learned routines are kept in (else the
+                              config's `routines`, else routines.json in the
+                              per-user data folder)
+    INCORD_MEMORY_URL         the local memory engine routine_save reads
+                              Watchman records from (default
+                              http://127.0.0.1:9180; loopback only)
+
 OPTIONS for stop:
     --journal <PATH>          stop the server journalling to PATH
     --workspace <DIR>         stop the server for DIR's .incode/ journal
@@ -206,6 +214,9 @@ pub struct ServeOptions {
     pub display: Option<String>,
     /// The operator's commands around every call, if any.
     pub hooks: Option<Box<dyn Hooks>>,
+    /// Where routines are kept; `None` is the default
+    /// ([`crate::routine::store::Store::default_path`]).
+    pub routines: Option<PathBuf>,
     /// What the startup lines on stderr call this server (`incu`, or
     /// `incode-desktop` for incode's wrapper).
     pub name: &'static str,
@@ -228,6 +239,7 @@ impl ServeOptions {
             limits,
             display,
             hooks,
+            routines,
         } = config;
         Ok(Self {
             tier: args.tier,
@@ -235,9 +247,25 @@ impl ServeOptions {
             limits,
             display: args.display.or(display),
             hooks: shell_hooks(hooks),
+            routines,
             name: "incu",
         })
     }
+}
+
+/// The routines kit `incu` runs with: the file at `path`, else the default, and
+/// Watchman's records from the local memory engine as the source. `None` when
+/// there is no place to keep the file.
+///
+/// The engine is only asked when a routine is saved from record ids, and an
+/// engine that is not running is an error at that moment, not at startup: the
+/// crate works without it.
+fn routine_kit(path: Option<PathBuf>) -> Option<crate::mcp::RoutineKit> {
+    let path = path.or_else(crate::routine::store::Store::default_path)?;
+    Some(crate::mcp::RoutineKit::new(
+        crate::routine::store::Store::at(path),
+        Box::new(crate::routine::watchman::WatchmanSource::from_env()),
+    ))
 }
 
 /// [`ShellHooks`] for `config`, or none when it has nothing to run.
@@ -269,6 +297,7 @@ pub fn serve(options: ServeOptions) -> Result<(), String> {
         limits,
         display,
         hooks,
+        routines,
         name,
     } = options;
     crate::limits::set(
@@ -307,6 +336,18 @@ pub fn serve(options: ServeOptions) -> Result<(), String> {
         eprintln!("{name} journalling to {}", path.display());
         server = server.with_journal(path);
     }
+    server = match routine_kit(routines) {
+        Some(kit) => {
+            eprintln!("{name}: routines in {}", kit.path().display());
+            server.with_routines(kit)
+        }
+        None => {
+            eprintln!(
+                "{name}: routines are off: no data folder to keep them in (set INCU_ROUTINES)"
+            );
+            server
+        }
+    };
     // Named on stderr so an operator who asked for `read-only` can see that it
     // arrived. A capability restriction nobody can observe is one nobody trusts.
     eprintln!("{name} MCP server ready on stdio ({})", tier.label());

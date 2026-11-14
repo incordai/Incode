@@ -21,7 +21,8 @@
 
 use serde_json::{json, Value};
 
-use super::{ACTING, UNTRUSTED};
+use super::tools::looks_after;
+use super::UNTRUSTED;
 
 /// Every desktop tool, in MCP's shape. The toolbox offers these same
 /// definitions to a model (`toolbox::desktop`), so they are written once.
@@ -31,6 +32,7 @@ pub fn tool_definitions() -> Vec<Value> {
         "screenshot",
         "ui_tree",
         "wait_for",
+        "watch",
         "click_element",
         "set_value",
         "element_action",
@@ -42,6 +44,7 @@ pub fn tool_definitions() -> Vec<Value> {
         "drag",
     ];
     let mut tools = base_definitions();
+    tools.extend(super::routine_definitions::definitions());
     for tool in &mut tools {
         let name = tool["name"].as_str().unwrap_or_default().to_string();
         let properties = &mut tool["inputSchema"]["properties"];
@@ -52,7 +55,7 @@ pub fn tool_definitions() -> Vec<Value> {
                      focused window the call is REFUSED rather than typing somewhere else."
                 }
                 "screenshot" => "Capture only this window, from list_windows.",
-                "wait_for" => {
+                "wait_for" | "watch" => {
                     "The window to watch, from list_windows: for element_* the one the \
                      selector is looked for in, for screen_changes the one whose area is \
                      compared. Default: the window the selector names, else the focused one \
@@ -62,7 +65,7 @@ pub fn tool_definitions() -> Vec<Value> {
             };
             properties["window"] = json!({"type": "string", "description": what});
         }
-        if ACTING.contains(&name.as_str()) {
+        if looks_after(&name) {
             properties["screenshot_after"] = json!({
                 "type": "boolean",
                 "description": "Also return a screenshot of the window afterwards, to check \

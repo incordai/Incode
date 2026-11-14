@@ -196,8 +196,9 @@ impl PermissionPolicy {
         self
     }
 
-    /// The requirements for the seventeen tools of the desktop MCP server: six
-    /// that observe and eleven that move something.
+    /// The requirements for the twenty-three tools of the desktop MCP server: nine
+    /// that observe and fourteen that move something or change what a replay
+    /// will move.
     ///
     /// The server is the `incord-desktop` crate now, and it runs its own
     /// `Tier` (`crates/desktop/src/permission.rs`), which it cannot take from
@@ -220,8 +221,8 @@ impl PermissionPolicy {
     ///
     /// # The split, and why it is only two rungs
     ///
-    /// The six observing tools need `ReadOnly`; the eleven that move something
-    /// need `WorkspaceWrite`. Not `DangerFullAccess`, even though a click
+    /// The nine observing tools need `ReadOnly`; the fourteen that act need
+    /// `WorkspaceWrite`. Not `DangerFullAccess`, even though a click
     /// reaches far outside any workspace — because `workspace-write` is the
     /// default mode, and putting the desktop above it would mean the feature
     /// ships switched off and the flag becomes the thing people turn off.
@@ -248,8 +249,18 @@ impl PermissionPolicy {
             // Waits for a control, a window or a change of the screen: it
             // looks and changes nothing.
             .with_tool_requirement("wait_for", PermissionMode::ReadOnly)
+            // The same look held for hours; it changes nothing either.
+            .with_tool_requirement("watch", PermissionMode::ReadOnly)
+            // Read the routines file; neither the screen nor the file changes.
+            .with_tool_requirement("routine_list", PermissionMode::ReadOnly)
+            .with_tool_requirement("routine_match", PermissionMode::ReadOnly)
             // Acting. Each one changes the state of a machine the operator is
-            // signed into.
+            // signed into. A routine is what a replay later does to it: running
+            // one moves the mouse and keyboard, and saving or forgetting one
+            // changes what a replay will do.
+            .with_tool_requirement("routine_save", PermissionMode::WorkspaceWrite)
+            .with_tool_requirement("routine_run", PermissionMode::WorkspaceWrite)
+            .with_tool_requirement("routine_forget", PermissionMode::WorkspaceWrite)
             .with_tool_requirement("move_mouse", PermissionMode::WorkspaceWrite)
             .with_tool_requirement("click", PermissionMode::WorkspaceWrite)
             .with_tool_requirement("click_element", PermissionMode::WorkspaceWrite)

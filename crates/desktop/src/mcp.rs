@@ -52,8 +52,11 @@
 //! - [`tools`]: `run_tool` and one step per tool.
 //! - [`guard`]: the blocked-application, focus, point and region refusals a
 //!   tool asks before it acts.
-//! - `wait_tool`: `wait_for`, the one tool that polls: its arguments and the
-//!   live desktop, over the timing rules in [`crate::wait`].
+//! - `wait_tool`: `wait_for` and `watch`, the two tools that poll: their
+//!   arguments and the live desktop, over the timing rules in [`crate::wait`].
+//! - `routine_tool` and `routine_definitions`: the five routine tools over
+//!   [`crate::routine`], and `Server::gated_call`, the one path through every
+//!   gate that a live call and each step of a replayed routine both take.
 //! - `tests`: the tests, at their old path `mcp::tests`.
 //!
 //! # Wired to
@@ -75,6 +78,8 @@ use crate::permission::Tier;
 mod definitions;
 mod gate;
 mod guard;
+mod routine_definitions;
+mod routine_tool;
 mod tools;
 mod transport;
 mod wait_tool;
@@ -85,7 +90,11 @@ mod tests;
 #[cfg(test)]
 mod selector_tests;
 
+#[cfg(test)]
+mod routine_tests;
+
 pub use definitions::tool_definitions;
+pub use routine_tool::RoutineKit;
 pub use transport::run_stdio;
 
 use transport::{code, Failure};
@@ -128,6 +137,9 @@ pub struct Server {
     /// the contract, and for why a hook sees the real input rather than the
     /// redacted description the journal gets.
     hooks: Option<Box<dyn Hooks>>,
+    /// The routines file and where records come from. `None` until
+    /// [`Server::with_routines`]; the routine tools refuse by name without it.
+    routines: Option<RoutineKit>,
 }
 
 impl Server {
@@ -142,6 +154,7 @@ impl Server {
             stop_file: None,
             tier: Tier::Act,
             hooks: None,
+            routines: None,
         }
     }
 
@@ -227,15 +240,10 @@ impl Server {
         // tool refused. Reporting it as a protocol error would make a refused
         // click look like a broken server, and the agent would retry the
         // transport rather than read the reason.
-        self.catch_stop_file();
-        let permitted = self.authorise(name);
-        let raw_args = args.to_string();
-        let vetoed = self.hook_veto(&permitted, name, &raw_args);
-        let outcome = self.outcome(&permitted, vetoed, name, &args);
-        self.tell_post_hooks(name, &raw_args, &outcome);
-        self.record_call(name, &args, &outcome);
-
-        Ok(match outcome {
+        //
+        // The gates are `gated_call` (in `routine_tool`), the one path a
+        // replayed routine step takes too.
+        Ok(match self.gated_call(name, &args) {
             Ok(content) => json!({"content": content, "isError": false}),
             Err(why) => json!({
                 "content": [{"type": "text", "text": why}],
