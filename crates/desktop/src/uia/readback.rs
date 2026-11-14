@@ -90,7 +90,10 @@ mod tests {
     fn line_endings_are_not_differences() {
         assert_eq!(lines("a\r\nb\rc\nd"), "a\nb\nc\nd");
         // Notepad: RichEdit reads paragraphs back with a bare CR.
-        assert_eq!(judge("one\ntwo\nthree", None, "one\rtwo\rthree", false), ReadBack::Same);
+        assert_eq!(
+            judge("one\ntwo\nthree", None, "one\rtwo\rthree", false),
+            ReadBack::Same
+        );
         // A Windows edit control: CRLF.
         assert_eq!(judge("one\ntwo", None, "one\r\ntwo", false), ReadBack::Same);
         // And the other way round.
@@ -129,7 +132,10 @@ mod tests {
         match judge("new text", Some("old text"), "old text", false) {
             ReadBack::Differs(why) => {
                 assert!(why.contains("kept its old value"), "{why}");
-                assert!(!why.contains("old text") && !why.contains("new text"), "{why}");
+                assert!(
+                    !why.contains("old text") && !why.contains("new text"),
+                    "{why}"
+                );
             }
             other => panic!("{other:?}"),
         }

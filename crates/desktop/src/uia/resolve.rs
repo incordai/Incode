@@ -30,7 +30,7 @@
 //! [`tree_now`].
 
 use super::{bounded, platform, same_control, Done, Element, Tree, Want, WindowInfo};
-use crate::selector::Selector;
+use crate::selector::{SelectError, Selector};
 use crate::DesktopError;
 
 /// Windows listed in an error about a window that was not found.
@@ -173,7 +173,41 @@ pub fn window_for(
 /// own, or the default), for a caller that only looks (`wait_for`). Not
 /// recorded as shown: an id is not being handed out.
 pub fn tree_now(window: &str, depth: Option<u32>) -> Result<Tree, DesktopError> {
-    platform::tree(Some(window), resolve_depth(depth))
+    platform::tree(
+        Some(window),
+        resolve_depth(depth),
+        super::resolve_max_elements(),
+    )
+}
+
+/// How long a browser is given, once, to build a page's accessibility tree
+/// after a selector found nothing in it.
+///
+/// A browser does not expose a page until an accessibility client asks (Chrome
+/// measured: the first walk of a fresh page held only the browser's own
+/// controls, and about 3 s later the page was there). The walk is the ask; this
+/// is the pause before the second walk.
+const BROWSER_WARMUP: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Programs whose windows hold a web page, by the start of their name
+/// (lower-cased): Windows and Linux process names, macOS application names.
+const BROWSERS: &[&str] = &[
+    "chrome",
+    "google chrome",
+    "chromium",
+    "msedge",
+    "microsoft edge",
+    "brave",
+    "vivaldi",
+    "opera",
+    "firefox",
+];
+
+/// Whether `app` is a web browser, whose page content may not be in its first
+/// walk.
+fn is_browser(app: &str) -> bool {
+    let app = app.trim().to_lowercase();
+    BROWSERS.iter().any(|b| app.starts_with(b))
 }
 
 /// The control `selector` names in `tree`, which was walked at `depth`.
@@ -189,8 +223,10 @@ pub(crate) fn resolved_from(
         .map_err(|e| {
             let cut = if tree.truncated {
                 format!(
-                    " (the tree was cut at {} elements, so it may lie beyond the cut)",
-                    super::max_elements()
+                    " (the walk was cut at its bound, {} elements kept or {} nodes visited, so \
+                     it may lie beyond)",
+                    tree.elements.len(),
+                    crate::limits::get().tree_max_visited
                 )
             } else {
                 String::new()
@@ -223,8 +259,49 @@ pub(crate) fn resolved_from(
 pub fn resolve_in(info: WindowInfo, selector: &Selector) -> Result<Resolved, DesktopError> {
     selector.require_element().map_err(os)?;
     let depth = resolve_depth(selector.depth);
-    let tree = platform::tree(Some(&info.id), depth)?;
-    resolved_from(info, tree, selector, depth)
+    let window = info.id.clone();
+    resolve_with(
+        info,
+        selector,
+        depth,
+        &mut || platform::tree(Some(&window), depth, super::resolve_max_elements()),
+        &mut || std::thread::sleep(BROWSER_WARMUP),
+    )
+}
+
+/// [`resolve_in`] with its two outside effects handed in: `look` walks the
+/// window, `pause` waits [`BROWSER_WARMUP`]. Separate so a test needs neither a
+/// desktop nor a clock.
+///
+/// A browser window in which nothing matched is walked a second time after the
+/// pause, once: the first walk is what makes the browser build the page's
+/// accessibility tree. Only a miss is retried (an ambiguity, a bad `nth`, or a
+/// match is the answer already), so a hit costs nothing.
+pub(crate) fn resolve_with(
+    info: WindowInfo,
+    selector: &Selector,
+    depth: u32,
+    look: &mut dyn FnMut() -> Result<Tree, DesktopError>,
+    pause: &mut dyn FnMut(),
+) -> Result<Resolved, DesktopError> {
+    let mut tree = look()?;
+    let warm = is_browser(&info.app)
+        && matches!(
+            selector.resolve_in(&tree.elements),
+            Err(SelectError::Missing)
+        );
+    if warm {
+        pause();
+        tree = look()?;
+    }
+    resolved_from(info, tree, selector, depth).map_err(|e| match (warm, e) {
+        (true, DesktopError::Os(message)) => os(format!(
+            "{message} (a browser builds a page's accessibility tree when first asked, and \
+             this waited {} ms for it once; if the control is on the page, ask again)",
+            BROWSER_WARMUP.as_millis()
+        )),
+        (_, e) => e,
+    })
 }
 
 /// [`super::set_value`] on a control found by selector.
@@ -550,6 +627,7 @@ mod tests {
         walk(
             root,
             depth,
+            crate::uia::resolve_max_elements(),
             &|n: &Node, id, d| Element {
                 id,
                 depth: d,
@@ -634,5 +712,198 @@ mod tests {
             default * 4,
             "held to the bound every walk is"
         );
+    }
+
+    // ---- finding is not bounded by what printing is ----
+
+    /// A long page: `links` links under one window, named `link0`, `link1`, ...
+    fn long_page(links: usize) -> Node {
+        node(
+            Role::Window,
+            "Article",
+            (0..links)
+                .map(|i| node(Role::Link, &format!("link{i}"), vec![]))
+                .collect(),
+        )
+    }
+
+    /// **A link low on a long page is found by selector.** Resolution shared
+    /// `ui_tree`'s 400-element cap, so everything past the 400th element of an
+    /// article could not be selected (measured on a Wikipedia article).
+    #[test]
+    fn a_control_past_the_print_cap_is_found_by_selector() {
+        let print_cap = crate::limits::get().tree_max_elements;
+        let low = print_cap + 600;
+        let page = long_page(low + 50);
+        let found = walked(&page, 4);
+        assert!(found.len() > low, "the resolving walk kept {}", found.len());
+        let s = sel(&format!("role=link;name=link{low}"));
+        let hit = s.resolve_in(&found).expect("found past the print cap");
+        assert_eq!(hit.name, format!("link{low}"));
+        // The same walk, cut at what is printed, cannot see it.
+        let printed = walk(
+            &page,
+            4,
+            print_cap,
+            &|n: &Node, id, d| Element {
+                id,
+                depth: d,
+                role: n.role,
+                name: n.name.clone(),
+                rect: rect(),
+                enabled: true,
+                secret: false,
+                automation_id: String::new(),
+            },
+            &|n: &Node| n.kids.clone(),
+        );
+        assert!(printed.truncated);
+        assert_eq!(printed.elements.len(), print_cap);
+        assert!(s.resolve_in(&printed.elements).is_err());
+        // And the resolving walk is bounded: by visits, not unbounded.
+        let huge = walked(
+            &long_page(crate::limits::get().tree_max_visited as usize + 500),
+            4,
+        );
+        assert!(huge.len() <= crate::limits::get().tree_max_visited as usize);
+    }
+
+    /// What `ui_tree` printed still means the same control to the resolver:
+    /// the walk order is the same, the larger cap only keeps more of the tail.
+    #[test]
+    fn a_selector_printed_within_the_cap_still_means_the_same_control() {
+        let print_cap = crate::limits::get().tree_max_elements;
+        // Names repeat, so the selectors printed for them carry an nth.
+        let twins = node(
+            Role::Window,
+            "Article",
+            (0..print_cap + 300)
+                .map(|i| node(Role::Link, &format!("same{}", i % 3), vec![]))
+                .collect(),
+        );
+        let all_twins = walked(&twins, 4);
+        let printed_twins = &all_twins[..print_cap];
+        let selectors = selectors_for(printed_twins, false, None);
+        for (e, s) in printed_twins.iter().zip(&selectors) {
+            let s = Selector::parse(&s.render()).unwrap();
+            let got = s.resolve_in(&all_twins).unwrap_or_else(|why| {
+                panic!("`{}` for {e:?}: {why}", s.render());
+            });
+            assert_eq!((got.id, got.name.as_str()), (e.id, e.name.as_str()));
+        }
+        assert!(selectors.iter().any(|s| s.render().contains("nth=")));
+    }
+
+    // ---- a browser's first walk ----
+
+    fn page_tree(with_target: bool) -> Tree {
+        let mut elements = vec![button(1, "Back")];
+        if with_target {
+            elements.push(Element {
+                role: Role::Link,
+                ..button(2, "Honshu")
+            });
+        }
+        tree_of(elements, false)
+    }
+
+    /// Run `resolve_with` over `trees` (one per look, the last repeating) and
+    /// say how many looks and pauses it took.
+    fn resolve_over(
+        app: &str,
+        selector: &str,
+        trees: Vec<Tree>,
+    ) -> (Result<Resolved, DesktopError>, usize, usize) {
+        let looks = std::cell::Cell::new(0usize);
+        let pauses = std::cell::Cell::new(0usize);
+        let result = resolve_with(
+            window("7", app, "Page"),
+            &sel(selector),
+            5,
+            &mut || {
+                let at = looks.get().min(trees.len() - 1);
+                looks.set(looks.get() + 1);
+                Ok(trees[at].clone())
+            },
+            &mut || pauses.set(pauses.get() + 1),
+        );
+        (result, looks.get(), pauses.get())
+    }
+
+    /// **A browser's first walk of a page may hold only the browser.** Chrome
+    /// builds the page's accessibility tree once asked, so a selector that finds
+    /// nothing in a browser is tried once more after a pause.
+    #[test]
+    fn a_miss_in_a_browser_waits_once_and_looks_again() {
+        let (got, looks, pauses) = resolve_over(
+            "chrome",
+            "role=link;name=Honshu",
+            vec![page_tree(false), page_tree(true)],
+        );
+        assert_eq!(got.unwrap().element.name, "Honshu");
+        assert_eq!((looks, pauses), (2, 1));
+    }
+
+    #[test]
+    fn a_hit_in_a_browser_costs_no_pause_and_a_second_look() {
+        let (got, looks, pauses) = resolve_over(
+            "Google Chrome",
+            "role=link;name=Honshu",
+            vec![page_tree(true)],
+        );
+        assert!(got.is_ok());
+        assert_eq!((looks, pauses), (1, 0));
+    }
+
+    #[test]
+    fn a_browser_that_still_has_no_match_is_asked_once_not_forever_and_says_so() {
+        let (got, looks, pauses) =
+            resolve_over("msedge", "role=link;name=Honshu", vec![page_tree(false)]);
+        let err = got.unwrap_err().to_string();
+        assert_eq!(
+            (looks, pauses),
+            (2, 1),
+            "one retry, however often it misses"
+        );
+        assert!(err.contains("matches no element"), "{err}");
+        assert!(err.contains("accessibility tree when first asked"), "{err}");
+    }
+
+    #[test]
+    fn a_miss_in_another_program_is_not_retried() {
+        let (got, looks, pauses) =
+            resolve_over("notepad", "role=link;name=Honshu", vec![page_tree(false)]);
+        let err = got.unwrap_err().to_string();
+        assert_eq!((looks, pauses), (1, 0));
+        assert!(!err.contains("when first asked"), "{err}");
+    }
+
+    #[test]
+    fn an_ambiguity_in_a_browser_is_an_answer_and_is_not_retried() {
+        let mut two = page_tree(true);
+        two.elements.push(Element {
+            role: Role::Link,
+            ..button(3, "Honshu")
+        });
+        let (got, looks, pauses) = resolve_over("firefox", "role=link;name=Honshu", vec![two]);
+        assert!(got.unwrap_err().to_string().contains("matches 2 elements"));
+        assert_eq!((looks, pauses), (1, 0));
+    }
+
+    #[test]
+    fn browsers_are_told_from_other_programs_by_name() {
+        for app in [
+            "chrome",
+            "Google Chrome",
+            "msedge",
+            "Microsoft Edge",
+            "firefox",
+            "brave",
+        ] {
+            assert!(is_browser(app), "{app}");
+        }
+        for app in ["notepad", "explorer", "archive", "search", ""] {
+            assert!(!is_browser(app), "{app}");
+        }
     }
 }

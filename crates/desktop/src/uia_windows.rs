@@ -260,13 +260,17 @@ pub(super) fn window_info(window: Option<&str>) -> Result<WindowInfo, DesktopErr
     Ok(target(&automation, window)?.1)
 }
 
-pub(super) fn tree(window: Option<&str>, max_depth: u32) -> Result<Tree, DesktopError> {
+pub(super) fn tree(
+    window: Option<&str>,
+    max_depth: u32,
+    keep: usize,
+) -> Result<Tree, DesktopError> {
     let automation = automation()?;
     let (root, info) = target(&automation, window)?;
     let walker = automation
         .create_tree_walker()
         .map_err(|e| DesktopError::Os(format!("could not walk the tree: {e}")))?;
-    let walked = walk(&root, max_depth, &describe, &|e: &UIElement| {
+    let walked = walk(&root, max_depth, keep, &describe, &|e: &UIElement| {
         children_of(&walker, e)
     });
     Ok(Tree {

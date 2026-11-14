@@ -45,9 +45,30 @@ pub const DEFAULT_DEPTH: u32 = super::limits::DEFAULT_TREE_DEPTH;
 /// admin.json `desktop_limits.tree_max_elements` changes it.
 pub const MAX_ELEMENTS: usize = super::limits::DEFAULT_TREE_MAX_ELEMENTS as usize;
 
-/// The element cap in force.
+/// The element cap in force for what `ui_tree` PRINTS.
 fn max_elements() -> usize {
     super::limits::get().tree_max_elements
+}
+
+/// The element cap in force when a walk is made to FIND a control (a selector,
+/// `wait_for`, acting on what a selector found).
+///
+/// Printing is bounded by what fits in the agent's context (400 by default);
+/// finding is not, since only one control is reported. Sharing the print cap
+/// hid everything past the first 400 elements of a long page: a link low on a
+/// Wikipedia article could not be selected at all. So finding is bounded by the
+/// walk's other bound, the number of nodes VISITED (`tree_max_visited`, 4000 by
+/// default), which already caps its time and cost, and never by less than the
+/// print cap (an operator who raises that cap is not lowered below it).
+///
+/// The walk order is the same, so a control within the first 400 has the same
+/// id, `nth` and `path` whichever cap walked: a selector `ui_tree` printed
+/// still means the same control.
+pub(crate) fn resolve_max_elements() -> usize {
+    let limits = super::limits::get();
+    limits
+        .tree_max_elements
+        .max(limits.tree_max_visited as usize)
 }
 
 /// A control's kind, in a small closed vocabulary.
@@ -520,7 +541,7 @@ pub fn window_position_unknown(window: &WindowInfo) -> Option<String> {
 /// the focused window.
 pub fn window_tree(window: Option<&str>, depth: u32) -> Result<Tree, DesktopError> {
     let depth = bounded(depth);
-    let tree = platform::tree(window, depth)?;
+    let tree = platform::tree(window, depth, max_elements())?;
     remember_shown(&tree, depth);
     Ok(tree)
 }
@@ -617,7 +638,7 @@ pub fn locate(window: Option<&str>, id: u32) -> Result<Option<Element>, DesktopE
     let (info, depth, want) = wanted(window, id)?;
     // Not `window_tree`: this walk is a check, and recording it as shown
     // would let a retry of the same stale id pass against it unseen.
-    let tree = platform::tree(Some(&info.id), depth)?;
+    let tree = platform::tree(Some(&info.id), depth, max_elements())?;
     // A position is what the caller wants from this; one that is not real
     // would put the click in the window's corner.
     if let Some(why) = tree.no_positions {
@@ -705,7 +726,7 @@ mod platform {
     pub(super) fn window_info(_: Option<&str>) -> Result<WindowInfo, DesktopError> {
         Err(NO)
     }
-    pub(super) fn tree(_: Option<&str>, _: u32) -> Result<Tree, DesktopError> {
+    pub(super) fn tree(_: Option<&str>, _: u32, _: usize) -> Result<Tree, DesktopError> {
         Err(NO)
     }
     pub(super) fn set_value(
@@ -740,6 +761,8 @@ struct Walk<'a, N> {
     out: Vec<Element>,
     next_id: u32,
     max_visited: u32,
+    /// Most elements kept: `ui_tree`'s cap, or [`resolve_max_elements`].
+    keep: usize,
     truncated: bool,
     offscreen: u32,
     want: Option<&'a Want>,
@@ -762,7 +785,7 @@ impl<N: Clone> Walk<'_, N> {
         if self.done {
             return;
         }
-        if self.out.len() >= max_elements() || self.next_id >= self.max_visited {
+        if self.out.len() >= self.keep || self.next_id >= self.max_visited {
             self.truncated = true;
             self.done = true;
             return;
@@ -806,6 +829,7 @@ impl<N: Clone> Walk<'_, N> {
 pub(crate) fn walk<N: Clone>(
     root: &N,
     max_depth: u32,
+    keep: usize,
     describe: &dyn Fn(&N, u32, u32) -> Element,
     children: &dyn Fn(&N) -> Vec<N>,
 ) -> Walked {
@@ -816,6 +840,7 @@ pub(crate) fn walk<N: Clone>(
         out: Vec::new(),
         next_id: 0,
         max_visited: super::limits::get().tree_max_visited,
+        keep,
         truncated: false,
         offscreen: 0,
         want: None,
@@ -850,6 +875,8 @@ pub(crate) fn find<N: Clone>(
         out: Vec::new(),
         next_id: 0,
         max_visited: super::limits::get().tree_max_visited,
+        // Ids a selector's walk handed out can lie past what `ui_tree` prints.
+        keep: resolve_max_elements(),
         truncated: false,
         offscreen: 0,
         want: Some(want),
@@ -906,7 +933,7 @@ mod tests {
     }
 
     fn walk_of(root: &Node, depth: u32) -> (Vec<Element>, bool) {
-        let walked = walk(root, depth, &node, &|n: &Node| n.2.clone());
+        let walked = walk(root, depth, MAX_ELEMENTS, &node, &|n: &Node| n.2.clone());
         (walked.elements, walked.truncated)
     }
 
@@ -1060,7 +1087,7 @@ mod tests {
             ],
         );
         let children = |n: &Node| n.2.clone();
-        let walked = walk(&tree, 8, &node, &children);
+        let walked = walk(&tree, 8, MAX_ELEMENTS, &node, &children);
         let seen: Vec<(u32, &str)> = walked
             .elements
             .iter()
@@ -1114,6 +1141,33 @@ mod tests {
         let (kept, truncated) = walk_of(&Node(Role::Window, "w", leaves), 4);
         assert_eq!(kept.len(), MAX_ELEMENTS);
         assert!(truncated);
+    }
+
+    /// Finding is bounded by visits, not by what printing is: the resolving cap
+    /// is never below the print cap, and a control past the print cap keeps the
+    /// id it would have, found by id too.
+    #[test]
+    fn finding_a_control_is_not_held_to_the_print_cap() {
+        assert!(resolve_max_elements() >= max_elements());
+        assert!(resolve_max_elements() > MAX_ELEMENTS);
+        let leaves = (0..MAX_ELEMENTS + 50)
+            .map(|_| Node(Role::Button, "b", vec![]))
+            .collect::<Vec<_>>();
+        let tree = Node(Role::Window, "w", leaves);
+        let children = |n: &Node| n.2.clone();
+        let printed = walk(&tree, 4, max_elements(), &node, &children);
+        let found = walk(&tree, 4, resolve_max_elements(), &node, &children);
+        assert!(printed.truncated && !found.truncated);
+        // Every leaf, and the window above them.
+        assert_eq!(found.elements.len(), MAX_ELEMENTS + 51);
+        assert_eq!(
+            printed.elements[..],
+            found.elements[..MAX_ELEMENTS],
+            "the larger walk starts exactly as the printed one"
+        );
+        let low = &found.elements[MAX_ELEMENTS + 10];
+        let (_, again) = find(&tree, 4, &node, &children, &want(low)).expect("past the cap");
+        assert_eq!(again.id, low.id);
     }
 
     /// macOS roles map onto the same vocabulary as Windows; a tab is a radio

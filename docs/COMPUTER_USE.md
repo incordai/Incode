@@ -280,6 +280,18 @@ ids work exactly as before.
 | `nth` | which of several matches, from 0, in `ui_tree` order. Out of range is an error |
 | `depth` | how deep the window is walked to find the control (default 12, held to 4x that). `nth` and `path` count the controls of a walk, so the walk that prints a selector and the one that resolves it must be the same: `ui_tree` writes `depth=N` into every selector when it was asked for a depth other than the default, and the resolver walks as deep as the selector says, else to the default. Not a control part on its own |
 
+*Resolution's own bound.* `ui_tree` stops printing at 400 elements (what fits in a reply). A
+selector is resolved against its **own** walk, which is bounded by the number of nodes
+visited (`desktop_limits.tree_max_visited`, default 4000: the limit on time and cost every walk
+already had) and not by the print cap, so a link far down a long article is found. The walk
+order is the same, so a control within the first 400 has the same id, `nth` and `path` in
+both. When even the larger bound cuts the walk, an error or result says so and that a second
+match may lie beyond it. *Browsers.* A browser exposes a page only after a client asks for it,
+so its first walk can hold just its own controls. A selector that matches nothing in a
+browser window (chrome, msedge, firefox, brave, vivaldi, opera, chromium) is walked once more
+after 1.5 s, and the error then says it waited; a match, an ambiguity or any other program is
+never retried. `wait_for` needs none of this, since it polls.
+
 `key=value` pairs joined by `;`, with no spaces around the `;`; `\\`, `\;`, `\n`, `\r` escape a
 value. Unknown or repeated keys and bad numbers are refused by name. `app`/`window` pick the
 window (the one named, else `window=<id>`, else the focused one); the other keys pick the
@@ -318,9 +330,12 @@ is the one watched, by id, so a change of focus is not mistaken for the control 
 *Bounds.* `timeout_ms` default 5000, held to **60000** (a longer request is held to it and the
 reply's `notes` says so); `poll_ms` default 250, held to 50 to 2000. The first look is at once;
 no look starts after the deadline, and the last starts exactly at it, so a condition that
-comes true at the deadline is caught; a look under way is not interrupted, so the call can end
-later than `timeout_ms` by one look (listing the windows takes a few hundred ms on a busy
-Windows desktop, measured). The operator's stop (stop file or `Safety`) is asked between
+comes true at the deadline is caught. Each look runs on a thread of its own and is waited for
+until the deadline plus 1 s: a look the desktop does not answer by then (a program that
+hangs, a window that closed under the walk) counts as a look that saw nothing, and the wait
+ends as a `timeout` whose `last_seen` says so, never as `gone`. So the call ends no later
+than `timeout_ms` plus that second. A pinned window that no
+longer exists is `element_gone` at once. The operator's stop (stop file or `Safety`) is asked between
 looks and every 100 ms of sleeping, and ends the wait with the stop's refusal.
 
 *Reply.* JSON whose `result` is `found` or `timeout` (a timeout is a reply, not a tool error,

@@ -624,8 +624,9 @@ fn by_selector(done: String, found: &uia::Resolved) -> String {
 fn with_cut_note(base: String, found: &uia::Resolved) -> String {
     if found.truncated {
         format!(
-            "{base} (the tree was cut at its element limit, so a second control that fits the \
-             selector may lie beyond it)"
+            "{base} (the walk was cut at its bound of {} nodes visited, so a second control \
+             that fits the selector may lie beyond it)",
+            crate::limits::get().tree_max_visited
         )
     } else {
         base

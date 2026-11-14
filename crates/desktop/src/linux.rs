@@ -1143,13 +1143,18 @@ pub(crate) fn window_info(window: Option<&str>) -> Result<WindowInfo, DesktopErr
     Ok(target(&desktop, window)?.info.clone())
 }
 
-pub(crate) fn tree(window: Option<&str>, max_depth: u32) -> Result<Tree, DesktopError> {
+pub(crate) fn tree(
+    window: Option<&str>,
+    max_depth: u32,
+    keep: usize,
+) -> Result<Tree, DesktopError> {
     let desktop = desktop()?;
     let listed = target(&desktop, window)?;
     let (bus, window) = accessible(&desktop, listed)?;
     let walked = uia::walk(
         window,
         max_depth,
+        keep,
         &|node: &Node, id, depth| describe(bus, node, id, depth),
         &|node: &Node| children(bus, node),
     );
@@ -1229,7 +1234,9 @@ pub(crate) fn set_value(
     // What it held before (never a password field's), to tell a field that
     // ignored the set from one whose read-back is unreliable.
     let before = (!described.secret)
-        .then(|| ask::<String, _>(bus, &node, "org.a11y.atspi.Text", "GetText", &(0i32, -1i32)).ok())
+        .then(|| {
+            ask::<String, _>(bus, &node, "org.a11y.atspi.Text", "GetText", &(0i32, -1i32)).ok()
+        })
         .flatten();
     let set: bool = ask(
         bus,
@@ -1249,7 +1256,10 @@ pub(crate) fn set_value(
     let did = described.set_to(value);
     let tried = described.tried_to_set(value);
     if described.secret {
-        return Ok(Done::unverified(tried, "a password field is never read back"));
+        return Ok(Done::unverified(
+            tried,
+            "a password field is never read back",
+        ));
     }
     Ok(
         match ask::<String, _>(bus, &node, "org.a11y.atspi.Text", "GetText", &(0i32, -1i32)) {

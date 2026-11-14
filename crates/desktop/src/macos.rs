@@ -679,9 +679,13 @@ pub(crate) fn window_info(window: Option<&str>) -> Result<WindowInfo, DesktopErr
     Ok(target(window)?.1)
 }
 
-pub(crate) fn tree(window: Option<&str>, max_depth: u32) -> Result<Tree, DesktopError> {
+pub(crate) fn tree(
+    window: Option<&str>,
+    max_depth: u32,
+    keep: usize,
+) -> Result<Tree, DesktopError> {
     let (root, info) = target(window)?;
-    let walked = walk(&root, max_depth, &describe, &children);
+    let walked = walk(&root, max_depth, keep, &describe, &children);
     Ok(Tree {
         root_name: info.title,
         window: info.id,
@@ -726,7 +730,10 @@ pub(crate) fn set_value(
     let did = described.set_to(value);
     let tried = described.tried_to_set(value);
     if described.secret {
-        return Ok(Done::unverified(tried, "a password field is never read back"));
+        return Ok(Done::unverified(
+            tried,
+            "a password field is never read back",
+        ));
     }
     // `text_attribute` trims and drops an empty value, so the sent text is
     // trimmed too and an empty read-back is `None`.
