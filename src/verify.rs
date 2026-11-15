@@ -2039,14 +2039,10 @@ mod tests {
         #[cfg(not(windows))]
         {
             let script_path = dir.path().join("check.sh");
-            std::fs::write(&script_path, "#!/bin/sh\necho verified_ok\nexit 0\n").expect("write");
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
-                perms.set_mode(0o755);
-                std::fs::set_permissions(&script_path, perms).unwrap();
-            }
+            crate::test_support::write_script(
+                &script_path,
+                "#!/bin/sh\necho verified_ok\nexit 0\n",
+            );
             let argv = vec![script_path.to_string_lossy().to_string()];
             let outcome = run(&argv, dir.path()).expect("script runs");
             assert_eq!(outcome.exit(), Some(0));

@@ -585,7 +585,6 @@ fn child_script(path: &Path, records_argv: Option<&Path>, marker: &str, value: &
     let exe = std::env::current_exe().expect("test binary");
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
         let before = records_argv
             .map(|argv| format!("printf '%s\\0' \"$@\" > '{}'", argv.display()))
             .unwrap_or_default();
@@ -594,8 +593,7 @@ fn child_script(path: &Path, records_argv: Option<&Path>, marker: &str, value: &
             value.display(),
             exe.display()
         );
-        std::fs::write(path, body).expect("write the script");
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("runnable");
+        crate::test_support::write_script(path, &body);
     }
     #[cfg(windows)]
     {

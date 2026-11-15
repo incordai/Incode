@@ -252,14 +252,11 @@ fn fake_soffice(dir: &Path) -> PathBuf {
     }
     #[cfg(not(windows))]
     {
-        use std::os::unix::fs::PermissionsExt;
         let path = dir.join("soffice");
-        std::fs::write(
+        crate::test_support::write_script(
             &path,
             "#!/bin/sh\nall=\"$*\"\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = --outdir ]; then out=\"$2\"; shift; fi\n  last=\"$1\"; shift\ndone\nstem=$(basename \"$last\"); stem=${stem%.*}\necho \"$all\" > \"$out/$stem.pdf\"\n",
-        )
-        .expect("fake");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        );
         path
     }
 }

@@ -69,6 +69,8 @@ pub mod task_run;
 pub mod team;
 pub mod team_mcp;
 pub mod telemetry;
+#[cfg(all(test, not(windows)))]
+pub(crate) mod test_support;
 pub mod text;
 pub mod tool_bridge;
 pub mod toolbox;

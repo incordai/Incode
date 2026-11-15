@@ -814,7 +814,6 @@ pub(crate) mod fake {
         }
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
             let mut script = String::from("#!/bin/sh\nhere=\"$(dirname \"$0\")\"\n");
             for (sub, reply) in replies {
                 script.push_str(&format!(
@@ -832,9 +831,7 @@ pub(crate) mod fake {
             }
             script.push_str("exit 0\n");
             let path = dir.join("fake-engine.sh");
-            std::fs::write(&path, script).expect("write the fake engine");
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-                .expect("make it runnable");
+            crate::test_support::write_script(&path, &script);
             path
         }
     }
@@ -967,15 +964,13 @@ mod tests {
         let bin = {
             // The shared helper is `sh -c <script>`; as an engine it has to be
             // one runnable file.
-            use std::os::unix::fs::PermissionsExt;
             let script = command
                 .get_args()
                 .nth(1)
                 .map(|a| a.to_string_lossy().into_owned())
                 .expect("the script");
             let path = dir.path().join("slow-engine.sh");
-            std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).expect("write");
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+            crate::test_support::write_script(&path, &format!("#!/bin/sh\n{script}\n"));
             path
         };
         let engine = fake::engine(bin).capped(Duration::from_secs(3));
