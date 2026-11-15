@@ -131,6 +131,7 @@ fn connect_ext_tools(prepared: &Prepared) {
     for line in said {
         render::print_info(&line);
     }
+    crate::plugins::offer_engine_plugins(&prepared.workspace, &prepared.session.session_tools());
     let on_connected: crate::toolbox::OnConnected =
         std::sync::Arc::new(|line| crate::trace!("tool", "{line}"));
     for line in prepared.session.session_tools().connect_client_servers(

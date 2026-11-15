@@ -60,6 +60,7 @@ mod convert;
 mod desktop;
 mod dispatch;
 mod edits;
+pub(crate) mod engine_plugins;
 mod gates;
 mod image;
 mod listing;
@@ -209,6 +210,9 @@ pub fn reach_of(name: &str) -> Option<Reach> {
         // Each writes a PDF into the workspace.
         CONVERT_DOCUMENT | RENDER_PDF => Reach::Change,
         BASH | KILL_SHELL | DIAGNOSTICS | AGENT | crate::verify::VERIFY_TOOL => Reach::Run,
+        // What a plugin's server or tool touches cannot be known from here,
+        // and describing one may start its program: as every MCP tool.
+        engine_plugins::PLUGIN_TOOLS | engine_plugins::PLUGIN_CALL => Reach::Run,
         // The desktop: looking at the screen observes; everything that moves
         // the mouse or types acts on a machine signed into real accounts.
         other if desktop::OBSERVING.contains(&other) => Reach::Observe,
@@ -247,6 +251,10 @@ pub struct SessionTools {
     /// `allowed-tools` narrowed it; `None` the rest of the time. Set and
     /// lifted by the session around one turn ([`TurnRestriction`]).
     turn_allow: Mutex<Option<Arc<crate::permissions::rules::Allowlist>>>,
+    /// The plugin tool servers the memory engine runs for this session, when
+    /// it named any at the start ([`engine_plugins`]); `None` otherwise, and
+    /// then `PluginTools` and `PluginCall` are not offered.
+    engine_plugins: RwLock<Option<Arc<engine_plugins::Index>>>,
 }
 
 /// A turn's narrowing of the session's tools, in force until this is
@@ -348,7 +356,26 @@ impl SessionTools {
             filter_env,
             allowed: Arc::default(),
             turn_allow: Mutex::new(None),
+            engine_plugins: RwLock::new(None),
         })
+    }
+
+    /// Offer the memory engine's plugin tool servers in `index` through every
+    /// toolbox sharing this state. Set where the session's servers are
+    /// gathered (`cli::connect_ext_tools`, `task_run::connect_ext_tools`).
+    pub(crate) fn set_engine_plugins(&self, index: engine_plugins::Index) {
+        *self
+            .engine_plugins
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(index));
+    }
+
+    /// The memory engine's plugin tool servers, when there are any.
+    fn engine_plugins(&self) -> Option<Arc<engine_plugins::Index>> {
+        self.engine_plugins
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Hold every toolbox sharing this state to `list` until the returned
@@ -856,6 +883,9 @@ impl Toolbox {
             CONVERT_DOCUMENT => self.soffice().is_some(),
             SCREENSHOT => self.browser().is_some(),
             RENDER_PDF => self.printer().is_some(),
+            engine_plugins::PLUGIN_TOOLS | engine_plugins::PLUGIN_CALL => {
+                self.state.engine_plugins().is_some()
+            }
             other if desktop::is_desktop(other) => self.desktop.is_some(),
             _ => true,
         }
@@ -880,6 +910,10 @@ impl Toolbox {
                 "{name} is not available: no browser that can print was found (set {}, or \
                  install the headless browser)",
                 pdf::PDF_BROWSER_ENV
+            ),
+            engine_plugins::PLUGIN_TOOLS | engine_plugins::PLUGIN_CALL => format!(
+                "{name} is not available: the memory engine runs no plugin tool servers for \
+                 this session, or did not answer when it started"
             ),
             other => {
                 format!("{other} is not available: the desktop is not switched on for this session")
@@ -1444,6 +1478,13 @@ impl Toolbox {
                         def["description"] = json!(format!("{text} {shell}"));
                     }
                 }
+                // The memory engine's plugin servers, one line each, where the
+                // model decides whether one of them has the tool it needs.
+                if def.get("name").and_then(Value::as_str) == Some(engine_plugins::PLUGIN_TOOLS) {
+                    if let Some(index) = self.state.engine_plugins() {
+                        def["description"] = json!(index.description());
+                    }
+                }
                 if !browser
                     && def.get("name").and_then(Value::as_str) == Some(crate::web::FETCH_TOOL)
                 {
@@ -1704,6 +1745,7 @@ fn catalogue() -> Vec<Value> {
     all.push(pdf::definition());
     all.extend(team::definitions());
     all.extend(desktop::definitions());
+    all.extend(engine_plugins::definitions());
     all
 }
 
@@ -2260,6 +2302,15 @@ impl Toolbox {
             },
             other if desktop::is_desktop(other) => self.run_desktop(other, input),
             other if self.state.is_client_tool(other) => self.run_client_tool(other, input),
+            // A ToolOutput, so a plugin tool's pictures reach the model.
+            engine_plugins::PLUGIN_CALL => match self.state.engine_plugins() {
+                Some(index) => engine_plugins::call(&index, input),
+                None => Err(Self::unavailable(name)),
+            },
+            engine_plugins::PLUGIN_TOOLS => match self.state.engine_plugins() {
+                Some(index) => engine_plugins::describe(&index, input).map(ToolOutput::from),
+                None => Err(Self::unavailable(name)),
+            },
             other => self
                 .dispatch_text(call_id, other, input)
                 .map(ToolOutput::from),

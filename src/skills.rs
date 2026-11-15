@@ -135,12 +135,24 @@ pub fn skills_url() -> String {
 pub fn parse(body: &str) -> Result<Skillset, String> {
     let value: serde_json::Value = serde_json::from_str(body)
         .map_err(|e| format!("the skill store's answer did not parse: {e}"))?;
+    let mut discovered: Vec<Skill> = value
+        .get("discovered")
+        .map(discovered_from)
+        .unwrap_or_default();
+    // Installed plugins' skills, which the store lists only in its `catalog`:
+    // named `<plugin>:<skill>`, on while their plugin is.
+    for skill in value
+        .get("catalog")
+        .map(discovered_from)
+        .unwrap_or_default()
+    {
+        if skill.name.contains(':') && !discovered.iter().any(|s| s.name == skill.name) {
+            discovered.push(skill);
+        }
+    }
     Ok(Skillset {
         managed: value.get("managed").map(managed_from).unwrap_or_default(),
-        discovered: value
-            .get("discovered")
-            .map(discovered_from)
-            .unwrap_or_default(),
+        discovered,
     })
 }
 
@@ -192,7 +204,12 @@ pub fn load(root: &Path) -> (Skillset, Source) {
     let (mut set, source) = choose(fetched, root);
     // Plugins' skills are folders like any installed one, read from disk
     // rather than the store, so they are added after the cache is written.
-    set.discovered.extend(crate::plugins::session_skills());
+    // A plugin installed in incode wins over the store's copy of the same
+    // skill, as its servers win over the engine's (`plugins::offer_engine_plugins`).
+    let local = crate::plugins::session_skills();
+    set.discovered
+        .retain(|skill| !local.iter().any(|own| own.name == skill.name));
+    set.discovered.extend(local);
     (set, source)
 }
 
@@ -487,6 +504,38 @@ mod tests {
             set.discovered[0].path.ends_with("aframe-webxr"),
             "it carries the folder to read instead: {:?}",
             set.discovered[0]
+        );
+    }
+
+    /// **AN INSTALLED PLUGIN'S SKILLS COME FROM THE STORE'S CATALOG** —
+    /// named `<plugin>:<skill>`, while their plugin is on — and nothing else
+    /// in the catalog is added, nor a skill already listed.
+    #[test]
+    fn plugin_skills_are_taken_from_the_catalog_while_their_plugin_is_on() {
+        let answer = r#"{
+          "managed": [],
+          "discovered": [{"name": "kit:shared", "description": "listed already", "path": "/a"}],
+          "catalog": [
+            {"name": "kit:review", "description": "Review a change", "enabled": true,
+             "path": "/plugins/kit/1.0.0/skills/review/SKILL.md", "source": "claude"},
+            {"name": "off:design", "description": "Its plugin is off", "enabled": false,
+             "path": "/plugins/off/skills/design/SKILL.md", "source": "claude"},
+            {"name": "aframe", "description": "Not a plugin's", "enabled": true,
+             "path": "/agents/skills/aframe/SKILL.md", "source": "agents"},
+            {"name": "kit:shared", "description": "listed twice", "enabled": true,
+             "path": "/b", "source": "claude"}
+          ]}"#;
+        let set = parse(answer).expect("parses");
+        let names: Vec<&str> = set.discovered.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["kit:shared", "kit:review"]);
+        assert_eq!(set.discovered[0].path, "/a");
+        assert_eq!(
+            set.discovered[1].path,
+            "/plugins/kit/1.0.0/skills/review/SKILL.md"
+        );
+        assert!(
+            set.discovered[1].body.is_empty(),
+            "read only when asked for"
         );
     }
 

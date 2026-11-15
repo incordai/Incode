@@ -554,6 +554,46 @@ fn hooks_of(plugins: &[Plugin]) -> crate::hooks::HookConfig {
     all
 }
 
+/// Offer the memory engine's plugin tool servers through `tools`
+/// ([`crate::toolbox::engine_plugins`]), leaving out each one a usable local
+/// plugin already runs ([`local_server_keys`]) — the local one is started by
+/// [`session_servers`], with its hooks and its own keys, so none runs twice.
+/// Only for a session that has the engine, as every memory request is.
+///
+/// Called beside [`session_servers`] by `cli::connect_ext_tools` (REPL) and
+/// `task_run::connect_ext_tools` (`-t`).
+pub(crate) fn offer_engine_plugins(workspace: &Path, tools: &crate::toolbox::SessionTools) {
+    if crate::hooks::engine::Engine::locate().is_none() {
+        return;
+    }
+    let local = local_server_keys(workspace);
+    if let Some(index) = crate::toolbox::engine_plugins::fetch_index(&local) {
+        tools.set_engine_plugins(index);
+    }
+}
+
+/// The server names, as each plugin's own file writes them, of every usable
+/// plugin's MCP servers for `workspace`: `db` for the server `web_db`.
+#[must_use]
+pub(crate) fn local_server_keys(workspace: &Path) -> Vec<String> {
+    server_keys(&discover_usable(workspace).plugins)
+}
+
+/// [`local_server_keys`] of these plugins.
+fn server_keys(plugins: &[Plugin]) -> Vec<String> {
+    plugins
+        .iter()
+        .flat_map(|plugin| {
+            let prefix = format!("{}_", plugin.manifest.name);
+            plugin
+                .servers()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(move |spec| spec.name.strip_prefix(&prefix).map(str::to_string))
+        })
+        .collect()
+}
+
 /// Every plugin's MCP servers for `workspace`, and a line for each that could
 /// not be read.
 #[must_use]
@@ -1208,6 +1248,27 @@ mod tests {
         // What an approval is shown counts every event's commands.
         let shown = contents(&load_one(&project, Scope::Project).expect("project plugin"));
         assert!(shown.contains("4 hook(s)"), "{shown}");
+    }
+
+    /// **A LOCAL PLUGIN'S SERVERS ARE NAMED AS ITS OWN FILE NAMES THEM**, so
+    /// the memory engine's copy of the same server is left out of its index
+    /// (`offer_engine_plugins`) and not run twice.
+    #[test]
+    fn a_local_plugins_servers_are_named_as_its_file_names_them() {
+        let dir = tempfile::tempdir().expect("dir");
+        let root = plugin(dir.path(), "review-kit", "Reviews");
+        write(
+            &root.join(".mcp.json"),
+            r#"{"mcpServers": {"greptile": {"command": "g"}, "db": {"url": "http://x/mcp"}}}"#,
+        );
+        let bare = plugin(dir.path(), "bare", "No servers");
+        let plugins = [
+            load_one(&root, Scope::User).expect("loads"),
+            load_one(&bare, Scope::User).expect("loads"),
+        ];
+        let mut keys = server_keys(&plugins);
+        keys.sort();
+        assert_eq!(keys, ["db", "greptile"]);
     }
 
     #[test]
