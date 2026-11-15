@@ -58,7 +58,9 @@ mod client_servers;
 mod code_edits;
 mod convert;
 mod desktop;
+mod dispatch;
 mod edits;
+mod gates;
 mod image;
 mod listing;
 mod mcp_client;
@@ -76,6 +78,7 @@ pub use code_edits::{
     CodeEdits, EditLedger, EngineLedger, LedgerError, Route as EditRoute, ROOT_AGENT,
 };
 pub use desktop::DesktopSetup;
+use gates::Gate;
 pub use image::{Image, ImageFormat, ToolOutput, MAX_IMAGES_PER_RESULT, MAX_IMAGE_EDGE};
 pub(crate) use todo::{parse_todos, Priority, TodoStatus};
 
@@ -458,24 +461,6 @@ impl SessionTools {
     fn todos(&self) -> MutexGuard<'_, Vec<todo::Todo>> {
         self.todos.lock().unwrap_or_else(PoisonError::into_inner)
     }
-}
-
-/// What the memory engine decided about one call, before it runs.
-enum Gate {
-    /// Run it; `context` is guidance for this action, handed to the model with
-    /// the result.
-    Run { context: Option<String> },
-    /// Do not run it; the model is told why, as an error.
-    Refused(String),
-    /// A question the owner already answered in their app: the answer IS the
-    /// result, and it is not an error.
-    Answered(String),
-    /// The recorder already ran this exact call and served its recorded
-    /// output ([`crate::hooks::engine::is_served`]): that output IS the
-    /// result. It arrives shaped like a refusal, and handed back as one it
-    /// read as a failed call — so the model retried, or worked around a tool
-    /// that had in fact answered.
-    Served(String),
 }
 
 /// The most of the engine's reason a decision carries to a watch, in
@@ -1750,13 +1735,17 @@ impl Toolbox {
         result
     }
 
-    /// Every gate, then the tool: [`Self::run_call`]'s body.
-    fn decide_and_run(
+    /// The checks that cost nothing and ask nobody, first of
+    /// [`Self::decide_and_run`]'s gates: the tool exists, this agent may use
+    /// it, this session offers it, its input fits its schema, the command
+    /// that started the turn allows it, and no permission rule denies it.
+    /// Returns its reach and the rules' verdict, weighed with the mode later
+    /// (`Toolbox::mode_allows`, `toolbox/gates.rs`).
+    fn admit(
         &self,
-        call_id: &str,
         name: &str,
         input: &Value,
-    ) -> Result<ToolOutput, String> {
+    ) -> Result<(Reach, Option<crate::permissions::rules::Verdict>), String> {
         // A name nobody classified is not a tool: refused before a guard, a
         // person or the engine is asked about it. A tool of the client's MCP
         // servers RUNS something nobody here can inspect, so it is `run`:
@@ -1835,9 +1824,18 @@ impl Toolbox {
                 ));
             }
         }
-        // BEFORE the call, not after. The sentinel that watches the tree can
-        // only report a write that already happened; a protected path has to be
-        // refused while refusing it still means something.
+        Ok((reach, ruled))
+    }
+
+    /// The guards on protected paths, second of [`Self::decide_and_run`]'s
+    /// gates: a write to a protected path is refused, or put to a person
+    /// (`Toolbox::ask_protected`). `Ok(true)` when a person allowed it, so the
+    /// mode does not ask the same person the same thing again.
+    ///
+    /// BEFORE the call, not after. The sentinel that watches the tree can
+    /// only report a write that already happened; a protected path has to be
+    /// refused while refusing it still means something.
+    fn guard_protected(&self, call_id: &str, name: &str, input: &Value) -> Result<bool, String> {
         // Set when a person allowed a protected write, so a session that asks
         // before every change does not ask the same person the same thing twice.
         let mut confirmed = false;
@@ -1893,6 +1891,29 @@ impl Toolbox {
                 }
             }
         }
+        Ok(confirmed)
+    }
+
+    /// Every gate, then the tool: [`Self::run_call`]'s body.
+    ///
+    /// The order is the contract, each gate a step of its own: the free
+    /// checks ([`Self::admit`]), the guards on protected paths
+    /// ([`Self::guard_protected`]), the session's mode and the rules' ask and
+    /// allow (`Toolbox::mode_allows`), the operator's pre-tool hook
+    /// ([`Self::operator_hook_before`]), the memory engine
+    /// (`Toolbox::engine_gate`; both in `toolbox/gates.rs`), and the edit check
+    /// ([`Self::announce_or_refuse`]). Then the tool runs ([`Self::dispatch`]),
+    /// its writes are settled, the engine and the operator's post-tool hook
+    /// are told, and what they said travels with the result
+    /// ([`Self::with_guidance`]).
+    fn decide_and_run(
+        &self,
+        call_id: &str,
+        name: &str,
+        input: &Value,
+    ) -> Result<ToolOutput, String> {
+        let (reach, ruled) = self.admit(name, input)?;
+        let confirmed = self.guard_protected(call_id, name, input)?;
         // The session's mode, before the engine: it is decided here, costs
         // nothing, and a call it refuses need not cost an engine process. A
         // call a person already allowed is not asked about again: it is never
@@ -1933,43 +1954,8 @@ impl Toolbox {
         // The edit check, last: every gate above refuses a call for reasons
         // of its own, and a write announced to the engine and then refused
         // by one of them would leave a mark for a write that never came.
-        let announced = if reach == Reach::Change {
-            match self.announce_writes(call_id, name, input) {
-                Ok(announced) => announced,
-                Err(refusal) => {
-                    self.tell_decided(
-                        call_id,
-                        crate::watch::Decision {
-                            by: crate::watch::Decider::Engine,
-                            allowed: false,
-                            rule: None,
-                            path: None,
-                            reason: Some(crate::text::truncate(
-                                &refusal,
-                                MAX_DECISION_REASON_CHARS,
-                            )),
-                        },
-                    );
-                    return Err(refusal);
-                }
-            }
-        } else {
-            code_edits::Announced::default()
-        };
-        // With no engine, the guards had the last word on a call they look
-        // at, and it was yes.
-        if self.engine.is_none() && Self::guarded(name) && self.guards.is_ok() {
-            self.tell_decided(
-                call_id,
-                crate::watch::Decision {
-                    by: crate::watch::Decider::Guards,
-                    allowed: true,
-                    rule: None,
-                    path: None,
-                    reason: None,
-                },
-            );
-        }
+        let announced = self.announce_or_refuse(call_id, name, input, reach)?;
+        self.tell_guards_said_yes(call_id, name);
         // Every gate passed: the call RUNS, whatever it then returns.
         CALL_RAN.with(|ran| ran.set(true));
         let outcome = self.dispatch(call_id, name, input, reach);
@@ -1991,6 +1977,67 @@ impl Toolbox {
         // and the pre-tool commands printed travels with the result.
         let mut said_hooks = said_before;
         said_hooks.extend(self.operator_hook_after(name, input, &outcome));
+        Self::with_guidance(outcome, context, &said_hooks)
+    }
+
+    /// The edit check, last of [`Self::decide_and_run`]'s gates: a call that
+    /// changes something announces its writes ([`Self::announce_writes`]);
+    /// when that refuses, the watch is told it was the engine's refusal and
+    /// the call is not run. A call of any other reach announces nothing.
+    fn announce_or_refuse(
+        &self,
+        call_id: &str,
+        name: &str,
+        input: &Value,
+        reach: Reach,
+    ) -> Result<code_edits::Announced, String> {
+        if reach != Reach::Change {
+            return Ok(code_edits::Announced::default());
+        }
+        match self.announce_writes(call_id, name, input) {
+            Ok(announced) => Ok(announced),
+            Err(refusal) => {
+                self.tell_decided(
+                    call_id,
+                    crate::watch::Decision {
+                        by: crate::watch::Decider::Engine,
+                        allowed: false,
+                        rule: None,
+                        path: None,
+                        reason: Some(crate::text::truncate(&refusal, MAX_DECISION_REASON_CHARS)),
+                    },
+                );
+                Err(refusal)
+            }
+        }
+    }
+
+    /// With no engine, the guards had the last word on a call they look at,
+    /// and it was yes: the watch is told so ([`Self::tell_decided`]).
+    fn tell_guards_said_yes(&self, call_id: &str, name: &str) {
+        if self.engine.is_none() && Self::guarded(name) && self.guards.is_ok() {
+            self.tell_decided(
+                call_id,
+                crate::watch::Decision {
+                    by: crate::watch::Decider::Guards,
+                    allowed: true,
+                    rule: None,
+                    path: None,
+                    reason: None,
+                },
+            );
+        }
+    }
+
+    /// The call's result with what travels with it: the operator's hooks'
+    /// lines (`said_hooks`), after the engine's guidance for this action
+    /// (`context`), appended to the result or the error alike — the one place
+    /// the model reads them at the moment they apply.
+    fn with_guidance(
+        outcome: Result<ToolOutput, String>,
+        context: Option<String>,
+        said_hooks: &[String],
+    ) -> Result<ToolOutput, String> {
         let context = match (context, said_hooks.is_empty()) {
             (context, true) => context,
             (context, false) => {
@@ -2110,257 +2157,6 @@ impl Toolbox {
         for path in self.changed_paths(name, input).unwrap_or_default() {
             let shown = json!({ "path": self.absolute(&path) });
             engine.code_edit(at, name, &shown, said);
-        }
-    }
-
-    /// What the settings' permission rules say about this call, if anything.
-    fn rule_verdict(
-        &self,
-        name: &str,
-        input: &Value,
-    ) -> Option<crate::permissions::rules::Verdict> {
-        if self.rules.is_empty() {
-            return None;
-        }
-        self.rules
-            .decide(name, &self.rule_subject(name, input), &self.rule_context())
-    }
-
-    /// What a rule's specifier is matched against for this call: the command,
-    /// the paths or the address it names.
-    fn rule_subject(&self, name: &str, input: &Value) -> crate::permissions::rules::Subject {
-        use crate::permissions::rules::Subject;
-        let text = |key: &str| {
-            input
-                .get(key)
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string()
-        };
-        match name {
-            BASH => Subject::Command(text("command")),
-            // A search or a listing with no `path` covers the workspace.
-            READ | WRITE | EDIT | MULTI_EDIT | NOTEBOOK_EDIT | LS | OUTLINE | GLOB | GREP => {
-                let path = text("path");
-                Subject::Paths(vec![if path.is_empty() {
-                    ".".to_string()
-                } else {
-                    path
-                }])
-            }
-            APPLY_PATCH | CONVERT_DOCUMENT | RENDER_PDF => {
-                let mut paths = self.changed_paths(name, input).unwrap_or_default();
-                if let Some(read) = input.get("path").and_then(Value::as_str) {
-                    paths.push(read.to_string());
-                }
-                Subject::Paths(paths)
-            }
-            crate::web::FETCH_TOOL => Subject::Url(text("url")),
-            _ => Subject::None,
-        }
-    }
-
-    /// Where a rule's relative paths are resolved, and what `~` is.
-    fn rule_context(&self) -> crate::permissions::rules::PathContext {
-        crate::permissions::rules::PathContext {
-            workspace: self.workspace.clone(),
-            home: crate::admin::home_dir(),
-        }
-    }
-
-    /// Whether the session's permission mode, and the settings' `ask` and
-    /// `allow` rules, let this call run (a `deny` rule was applied before).
-    ///
-    /// Decided by the call's [`Reach`]: a tool that only observes runs under
-    /// every mode; everything else is refused read-only and asked about under
-    /// `prompt`. A subagent is refused wherever the mode restricts anything,
-    /// because the agent it would start does not carry this mode and could do
-    /// what this one may not.
-    ///
-    /// The rules come after those two refusals and before the rest: read-only
-    /// is a promise that nothing changes, which no allow rule breaks. Past it,
-    /// an `ask` rule asks the person, whatever the mode — even for a tool that
-    /// only observes — and an `allow` rule runs the call without the `prompt`
-    /// mode's question.
-    fn mode_allows(
-        &self,
-        call_id: &str,
-        name: &str,
-        input: &Value,
-        reach: Reach,
-        ruled: Option<&crate::permissions::rules::Verdict>,
-    ) -> Result<(), String> {
-        use crate::permissions::rules::Effect;
-        use crate::permissions::PermissionMode;
-        if let Some(mode) = self.mode {
-            let restricted = matches!(mode, PermissionMode::ReadOnly | PermissionMode::Prompt);
-            if name == AGENT && restricted {
-                return Err(format!(
-                    "this session is {}, and a subagent would not be held to that. Do the \
-                     work here instead.",
-                    mode.as_str()
-                ));
-            }
-            if mode == PermissionMode::ReadOnly && !reach.only_observes() {
-                return Err(format!(
-                    "NOT RUN — this session is read-only, and {name} changes the workspace or \
-                     runs code. Describe the change instead of making it."
-                ));
-            }
-        }
-        if let Some(verdict) = ruled {
-            match verdict.effect {
-                Effect::Ask => {
-                    let reason = format!("the {} asks before this {name}", verdict.describe());
-                    return self.confirm_with_person(call_id, name, input, &reason);
-                }
-                Effect::Allow => {
-                    crate::trace!("tool", "{name} allowed by {}", verdict.describe());
-                    return Ok(());
-                }
-                // Applied before this was asked.
-                Effect::Deny => {}
-            }
-        }
-        if reach.only_observes() {
-            return Ok(());
-        }
-        match self.mode {
-            Some(PermissionMode::Prompt) => {
-                let reason = format!("the session asks before every {name}");
-                self.confirm_with_person(call_id, name, input, &reason)
-            }
-            Some(
-                PermissionMode::ReadOnly
-                | PermissionMode::WorkspaceWrite
-                | PermissionMode::DangerFullAccess
-                | PermissionMode::Allow,
-            )
-            | None => Ok(()),
-        }
-    }
-
-    /// Put this call to the person at the session, for `reason`. Refused when
-    /// nobody can be asked.
-    fn confirm_with_person(
-        &self,
-        call_id: &str,
-        name: &str,
-        input: &Value,
-        reason: &str,
-    ) -> Result<(), String> {
-        let shown = self.event_input(name, input);
-        let ask = crate::hooks::engine::Ask {
-            call_id,
-            tool_name: name,
-            tool_input: &shown,
-            reason,
-        };
-        let stopped = || {
-            self.cancel
-                .as_ref()
-                .is_some_and(crate::runtime::cancel::CancelToken::is_cancelled)
-        };
-        let answer = self
-            .prompter
-            .as_ref()
-            .and_then(|p| p.confirm(&ask, &stopped));
-        crate::telemetry::permission_prompt(
-            name,
-            match &answer {
-                Some(crate::hooks::engine::Verdict::Allow) => "allow",
-                Some(crate::hooks::engine::Verdict::Deny(_)) => "deny",
-                None => "unanswered",
-            },
-        );
-        match answer {
-            Some(crate::hooks::engine::Verdict::Allow) => Ok(()),
-            Some(crate::hooks::engine::Verdict::Deny(why)) => Err(why),
-            None => Err(format!("NOT RUN — {reason}, and nobody could be asked.")),
-        }
-    }
-
-    /// What the memory engine says about this call.
-    ///
-    /// # The failure policy (the owner's decision)
-    ///
-    /// When the engine cannot decide — it is missing where it was named, it
-    /// crashed, it ran past its bound — a call that changes or runs something
-    /// ([`Reach::fails_closed`]) is REFUSED: the guard is a safety function,
-    /// and a change made because the guard was down is the one it exists to
-    /// stop. A call that only observes runs, traced. The same rule as the
-    /// guards file above: an unreadable guard must not read as no guard.
-    fn engine_gate(&self, call_id: &str, name: &str, input: &Value, reach: Reach) -> Gate {
-        let gate = self.engine_gate_inner(call_id, name, input, reach);
-        if self.engine.is_some() {
-            let (allowed, reason) = match &gate {
-                Gate::Run { .. } => (true, None),
-                Gate::Refused(why) => (false, Some(why.clone())),
-                // The owner answered a question in the app, or the recorder
-                // served the call: nothing was refused, and that is the result.
-                Gate::Answered(_) | Gate::Served(_) => (true, None),
-            };
-            self.tell_decided(
-                call_id,
-                crate::watch::Decision {
-                    by: crate::watch::Decider::Engine,
-                    allowed,
-                    rule: None,
-                    path: None,
-                    reason: reason
-                        .map(|why| crate::text::truncate(&why, MAX_DECISION_REASON_CHARS)),
-                },
-            );
-        }
-        gate
-    }
-
-    /// [`Self::engine_gate`]'s decision, before it is told.
-    fn engine_gate_inner(&self, call_id: &str, name: &str, input: &Value, reach: Reach) -> Gate {
-        let Some(engine) = &self.engine else {
-            return Gate::Run { context: None };
-        };
-        let shown = self.event_input(name, input);
-        let cancel = self.cancel.as_ref();
-        match engine.pre_tool(&self.session, &self.workspace, name, &shown, cancel) {
-            crate::hooks::engine::PreTool::Allow { context } => Gate::Run { context },
-            // Exit 2 on a question is the owner's ANSWER, given in the app.
-            crate::hooks::engine::PreTool::Block(said) if name == ASK_USER_QUESTION => {
-                Gate::Answered(said)
-            }
-            // Never for a write: the engine serves only reads (`Read`, recall,
-            // and a one-file `cat`/`head`/`tail`/`sed -n` through the shell),
-            // and a "served" answer to a write would read as a write that
-            // landed when none was made.
-            crate::hooks::engine::PreTool::Block(recorded)
-                if reach != Reach::Change && crate::hooks::engine::is_served(&recorded) =>
-            {
-                Gate::Served(recorded)
-            }
-            crate::hooks::engine::PreTool::Block(reason) => Gate::Refused(reason),
-            crate::hooks::engine::PreTool::Ask { reason, context } => {
-                let ask = crate::hooks::engine::Ask {
-                    call_id,
-                    tool_name: name,
-                    tool_input: &shown,
-                    reason: &reason,
-                };
-                let prompter = self.prompter.as_deref();
-                match engine.settle(&ask, &self.session, &self.workspace, prompter, cancel) {
-                    crate::hooks::engine::Verdict::Allow => Gate::Run { context },
-                    crate::hooks::engine::Verdict::Deny(why) => Gate::Refused(why),
-                }
-            }
-            crate::hooks::engine::PreTool::Failed(why) if reach.fails_closed() => {
-                Gate::Refused(format!(
-                    "NOT RUN — the Incord guard could not decide on this {name}, and a change \
-                     is not made unguarded: {why}"
-                ))
-            }
-            crate::hooks::engine::PreTool::Failed(why) => {
-                crate::trace!("tool", "{name} runs unguarded, the engine failed: {why}");
-                Gate::Run { context: None }
-            }
         }
     }
 
@@ -2546,107 +2342,6 @@ impl Toolbox {
             ),
         };
         ran.map_err(|e| e.to_string())
-    }
-
-    /// The tools whose answer is text alone.
-    fn dispatch_text(&self, call_id: &str, name: &str, input: &Value) -> Result<String, String> {
-        // The file and shell tools parse their own JSON from a string, which is
-        // the interface they were written to; re-serialising here keeps that
-        // contract rather than rewriting six working implementations.
-        let raw = input.to_string();
-        // The workspace, or the added directory the call names a path in —
-        // and for `Read` alone, a folder only it may open.
-        let ws = if name == READ {
-            self.read_root_for(input)
-        } else if matches!(
-            name,
-            WRITE | EDIT | GLOB | GREP | MULTI_EDIT | NOTEBOOK_EDIT | LS | OUTLINE
-        ) {
-            self.root_for(input)
-        } else {
-            self.workspace.as_path()
-        };
-
-        let background = input.get("run_in_background").and_then(Value::as_bool) == Some(true);
-        // The page's script, run by the headless browser, for a WebFetch
-        // that needs it — when the browser is installed.
-        let render = |url: &str| match self.browser() {
-            Some(bin) => browser::render_html(bin, url, self.filter_env),
-            None => Err("no headless browser is installed".to_string()),
-        };
-        let render: Option<crate::web::Render<'_>> = self.browser().is_some().then_some(&render);
-        match name {
-            READ => crate::tools::file_ops::read_file(ws, &raw).map_err(|e| e.to_string()),
-            WRITE => crate::tools::file_ops::write_file(ws, &raw).map_err(|e| e.to_string()),
-            EDIT => crate::tools::file_ops::edit_file(ws, &raw).map_err(|e| e.to_string()),
-            MULTI_EDIT => edits::multi_edit(ws, input),
-            NOTEBOOK_EDIT => edits::notebook_edit(ws, input),
-            APPLY_PATCH => edits::apply_patch(input, &|path| self.resolve(path)),
-            LS => listing::list(ws, input),
-            GLOB => crate::tools::search::glob_search(ws, input),
-            GREP => crate::tools::search::grep_search(ws, input),
-            OUTLINE => outline::run(ws, input),
-            CONVERT_DOCUMENT => match self.soffice() {
-                Some(soffice) => {
-                    convert::run(soffice, input, self.filter_env, &|path| self.resolve(path))
-                }
-                None => Err("LibreOffice was not found".to_string()),
-            },
-            BASH if background => shell::start(&self.state, ws, input, &self.sandbox()?),
-            BASH => {
-                // A write through the shell is credited to this agent: the
-                // engine's window around the command (`shell_window`).
-                let command = input.get("command").and_then(Value::as_str).unwrap_or("");
-                self.shell_window("begin", command, call_id);
-                let ran = self.run_shell(call_id, ws, &raw);
-                self.shell_window("end", command, call_id);
-                ran
-            }
-            BASH_OUTPUT => shell::output(&self.state, input),
-            KILL_SHELL => shell::kill(&self.state, input),
-            TODO_WRITE => todo::write(&mut self.state.todos(), input),
-            DIAGNOSTICS => checks::diagnostics(ws, input, &|path| self.resolve(path)),
-            crate::verify::VERIFY_TOOL => crate::verify::run_tool(ws),
-            crate::verify::PLAN_TOOL => Ok(crate::verify::run_plan_tool(ws)),
-            crate::recall::INDEX_TOOL => crate::recall::run_index_tool(&raw, ws),
-            crate::recall::GET_TOOL => crate::recall::run_get_tool(&raw),
-            crate::recall::TIMELINE_TOOL => crate::recall::run_timeline_tool(&raw),
-            crate::recorder::LOOKUP_TOOL => {
-                crate::recorder::run_lookup_tool(ws, input).map(|found| {
-                    if let Some(watch) = &self.watch {
-                        watch.recorded(call_id, found.hit, found.observations);
-                    }
-                    found.text
-                })
-            }
-            SKILL => self.read_skill(input),
-            AGENT => self.run_subagent(input),
-            ASK_USER_QUESTION => self.ask_here(input),
-            crate::brief::SAVE_TOOL => self.save_brief(&raw),
-            crate::brief_read::READ_TOOL => crate::brief_read::run(ws),
-            other => crate::knowledge::handle_tool(
-                other,
-                input,
-                &crate::knowledge::CodeContext {
-                    cwd: &self.workspace,
-                    session: &self.session,
-                    resolve: &|path| self.resolve(path),
-                },
-            )
-            .or_else(|| {
-                crate::session_record::handle_tool(
-                    other,
-                    input,
-                    &crate::session_record::Record {
-                        session: &self.session,
-                        workspace: &self.workspace,
-                    },
-                )
-            })
-            .or_else(|| crate::web::handle_tool(other, input, render))
-            .or_else(|| self.team.handle(other, input))
-            .unwrap_or_else(|| Err(format!("there is no tool called `{other}`"))),
-        }
     }
 }
 
