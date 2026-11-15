@@ -616,6 +616,7 @@ fn connect_ext_tools(workspace: &Path) -> std::sync::Arc<crate::toolbox::Session
     for line in said {
         eprintln!("incode: {line}");
     }
+    crate::plugins::offer_engine_plugins(workspace, &tools);
     let on_connected: crate::toolbox::OnConnected =
         std::sync::Arc::new(|line| crate::trace!("tool", "{line}"));
     for line in tools.connect_client_servers(specs, workspace, &on_connected) {
