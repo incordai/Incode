@@ -6,6 +6,10 @@
 //! `selector_tests::live`, and every step is one that touches nothing: a wait
 //! for a window that does not exist to be gone (found at once) or to appear (a
 //! timeout of 100 ms).
+//!
+//! A test that starts a [`Server`] starts the input thread, which on Linux
+//! needs a display: there it is ignored, as CI's Linux test job has none. The
+//! tests that start no server run everywhere.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -207,6 +211,10 @@ fn the_six_new_tools_are_offered_in_their_tiers() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "starts the input thread: needs a display"
+)]
 fn a_routine_is_saved_from_steps_listed_matched_and_forgotten() {
     let dir = folder("lifecycle");
     let mut s = server(&dir);
@@ -246,6 +254,10 @@ fn a_routine_is_saved_from_steps_listed_matched_and_forgotten() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "starts the input thread: needs a display"
+)]
 fn a_run_that_cannot_be_replayed_is_refused_with_the_reason_and_nothing_is_written() {
     let dir = folder("refused");
     let mut s = server(&dir);
@@ -288,6 +300,10 @@ fn a_run_that_cannot_be_replayed_is_refused_with_the_reason_and_nothing_is_writt
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "starts the input thread: needs a display"
+)]
 fn a_routine_is_learned_from_watchman_records_in_the_order_they_happened() {
     let dir = folder("records");
     let source = MemorySource::new()
@@ -341,6 +357,10 @@ fn never_gone_second() -> Value {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "starts the input thread: needs a display"
+)]
 fn a_failed_recorded_run_is_not_learned() {
     let dir = folder("failed-record");
     let source = MemorySource::new().with(Record::new(
@@ -362,6 +382,10 @@ fn a_failed_recorded_run_is_not_learned() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "starts the input thread: needs a display"
+)]
 fn a_saved_routine_runs_every_step_through_the_gates_and_the_journal() {
     let dir = folder("run");
     let journal = dir.join("desktop.jsonl");
@@ -405,6 +429,10 @@ fn a_saved_routine_runs_every_step_through_the_gates_and_the_journal() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "starts the input thread: needs a display"
+)]
 fn the_first_failing_step_stops_the_replay_and_the_rest_never_run() {
     let dir = folder("stop-first");
     let journal = dir.join("desktop.jsonl");
@@ -441,6 +469,10 @@ fn the_first_failing_step_stops_the_replay_and_the_rest_never_run() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "starts the input thread: needs a display"
+)]
 fn the_operators_hook_can_refuse_a_step_of_a_replay() {
     let dir = folder("veto");
     let (hooks, _pre, _post) = Recording::new(Some("wait_for"));
@@ -462,6 +494,10 @@ fn the_operators_hook_can_refuse_a_step_of_a_replay() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "starts the input thread: needs a display"
+)]
 fn the_stop_file_ends_a_replay_between_steps() {
     let dir = folder("stop-file");
     let journal = dir.join("desktop.jsonl");
@@ -484,6 +520,10 @@ fn the_stop_file_ends_a_replay_between_steps() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "starts the input thread: needs a display"
+)]
 fn a_read_only_session_may_look_at_routines_and_may_not_change_or_run_them() {
     let dir = folder("tier");
     let mut s = server(&dir).with_tier(Tier::Observe);
@@ -511,6 +551,10 @@ fn a_read_only_session_may_look_at_routines_and_may_not_change_or_run_them() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "starts the input thread: needs a display"
+)]
 fn a_routine_unused_for_thirty_days_is_gone_unless_it_was_taught() {
     let dir = folder("expiry");
     let old = |phrase: &str, taught: bool| Routine {
@@ -542,6 +586,10 @@ fn a_routine_unused_for_thirty_days_is_gone_unless_it_was_taught() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "starts the input thread: needs a display"
+)]
 fn a_stored_step_the_rules_refuse_runs_nothing() {
     let dir = folder("tampered");
     let (hooks, pre, _post) = Recording::new(None);
@@ -576,6 +624,10 @@ fn a_stored_step_the_rules_refuse_runs_nothing() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "starts the input thread: needs a display"
+)]
 fn a_server_without_routines_refuses_them_by_name() {
     let mut s = Server::new(InputThread::start().expect("input thread"));
     let reply = call(&mut s, "routine_list", json!({}));
@@ -624,6 +676,10 @@ fn a_keyboard_steps_window_is_looked_up_at_replay_and_a_missing_one_is_a_failed_
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "starts the input thread: needs a display"
+)]
 fn a_replayed_typing_step_into_a_window_that_is_not_there_fails_and_types_nothing() {
     let dir = folder("typing");
     let (hooks, pre, _post) = Recording::new(None);
@@ -663,6 +719,10 @@ fn a_replayed_typing_step_into_a_window_that_is_not_there_fails_and_types_nothin
 const TYPING_WINDOW: &str = NO_SUCH_WINDOW;
 
 #[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "starts the input thread: needs a display"
+)]
 fn a_secret_typed_into_a_password_field_is_a_parameter_and_never_stored_or_journalled() {
     let dir = folder("secret");
     let journal = dir.join("desktop.jsonl");
@@ -853,6 +913,10 @@ fn a_secret_typed_into_a_password_field_is_a_parameter_and_never_stored_or_journ
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "starts the input thread: needs a display"
+)]
 fn a_recordings_placeholder_is_a_parameter_and_is_not_replayed() {
     let dir = folder("redacted-record");
     let source = MemorySource::new().with(Record::new(
@@ -883,6 +947,10 @@ fn a_recordings_placeholder_is_a_parameter_and_is_not_replayed() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "starts the input thread: needs a display"
+)]
 fn the_full_text_of_every_step_is_shown_when_saving_listing_and_matching() {
     let dir = folder("review");
     let mut s = server(&dir);
@@ -922,6 +990,10 @@ fn the_full_text_of_every_step_is_shown_when_saving_listing_and_matching() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "starts the input thread: needs a display"
+)]
 fn the_agent_cannot_make_a_routine_kept_and_a_save_never_sets_it() {
     let dir = folder("taught");
     let mut s = server(&dir);
@@ -948,6 +1020,10 @@ fn the_agent_cannot_make_a_routine_kept_and_a_save_never_sets_it() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "starts the input thread: needs a display"
+)]
 fn a_failed_shell_call_or_a_failed_record_is_not_learned() {
     let dir = folder("any-failure");
     let source = MemorySource::new()
@@ -1044,6 +1120,10 @@ fn the_invoke_falls_back_to_the_recorded_click_only_when_it_was_refused_before_a
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "starts the input thread: needs a display"
+)]
 fn a_replay_leaves_a_folder_of_pictures_and_only_the_last_runs() {
     let dir = folder("pictures");
     let mut s = server(&dir);
@@ -1115,6 +1195,10 @@ fn a_replay_leaves_a_folder_of_pictures_and_only_the_last_runs() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "starts the input thread: needs a display"
+)]
 fn a_screen_that_cannot_be_captured_is_said_and_does_not_fail_the_replay() {
     let dir = folder("no-pictures");
     let kit = RoutineKit::new(Store::at(dir.join("routines.json")), Box::new(NoSource))
@@ -1139,6 +1223,10 @@ fn a_screen_that_cannot_be_captured_is_said_and_does_not_fail_the_replay() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "starts the input thread: needs a display"
+)]
 fn a_failed_replay_names_the_pictures_of_the_failed_step() {
     let dir = folder("failed-pictures");
     let mut s = server(&dir);
@@ -1170,6 +1258,10 @@ fn a_failed_replay_names_the_pictures_of_the_failed_step() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "starts the input thread: needs a display"
+)]
 fn two_servers_saving_at_once_each_keep_the_others_routines() {
     let dir = folder("two-servers");
     let workers: Vec<_> = (0..2)
@@ -1201,6 +1293,10 @@ fn two_servers_saving_at_once_each_keep_the_others_routines() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "starts the input thread: needs a display"
+)]
 fn a_routine_saved_for_copying_one_way_is_not_run_for_the_other() {
     let dir = folder("direction");
     let mut s = server(&dir);
@@ -1277,6 +1373,10 @@ fn ping(id: u32) -> Value {
 /// request sent runs to its own end and is answered, as does one with another
 /// request after it.
 #[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "starts the input thread: needs a display"
+)]
 fn a_pipelined_watch_completes_normally_after_end_of_input() {
     let dir = folder("eof-watch");
     let watch = |id: u32| {
@@ -1317,6 +1417,10 @@ fn a_pipelined_watch_completes_normally_after_end_of_input() {
 
 /// Likewise a replay that was the last request sent.
 #[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "starts the input thread: needs a display"
+)]
 fn a_pipelined_routine_run_completes_normally_after_end_of_input() {
     let dir = folder("eof-run");
     let mut s = server(&dir);
@@ -1341,6 +1445,10 @@ fn a_pipelined_routine_run_completes_normally_after_end_of_input() {
 /// The one thing end of input does: stop the desktop, after every line before it
 /// has been answered.
 #[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "starts the input thread: needs a display"
+)]
 fn end_of_input_with_nothing_running_stops_the_desktop_and_returns() {
     let dir = folder("eof-idle");
     let s = server(&dir);
@@ -1357,6 +1465,10 @@ fn end_of_input_with_nothing_running_stops_the_desktop_and_returns() {
 
 /// A picture is a `screenshot`: a hook that refuses it refuses the picture.
 #[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "starts the input thread: needs a display"
+)]
 fn a_hook_that_refuses_screenshot_refuses_the_replays_pictures_and_they_are_asked_of_it() {
     let dir = folder("screenshot-veto");
     let (hooks, pre, _post) = Recording::new(Some("screenshot"));
@@ -1395,6 +1507,10 @@ fn a_hook_that_refuses_screenshot_refuses_the_replays_pictures_and_they_are_aske
 
 /// No picture after a step that typed a secret, nor before the one after it.
 #[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "starts the input thread: needs a display"
+)]
 fn no_picture_is_taken_after_a_step_that_typed_a_secret_or_before_the_next() {
     use super::routine_tool::Live;
     use crate::routine::pictures::When;
@@ -1506,6 +1622,10 @@ fn the_hooks_are_not_shown_a_parameters_value_or_a_params_entry() {
 /// The person's "kept" is for what they read: other steps saved over it are not
 /// kept, and the reply says so.
 #[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "starts the input thread: needs a display"
+)]
 fn saving_other_steps_over_a_kept_routine_un_keeps_it_and_says_so() {
     let dir = folder("unkept");
     let mut s = server(&dir);
@@ -1543,6 +1663,10 @@ fn saving_other_steps_over_a_kept_routine_un_keeps_it_and_says_so() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "starts the input thread: needs a display"
+)]
 fn every_line_before_the_end_of_input_is_still_answered() {
     let dir = folder("eof-lines");
     let (to_server, from_client) = std::sync::mpsc::channel::<Vec<u8>>();
@@ -1560,6 +1684,10 @@ fn every_line_before_the_end_of_input_is_still_answered() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "starts the input thread: needs a display"
+)]
 fn watch_returns_at_once_for_a_condition_that_holds_and_tells_the_hook_what_it_saw() {
     let dir = folder("watch");
     let journal = dir.join("desktop.jsonl");
@@ -1606,6 +1734,10 @@ fn watch_returns_at_once_for_a_condition_that_holds_and_tells_the_hook_what_it_s
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "starts the input thread: needs a display"
+)]
 fn a_watch_that_times_out_is_a_reply_and_still_notifies() {
     let dir = folder("watch-timeout");
     let (hooks, _pre, post) = Recording::new(None);
@@ -1631,6 +1763,10 @@ fn a_watch_that_times_out_is_a_reply_and_still_notifies() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "starts the input thread: needs a display"
+)]
 fn the_stop_file_ends_a_watch_that_has_a_day_to_run() {
     let dir = folder("watch-stop");
     let journal = dir.join("desktop.jsonl");
@@ -1658,6 +1794,10 @@ fn the_stop_file_ends_a_watch_that_has_a_day_to_run() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "starts the input thread: needs a display"
+)]
 fn a_watch_message_that_is_too_long_or_not_text_is_refused() {
     let dir = folder("watch-message");
     let mut s = server(&dir);
