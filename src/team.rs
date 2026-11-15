@@ -14,7 +14,7 @@
 //!
 //! # Why a file, and not a socket or a queue
 //!
-//! Same reason as [`crate::desktop::journal`], and it is the same constraint.
+//! Same reason as [`incord_desktop::journal`], and it is the same constraint.
 //! An agent is a SUBPROCESS with its own loop; the harness does not share
 //! memory with it, and there may be no second agent alive at the moment a
 //! question is asked. A file is the one medium every participant can reach,

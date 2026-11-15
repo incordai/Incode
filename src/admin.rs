@@ -326,12 +326,12 @@ pub struct AdminConfig {
 
     /// The desktop's limits — rate cap, heartbeat, tree size, journal size,
     /// timeouts. Unset fields are the defaults; the two safety limits may
-    /// only be made stricter. See [`crate::desktop::limits`].
+    /// only be made stricter. See [`incord_desktop::limits`].
     #[serde(
         default,
-        skip_serializing_if = "crate::desktop::limits::DesktopLimits::is_empty"
+        skip_serializing_if = "incord_desktop::limits::DesktopLimits::is_empty"
     )]
-    pub desktop_limits: crate::desktop::limits::DesktopLimits,
+    pub desktop_limits: incord_desktop::limits::DesktopLimits,
 
     /// How the REPL says a long turn finished or that it is waiting on you:
     /// `auto` (the default: OSC 9 where the terminal is known to show it, a

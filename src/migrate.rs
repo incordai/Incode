@@ -613,13 +613,13 @@ mod tests {
     /// file added there later is migrated too — or this fails and says which.
     #[test]
     fn every_project_path_incode_writes_is_on_the_list() {
-        let desktop_stop = crate::desktop::safety::stop_path_in(Path::new(""));
+        let desktop_stop = incord_desktop::safety::stop_path_in(Path::new(""));
         let paths: Vec<String> = vec![
             crate::brief::CACHE_FILE.to_string(),
             crate::contracts::CONTRACTS_FILE.to_string(),
             crate::guards::GUARDS_FILE.to_string(),
             crate::findings::DIR.to_string(),
-            crate::desktop::journal::FILE.to_string(),
+            incord_desktop::journal::FILE.to_string(),
             desktop_stop.to_string_lossy().replace('\\', "/"),
             crate::team::FILE.to_string(),
             crate::transcript::DIR.to_string(),

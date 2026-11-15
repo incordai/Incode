@@ -1,16 +1,14 @@
-//! Computer use, as incode sees it: the `incord-desktop` crate (`crates/desktop`,
-//! binary `incu`) under its old path, and the few things that name incode.
+//! The part of computer use that names incode. The desktop itself is the
+//! `incord-desktop` crate (`crates/desktop`, binary `incu`).
 //!
 //! # Where this sits
 //!
 //! The desktop began as this module and moved out whole, for the reasons in the
 //! `incord-desktop` crate header: it does not depend on incode, and incode
-//! depends on it as it does on `incord-sandbox`. `pub use incord_desktop::*`
-//! keeps every `crate::desktop::…` path in incode (`serve::http`, `runtime::
-//! cancel`, `migrate`, `admin`, `cli`, the toolbox) as it was; rewriting them to
-//! name the crate is a later step.
-//!
-//! Three things are not re-exported as they are, because they are incode's:
+//! depends on it as it does on `incord-sandbox`. incode names the crate
+//! directly (`incord_desktop::journal`, `incord_desktop::capture`, …) for
+//! everything the crate has; this module holds only the three things that are
+//! incode's:
 //!
 //! - [`mcp::client_config`], [`mcp::client_config_json`] and
 //!   [`mcp::codex_config_overrides`] build the registration an agent CLI needs
@@ -28,13 +26,14 @@
 //! # Wired to
 //!
 //! - **Called by** `main.rs` (`Parsed::DesktopMcp`) for [`serve`];
-//!   `cli::agent_session` and `agent::codex` for [`mcp::codex_config_overrides`].
-//! - **Calls** `incord_desktop` for everything else.
+//!   `cli::agent_session` and `agent::codex` for [`mcp::codex_config_overrides`];
+//!   `serve::http`, `runtime::cancel` and `main.rs` (`--desktop-stop`) for
+//!   [`safety::request_stop`].
+//! - **Calls** `incord_desktop` (`cli::serve`, `safety::request_stop`).
 
 use std::path::PathBuf;
 
-pub use incord_desktop::*;
-
+use incord_desktop::cli;
 use incord_desktop::hooks::{HookOutcome, Hooks};
 use incord_desktop::permission::Tier;
 
@@ -42,9 +41,8 @@ use crate::admin::AdminConfig;
 use crate::permissions::PermissionMode;
 
 pub mod mcp {
-    //! The server (the crate's), and the registration of it that names incode.
-
-    pub use incord_desktop::mcp::*;
+    //! The registration of the desktop server (the crate's
+    //! `incord_desktop::mcp`) that names incode.
 
     use serde_json::{json, Value};
 
@@ -141,10 +139,8 @@ pub mod mcp {
 }
 
 pub mod safety {
-    //! The kill switch (the crate's), with incode's `.incode/` folder handling on
-    //! the one function that creates a file.
-
-    pub use incord_desktop::safety::*;
+    //! incode's `.incode/` folder handling on the one function of the crate's
+    //! kill switch (`incord_desktop::safety`) that creates a file.
 
     /// Ask the desktop at this path to stop.
     ///
@@ -259,6 +255,7 @@ pub fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use incord_desktop::permission;
     use serde_json::{json, Value};
 
     /// The config has to name the flag that actually starts the server.

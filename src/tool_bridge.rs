@@ -1087,9 +1087,9 @@ mod tests {
     fn the_bridge_hands_the_model_a_picture_and_incode_a_placeholder() {
         use std::sync::atomic::AtomicUsize;
         let ws = tempfile::tempdir().expect("ws");
-        let png = crate::desktop::capture::encode(
+        let png = incord_desktop::capture::encode(
             &image::RgbaImage::from_pixel(32, 24, image::Rgba([10, 20, 30, 255])),
-            crate::desktop::capture::ShotFormat::Png,
+            incord_desktop::capture::ShotFormat::Png,
             0,
         )
         .expect("png");

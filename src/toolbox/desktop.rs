@@ -100,7 +100,7 @@ pub(super) fn is_desktop(name: &str) -> bool {
 /// The desktop tools, in the toolbox's spelling (`input_schema`), from the
 /// desktop server's own definitions — one source for both.
 pub(super) fn definitions() -> Vec<Value> {
-    crate::desktop::mcp::tool_definitions()
+    incord_desktop::mcp::tool_definitions()
         .into_iter()
         .map(|mut def| {
             if let Some(object) = def.as_object_mut() {
@@ -247,7 +247,7 @@ pub(super) mod tests {
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let png = {
             let canvas = image::RgbaImage::from_pixel(4, 3, image::Rgba([1, 2, 3, 255]));
-            crate::desktop::capture::encode(&canvas, crate::desktop::capture::ShotFormat::Png, 0)
+            incord_desktop::capture::encode(&canvas, incord_desktop::capture::ShotFormat::Png, 0)
                 .expect("png")
         };
         use base64::Engine as _;

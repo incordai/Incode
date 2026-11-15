@@ -191,7 +191,7 @@ impl Image {
             decoded
         };
         let png =
-            crate::desktop::capture::encode(&shown, crate::desktop::capture::ShotFormat::Png, 0)
+            incord_desktop::capture::encode(&shown, incord_desktop::capture::ShotFormat::Png, 0)
                 .map_err(|e| e.to_string())?;
         let mut note = (scale < 1.0).then(|| {
             format!(
@@ -204,9 +204,9 @@ impl Image {
             return Ok((Self::from_encoded(png)?, note));
         }
         for quality in [85u8, 70, 50] {
-            let jpeg = crate::desktop::capture::encode(
+            let jpeg = incord_desktop::capture::encode(
                 &shown,
-                crate::desktop::capture::ShotFormat::Jpeg,
+                incord_desktop::capture::ShotFormat::Jpeg,
                 quality,
             )
             .map_err(|e| e.to_string())?;
@@ -410,7 +410,7 @@ mod tests {
 
     fn png(width: u32, height: u32) -> Vec<u8> {
         let canvas = image::RgbaImage::from_pixel(width, height, image::Rgba([30, 60, 120, 255]));
-        crate::desktop::capture::encode(&canvas, crate::desktop::capture::ShotFormat::Png, 0)
+        incord_desktop::capture::encode(&canvas, incord_desktop::capture::ShotFormat::Png, 0)
             .expect("encode")
     }
 
@@ -425,7 +425,7 @@ mod tests {
             let [a, b, c, _] = state.to_le_bytes();
             image::Rgba([a, b, c, 255])
         });
-        crate::desktop::capture::encode(&canvas, crate::desktop::capture::ShotFormat::Png, 0)
+        incord_desktop::capture::encode(&canvas, incord_desktop::capture::ShotFormat::Png, 0)
             .expect("encode")
     }
 
