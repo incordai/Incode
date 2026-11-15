@@ -473,7 +473,7 @@ fn run_mode(
             format,
             spec_gate,
             permission_mode,
-        } => run_task(
+        } => run_task_mode(
             &workspace,
             instruction,
             model,
@@ -507,7 +507,11 @@ fn run_mode(
 
 /// `-t`: one instruction, run by an installed agent. `created_outside` is what
 /// [`carry_over_old_state`] wrote outside the workspace, for the run's report.
-fn run_task(
+///
+/// Not named `run_task`: the wiring scan (`wiring.rs`) matches callers by
+/// name, and a call to a `run_task` here would count as a caller of
+/// `task_run::run_task`, which has none outside its tests.
+fn run_task_mode(
     workspace: &std::path::Path,
     instruction: String,
     model: Option<String>,
