@@ -436,67 +436,19 @@ fn step(index: u64, kind: &str, extra: &serde_json::Value) -> serde_json::Value 
 /// handed, then ends the turn with a result line.
 #[test]
 fn fake_agy_child() {
-    use std::io::Write as _;
     let Some(dir) = std::env::var_os(FAKE_AGY) else {
         return;
     };
     let dir = PathBuf::from(dir);
-    let say = |line: serde_json::Value| println!("{line}");
     say(
         serde_json::json!({"event":"init","conversation_id":"fake-conv","init":{"tools":["run_command","invoke_subagent"]}}),
     );
     let hooks_by = std::env::var(HOOKS_BY_ENV).unwrap_or_default();
     let result = serde_json::json!({"event":"result","result":{"conversation_id":"fake-conv","status":"SUCCESS","usage":{"input_tokens":1,"output_tokens":1}}});
-    if let Ok(how) = std::fs::read_to_string(dir.join(NO_SERVER)) {
-        if how == "error" {
-            // As agy refuses a model it does not know: at once, no server.
-            say(
-                serde_json::json!({"event":"result","result":{"conversation_id":"","status":"ERROR","error":"model x is not recognized"}}),
-            );
-            std::process::exit(1);
-        }
-        say(step(
-            1,
-            "agent_response",
-            &serde_json::json!({"text_delta": "no tools"}),
-        ));
-        say(result);
-        std::process::exit(0);
-    }
-    // The one agent file in the folder it was pointed at: this binary's.
-    let agent = std::fs::read_dir(dir.join("agents"))
-        .expect("agents folder")
-        .filter_map(Result::ok)
-        .map(|e| e.path())
-        .find(|p| p.extension().is_some_and(|x| x == "md"))
-        .expect("an agent file");
-    let file = std::fs::read_to_string(agent).expect("agent file");
-    let (command, args) = server_in(&file);
-    let mut server = std::process::Command::new(&command)
-        .args(&args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("start the tool server");
-    let mut to = server.stdin.take().expect("stdin");
-    let mut from = BufReader::new(server.stdout.take().expect("stdout"));
-    let mut ask = |id: u64, method: &str, params: serde_json::Value| -> serde_json::Value {
-        let request = serde_json::json!({"jsonrpc":"2.0","id":id,"method":method,"params":params});
-        writeln!(to, "{request}").expect("send");
-        to.flush().expect("flush");
-        loop {
-            let mut line = String::new();
-            if from.read_line(&mut line).expect("read") == 0 {
-                panic!("the tool server went away");
-            }
-            // The test harness's own banner is not a reply.
-            if let Ok(reply) = serde_json::from_str::<serde_json::Value>(&line) {
-                if reply["id"] == id {
-                    return reply;
-                }
-            }
-        }
-    };
+    answer_without_a_server(&dir, &result);
+    let mut server = start_agent_files_server(&dir);
+    let mut mcp = McpPipe::of(&mut server);
+    let mut ask = |id: u64, method: &str, params: serde_json::Value| mcp.ask(id, method, params);
     ask(
         0,
         "initialize",
@@ -527,7 +479,8 @@ fn fake_agy_child() {
                 "output": reply["result"]["content"][0]["text"]}}),
         ));
     }
-    drop(to);
+    // Its stdin closed, the server ends.
+    drop(mcp);
     let _ = server.wait();
     say(step(
         9,
@@ -536,6 +489,92 @@ fn fake_agy_child() {
     ));
     say(result);
     std::process::exit(0);
+}
+
+/// One line of [`fake_agy_child`]'s output, as agy prints them.
+fn say(line: serde_json::Value) {
+    println!("{line}");
+}
+
+/// When the test asked [`fake_agy_child`] to start no server (a `NO_SERVER`
+/// file in `dir`): it ends the turn without tools, or — the file saying
+/// `error` — refuses at once as agy refuses a model it does not know. Returns
+/// only when there is no such file.
+fn answer_without_a_server(dir: &Path, result: &serde_json::Value) {
+    let Ok(how) = std::fs::read_to_string(dir.join(NO_SERVER)) else {
+        return;
+    };
+    if how == "error" {
+        // As agy refuses a model it does not know: at once, no server.
+        say(
+            serde_json::json!({"event":"result","result":{"conversation_id":"","status":"ERROR","error":"model x is not recognized"}}),
+        );
+        std::process::exit(1);
+    }
+    say(step(
+        1,
+        "agent_response",
+        &serde_json::json!({"text_delta": "no tools"}),
+    ));
+    say(result.clone());
+    std::process::exit(0);
+}
+
+/// The MCP server named by the one agent file in `dir/agents` — this
+/// binary's — started with [`fake_agy_child`]'s own environment, as agy
+/// starts it.
+fn start_agent_files_server(dir: &Path) -> std::process::Child {
+    // The one agent file in the folder it was pointed at: this binary's.
+    let agent = std::fs::read_dir(dir.join("agents"))
+        .expect("agents folder")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|x| x == "md"))
+        .expect("an agent file");
+    let file = std::fs::read_to_string(agent).expect("agent file");
+    let (command, args) = server_in(&file);
+    std::process::Command::new(&command)
+        .args(&args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("start the tool server")
+}
+
+/// JSON-RPC over a started server's stdio, one request at a time, as
+/// [`fake_agy_child`] talks to it. Dropped, it closes the server's stdin.
+struct McpPipe {
+    to: std::process::ChildStdin,
+    from: BufReader<std::process::ChildStdout>,
+}
+
+impl McpPipe {
+    fn of(server: &mut std::process::Child) -> Self {
+        Self {
+            to: server.stdin.take().expect("stdin"),
+            from: BufReader::new(server.stdout.take().expect("stdout")),
+        }
+    }
+
+    /// Send request `id` and wait for the reply with that `id`.
+    fn ask(&mut self, id: u64, method: &str, params: serde_json::Value) -> serde_json::Value {
+        use std::io::Write as _;
+        let request = serde_json::json!({"jsonrpc":"2.0","id":id,"method":method,"params":params});
+        writeln!(self.to, "{request}").expect("send");
+        self.to.flush().expect("flush");
+        loop {
+            let mut line = String::new();
+            if self.from.read_line(&mut line).expect("read") == 0 {
+                panic!("the tool server went away");
+            }
+            // The test harness's own banner is not a reply.
+            if let Ok(reply) = serde_json::from_str::<serde_json::Value>(&line) {
+                if reply["id"] == id {
+                    return reply;
+                }
+            }
+        }
+    }
 }
 
 /// A script at `path` that runs this test binary's `test` with `marker` set
