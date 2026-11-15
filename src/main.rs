@@ -566,7 +566,7 @@ fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         Parsed::DesktopStop { workspace } => {
-            let path = incord_code::desktop::safety::stop_path_in(&workspace);
+            let path = incord_desktop::safety::stop_path_in(&workspace);
             // REPORTED, never swallowed. A stop request that silently failed is
             // worse than no stop button at all, because the operator walks away
             // believing the desktop is halted.

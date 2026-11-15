@@ -405,13 +405,13 @@ fn stream(workspace: PathBuf) -> Response<Body> {
     let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(8);
 
     tokio::spawn(async move {
-        let journal = crate::desktop::journal::path_in(&workspace);
+        let journal = incord_desktop::journal::path_in(&workspace);
         // `None` would mean "send everything in the file", which on connect is
         // a replay of the whole recent history. The FIRST poll therefore takes
         // the current end as the starting cursor and shows nothing older —
         // this stream is what the agent is doing NOW. The file itself is the
         // record for anyone who wants the history.
-        let mut seen: Option<u64> = crate::desktop::journal::since(&journal, None)
+        let mut seen: Option<u64> = incord_desktop::journal::since(&journal, None)
             .last()
             .map(|entry| entry.seq);
 
@@ -421,7 +421,7 @@ fn stream(workspace: PathBuf) -> Response<Body> {
             // discrete thing that happened, not a change to a board, and
             // folding it into the run snapshot would lose every action that
             // happened between two polls.
-            let fresh = crate::desktop::journal::since(&journal, seen);
+            let fresh = incord_desktop::journal::since(&journal, seen);
             let mut sent_desktop = false;
             for entry in &fresh {
                 let data = serde_json::to_string(entry).unwrap_or_default();
@@ -1120,8 +1120,8 @@ mod tests {
     #[tokio::test]
     async fn a_desktop_action_reaches_the_stream_as_its_own_event() {
         let dir = tempfile::tempdir().expect("a workspace");
-        let path = crate::desktop::journal::path_in(dir.path());
-        let mut journal = crate::desktop::journal::Journal::at(path);
+        let path = incord_desktop::journal::path_in(dir.path());
+        let mut journal = incord_desktop::journal::Journal::at(path);
 
         // Written BEFORE the stream opens, so it belongs to the history the
         // stream must NOT replay.

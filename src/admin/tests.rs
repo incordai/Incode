@@ -460,7 +460,7 @@ fn settings_round_trip_through_the_file() {
         plugins: Plugins::default(),
         desktop_hooks: a_hook_on_every_desktop_event(),
         desktop_display: Some("xvfb:1280x800".to_string()),
-        desktop_limits: crate::desktop::limits::DesktopLimits {
+        desktop_limits: incord_desktop::limits::DesktopLimits {
             max_actions_per_minute: Some(60),
             tree_depth: Some(20),
             ..Default::default()

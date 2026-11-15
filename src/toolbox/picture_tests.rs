@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn png(width: u32, height: u32) -> Vec<u8> {
     let canvas = ::image::RgbaImage::from_pixel(width, height, ::image::Rgba([40, 80, 160, 255]));
-    crate::desktop::capture::encode(&canvas, crate::desktop::capture::ShotFormat::Png, 0)
+    incord_desktop::capture::encode(&canvas, incord_desktop::capture::ShotFormat::Png, 0)
         .expect("png")
 }
 
@@ -25,7 +25,7 @@ fn heavy_png() -> Vec<u8> {
         let [a, b, c, _] = state.to_le_bytes();
         ::image::Rgba([a, b, c, 255])
     });
-    crate::desktop::capture::encode(&canvas, crate::desktop::capture::ShotFormat::Png, 0)
+    incord_desktop::capture::encode(&canvas, incord_desktop::capture::ShotFormat::Png, 0)
         .expect("png")
 }
 
@@ -209,8 +209,8 @@ fn a_read_only_session_refuses_every_input_action_before_the_desktop() {
 #[test]
 fn the_real_desktop_screenshot_is_an_image_block() {
     let ws = tempfile::tempdir().expect("ws");
-    let input = crate::desktop::thread::InputThread::start().expect("input thread");
-    let mut server = crate::desktop::mcp::Server::new(input);
+    let input = incord_desktop::thread::InputThread::start().expect("input thread");
+    let mut server = incord_desktop::mcp::Server::new(input);
     let link = desktop::tests::InProcess::new(
         move |line| server.handle_line(line),
         Arc::new(AtomicUsize::new(0)),

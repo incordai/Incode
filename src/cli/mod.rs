@@ -231,7 +231,7 @@ pub(crate) fn desktop_setup_for(
     let exe = exe?;
     desktop.then(|| crate::toolbox::DesktopSetup {
         exe,
-        journal: crate::desktop::journal::path_in(workspace),
+        journal: incord_desktop::journal::path_in(workspace),
     })
 }
 
@@ -249,7 +249,7 @@ pub(crate) fn mcp_overrides_for(
     if desktop {
         out.extend(crate::desktop::mcp::codex_config_overrides(
             &exe,
-            Some(&crate::desktop::journal::path_in(workspace)),
+            Some(&incord_desktop::journal::path_in(workspace)),
             mode,
         ));
     }
