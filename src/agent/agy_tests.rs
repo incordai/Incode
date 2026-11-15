@@ -468,7 +468,6 @@ fn stand_in_agy(dir: &std::path::Path, lines: &[&str], stderr: &str, code: i32) 
     }
     #[cfg(not(windows))]
     {
-        use std::os::unix::fs::PermissionsExt;
         let mut body = String::from("#!/bin/sh\n");
         for line in lines {
             body.push_str(&format!("echo '{line}'\n"));
@@ -478,9 +477,7 @@ fn stand_in_agy(dir: &std::path::Path, lines: &[&str], stderr: &str, code: i32) 
         }
         body.push_str(&format!("exit {code}\n"));
         let path = dir.join("agy.sh");
-        std::fs::write(&path, body).expect("write the stand-in agy");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-            .expect("make it runnable");
+        crate::test_support::write_script(&path, &body);
         path
     }
 }
@@ -524,6 +521,7 @@ fn a_whole_turn_reports_these_events_and_this_outcome() {
         0,
         |b| b.set_models(&strings(&["gemini-3.8-flash-high"])),
     );
+    // With the turn's end, so a turn that never started says why.
     assert_eq!(
         seen,
         vec![
@@ -540,7 +538,8 @@ fn a_whole_turn_reports_these_events_and_this_outcome() {
                 cache_creation_tokens: 0,
                 cache_read_tokens: 5,
             },
-        ]
+        ],
+        "the turn ended: {result:?}"
     );
     assert_eq!(
         result.expect("a result line"),

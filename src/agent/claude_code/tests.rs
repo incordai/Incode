@@ -225,17 +225,13 @@ fn a_loud_failing_agent(dir: &std::path::Path) -> PathBuf {
     }
     #[cfg(not(windows))]
     {
-        use std::os::unix::fs::PermissionsExt;
         let path = dir.join("loud-agent.sh");
-        std::fs::write(
+        crate::test_support::write_script(
             &path,
             "#!/bin/sh\ni=0\nwhile [ $i -lt 3000 ]; do echo \"stderr line $i padding \
              padding padding padding padding padding padding\" >&2; i=$((i+1)); done\n\
              echo 'token=hunter2-not-a-real-secret' >&2\nexit 3\n",
-        )
-        .expect("write the fake agent");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-            .expect("make it runnable");
+        );
         path
     }
 }
@@ -350,7 +346,6 @@ fn a_cli_without_the_thinking_flag(dir: &std::path::Path) -> PathBuf {
     }
     #[cfg(not(windows))]
     {
-        use std::os::unix::fs::PermissionsExt;
         let mut body = String::from(
             "#!/bin/bash\necho x >> \"$(dirname \"$0\")/starts.txt\"\n\
              case \"$*\" in *--thinking-display*) \
@@ -361,9 +356,7 @@ fn a_cli_without_the_thinking_flag(dir: &std::path::Path) -> PathBuf {
             body.push_str(&format!("echo '{line}'\n"));
         }
         let path = dir.join("old-agent.sh");
-        std::fs::write(&path, body).expect("write the stand-in agent");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-            .expect("make it runnable");
+        crate::test_support::write_script(&path, &body);
         path
     }
 }
@@ -444,7 +437,6 @@ pub(crate) fn stand_in_cli(dir: &std::path::Path, waits: bool) -> PathBuf {
     }
     #[cfg(not(windows))]
     {
-        use std::os::unix::fs::PermissionsExt;
         let mut body = format!("#!/bin/bash\n{}echo '{}'\n", lists_the_tools(dir), LINES[0]);
         if waits {
             body.push_str("sleep 30\n");
@@ -453,9 +445,7 @@ pub(crate) fn stand_in_cli(dir: &std::path::Path, waits: bool) -> PathBuf {
             body.push_str(&format!("echo '{line}'\n"));
         }
         let path = dir.join(if waits { "slow-agent.sh" } else { "agent.sh" });
-        std::fs::write(&path, body).expect("write the stand-in agent");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-            .expect("make it runnable");
+        crate::test_support::write_script(&path, &body);
         path
     }
 }
@@ -554,15 +544,12 @@ fn a_cli_whose_tool_server_never_starts(dir: &std::path::Path) -> PathBuf {
     }
     #[cfg(not(windows))]
     {
-        use std::os::unix::fs::PermissionsExt;
         let mut body = String::from("#!/bin/sh\n");
         for line in LINES {
             body.push_str(&format!("echo '{line}'\n"));
         }
         let path = dir.join("toolless-agent.sh");
-        std::fs::write(&path, body).expect("write the stand-in agent");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-            .expect("make it runnable");
+        crate::test_support::write_script(&path, &body);
         path
     }
 }
@@ -608,18 +595,14 @@ fn a_cli_reporting_the_tool_server_failed(dir: &std::path::Path) -> PathBuf {
     }
     #[cfg(not(windows))]
     {
-        use std::os::unix::fs::PermissionsExt;
         let path = dir.join("failed-server-agent.sh");
-        std::fs::write(
+        crate::test_support::write_script(
             &path,
-            format!(
+            &format!(
                 "#!/bin/sh\necho '{INIT}'\nsleep 5\n\
                  touch \"$(dirname \"$0\")/still-running.txt\"\necho '{RESULT}'\n"
             ),
-        )
-        .expect("write the stand-in agent");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-            .expect("make it runnable");
+        );
         path
     }
 }
@@ -689,12 +672,8 @@ fn a_cli_that_ends_without_a_result(dir: &std::path::Path) -> PathBuf {
     }
     #[cfg(not(windows))]
     {
-        use std::os::unix::fs::PermissionsExt;
         let path = dir.join("cut-agent.sh");
-        std::fs::write(&path, format!("#!/bin/sh\necho '{INIT}'\nexit 0\n"))
-            .expect("write the stand-in agent");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-            .expect("make it runnable");
+        crate::test_support::write_script(&path, &format!("#!/bin/sh\necho '{INIT}'\nexit 0\n"));
         path
     }
 }
