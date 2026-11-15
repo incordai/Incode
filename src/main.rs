@@ -298,90 +298,20 @@ const COMPLETION: completions::Command = {
     }
 };
 
+/// The entry point, as the steps it takes in order: the insbx helper
+/// (`incord_sandbox::enter_if_requested`), [`sandbox_exec_if_asked`],
+/// [`run_subcommand`], [`parse_args`], [`carry_over_old_state`],
+/// [`ignored_spec_gate`] and [`run_mode`] — and, when the arguments named no
+/// other mode, the REPL ([`incord_code::cli::CliApp`]).
 fn main() -> anyhow::Result<()> {
     // The insbx engine's helper (`incode __insbx-enter ...`): confine this
     // process and exec the command, before any thread starts. Returns at once
     // for every other invocation.
     incord_sandbox::enter_if_requested();
-    // BEFORE ANYTHING ELSE, and before any thread starts: this mode applies the
-    // OS sandbox to THIS process and then execs the command, and an early
-    // Landlock ruleset binds only the thread that set it. On success it never
-    // returns; it runs only on Unix (Windows launches a confined child
-    // instead), so the argument is simply passed through to the ordinary
-    // parser elsewhere.
-    {
-        let raw: Vec<String> = std::env::args().skip(1).collect();
-        if raw.first().map(String::as_str) == Some("--sandbox-exec") {
-            #[cfg(unix)]
-            {
-                incord_code::sandbox::exec(&raw[1..])?;
-                unreachable!("sandbox::exec replaces this process on success");
-            }
-            #[cfg(windows)]
-            {
-                let code = incord_code::sandbox::run_windows_helper(&raw[1..])?;
-                std::process::exit(code);
-            }
-        }
-    }
-    // `incode review`: a subcommand with its own few flags, read by the
-    // module that runs it.
-    {
-        let raw: Vec<String> = std::env::args().skip(1).collect();
-        if raw.first().map(String::as_str) == Some("review") {
-            let args =
-                incord_code::review::Args::parse(&raw[1..]).map_err(|e| anyhow::anyhow!(e))?;
-            if args.help {
-                println!("{}", incord_code::review::USAGE);
-                return Ok(());
-            }
-            return on_a_runtime(|| {
-                incord_code::review::run(
-                    &args.workspace,
-                    args.base.as_deref(),
-                    args.model.as_deref(),
-                    args.print_only,
-                )
-            })?
-            .map_err(|e| anyhow::anyhow!(e));
-        }
-    }
-    // `incode plugin ...` manages plugin folders and runs nothing else.
-    {
-        let raw: Vec<String> = std::env::args().skip(1).collect();
-        if raw.first().map(String::as_str) == Some("plugin") {
-            let workspace = std::env::current_dir()?;
-            let said =
-                incord_code::plugins::cli(&raw[1..], &workspace).map_err(|e| anyhow::anyhow!(e))?;
-            println!("{}", said.trim_end());
-            return Ok(());
-        }
-        // `incode lifecycle ...`: show or approve this project's lifecycle
-        // commands, which run nowhere until approved.
-        if raw.first().map(String::as_str) == Some("lifecycle") {
-            let workspace = std::env::current_dir()?;
-            let said = incord_code::runtime::lifecycle::cli(
-                &raw[1..],
-                &workspace,
-                &incord_code::admin::AdminConfig::default_dir(),
-            )
-            .map_err(|e| anyhow::anyhow!(e))?;
-            println!("{}", said.trim_end());
-            return Ok(());
-        }
-        // `incode remote ...`: run a task on GitHub Actions and print its
-        // result; non-zero when the run or the task failed, or the wait ran
-        // out.
-        if raw.first().map(String::as_str) == Some("remote") {
-            let workspace = std::env::current_dir()?;
-            let outcome =
-                incord_code::remote::cli(&raw[1..], &workspace).map_err(|e| anyhow::anyhow!(e))?;
-            println!("{}", outcome.text.trim_end());
-            if !outcome.ok {
-                std::process::exit(1);
-            }
-            return Ok(());
-        }
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    sandbox_exec_if_asked(&raw)?;
+    if let Some(done) = run_subcommand(&raw) {
+        return done;
     }
     // NOTE: the crate emits `tracing` events (MCP connection failures, tool
     // errors) but no subscriber is installed, so they currently go nowhere.
@@ -394,9 +324,118 @@ fn main() -> anyhow::Result<()> {
             return Err(e);
         }
     };
-    // Before anything reads `~/.incode/` or a project's `.incode/`: state left
-    // under the old names (`~/.incord-code/`, `.incord/`) is carried over.
-    // stderr, never stdout: several modes speak a protocol on stdout.
+    let created_outside = carry_over_old_state(&parsed);
+    if let Some(note) = ignored_spec_gate(
+        &parsed,
+        std::env::var(incord_code::spec::SpecGate::ENV)
+            .ok()
+            .as_deref(),
+    ) {
+        eprintln!("{note}");
+    }
+    match run_mode(parsed, &created_outside)? {
+        Some(config) => on_a_runtime(|| incord_code::cli::CliApp::new(*config).run())?,
+        None => Ok(()),
+    }
+}
+
+/// `incode --sandbox-exec ...`, checked BEFORE ANYTHING ELSE, and before any
+/// thread starts: this mode applies the OS sandbox to THIS process and then
+/// execs the command, and an early Landlock ruleset binds only the thread that
+/// set it. On success it never returns; it runs only on Unix (Windows launches
+/// a confined child instead), so the argument is simply passed through to the
+/// ordinary parser elsewhere. Returns at once for every other invocation.
+fn sandbox_exec_if_asked(raw: &[String]) -> anyhow::Result<()> {
+    if raw.first().map(String::as_str) == Some("--sandbox-exec") {
+        #[cfg(unix)]
+        {
+            incord_code::sandbox::exec(&raw[1..])?;
+            unreachable!("sandbox::exec replaces this process on success");
+        }
+        #[cfg(windows)]
+        {
+            let code = incord_code::sandbox::run_windows_helper(&raw[1..])?;
+            std::process::exit(code);
+        }
+    }
+    Ok(())
+}
+
+/// The subcommands with flags of their own, each read by the module that runs
+/// it: `review`, `plugin`, `lifecycle` and `remote`. `Some`, with how it went,
+/// when `raw` starts with one; `None` for every other invocation. (`update`,
+/// `mcp` and `completions` are subcommands too, but [`parse_args`] reads them.)
+fn run_subcommand(raw: &[String]) -> Option<anyhow::Result<()>> {
+    let (name, rest) = raw.split_first()?;
+    let run: fn(&[String]) -> anyhow::Result<()> = match name.as_str() {
+        "review" => run_review,
+        "plugin" => run_plugin_command,
+        "lifecycle" => run_lifecycle_command,
+        "remote" => run_remote,
+        _ => return None,
+    };
+    Some(run(rest))
+}
+
+/// `incode review`: a subcommand with its own few flags, read by the module
+/// that runs it.
+fn run_review(rest: &[String]) -> anyhow::Result<()> {
+    let args = incord_code::review::Args::parse(rest).map_err(|e| anyhow::anyhow!(e))?;
+    if args.help {
+        println!("{}", incord_code::review::USAGE);
+        return Ok(());
+    }
+    on_a_runtime(|| {
+        incord_code::review::run(
+            &args.workspace,
+            args.base.as_deref(),
+            args.model.as_deref(),
+            args.print_only,
+        )
+    })?
+    .map_err(|e| anyhow::anyhow!(e))
+}
+
+/// `incode plugin ...` manages plugin folders and runs nothing else.
+fn run_plugin_command(rest: &[String]) -> anyhow::Result<()> {
+    let workspace = std::env::current_dir()?;
+    let said = incord_code::plugins::cli(rest, &workspace).map_err(|e| anyhow::anyhow!(e))?;
+    println!("{}", said.trim_end());
+    Ok(())
+}
+
+/// `incode lifecycle ...`: show or approve this project's lifecycle commands,
+/// which run nowhere until approved.
+fn run_lifecycle_command(rest: &[String]) -> anyhow::Result<()> {
+    let workspace = std::env::current_dir()?;
+    let said = incord_code::runtime::lifecycle::cli(
+        rest,
+        &workspace,
+        &incord_code::admin::AdminConfig::default_dir(),
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+    println!("{}", said.trim_end());
+    Ok(())
+}
+
+/// `incode remote ...`: run a task on GitHub Actions and print its result;
+/// non-zero when the run or the task failed, or the wait ran out.
+fn run_remote(rest: &[String]) -> anyhow::Result<()> {
+    let workspace = std::env::current_dir()?;
+    let outcome = incord_code::remote::cli(rest, &workspace).map_err(|e| anyhow::anyhow!(e))?;
+    println!("{}", outcome.text.trim_end());
+    if !outcome.ok {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Before anything reads `~/.incode/` or a project's `.incode/`: state left
+/// under the old names (`~/.incord-code/`, `.incord/`) is carried over, and the
+/// reviewers incode ships are seeded. What was done is said on stderr, never
+/// stdout: several modes speak a protocol on stdout. Returns the files written
+/// outside the workspace, for a task to report (`task_run::RunOptions`).
+fn carry_over_old_state(parsed: &Parsed) -> Vec<PathBuf> {
     let mut migrated = Vec::new();
     let mut created_outside = Vec::new();
     if parsed.reads_data_dir() {
@@ -414,20 +453,19 @@ fn main() -> anyhow::Result<()> {
     for line in migrated {
         eprintln!("{line}");
     }
-    if let Some(note) = ignored_spec_gate(
-        &parsed,
-        std::env::var(incord_code::spec::SpecGate::ENV)
-            .ok()
-            .as_deref(),
-    ) {
-        eprintln!("{note}");
-    }
-    let config = match parsed {
-        Parsed::Run(config) => config,
-        Parsed::Exit(message) => {
-            println!("{message}");
-            return Ok(());
-        }
+    created_outside
+}
+
+/// Run the mode the arguments named, one step per mode. `Some` with the
+/// REPL's config when they named none (`Parsed::Run`), for [`main`] to start;
+/// `None` once the mode ran.
+fn run_mode(
+    parsed: Parsed,
+    created_outside: &[PathBuf],
+) -> anyhow::Result<Option<Box<IncordCodeConfig>>> {
+    match parsed {
+        Parsed::Run(config) => return Ok(Some(config)),
+        Parsed::Exit(message) => println!("{message}"),
         Parsed::Task {
             workspace,
             instruction,
@@ -435,172 +473,205 @@ fn main() -> anyhow::Result<()> {
             format,
             spec_gate,
             permission_mode,
-        } => {
-            let spec_gate = incord_code::spec::SpecGate::resolve(
-                spec_gate,
-                std::env::var(incord_code::spec::SpecGate::ENV)
-                    .ok()
-                    .as_deref(),
-            )
-            .map_err(|e| {
-                json_failure(std::env::args().skip(1), &e);
-                anyhow::anyhow!(e)
-            })?;
-            // `-t "/name args"` runs the operator's custom command, held to
-            // its `allowed-tools`.
-            let task = incord_code::custom_commands::expand_task(&workspace, instruction, model);
-            return on_a_runtime(|| {
-                incord_code::task_run::run_task_as(
-                    &workspace,
-                    &task.instruction,
-                    task.model.as_deref(),
-                    format,
-                    spec_gate,
-                    &incord_code::task_run::RunOptions {
-                        command_tools: &task.allowed_tools,
-                        permission_mode,
-                        created: &created_outside,
-                    },
-                )
-            })?
-            .map(|_| ())
-            .map_err(|e| anyhow::anyhow!(e));
-        }
+        } => run_task_mode(
+            &workspace,
+            instruction,
+            model,
+            format,
+            spec_gate,
+            permission_mode,
+            created_outside,
+        )?,
         Parsed::DesktopMcp {
             journal,
             permission_mode,
-        } => {
-            // Synchronous on this thread, deliberately: the protocol is a
-            // line-oriented pipe and the input thread is its own OS thread, so
-            // a tokio runtime would add a scheduler to a program that has
-            // nothing to schedule.
-            //
-            // Nothing is printed to stdout — it is the protocol channel, and a
-            // banner there is a parse error at the client.
-            //
-            // The operator's settings, read from `~/.incode/admin.json`.
-            // This process holds no workspace, so a machine-wide file is the
-            // only place its configuration can come from — and a guard on the
-            // desktop is a machine-wide concern anyway.
-            //
-            // `load`, not `load_default`: a malformed file is refused here
-            // rather than read as empty, because empty would start the
-            // desktop with no hooks and default limits — a guard the
-            // operator wrote, silently gone.
-            let admin = incord_code::admin::AdminConfig::load(
-                &incord_code::admin::AdminConfig::default_dir(),
-            )
-            .map_err(|e| anyhow::anyhow!("the desktop will not start: {e}"))?;
-            // The server itself is the `incord-desktop` crate's (`incu serve`
-            // is the same code); this flag is its wrapper, so every agent
-            // config and installer that launches `incode --desktop-mcp` is
-            // unchanged. The limits, the Linux display and the hooks are
-            // `admin`'s; see `incord_code::desktop::serve`.
-            incord_code::desktop::serve(journal, permission_mode, admin)
-                .map_err(|e| anyhow::anyhow!(e))?;
-            return Ok(());
-        }
-        Parsed::Acp(config) => {
-            // Its own threads, no runtime around them: the protocol is a
-            // line-oriented pipe, and the HTTP helpers bring their own runtime
-            // when none is ambient. Nothing may reach stdout — `run_stdio`
-            // moves the standard handles before anything is printed.
-            return incord_code::acp_agent::run_stdio(*config);
-        }
-        Parsed::Mcp(args) => {
-            let workspace = std::env::current_dir()?;
-            let data_dir = incord_code::admin::AdminConfig::default_dir();
-            match incord_code::mcp_config::command(&args, &workspace, &data_dir) {
-                Ok(said) => println!("{said}"),
-                Err(why) => anyhow::bail!("{why}"),
-            }
-            return Ok(());
-        }
-        Parsed::InstallTools => {
-            let (lines, all) = incord_code::ext_tools::install_all(
-                &incord_code::admin::AdminConfig::default_dir(),
-            );
-            for line in lines {
-                println!("{line}");
-            }
-            if !all {
-                anyhow::bail!("not every configured tool is installed");
-            }
-            return Ok(());
-        }
-        Parsed::Update { check_only } => {
-            // No runtime around it: the HTTP helpers bring their own when none
-            // is ambient, as for `--install-tools`.
-            let said = incord_code::self_update::run(check_only)
-                .map_err(|why| anyhow::anyhow!("incode update: {why}"))?;
-            println!("{said}");
-            return Ok(());
-        }
-        Parsed::ToolServer => {
-            // stdout is the protocol channel; this process prints nothing
-            // else there, and runs no tool itself.
-            incord_code::tool_bridge::run_stdio()?;
-            return Ok(());
-        }
-        Parsed::TeamMcp { channel } => {
-            let speaking_as = incord_code::team_mcp::Server::identity_from_env();
-            // stderr, never stdout: stdout is the protocol channel and a
-            // banner there is a parse error at the client.
-            eprintln!("incode-team MCP server ready on stdio, speaking as `{speaking_as}`");
-            let server = incord_code::team_mcp::Server::new(
-                incord_code::team::Channel::at(channel),
-                speaking_as,
-            );
-            incord_code::team_mcp::run_stdio(server)?;
-            return Ok(());
-        }
-        Parsed::CheckFindings { workspace, path } => {
-            // stdout on a pass, an error on a failure, because that is how
-            // `verify` reads a check: the exit code decides and the text is
-            // the evidence either way. The failure text is written for the
-            // AGENT that reads it on its next attempt, so it says what to do
-            // rather than merely that something is wrong.
-            let found = incord_code::findings::check(&workspace, &path)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            println!("findings delivered: {found}");
-            return Ok(());
-        }
-        Parsed::DesktopStop { workspace } => {
-            let path = incord_desktop::safety::stop_path_in(&workspace);
-            // REPORTED, never swallowed. A stop request that silently failed is
-            // worse than no stop button at all, because the operator walks away
-            // believing the desktop is halted.
-            incord_code::desktop::safety::request_stop(&path).map_err(|e| {
-                anyhow::anyhow!("could not request a stop at {}: {e}", path.display())
-            })?;
-            println!("desktop stop requested: {}", path.display());
-            println!(
-                "It takes effect before the desktop's next action, and is permanent \
-                 for that session. Delete the file to allow a NEW session to act."
-            );
-            return Ok(());
-        }
-        Parsed::Serve { workspace, port } => {
-            // The banner is printed by `listen`, AFTER the bind, because until
-            // then the port is not known — asking the OS for a free one is the
-            // default. Announcing an address before it is held would print a
-            // URL that may never answer.
-            // AWAITED on its own runtime, not run inside one.
-            //
-            // `on_a_runtime` exists for the harness's SYNCHRONOUS work — a
-            // readline loop whose callees need a runtime nearby — so it calls
-            // its closure from within the runtime. This mode is itself the
-            // async work, and calling `block_on` from in there panics with
-            // "Cannot start a runtime from within a runtime". Measured, on the
-            // first run of this flag.
-            let runtime = tokio::runtime::Runtime::new()?;
-            return runtime
-                .block_on(incord_code::serve::http::listen(workspace, port))
-                .map_err(anyhow::Error::from);
-        }
-    };
+        } => run_desktop_mcp(journal, permission_mode)?,
+        // Its own threads, no runtime around them: the protocol is a
+        // line-oriented pipe, and the HTTP helpers bring their own runtime
+        // when none is ambient. Nothing may reach stdout — `run_stdio` moves
+        // the standard handles before anything is printed.
+        Parsed::Acp(config) => incord_code::acp_agent::run_stdio(*config)?,
+        Parsed::Mcp(args) => run_mcp_command(&args)?,
+        Parsed::InstallTools => run_install_tools()?,
+        Parsed::Update { check_only } => run_update(check_only)?,
+        // stdout is the protocol channel; this process prints nothing else
+        // there, and runs no tool itself.
+        Parsed::ToolServer => incord_code::tool_bridge::run_stdio()?,
+        Parsed::TeamMcp { channel } => run_team_mcp(channel)?,
+        Parsed::CheckFindings { workspace, path } => run_check_findings(&workspace, &path)?,
+        Parsed::DesktopStop { workspace } => run_desktop_stop(&workspace)?,
+        Parsed::Serve { workspace, port } => run_serve(workspace, port)?,
+    }
+    Ok(None)
+}
 
-    on_a_runtime(|| incord_code::cli::CliApp::new(*config).run())?
+/// `-t`: one instruction, run by an installed agent. `created_outside` is what
+/// [`carry_over_old_state`] wrote outside the workspace, for the run's report.
+///
+/// Not named `run_task`: the wiring scan (`wiring.rs`) matches callers by
+/// name, and a call to a `run_task` here would count as a caller of
+/// `task_run::run_task`, which has none outside its tests.
+fn run_task_mode(
+    workspace: &std::path::Path,
+    instruction: String,
+    model: Option<String>,
+    format: incord_code::task_run::OutputFormat,
+    spec_gate: Option<incord_code::spec::SpecGate>,
+    permission_mode: Option<incord_code::PermissionMode>,
+    created_outside: &[PathBuf],
+) -> anyhow::Result<()> {
+    let spec_gate = incord_code::spec::SpecGate::resolve(
+        spec_gate,
+        std::env::var(incord_code::spec::SpecGate::ENV)
+            .ok()
+            .as_deref(),
+    )
+    .map_err(|e| {
+        json_failure(std::env::args().skip(1), &e);
+        anyhow::anyhow!(e)
+    })?;
+    // `-t "/name args"` runs the operator's custom command, held to its
+    // `allowed-tools`.
+    let task = incord_code::custom_commands::expand_task(workspace, instruction, model);
+    on_a_runtime(|| {
+        incord_code::task_run::run_task_as(
+            workspace,
+            &task.instruction,
+            task.model.as_deref(),
+            format,
+            spec_gate,
+            &incord_code::task_run::RunOptions {
+                command_tools: &task.allowed_tools,
+                permission_mode,
+                created: created_outside,
+            },
+        )
+    })?
+    .map(|_| ())
+    .map_err(|e| anyhow::anyhow!(e))
+}
+
+/// `--desktop-mcp`: the desktop server on stdio, under `permission_mode`.
+///
+/// Synchronous on this thread, deliberately: the protocol is a line-oriented
+/// pipe and the input thread is its own OS thread, so a tokio runtime would add
+/// a scheduler to a program that has nothing to schedule.
+///
+/// Nothing is printed to stdout — it is the protocol channel, and a banner
+/// there is a parse error at the client.
+fn run_desktop_mcp(
+    journal: Option<PathBuf>,
+    permission_mode: incord_code::PermissionMode,
+) -> anyhow::Result<()> {
+    // The operator's settings, read from `~/.incode/admin.json`. This process
+    // holds no workspace, so a machine-wide file is the only place its
+    // configuration can come from — and a guard on the desktop is a
+    // machine-wide concern anyway.
+    //
+    // `load`, not `load_default`: a malformed file is refused here rather than
+    // read as empty, because empty would start the desktop with no hooks and
+    // default limits — a guard the operator wrote, silently gone.
+    let admin =
+        incord_code::admin::AdminConfig::load(&incord_code::admin::AdminConfig::default_dir())
+            .map_err(|e| anyhow::anyhow!("the desktop will not start: {e}"))?;
+    // The server itself is the `incord-desktop` crate's (`incu serve` is the
+    // same code); this flag is its wrapper, so every agent config and installer
+    // that launches `incode --desktop-mcp` is unchanged. The limits, the Linux
+    // display and the hooks are `admin`'s; see `incord_code::desktop::serve`.
+    incord_code::desktop::serve(journal, permission_mode, admin).map_err(|e| anyhow::anyhow!(e))
+}
+
+/// `incode mcp …`: the MCP servers of `.mcp.json` and `~/.incode/mcp.json`.
+fn run_mcp_command(args: &[String]) -> anyhow::Result<()> {
+    let workspace = std::env::current_dir()?;
+    let data_dir = incord_code::admin::AdminConfig::default_dir();
+    match incord_code::mcp_config::command(args, &workspace, &data_dir) {
+        Ok(said) => println!("{said}"),
+        Err(why) => anyhow::bail!("{why}"),
+    }
+    Ok(())
+}
+
+/// `--install-tools`: every tool `admin.json` names, installed; an error when
+/// one is not.
+fn run_install_tools() -> anyhow::Result<()> {
+    let (lines, all) =
+        incord_code::ext_tools::install_all(&incord_code::admin::AdminConfig::default_dir());
+    for line in lines {
+        println!("{line}");
+    }
+    if !all {
+        anyhow::bail!("not every configured tool is installed");
+    }
+    Ok(())
+}
+
+/// `incode update`: no runtime around it, as the HTTP helpers bring their own
+/// when none is ambient, as for `--install-tools`.
+fn run_update(check_only: bool) -> anyhow::Result<()> {
+    let said = incord_code::self_update::run(check_only)
+        .map_err(|why| anyhow::anyhow!("incode update: {why}"))?;
+    println!("{said}");
+    Ok(())
+}
+
+/// `--team-mcp`: the team channel's MCP server on stdio.
+fn run_team_mcp(channel: PathBuf) -> anyhow::Result<()> {
+    let speaking_as = incord_code::team_mcp::Server::identity_from_env();
+    // stderr, never stdout: stdout is the protocol channel and a banner there
+    // is a parse error at the client.
+    eprintln!("incode-team MCP server ready on stdio, speaking as `{speaking_as}`");
+    let server =
+        incord_code::team_mcp::Server::new(incord_code::team::Channel::at(channel), speaking_as);
+    incord_code::team_mcp::run_stdio(server)?;
+    Ok(())
+}
+
+/// `--check-findings`: stdout on a pass, an error on a failure, because that
+/// is how `verify` reads a check: the exit code decides and the text is the
+/// evidence either way. The failure text is written for the AGENT that reads it
+/// on its next attempt, so it says what to do rather than merely that something
+/// is wrong.
+fn run_check_findings(workspace: &std::path::Path, path: &str) -> anyhow::Result<()> {
+    let found =
+        incord_code::findings::check(workspace, path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    println!("findings delivered: {found}");
+    Ok(())
+}
+
+/// `--desktop-stop`: halt the desktop driving `workspace`.
+fn run_desktop_stop(workspace: &std::path::Path) -> anyhow::Result<()> {
+    let path = incord_desktop::safety::stop_path_in(workspace);
+    // REPORTED, never swallowed. A stop request that silently failed is worse
+    // than no stop button at all, because the operator walks away believing
+    // the desktop is halted.
+    incord_code::desktop::safety::request_stop(&path)
+        .map_err(|e| anyhow::anyhow!("could not request a stop at {}: {e}", path.display()))?;
+    println!("desktop stop requested: {}", path.display());
+    println!(
+        "It takes effect before the desktop's next action, and is permanent \
+         for that session. Delete the file to allow a NEW session to act."
+    );
+    Ok(())
+}
+
+/// `--serve`: what the run is doing, served to a local interface.
+///
+/// The banner is printed by `listen`, AFTER the bind, because until then the
+/// port is not known — asking the OS for a free one is the default. Announcing
+/// an address before it is held would print a URL that may never answer.
+fn run_serve(workspace: PathBuf, port: Option<u16>) -> anyhow::Result<()> {
+    // AWAITED on its own runtime, not run inside one.
+    //
+    // `on_a_runtime` exists for the harness's SYNCHRONOUS work — a readline
+    // loop whose callees need a runtime nearby — so it calls its closure from
+    // within the runtime. This mode is itself the async work, and calling
+    // `block_on` from in there panics with "Cannot start a runtime from within
+    // a runtime". Measured, on the first run of this flag.
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime
+        .block_on(incord_code::serve::http::listen(workspace, port))
+        .map_err(anyhow::Error::from)
 }
 
 /// Run the CLI's blocking work with a tokio runtime available underneath it.
