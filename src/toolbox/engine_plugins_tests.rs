@@ -245,10 +245,16 @@ fn the_index_is_bounded_and_counts_the_rest() {
 #[ignore = "talks to the real memory engine and the plugin servers it reaches"]
 fn the_real_engines_plugin_servers_answer_or_say_why_not() {
     let index = fetch_index(&[]).expect("the engine named plugin servers");
-    eprintln!("index: {:?}", index.servers.iter().map(|s| &s.name).collect::<Vec<_>>());
+    eprintln!(
+        "index: {:?}",
+        index.servers.iter().map(|s| &s.name).collect::<Vec<_>>()
+    );
     let server = index.servers[0].name.clone();
     match describe(&index, &json!({"server": server})) {
-        Ok(listed) => eprintln!("described `{server}`: {}", listed.lines().next().unwrap_or("")),
+        Ok(listed) => eprintln!(
+            "described `{server}`: {}",
+            listed.lines().next().unwrap_or("")
+        ),
         Err(why) => {
             eprintln!("describe `{server}`: {why}");
             assert!(why.starts_with("BLOCKED ON SIGN-IN") || why.contains("could not run"));
