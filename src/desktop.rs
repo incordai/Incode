@@ -249,6 +249,9 @@ pub fn serve(
         limits: admin.desktop_limits,
         display: admin.desktop_display,
         hooks,
+        // incode's `admin.json` has no setting for it: `$INCU_ROUTINES`, else
+        // the crate's per-user data folder, the same file `incu` uses.
+        routines: None,
         name: "incode-desktop",
     })
 }
@@ -329,7 +332,7 @@ mod tests {
     /// **The crate's tier and incode's policy must say the same thing.** The
     /// server now runs the tier; `PermissionPolicy::for_desktop` stays as incode's
     /// statement of the same table, and this is what keeps the two from
-    /// drifting: every mode, every one of the 17 tools, the same verdict and the
+    /// drifting: every mode, every one of the 23 tools, the same verdict and the
     /// same words in a refusal.
     #[test]
     fn the_crates_tier_agrees_with_the_desktop_permission_policy() {
@@ -340,7 +343,7 @@ mod tests {
             .iter()
             .filter_map(|t| t["name"].as_str().map(str::to_string))
             .collect();
-        assert_eq!(offered.len(), 17, "{offered:?}");
+        assert_eq!(offered.len(), 23, "{offered:?}");
         for name in &offered {
             assert!(
                 permission::OBSERVING.contains(&name.as_str())
@@ -348,8 +351,15 @@ mod tests {
                 "{name} is offered by the desktop server but has no tier"
             );
         }
-        // `wait_for` only looks: a read-only session may use it.
-        assert!(permission::OBSERVING.contains(&"wait_for"));
+        // `wait_for` and `watch` only look, and `routine_list` and
+        // `routine_match` only read the routines file: a read-only session may
+        // use them. Saving, forgetting or running a routine acts.
+        for looking in ["wait_for", "watch", "routine_list", "routine_match"] {
+            assert!(permission::OBSERVING.contains(&looking), "{looking}");
+        }
+        for acting in ["routine_save", "routine_run", "routine_forget"] {
+            assert!(permission::ACTING.contains(&acting), "{acting}");
+        }
         let modes = [
             PermissionMode::ReadOnly,
             PermissionMode::WorkspaceWrite,

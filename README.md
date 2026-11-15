@@ -850,8 +850,8 @@ anything runs.
 | `Screenshot` | observe | A picture of a public page or a workspace HTML/SVG file. Offered only when the headless browser is found. |
 | `RenderPdf` | change | A public page or a workspace HTML/SVG file printed to PDF. Offered only when a printer is found (below). |
 | `ConvertDocument` | change | An office document to PDF through LibreOffice. Offered only when LibreOffice is found. |
-| `screen_info` · `list_windows` · `screenshot` · `ui_tree` · `cursor_position` · `wait_for` | observe | Look at the desktop, or wait (bounded) for a control, a window or a change of the screen. Offered only when `INCODE_DESKTOP=1` — see [Computer use](#computer-use). |
-| `click_element` · `set_value` · `element_action` · `focus_window` · `type_text` · `paste_text` · `key` · `scroll` · `drag` · `move_mouse` · `click` | run | Act on the desktop. Same condition; refused in read-only. |
+| `screen_info` · `list_windows` · `screenshot` · `ui_tree` · `cursor_position` · `wait_for` · `watch` · `routine_list` · `routine_match` | observe | Look at the desktop, wait (bounded) for a control, a window or a change of the screen, watch for one for hours, or look up a saved routine. Offered only when `INCODE_DESKTOP=1` — see [Computer use](#computer-use). |
+| `click_element` · `set_value` · `element_action` · `focus_window` · `type_text` · `paste_text` · `key` · `scroll` · `drag` · `move_mouse` · `click` · `routine_save` · `routine_run` · `routine_forget` | run | Act on the desktop, or keep, replay and forget a routine of such actions. Same condition; refused in read-only. |
 | `Skill` | observe | Read one skill's text from the shared store. |
 | `Agent` | run | Hand a self-contained task to a sub-agent (a second headless run of the session's CLI, or the API route), with the session's mode, guards and cancel; at most 2 levels deep. Takes `agent: <name>` for a [user-defined sub-agent](#user-defined-sub-agents). |
 | `AskUserQuestion` | session | A multiple-choice question to the owner: answered in the owner's app through the memory engine, else at the terminal, else reported unanswered. |
@@ -1079,6 +1079,9 @@ plain screenshots and pixel clicks still work.
 | `screenshot` | The primary display, or one `window`. The reply carries the region and origin, so a point in the picture maps back to the screen. |
 | `cursor_position` | Where the pointer is. |
 | `wait_for` | Wait, bounded, until a control matching a `selector` appears or goes, a window appears or closes, or the screen changes. Returns what it found, or a `timeout` reply with what it last saw. |
+| `watch` | `wait_for` for up to 24 hours, looked at every second, with no model polling. When it ends, your post-tool hook for `watch` is run with the reply as `tool_response`: that is the notification or follow-up. **The call blocks** until then. See [Routines and `watch`](#routines-and-watch). |
+| `routine_save` · `routine_run` · `routine_forget` | Keep what was done as a routine, run it again with no model, or forget it. |
+| `routine_list` · `routine_match` | List the saved routines, or show which one a phrase would run without running it. |
 | `click_element` | Click a control by id or `selector`, at its centre as it is *now*. |
 | `set_value` | Set a text field's value (by id or `selector`) through the accessibility interface: no typing, no focus, no clipboard. Read back and marked `(verified)`, or `(unverified: why)`. A password field is never read back. |
 | `element_action` | Run one of a control's own actions (by id or `selector`) without the mouse: `press`, `toggle`, `expand`, `collapse`, `select` and `focus` everywhere, plus what the platform adds (`scroll_into_view` on Windows; `show_menu`, `increment`, `decrement`, `confirm`, `cancel` on macOS). An action the control lacks is refused, and the refusal lists the ones it offers. |
@@ -1120,6 +1123,77 @@ conditions take only `app`/`window`), `timeout_ms` (default 5000, held to
 60000) and `poll_ms` (250, 50–2000), and answers JSON whose `result` is `found`
 or `timeout`. The full grammar and what each platform supplies is in
 `docs/COMPUTER_USE.md`.
+
+### Routines and `watch`
+
+A **routine** is a phrase and the desktop calls that carried it out, kept so
+`routine_run` can do it again with no model. It is made from what Watchman
+already recorded (`routine_save` with `records`, the `w-…` ids of the turns that
+did the task, read from the local memory engine) or from an explicit `steps`
+list; the engine is optional.
+
+- `ui_tree`, `screenshot` and the other looking calls are dropped; `wait_for` is
+  kept.
+- **Nothing is kept** when the phrase says "this" or "that", when ANY call or
+  span in the records failed (a shell command too, not only a desktop call) or
+  the record says its run failed, when a `wait_for` timed out, or when any step uses an `eN` id, a pixel
+  coordinate (`click`, `move_mouse`, `drag`) or a window handle (`window`,
+  `focus_window`). Only selector-based steps replay, and each must say where:
+  a selector needs an `app=`/`window=` part, and a typing or key step carries
+  `in_window` (a recording has none, so it is given the window of the step before
+  it; the replay still refuses to type unless that window has the focus).
+  `scroll` is never replayable. A replay invokes links and buttons through
+  `element_action invoke` (no mouse, no focus) and falls back to the recorded
+  click only when the invoke was refused before it did anything (the control
+  does not offer it), and it stops when a `set_value` or an `element_action`
+  that changes a state (toggle, select, expand, collapse, increment, ...)
+  answers "unverified" and the next step acts on it; a button press (`invoke`,
+  `press`, `scroll_into_view`) always says "unverified" and never stops it.
+- A phrase matches by its **words in any order, ignoring filler words**, except
+  that the words on each side of `to`, `from`, `into`, `onto`, `over`, `under`,
+  `before` or `after` stay on that side ("copy a to b" is not "copy b to a"); a
+  near miss runs nothing. `routine_match` shows what a phrase would run.
+- A replay runs every step through the same checks as a live call (blocked apps,
+  hooks, stop file, journal) and **stops at the first failure**, saying which
+  step and why, with the paths of that step's before and after pictures (one of
+  each is taken for every step, through the same gates as `screenshot`, in a
+  folder of its own for each run beside `routines.json`, only the last run kept;
+  none is taken of a step that typed a secret; never sent to OCR). There is no
+  repair: do the task yourself and `routine_save` it under the same phrase to
+  replace the routine.
+- A routine unused for 30 days is forgotten. Only **you** can keep one for good:
+  `incu routine keep <words>` (and `unkeep`, `list`) at a terminal; no tool has
+  an argument for it, and saving other steps over a kept routine un-keeps it.
+  That is a convenience, not a security boundary: an agent with a shell can run
+  the command too.
+- The file is `routines.json` in the per-user data folder
+  (`%APPDATA%\incord-desktop`, `~/Library/Application Support/incord-desktop`,
+  or `$XDG_DATA_HOME`/`~/.local/share/incord-desktop`), overridden by
+  `INCU_ROUTINES` or `routines` in the config. It holds typed text as typed, and
+  `routine_save`, `routine_list` and `routine_match` show every step's full
+  text so you can read what a routine will type. **Typed text is stored only
+  when the typing step itself names a plain text box** (a `selector` of its own
+  with a window, role edit or combobox, no password-like name, and not a password
+  field on the desktop when saved; the replay focuses it first). **Every other
+  typed text is never stored**: it is a parameter (`{{password}}`), so a routine
+  saved from a recording has one for all its typing. You bind each at a terminal,
+  `incu routine bind <words> <param> INCU_PARAM_<NAME>`, to a variable you set in
+  incu's environment; only the variable's name is stored, `routine_run` takes no
+  `params` and refuses to start until every one is bound for the steps as they
+  are, and saving other steps drops the bindings. The hooks are never shown a
+  value. Changes to the file take an OS file lock, so two servers do not lose
+  each other's saves.
+
+`watch` is `wait_for` with a long deadline (default 1 hour, at most 24, looked
+at every second, every five for `screen_changes`): it blocks until the condition
+holds, then runs your post-tool hook for the tool `watch` with the reply
+(`result`, what it found, the `message` you passed) as `tool_response`. Put the
+notification in that hook, for example `osascript -e 'display notification "…"'`
+on macOS or `notify-send` on Linux. The stop file (`incu stop`) ends a watch
+within a second; nothing else does but its deadline, not even the client going
+away (end of input does not cut off a request the client already sent), so an
+orphaned watch lasts until its deadline or `incu stop`; while it runs the server
+answers nothing else.
 
 ### What it will not do
 

@@ -1,5 +1,5 @@
-//! The settings the crate owns: limits, the Linux display and the operator's
-//! hooks.
+//! The settings the crate owns: limits, the Linux display, the operator's
+//! hooks and where routines are kept.
 //!
 //! # One file for either binary
 //!
@@ -48,6 +48,11 @@ pub struct Config {
     /// The operator's commands around every call. See [`crate::hooks`].
     #[serde(default, alias = "desktop_hooks", alias = "hooks")]
     pub hooks: HookConfig,
+    /// Where learned routines are kept. Unset: `$INCU_ROUTINES`, else
+    /// `routines.json` in the per-user data folder
+    /// ([`crate::routine::store::Store::default_path`]).
+    #[serde(default, alias = "routines_file")]
+    pub routines: Option<PathBuf>,
 }
 
 impl Config {
@@ -147,6 +152,18 @@ mod tests {
                 .expect("config");
         assert_eq!(config.limits.tree_depth, Some(4));
         assert_eq!(config.display.as_deref(), Some(":99"));
+    }
+
+    /// Where routines are kept is overridable, under either name.
+    #[test]
+    fn the_routines_file_can_be_named_in_the_config() {
+        let config: Config =
+            serde_json::from_str(r#"{"routines": "/data/r.json"}"#).expect("config");
+        assert_eq!(config.routines, Some(PathBuf::from("/data/r.json")));
+        let alias: Config =
+            serde_json::from_str(r#"{"routines_file": "/data/s.json"}"#).expect("config");
+        assert_eq!(alias.routines, Some(PathBuf::from("/data/s.json")));
+        assert_eq!(Config::default().routines, None);
     }
 
     #[test]
