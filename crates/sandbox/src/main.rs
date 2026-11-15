@@ -536,17 +536,31 @@ fn setup_windows(args: &[OsString]) -> Result<i32, String> {
     }
 }
 
+/// `insbx mcp`: the sandbox server on stdio, its sandboxes under `--root` or,
+/// by default, under `<temp>/insbx-mcp-<pid>`. That default root is this
+/// server's own and is removed when the server stops, unless `--keep` was
+/// given (tested by `tests/mcp_root.rs`; the server is
+/// `incord_sandbox::server::Server`).
 fn mcp(args: &[OsString]) -> Result<i32, String> {
-    let (root, mut ceilings) = parse_mcp(args)?;
-    let root = root
+    let (given, mut ceilings) = parse_mcp(args)?;
+    let root = given
+        .clone()
         .unwrap_or_else(|| std::env::temp_dir().join(format!("insbx-mcp-{}", std::process::id())));
     std::fs::create_dir_all(&root).map_err(|e| format!("{}: {e}", root.display()))?;
     ceilings.root =
         incord_sandbox::plain_path(std::fs::canonicalize(&root).map_err(|e| e.to_string())?);
+    let keep = ceilings.keep;
     let stdin = std::io::stdin();
-    incord_sandbox::server::Server::new(ceilings)
-        .serve(stdin.lock(), std::io::stdout().lock())
-        .map_err(|e| format!("mcp: {e}"))?;
+    let served =
+        incord_sandbox::server::Server::new(ceilings).serve(stdin.lock(), std::io::stdout().lock());
+    // The default root is this server's own: once its sandboxes are gone,
+    // remove it too, so no empty `insbx-mcp-<pid>` is left per server. Only
+    // when empty (`remove_dir` refuses a folder with anything in it): a
+    // sandbox that could not be deleted stays where it is.
+    if given.is_none() && !keep {
+        let _ = std::fs::remove_dir(&root);
+    }
+    served.map_err(|e| format!("mcp: {e}"))?;
     Ok(0)
 }
 
